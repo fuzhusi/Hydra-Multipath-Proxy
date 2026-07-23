@@ -61,7 +61,7 @@ impl HydraApp {
             self.add_log("代理已经在运行".to_string());
             return;
         }
-        
+
         let proxy_addr: SocketAddr = match self.proxy_addr.parse() {
             Ok(addr) => addr,
             Err(e) => {
@@ -69,40 +69,30 @@ impl HydraApp {
                 return;
             }
         };
-        
-        // 创建调度器
-        let _scheduler = Arc::new(Scheduler::new());
-        
-        // 添加节点
+
+        // 解析节点地址
+        let mut nodes = Vec::new();
         let mut logs_to_add = Vec::new();
         for node_addr in &self.config.node_addrs {
             if let Ok(addr) = node_addr.parse::<SocketAddr>() {
-                let _node_info = NodeInfo {
-                    address: addr,
-                    bandwidth: 100.0,
-                    latency: 10.0,
-                    loss_rate: 0.01,
-                    load: 0.5,
-                    status: NodeStatus::Online,
-                };
-                // 这里需要异步运行时，暂时跳过
+                nodes.push(addr);
                 logs_to_add.push(format!("添加节点: {}", addr));
             }
         }
-        
+
         // 添加日志
         for log in logs_to_add {
             self.add_log(log);
         }
-        
-        // 启动代理
-        let proxy = ProxyServer::new(proxy_addr);
+
+        // 启动代理（传入节点）
+        let proxy = ProxyServer::new(proxy_addr).with_nodes(nodes);
         let handle = tokio::spawn(async move {
             if let Err(e) = proxy.start().await {
                 eprintln!("代理错误: {}", e);
             }
         });
-        
+
         self.proxy_handle = Some(handle);
         self.proxy_running = true;
         self.add_log(format!("代理已启动，监听地址: {}", proxy_addr));
