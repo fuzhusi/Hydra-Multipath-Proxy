@@ -1,5 +1,6 @@
 use eframe::egui;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use hydra_client::{Scheduler, ProxyServer, Transport, ShareLink, parse_share_links, generate_share_links};
 use hydra_protocol::{NodeInfo, NodeStatus, Result};
@@ -22,6 +23,7 @@ struct HydraApp {
     // 运行时状态
     scheduler: Option<Arc<Scheduler>>,
     transport: Option<Arc<Transport>>,
+    stop_flag: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Default, Clone)]
@@ -88,17 +90,33 @@ impl HydraApp {
         let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), std::io::Error>>();
         let proxy_addr_clone = proxy_addr;
         let nodes_clone = nodes.clone();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_flag_clone = stop_flag.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
                 let proxy = ProxyServer::new(proxy_addr_clone).with_nodes(nodes_clone);
                 // 发送启动信号
                 let _ = tx.send(Ok(()));
-                if let Err(e) = proxy.start().await {
-                    eprintln!("代理错误: {}", e);
+                // 启动代理
+                tokio::select! {
+                    result = proxy.start() => {
+                        if let Err(e) = result {
+                            eprintln!("代理错误: {}", e);
+                        }
+                    }
+                    _ = async {
+                        while !stop_flag_clone.load(Ordering::Relaxed) {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    } => {
+                        println!("代理收到停止信号");
+                    }
                 }
             });
         });
+
+        self.stop_flag = Some(stop_flag);
 
         // 等待代理启动
         match rx.recv() {
@@ -118,9 +136,12 @@ impl HydraApp {
     }
     
     fn stop_proxy(&mut self) {
-        // 代理会在下次连接时检测到端口关闭而停止
+        if let Some(stop_flag) = &self.stop_flag {
+            stop_flag.store(true, Ordering::Relaxed);
+        }
         self.proxy_running = false;
-        self.add_log("代理已停止（请重启应用以完全释放端口）".to_string());
+        self.stop_flag = None;
+        self.add_log("代理已停止".to_string());
     }
     
     fn export_share_links(&mut self) {
