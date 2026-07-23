@@ -96,21 +96,31 @@ impl HydraApp {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
                 let proxy = ProxyServer::new(proxy_addr_clone).with_nodes(nodes_clone);
-                // 发送启动信号
-                let _ = tx.send(Ok(()));
-                // 启动代理
-                tokio::select! {
-                    result = proxy.start() => {
-                        if let Err(e) = result {
-                            eprintln!("代理错误: {}", e);
+                // 先绑定端口
+                match tokio::net::TcpListener::bind(proxy_addr_clone).await {
+                    Ok(listener) => {
+                        // 端口绑定成功，发送信号
+                        let _ = tx.send(Ok(()));
+                        // 关闭测试 listener
+                        drop(listener);
+                        // 启动代理
+                        tokio::select! {
+                            result = proxy.start() => {
+                                if let Err(e) = result {
+                                    eprintln!("代理错误: {}", e);
+                                }
+                            }
+                            _ = async {
+                                while !stop_flag_clone.load(Ordering::Relaxed) {
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                }
+                            } => {
+                                println!("代理收到停止信号");
+                            }
                         }
                     }
-                    _ = async {
-                        while !stop_flag_clone.load(Ordering::Relaxed) {
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                    } => {
-                        println!("代理收到停止信号");
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
                     }
                 }
             });
@@ -121,8 +131,8 @@ impl HydraApp {
         // 等待代理启动
         match rx.recv() {
             Ok(Ok(())) => {
-                // 等待端口绑定
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                // 等待端口绑定完成
+                std::thread::sleep(std::time::Duration::from_millis(200));
                 self.proxy_running = true;
                 self.add_log(format!("代理已启动，监听地址: {}", proxy_addr));
             }
