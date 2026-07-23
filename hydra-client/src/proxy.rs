@@ -29,6 +29,7 @@ impl ProxyServer {
 
     pub async fn start(&self) -> Result<()> {
         // Add nodes to scheduler
+        info!("Initializing proxy with {} nodes...", self.nodes.len());
         for addr in &self.nodes {
             let node = NodeInfo {
                 address: *addr,
@@ -39,22 +40,29 @@ impl ProxyServer {
                 status: NodeStatus::Online,
             };
             self.scheduler.add_node(node).await;
-            info!("Added node: {}", addr);
+            info!("Added node to scheduler: {}", addr);
         }
 
+        info!("Binding proxy listener to {}...", self.listen_addr);
         let listener = TcpListener::bind(self.listen_addr).await?;
-        info!("Proxy server listening on {}", self.listen_addr);
+        info!("✓ Proxy server listening on {}", self.listen_addr);
 
         loop {
-            let (stream, addr) = listener.accept().await?;
-            info!("New connection from {}", addr);
-
-            let scheduler = self.scheduler.clone();
-            tokio::spawn(async move {
-                if let Err(e) = Self::handle_connection(stream, scheduler).await {
-                    error!("Error handling connection from {}: {}", addr, e);
+            match listener.accept().await {
+                Ok((stream, addr)) => {
+                    info!("━━━ New SOCKS5 connection from {} ━━━", addr);
+                    let scheduler = self.scheduler.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::handle_connection(stream, scheduler).await {
+                            error!("Connection error from {}: {}", addr, e);
+                        }
+                        info!("━━━ Connection from {} finished ━━━", addr);
+                    });
                 }
-            });
+                Err(e) => {
+                    error!("Failed to accept connection: {}", e);
+                }
+            }
         }
     }
 
@@ -64,21 +72,29 @@ impl ProxyServer {
     ) -> Result<()> {
         // SOCKS5 handshake
         let mut buf = [0u8; 256];
+        let peer_addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
 
         // Read greeting
+        info!("[{}] Reading SOCKS5 greeting...", peer_addr);
         let n = stream.read(&mut buf).await?;
         if n < 2 || buf[0] != 0x05 {
+            error!("[{}] Invalid SOCKS5 greeting: {:?}", peer_addr, &buf[..n]);
             return Err(HydraError::ProtocolError("Invalid SOCKS5 greeting".to_string()));
         }
+        info!("[{}] SOCKS5 greeting received ({} bytes)", peer_addr, n);
 
         // Send no auth required
         stream.write_all(&[0x05, 0x00]).await?;
+        info!("[{}] Sent no-auth response", peer_addr);
 
         // Read request
+        info!("[{}] Reading SOCKS5 request...", peer_addr);
         let n = stream.read(&mut buf).await?;
         if n < 7 || buf[0] != 0x05 {
+            error!("[{}] Invalid SOCKS5 request: {:?}", peer_addr, &buf[..n]);
             return Err(HydraError::ProtocolError("Invalid SOCKS5 request".to_string()));
         }
+        info!("[{}] SOCKS5 request received ({} bytes), cmd={}", peer_addr, n, buf[1]);
 
         // Parse command
         let cmd = buf[1];
@@ -90,6 +106,8 @@ impl ProxyServer {
 
         // Parse address type
         let atyp = buf[3];
+        info!("[{}] Address type: 0x{:02x}", peer_addr, atyp);
+
         let target_addr = match atyp {
             0x01 => {
                 // IPv4
@@ -98,7 +116,9 @@ impl ProxyServer {
                 }
                 let ip = std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
                 let port = u16::from_be_bytes([buf[8], buf[9]]);
-                SocketAddr::new(ip.into(), port)
+                let addr = SocketAddr::new(ip.into(), port);
+                info!("[{}] Target IPv4: {}", peer_addr, addr);
+                addr
             }
             0x03 => {
                 // Domain name
@@ -112,13 +132,18 @@ impl ProxyServer {
                 let domain = String::from_utf8_lossy(&buf[5..5 + domain_len]);
                 let port = u16::from_be_bytes([buf[5 + domain_len], buf[5 + domain_len + 1]]);
 
+                info!("[{}] Target domain: {}:{} - resolving DNS...", peer_addr, domain, port);
+
                 // DNS resolution - use a simple approach
                 let ip = tokio::net::lookup_host(format!("{}:{}", domain, port))
                     .await?
                     .next()
                     .ok_or_else(|| HydraError::ProtocolError("DNS resolution failed".to_string()))?
                     .ip();
-                SocketAddr::new(ip, port)
+
+                let addr = SocketAddr::new(ip, port);
+                info!("[{}] DNS resolved: {} -> {}", peer_addr, domain, addr);
+                addr
             }
             0x04 => {
                 // IPv6
@@ -136,27 +161,31 @@ impl ProxyServer {
                     u16::from_be_bytes([buf[18], buf[19]]),
                 );
                 let port = u16::from_be_bytes([buf[20], buf[21]]);
-                SocketAddr::new(ip.into(), port)
+                let addr = SocketAddr::new(ip.into(), port);
+                info!("[{}] Target IPv6: {}", peer_addr, addr);
+                addr
             }
             _ => {
+                error!("[{}] Unsupported address type: 0x{:02x}", peer_addr, atyp);
                 stream.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
                 return Err(HydraError::ProtocolError("Unsupported address type".to_string()));
             }
         };
 
-        info!("SOCKS5 CONNECT request to {}", target_addr);
+        info!("[{}] >>> SOCKS5 CONNECT request to {}", peer_addr, target_addr);
 
         // Get best node from scheduler
+        info!("[{}] Selecting best node from scheduler...", peer_addr);
         let node = scheduler.get_best_node().await
             .ok_or_else(|| {
-                error!("No available nodes in scheduler");
+                error!("[{}] No available nodes in scheduler!", peer_addr);
                 HydraError::ConnectionError("No available nodes".to_string())
             })?;
 
-        info!("Selected node: {}", node.address);
+        info!("[{}] Selected node: {} (score: {})", peer_addr, node.address, node.calculate_score());
 
         // Connect to remote node via QUIC
-        info!("Connecting to node {} via QUIC...", node.address);
+        info!("[{}] Connecting to node {} via QUIC...", peer_addr, node.address);
         let transport = match Transport::new_client().await {
             Ok(t) => t,
             Err(e) => {
@@ -224,9 +253,11 @@ impl ProxyServer {
         }
 
         // Send success response to client
+        info!("[{}] Sending SOCKS5 success response to client...", peer_addr);
         stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
 
-        info!("Connected to {} via node {}", target_addr, node.address);
+        info!("[{}] ✓ Connected to {} via node {}", peer_addr, target_addr, node.address);
+        info!("[{}] Starting bidirectional traffic forwarding...", peer_addr);
 
         // Forward traffic bidirectionally
         let (mut client_read, mut client_write) = stream.into_split();

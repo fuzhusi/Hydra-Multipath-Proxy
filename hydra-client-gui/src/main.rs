@@ -258,10 +258,16 @@ impl HydraApp {
                         // 关闭测试 listener
                         drop(listener);
                         // 启动代理
+                        println!("[Proxy Thread] Starting proxy server...");
                         tokio::select! {
                             result = proxy.start() => {
-                                if let Err(e) = result {
-                                    eprintln!("代理错误: {}", e);
+                                match result {
+                                    Ok(()) => {
+                                        println!("[Proxy Thread] Proxy server exited normally");
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[Proxy Thread] Proxy server error: {}", e);
+                                    }
                                 }
                             }
                             _ = async {
@@ -269,15 +275,17 @@ impl HydraApp {
                                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                 }
                             } => {
-                                println!("代理收到停止信号");
+                                println!("[Proxy Thread] Received stop signal");
                             }
                         }
                     }
                     Err(e) => {
+                        eprintln!("[Proxy Thread] Failed to bind port: {}", e);
                         let _ = tx.send(Err(e));
                     }
                 }
             });
+            println!("[Proxy Thread] Thread exiting...");
             // 代理线程退出时发送通知
             let _ = exit_tx.send(());
         });
