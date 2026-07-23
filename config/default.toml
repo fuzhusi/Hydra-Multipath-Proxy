@@ -1,0 +1,9 @@
+[server]
+listen_addr = "0.0.0.0:8080"
+max_connections = 1000
+buffer_size = 65536
+log_level = "info"
+
+[client]
+proxy_addr = "127.0.0.1:1080"
+nodes = ["127.0.0.1:8080"]

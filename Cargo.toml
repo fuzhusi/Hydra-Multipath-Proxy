@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "hydra-client",
+    "hydra-node",
+    "hydra-protocol",
+    "hydra-client-gui",
+]
+resolver = "2"
