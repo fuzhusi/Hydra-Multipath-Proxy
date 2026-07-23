@@ -5,20 +5,28 @@ use tracing::{info, error, warn};
 use hydra_protocol::{Result, HydraError, NodeInfo, NodeStatus};
 use crate::scheduler::Scheduler;
 use crate::transport::Transport;
+use crate::pool::{ConnectionPool, PoolConfig};
 use std::sync::Arc;
 
 pub struct ProxyServer {
     listen_addr: SocketAddr,
     scheduler: Arc<Scheduler>,
     nodes: Vec<SocketAddr>,
+    pool: Arc<ConnectionPool>,
 }
 
 impl ProxyServer {
     pub fn new(listen_addr: SocketAddr) -> Self {
+        let (endpoint, _) = Transport::create_shared_endpoint()
+            .expect("Failed to create QUIC endpoint");
+
+        let pool = ConnectionPool::new(endpoint, PoolConfig::default());
+
         Self {
             listen_addr,
             scheduler: Arc::new(Scheduler::new()),
             nodes: Vec::new(),
+            pool: Arc::new(pool),
         }
     }
 
@@ -43,6 +51,12 @@ impl ProxyServer {
             info!("Added node to scheduler: {}", addr);
         }
 
+        // 预热连接池
+        info!("Warming up connection pool...");
+        for addr in &self.nodes {
+            self.pool.warm_up(*addr, 2).await;
+        }
+
         info!("Binding proxy listener to {}...", self.listen_addr);
         let listener = TcpListener::bind(self.listen_addr).await?;
         info!("✓ Proxy server listening on {}", self.listen_addr);
@@ -52,9 +66,10 @@ impl ProxyServer {
                 Ok((stream, addr)) => {
                     info!("━━━ New SOCKS5 connection from {} ━━━", addr);
                     let scheduler = self.scheduler.clone();
+                    let pool = self.pool.clone();
                     tokio::spawn(async move {
                         // 包装错误处理，确保发送 SOCKS5 错误响应
-                        match Self::handle_connection(stream, scheduler).await {
+                        match Self::handle_connection(stream, scheduler, pool).await {
                             Ok(()) => {
                                 info!("━━━ Connection from {} completed successfully ━━━", addr);
                             }
@@ -75,6 +90,7 @@ impl ProxyServer {
     async fn handle_connection(
         mut stream: TcpStream,
         scheduler: Arc<Scheduler>,
+        pool: Arc<ConnectionPool>,
     ) -> Result<()> {
         let mut buf = [0u8; 4096];
         let peer_addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
@@ -97,11 +113,11 @@ impl ProxyServer {
         if buf[0] == 0x05 {
             // SOCKS5 协议
             info!("[{}] Detected SOCKS5 protocol", peer_addr);
-            Self::handle_socks5(stream, &buf, n, scheduler).await
+            Self::handle_socks5(stream, &buf, n, scheduler, pool).await
         } else if buf[0] >= b'A' && buf[0] <= b'Z' {
             // HTTP 协议 (CONNECT, GET, POST 等)
             info!("[{}] Detected HTTP protocol", peer_addr);
-            Self::handle_http(stream, &buf, n, scheduler).await
+            Self::handle_http(stream, &buf, n, scheduler, pool).await
         } else {
             error!("[{}] Unknown protocol, first byte: 0x{:02x}", peer_addr, buf[0]);
             let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
@@ -115,6 +131,7 @@ impl ProxyServer {
         initial_buf: &[u8],
         initial_len: usize,
         scheduler: Arc<Scheduler>,
+        pool: Arc<ConnectionPool>,
     ) -> Result<()> {
         let peer_addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
 
@@ -158,7 +175,7 @@ impl ProxyServer {
             // CONNECT 请求 - 用于 HTTPS
             let target_str = url.to_string();
             info!("[{}] >>> HTTP CONNECT request to {}", peer_addr, target_str);
-            return Self::handle_http_connect(stream, target_str, scheduler).await;
+            return Self::handle_http_connect(stream, target_str, scheduler, pool).await;
         }
 
         // 普通 HTTP 请求 (GET, POST, etc.)
@@ -205,40 +222,17 @@ impl ProxyServer {
 
         info!("[{}] Selected node: {} (score: {})", peer_addr, node.address, node.calculate_score());
 
-        // 连接到节点
-        info!("[{}] Connecting to node {} via QUIC...", peer_addr, node.address);
-        let transport = match Transport::new_client().await {
-            Ok(t) => t,
+        // 从连接池获取连接
+        info!("[{}] Getting connection from pool for node {}...", peer_addr, node.address);
+        let (mut send, mut recv) = match pool.get_stream(node.address).await {
+            Ok(streams) => {
+                info!("[{}] Got connection to node {}", peer_addr, node.address);
+                streams
+            }
             Err(e) => {
-                error!("[{}] Failed to create QUIC transport: {}", peer_addr, e);
+                error!("[{}] Failed to get connection to node {}: {}", peer_addr, node.address, e);
                 let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 return Err(e);
-            }
-        };
-
-        let connection = match transport.connect(node.address).await {
-            Ok(c) => {
-                info!("[{}] QUIC connection established to {}", peer_addr, node.address);
-                c
-            }
-            Err(e) => {
-                error!("[{}] Failed to connect to node {}: {}", peer_addr, node.address, e);
-                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                return Err(e);
-            }
-        };
-
-        // 打开双向流
-        info!("[{}] Opening bidirectional stream to node...", peer_addr);
-        let (mut send, mut recv) = match connection.open_bi().await {
-            Ok(stream) => {
-                info!("[{}] Bidirectional stream opened successfully", peer_addr);
-                stream
-            }
-            Err(e) => {
-                error!("[{}] Failed to open bidirectional stream: {}", peer_addr, e);
-                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                return Err(HydraError::ProtocolError(format!("Failed to open stream: {}", e)));
             }
         };
 
@@ -334,6 +328,7 @@ impl ProxyServer {
         mut stream: TcpStream,
         target_str: String,
         scheduler: Arc<Scheduler>,
+        pool: Arc<ConnectionPool>,
     ) -> Result<()> {
         let peer_addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
 
@@ -350,40 +345,17 @@ impl ProxyServer {
 
         info!("[{}] Selected node: {} (score: {})", peer_addr, node.address, node.calculate_score());
 
-        // 连接到节点
-        info!("[{}] Connecting to node {} via QUIC...", peer_addr, node.address);
-        let transport = match Transport::new_client().await {
-            Ok(t) => t,
+        // 从连接池获取连接
+        info!("[{}] Getting connection from pool for node {}...", peer_addr, node.address);
+        let (mut send, mut recv) = match pool.get_stream(node.address).await {
+            Ok(streams) => {
+                info!("[{}] Got connection to node {}", peer_addr, node.address);
+                streams
+            }
             Err(e) => {
-                error!("[{}] Failed to create QUIC transport: {}", peer_addr, e);
+                error!("[{}] Failed to get connection to node {}: {}", peer_addr, node.address, e);
                 let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 return Err(e);
-            }
-        };
-
-        let connection = match transport.connect(node.address).await {
-            Ok(c) => {
-                info!("[{}] QUIC connection established to {}", peer_addr, node.address);
-                c
-            }
-            Err(e) => {
-                error!("[{}] Failed to connect to node {}: {}", peer_addr, node.address, e);
-                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                return Err(e);
-            }
-        };
-
-        // 打开双向流
-        info!("[{}] Opening bidirectional stream to node...", peer_addr);
-        let (mut send, mut recv) = match connection.open_bi().await {
-            Ok(stream) => {
-                info!("[{}] Bidirectional stream opened successfully", peer_addr);
-                stream
-            }
-            Err(e) => {
-                error!("[{}] Failed to open bidirectional stream: {}", peer_addr, e);
-                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                return Err(HydraError::ProtocolError(format!("Failed to open stream: {}", e)));
             }
         };
 
@@ -476,6 +448,7 @@ impl ProxyServer {
         initial_buf: &[u8],
         initial_len: usize,
         scheduler: Arc<Scheduler>,
+        pool: Arc<ConnectionPool>,
     ) -> Result<()> {
         let peer_addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
         let mut buf = [0u8; 256];
@@ -603,40 +576,17 @@ impl ProxyServer {
 
         info!("[{}] Selected node: {} (score: {})", peer_addr, node.address, node.calculate_score());
 
-        // Connect to remote node via QUIC
-        info!("[{}] Connecting to node {} via QUIC...", peer_addr, node.address);
-        let transport = match Transport::new_client().await {
-            Ok(t) => t,
+        // 从连接池获取连接
+        info!("[{}] Getting connection from pool for node {}...", peer_addr, node.address);
+        let (mut send, mut recv) = match pool.get_stream(node.address).await {
+            Ok(streams) => {
+                info!("[{}] Got connection to node {}", peer_addr, node.address);
+                streams
+            }
             Err(e) => {
-                error!("Failed to create QUIC transport: {}", e);
+                error!("[{}] Failed to get connection to node {}: {}", peer_addr, node.address, e);
                 stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
                 return Err(e);
-            }
-        };
-
-        let connection = match transport.connect(node.address).await {
-            Ok(c) => {
-                info!("QUIC connection established to {}", node.address);
-                c
-            }
-            Err(e) => {
-                error!("Failed to connect to node {}: {}", node.address, e);
-                stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-                return Err(e);
-            }
-        };
-
-        // Send target address to remote node
-        info!("Opening bidirectional stream to node...");
-        let (mut send, mut recv) = match connection.open_bi().await {
-            Ok(stream) => {
-                info!("Bidirectional stream opened successfully");
-                stream
-            }
-            Err(e) => {
-                error!("Failed to open bidirectional stream: {}", e);
-                stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-                return Err(HydraError::ProtocolError(format!("Failed to open stream: {}", e)));
             }
         };
 

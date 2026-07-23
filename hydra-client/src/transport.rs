@@ -11,6 +11,12 @@ pub struct Transport {
 
 impl Transport {
     pub async fn new_client() -> Result<Self> {
+        let (endpoint, _) = Self::create_shared_endpoint()?;
+        Ok(Self { endpoint })
+    }
+
+    /// 创建可共享的客户端 Endpoint 和配置
+    pub fn create_shared_endpoint() -> Result<(Endpoint, ClientConfig)> {
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())?;
 
         // Configure crypto
@@ -29,10 +35,10 @@ impl Transport {
         transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
         client_config.transport_config(Arc::new(transport_config));
 
-        endpoint.set_default_client_config(client_config);
+        endpoint.set_default_client_config(client_config.clone());
 
-        info!("Created new QUIC client endpoint on {}", endpoint.local_addr()?);
-        Ok(Self { endpoint })
+        info!("Created shared QUIC client endpoint on {}", endpoint.local_addr()?);
+        Ok((endpoint, client_config))
     }
 
     pub async fn new_server(addr: SocketAddr) -> Result<Self> {

@@ -7,6 +7,8 @@ pub mod transport;
 pub mod crypto;
 pub mod speedtest;
 pub mod share_link;
+pub mod pool;
+pub mod buf_pool;
 
 pub use proxy::*;
 pub use session::*;
@@ -17,3 +19,5 @@ pub use transport::*;
 pub use crypto::*;
 pub use speedtest::*;
 pub use share_link::*;
+pub use pool::*;
+pub use buf_pool::*;
