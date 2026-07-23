@@ -90,26 +90,39 @@ impl ConnectionHandler {
             }
         };
 
-        info!("Connecting to target: {}", target_addr);
+        info!("Connecting to target: {} (with 30s timeout)", target_addr);
+        let connect_start = std::time::Instant::now();
 
-        // Connect to target
-        let mut target_stream = match TcpStream::connect(target_addr).await {
-            Ok(stream) => {
+        // Connect to target with timeout
+        let target_stream = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            TcpStream::connect(target_addr)
+        ).await {
+            Ok(Ok(stream)) => {
+                let elapsed = connect_start.elapsed();
+                info!("Connected to target: {} (took {}ms)", target_addr, elapsed.as_millis());
                 // Send success response
                 send.write_all(&[0x00, 0x00]).await
                     .map_err(|e| HydraError::ProtocolError(format!("Write error: {}", e)))?;
                 stream
             }
-            Err(e) => {
-                error!("Failed to connect to {}: {}", target_addr, e);
+            Ok(Err(e)) => {
+                let elapsed = connect_start.elapsed();
+                error!("Failed to connect to {}: {} (took {}ms)", target_addr, e, elapsed.as_millis());
                 // Send failure response
                 send.write_all(&[0x01, 0x00]).await
                     .map_err(|e| HydraError::ProtocolError(format!("Write error: {}", e)))?;
                 return Err(HydraError::ConnectionError(format!("Failed to connect to {}: {}", target_addr, e)));
             }
+            Err(_) => {
+                let elapsed = connect_start.elapsed();
+                error!("Timeout connecting to {} ({}ms)", target_addr, elapsed.as_millis());
+                // Send failure response
+                send.write_all(&[0x01, 0x00]).await
+                    .map_err(|e| HydraError::ProtocolError(format!("Write error: {}", e)))?;
+                return Err(HydraError::ConnectionError(format!("Timeout connecting to {}", target_addr)));
+            }
         };
-
-        info!("Connected to target: {}", target_addr);
 
         // Forward traffic bidirectionally
         let (mut target_read, mut target_write) = target_stream.into_split();
