@@ -162,7 +162,8 @@ impl ProxyServer {
         }
 
         // 普通 HTTP 请求 (GET, POST, etc.)
-        // 从 URL 中提取主机名
+        // 对于 HTTP GET/POST，我们需要将请求转发到目标服务器
+        // 从 URL 或 Host header 中提取主机名
         let target_host = if url.starts_with("http://") {
             // 从 http://host/path 中提取 host
             let without_protocol = &url[7..];
@@ -668,7 +669,7 @@ impl ProxyServer {
                 addr
             }
             0x03 => {
-                // Domain name
+                // Domain name - 发送域名到服务器，让服务器解析 DNS
                 if n < 7 {
                     error!("[{}] Invalid domain name length: {}", peer_addr, n);
                     let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
@@ -683,37 +684,13 @@ impl ProxyServer {
                 let domain = String::from_utf8_lossy(&buf[5..5 + domain_len]);
                 let port = u16::from_be_bytes([buf[5 + domain_len], buf[5 + domain_len + 1]]);
 
-                info!("[{}] Target domain: {}:{} - resolving DNS...", peer_addr, domain, port);
+                info!("[{}] Target domain: {}:{} - sending to server for DNS resolution", peer_addr, domain, port);
 
-                // DNS resolution - prefer IPv4
-                let ip = match tokio::net::lookup_host(format!("{}:{}", domain, port)).await {
-                    Ok(addrs) => {
-                        let addrs_vec: Vec<_> = addrs.collect();
-                        // 优先使用 IPv4 地址
-                        let ipv4_addr = addrs_vec.iter().find(|a| a.is_ipv4());
-                        let addr = match ipv4_addr {
-                            Some(a) => *a,
-                            None => match addrs_vec.first() {
-                                Some(a) => *a,
-                                None => {
-                                    error!("[{}] DNS resolution failed for {}: no addresses found", peer_addr, domain);
-                                    let _ = stream.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
-                                    return Err(HydraError::ProtocolError("DNS resolution failed".to_string()));
-                                }
-                            }
-                        };
-                        addr.ip()
-                    }
-                    Err(e) => {
-                        error!("[{}] DNS resolution failed for {}: {}", peer_addr, domain, e);
-                        let _ = stream.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
-                        return Err(HydraError::ProtocolError(format!("DNS resolution failed: {}", e)));
-                    }
-                };
-
-                let addr = SocketAddr::new(ip, port);
-                info!("[{}] DNS resolved: {} -> {}", peer_addr, domain, addr);
-                addr
+                // 直接返回域名格式的地址，让服务器解析 DNS
+                // 使用一个特殊的 SocketAddr 来表示域名
+                // 这里我们用 0.0.0.0:0 作为占位符，实际发送域名到服务器
+                // 服务器会解析域名并连接
+                SocketAddr::new(std::net::Ipv4Addr::new(0, 0, 0, 0).into(), 0)
             }
             0x04 => {
                 // IPv6
@@ -797,7 +774,16 @@ impl ProxyServer {
         };
 
         // Send connect request: [target_addr_str]
-        let target_str = target_addr.to_string();
+        // 对于域名类型，发送域名而不是 IP 地址
+        let target_str = if atyp == 0x03 {
+            // 域名类型，发送域名:端口格式
+            let domain_len = buf[4] as usize;
+            let domain = String::from_utf8_lossy(&buf[5..5 + domain_len]);
+            let port = u16::from_be_bytes([buf[5 + domain_len], buf[5 + domain_len + 1]]);
+            format!("{}:{}", domain, port)
+        } else {
+            target_addr.to_string()
+        };
         info!("[{}] Sending target address to node: {}", peer_addr, target_str);
         if let Err(e) = send.write_all(target_str.as_bytes()).await {
             error!("[{}] Failed to send target address: {}", peer_addr, e);

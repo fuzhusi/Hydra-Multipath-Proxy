@@ -90,12 +90,12 @@ impl ConnectionHandler {
             }
         };
 
-        info!("Connecting to target: {} (with 30s timeout)", target_addr);
+        info!("Connecting to target: {} (with 60s timeout)", target_addr);
         let connect_start = std::time::Instant::now();
 
         // Connect to target with timeout
         let target_stream = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(60),
             TcpStream::connect(target_addr)
         ).await {
             Ok(Ok(stream)) => {
