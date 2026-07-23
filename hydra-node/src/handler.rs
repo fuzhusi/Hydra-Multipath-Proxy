@@ -125,37 +125,71 @@ impl ConnectionHandler {
         };
 
         // Forward traffic bidirectionally
+        info!("Starting bidirectional traffic forwarding for {}", target_addr);
         let (mut target_read, mut target_write) = target_stream.into_split();
 
         let quic_to_target = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
+            let mut total_bytes = 0;
             loop {
                 match recv.read(&mut buf).await {
-                    Ok(Some(0)) => break,
+                    Ok(Some(0)) => {
+                        info!("QUIC stream closed (0 bytes read)");
+                        break;
+                    }
                     Ok(Some(n)) => {
+                        total_bytes += n;
+                        if n < 100 {
+                            info!("Received {} bytes from QUIC: {:?}", n, String::from_utf8_lossy(&buf[..n]));
+                        } else {
+                            info!("Received {} bytes from QUIC (total: {})", n, total_bytes);
+                        }
                         if target_write.write_all(&buf[..n]).await.is_err() {
+                            error!("Failed to write to target");
                             break;
                         }
                     }
-                    Ok(None) => break,
-                    Err(_) => break,
+                    Ok(None) => {
+                        info!("QUIC stream ended (None)");
+                        break;
+                    }
+                    Err(e) => {
+                        error!("Error reading from QUIC: {}", e);
+                        break;
+                    }
                 }
             }
+            info!("QUIC to target forwarding finished (total: {} bytes)", total_bytes);
         });
 
         let target_to_quic = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
+            let mut total_bytes = 0;
             loop {
                 match target_read.read(&mut buf).await {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        info!("Target stream closed (0 bytes read)");
+                        break;
+                    }
                     Ok(n) => {
+                        total_bytes += n;
+                        if n < 100 {
+                            info!("Received {} bytes from target: {:?}", n, String::from_utf8_lossy(&buf[..n]));
+                        } else {
+                            info!("Received {} bytes from target (total: {})", n, total_bytes);
+                        }
                         if send.write_all(&buf[..n]).await.is_err() {
+                            error!("Failed to write to QUIC");
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        error!("Error reading from target: {}", e);
+                        break;
+                    }
                 }
             }
+            info!("Target to QUIC forwarding finished (total: {} bytes)", total_bytes);
         });
 
         // Wait for either direction to finish
