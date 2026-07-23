@@ -19,9 +19,11 @@ impl ConnectionHandler {
     }
 
     pub async fn handle_connection(&self, connection: Connection) -> Result<()> {
+        info!("Waiting for bidirectional stream from client...");
         loop {
             match connection.accept_bi().await {
                 Ok((send, recv)) => {
+                    info!("Accepted bidirectional stream, spawning handler");
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_stream(send, recv).await {
                             error!("Stream error: {}", e);
@@ -29,7 +31,7 @@ impl ConnectionHandler {
                     });
                 }
                 Err(quinn::ConnectionError::ApplicationClosed(_)) => {
-                    info!("Connection closed");
+                    info!("Connection closed by client");
                     break;
                 }
                 Err(e) => {

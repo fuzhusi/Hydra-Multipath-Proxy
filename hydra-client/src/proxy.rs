@@ -148,31 +148,77 @@ impl ProxyServer {
 
         // Get best node from scheduler
         let node = scheduler.get_best_node().await
-            .ok_or_else(|| HydraError::ConnectionError("No available nodes".to_string()))?;
+            .ok_or_else(|| {
+                error!("No available nodes in scheduler");
+                HydraError::ConnectionError("No available nodes".to_string())
+            })?;
 
         info!("Selected node: {}", node.address);
 
         // Connect to remote node via QUIC
-        let transport = Transport::new_client().await?;
-        let connection = transport.connect(node.address).await?;
+        info!("Connecting to node {} via QUIC...", node.address);
+        let transport = match Transport::new_client().await {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Failed to create QUIC transport: {}", e);
+                stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+                return Err(e);
+            }
+        };
+
+        let connection = match transport.connect(node.address).await {
+            Ok(c) => {
+                info!("QUIC connection established to {}", node.address);
+                c
+            }
+            Err(e) => {
+                error!("Failed to connect to node {}: {}", node.address, e);
+                stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+                return Err(e);
+            }
+        };
 
         // Send target address to remote node
-        let (mut send, mut recv) = connection.open_bi().await
-            .map_err(|e| HydraError::ProtocolError(format!("Failed to open stream: {}", e)))?;
+        info!("Opening bidirectional stream to node...");
+        let (mut send, mut recv) = match connection.open_bi().await {
+            Ok(stream) => {
+                info!("Bidirectional stream opened successfully");
+                stream
+            }
+            Err(e) => {
+                error!("Failed to open bidirectional stream: {}", e);
+                stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+                return Err(HydraError::ProtocolError(format!("Failed to open stream: {}", e)));
+            }
+        };
 
         // Send connect request: [target_addr_str]
         let target_str = target_addr.to_string();
+        info!("Sending target address to node: {}", target_str);
         send.write_all(target_str.as_bytes()).await
-            .map_err(|e| HydraError::ProtocolError(format!("Write error: {}", e)))?;
+            .map_err(|e| {
+                error!("Failed to send target address: {}", e);
+                HydraError::ProtocolError(format!("Write error: {}", e))
+            })?;
 
         // Read response from remote node
+        info!("Waiting for response from node...");
         let mut resp_buf = [0u8; 2];
         let n = recv.read(&mut resp_buf).await
-            .map_err(|e| HydraError::ProtocolError(format!("Read error: {}", e)))?
-            .ok_or_else(|| HydraError::ProtocolError("No response from node".to_string()))?;
+            .map_err(|e| {
+                error!("Failed to read response from node: {}", e);
+                HydraError::ProtocolError(format!("Read error: {}", e))
+            })?
+            .ok_or_else(|| {
+                error!("No response received from node");
+                HydraError::ProtocolError("No response from node".to_string())
+            })?;
+
+        info!("Received {} bytes response from node: {:?}", n, &resp_buf[..n]);
 
         if n < 2 || resp_buf[0] != 0x00 {
             // Connection failed
+            error!("Node returned error response: {:?}", &resp_buf[..n]);
             stream.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
             return Err(HydraError::ConnectionError("Remote node connection failed".to_string()));
         }
