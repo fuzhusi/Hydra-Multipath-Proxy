@@ -22,6 +22,9 @@ struct HydraApp {
     logs: Vec<String>,
     config: AppConfig,
 
+    // 输入状态
+    new_node_input: String,
+
     // 分享链接相关
     share_link_text: String,
     show_share_link_dialog: bool,
@@ -36,6 +39,7 @@ struct HydraApp {
     // 节点连接状态
     node_status: HashMap<String, NodeStatusInfo>,
     last_health_check: Option<std::time::Instant>,
+    health_check_receiver: Option<std::sync::mpsc::Receiver<(String, Option<(bool, u64)>)>>,
 }
 
 impl Default for HydraApp {
@@ -46,6 +50,7 @@ impl Default for HydraApp {
             nodes: Vec::new(),
             logs: Vec::new(),
             config: AppConfig::default(),
+            new_node_input: String::new(),
             share_link_text: String::new(),
             show_share_link_dialog: false,
             scheduler: None,
@@ -55,6 +60,7 @@ impl Default for HydraApp {
             proxy_exit_receiver: None,
             node_status: HashMap::new(),
             last_health_check: None,
+            health_check_receiver: None,
         }
     }
 }
@@ -99,6 +105,7 @@ impl HydraApp {
                 proxy_addr: "127.0.0.1:1080".to_string(),
                 node_addrs,
             },
+            new_node_input: String::new(),
             share_link_text: String::new(),
             show_share_link_dialog: false,
             scheduler: None,
@@ -108,6 +115,7 @@ impl HydraApp {
             proxy_exit_receiver: None,
             node_status,
             last_health_check: None,
+            health_check_receiver: None,
         }
     }
 
@@ -130,26 +138,58 @@ impl HydraApp {
         Some((connected, elapsed))
     }
 
-    /// Test all nodes and update status
+    /// Test all nodes and update status (non-blocking)
     fn test_all_nodes(&mut self) {
         let node_addrs = self.config.node_addrs.clone();
         let (tx, rx) = std::sync::mpsc::channel();
 
+        // 在后台线程中测试所有节点
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
+                // 并发测试所有节点
+                let mut handles = Vec::new();
                 for addr in &node_addrs {
-                    let result = Self::test_node_connection(addr).await;
-                    let _ = tx.send((addr.clone(), result));
+                    let addr = addr.clone();
+                    let tx = tx.clone();
+                    handles.push(tokio::spawn(async move {
+                        let result = Self::test_node_connection(&addr).await;
+                        let _ = tx.send((addr, result));
+                    }));
+                }
+                // 等待所有测试完成
+                for handle in handles {
+                    let _ = handle.await;
                 }
             });
         });
 
-        // Collect results with timeout
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok((addr, Some((connected, latency)))) => {
+        // 存储 receiver 以便在 update 循环中非阻塞地收集结果
+        self.health_check_receiver = Some(rx);
+        self.last_health_check = Some(std::time::Instant::now());
+    }
+
+    /// 在 update 循环中非阻塞地处理健康检查结果
+    fn poll_health_check_results(&mut self) {
+        // 先收集所有结果到临时列表，避免借用冲突
+        let mut results = Vec::new();
+        let mut should_clear = false;
+
+        if let Some(rx) = &self.health_check_receiver {
+            // 非阻塞地接收所有可用结果
+            while let Ok((addr, result)) = rx.try_recv() {
+                results.push((addr, result));
+            }
+            // 检查是否所有结果都已接收
+            if rx.try_recv().is_err() {
+                should_clear = true;
+            }
+        }
+
+        // 处理收集到的结果
+        for (addr, result) in results {
+            match result {
+                Some((connected, latency)) => {
                     self.node_status.insert(addr.clone(), NodeStatusInfo {
                         addr: addr.clone(),
                         connected,
@@ -162,7 +202,7 @@ impl HydraApp {
                         self.add_log(format!("节点 {} 连接失败", addr));
                     }
                 }
-                Ok((addr, None)) => {
+                None => {
                     self.node_status.insert(addr.clone(), NodeStatusInfo {
                         addr: addr.clone(),
                         connected: false,
@@ -171,11 +211,13 @@ impl HydraApp {
                     });
                     self.add_log(format!("节点 {} 测试失败", addr));
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                Err(_) => break,
             }
         }
-        self.last_health_check = Some(std::time::Instant::now());
+
+        // 清除 receiver
+        if should_clear {
+            self.health_check_receiver = None;
+        }
     }
     
     fn add_log(&mut self, message: String) {
@@ -526,10 +568,13 @@ impl eframe::App for HydraApp {
                 Some(last) => last.elapsed().as_secs() >= 30,
                 None => true,
             };
-            if should_check {
+            if should_check && self.health_check_receiver.is_none() {
                 self.test_all_nodes();
             }
         }
+
+        // 非阻塞地处理健康检查结果
+        self.poll_health_check_results();
 
         // 分享链接对话框
         if self.show_share_link_dialog {
@@ -579,10 +624,10 @@ impl eframe::App for HydraApp {
             // 添加节点
             ui.horizontal(|ui| {
                 ui.label("节点地址:");
-                let mut new_node = String::new();
-                ui.text_edit_singleline(&mut new_node);
+                ui.text_edit_singleline(&mut self.new_node_input);
                 if ui.button("添加").clicked() {
-                    if !new_node.is_empty() {
+                    if !self.new_node_input.is_empty() {
+                        let new_node = self.new_node_input.clone();
                         // 初始化节点状态
                         self.node_status.insert(new_node.clone(), NodeStatusInfo {
                             addr: new_node.clone(),
@@ -592,6 +637,7 @@ impl eframe::App for HydraApp {
                         });
                         self.config.node_addrs.push(new_node.clone());
                         self.add_log(format!("添加节点配置: {}", new_node));
+                        self.new_node_input.clear();
                     }
                 }
             });
