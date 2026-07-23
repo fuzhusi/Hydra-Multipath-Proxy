@@ -86,11 +86,22 @@ impl HydraApp {
 
         // 使用独立线程运行代理
         let (tx, rx) = std::sync::mpsc::channel();
+        let proxy_addr_clone = proxy_addr;
+        let nodes_clone = nodes.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let proxy = ProxyServer::new(proxy_addr).with_nodes(nodes);
-                let _ = tx.send(());
+                let proxy = ProxyServer::new(proxy_addr_clone).with_nodes(nodes_clone);
+                // 先绑定端口，再发送信号
+                match tokio::net::TcpListener::bind(proxy_addr_clone).await {
+                    Ok(_) => {
+                        let _ = tx.send(Ok(()));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                }
                 if let Err(e) = proxy.start().await {
                     eprintln!("代理错误: {}", e);
                 }
@@ -98,9 +109,18 @@ impl HydraApp {
         });
 
         // 等待代理启动
-        let _ = rx.recv();
-        self.proxy_running = true;
-        self.add_log(format!("代理已启动，监听地址: {}", proxy_addr));
+        match rx.recv() {
+            Ok(Ok(())) => {
+                self.proxy_running = true;
+                self.add_log(format!("代理已启动，监听地址: {}", proxy_addr));
+            }
+            Ok(Err(e)) => {
+                self.add_log(format!("代理启动失败: {}", e));
+            }
+            Err(e) => {
+                self.add_log(format!("代理启动错误: {}", e));
+            }
+        }
     }
     
     fn stop_proxy(&mut self) {
