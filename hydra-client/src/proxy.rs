@@ -76,31 +76,300 @@ impl ProxyServer {
         mut stream: TcpStream,
         scheduler: Arc<Scheduler>,
     ) -> Result<()> {
-        // SOCKS5 handshake
-        let mut buf = [0u8; 256];
+        let mut buf = [0u8; 4096];
         let peer_addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
 
-        // Read greeting
-        info!("[{}] Reading SOCKS5 greeting...", peer_addr);
+        // 读取第一个字节来判断协议类型
+        info!("[{}] Reading first byte to detect protocol...", peer_addr);
         let n = match stream.read(&mut buf).await {
             Ok(n) => n,
             Err(e) => {
-                error!("[{}] Failed to read greeting: {}", peer_addr, e);
+                error!("[{}] Failed to read: {}", peer_addr, e);
                 return Err(e.into());
             }
         };
-        if n < 2 || buf[0] != 0x05 {
-            error!("[{}] Invalid SOCKS5 greeting: {:?}", peer_addr, &buf[..n]);
+
+        if n == 0 {
+            return Err(HydraError::ProtocolError("Empty request".to_string()));
+        }
+
+        // 判断协议类型
+        if buf[0] == 0x05 {
+            // SOCKS5 协议
+            info!("[{}] Detected SOCKS5 protocol", peer_addr);
+            Self::handle_socks5(stream, &buf, n, scheduler).await
+        } else if buf[0] >= b'A' && buf[0] <= b'Z' {
+            // HTTP 协议 (CONNECT, GET, POST 等)
+            info!("[{}] Detected HTTP protocol", peer_addr);
+            Self::handle_http(stream, &buf, n, scheduler).await
+        } else {
+            error!("[{}] Unknown protocol, first byte: 0x{:02x}", peer_addr, buf[0]);
+            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            Err(HydraError::ProtocolError("Unknown protocol".to_string()))
+        }
+    }
+
+    /// 处理 HTTP CONNECT 代理请求
+    async fn handle_http(
+        mut stream: TcpStream,
+        initial_buf: &[u8],
+        initial_len: usize,
+        scheduler: Arc<Scheduler>,
+    ) -> Result<()> {
+        let peer_addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
+
+        // 将初始数据转换为字符串
+        let mut request = String::from_utf8_lossy(&initial_buf[..initial_len]).to_string();
+
+        // 读取完整的 HTTP 请求头（直到 \r\n\r\n）
+        while !request.contains("\r\n\r\n") {
+            let mut buf = [0u8; 4096];
+            let n = match stream.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    error!("[{}] Failed to read HTTP request: {}", peer_addr, e);
+                    return Err(e.into());
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            request.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+
+        info!("[{}] HTTP request: {}", peer_addr, request.lines().next().unwrap_or(""));
+
+        // 解析 CONNECT 请求
+        let first_line = request.lines().next().unwrap_or("");
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+
+        if parts.len() < 3 || parts[0] != "CONNECT" {
+            error!("[{}] Unsupported HTTP method: {}", peer_addr, first_line);
+            let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await;
+            return Err(HydraError::ProtocolError("Unsupported HTTP method".to_string()));
+        }
+
+        // 解析目标地址 (host:port)
+        let target_str = parts[1];
+        let target_addr = if target_str.contains(':') {
+            // 已经有端口
+            match target_str.parse::<SocketAddr>() {
+                Ok(addr) => addr,
+                Err(_) => {
+                    // 可能是域名:端口格式
+                    let parts: Vec<&str> = target_str.splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        let domain = parts[0];
+                        let port: u16 = parts[1].parse().unwrap_or(443);
+                        info!("[{}] Resolving domain: {}:{}", peer_addr, domain, port);
+                        match tokio::net::lookup_host(format!("{}:{}", domain, port)).await {
+                            Ok(mut addrs) => {
+                                match addrs.next() {
+                                    Some(addr) => addr,
+                                    None => {
+                                        error!("[{}] DNS resolution failed for {}", peer_addr, domain);
+                                        let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                                        return Err(HydraError::ProtocolError("DNS resolution failed".to_string()));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("[{}] DNS resolution failed for {}: {}", peer_addr, domain, e);
+                                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                                return Err(HydraError::ProtocolError(format!("DNS resolution failed: {}", e)));
+                            }
+                        }
+                    } else {
+                        error!("[{}] Invalid target address: {}", peer_addr, target_str);
+                        let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+                        return Err(HydraError::ProtocolError("Invalid target address".to_string()));
+                    }
+                }
+            }
+        } else {
+            // 没有端口，默认 443 (HTTPS)
+            let domain = target_str;
+            let port = 443u16;
+            info!("[{}] Resolving domain: {}:{}", peer_addr, domain, port);
+            match tokio::net::lookup_host(format!("{}:{}", domain, port)).await {
+                Ok(mut addrs) => {
+                    match addrs.next() {
+                        Some(addr) => addr,
+                        None => {
+                            error!("[{}] DNS resolution failed for {}", peer_addr, domain);
+                            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                            return Err(HydraError::ProtocolError("DNS resolution failed".to_string()));
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("[{}] DNS resolution failed for {}: {}", peer_addr, domain, e);
+                    let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                    return Err(HydraError::ProtocolError(format!("DNS resolution failed: {}", e)));
+                }
+            }
+        };
+
+        info!("[{}] >>> HTTP CONNECT request to {}", peer_addr, target_addr);
+
+        // 获取最佳节点
+        info!("[{}] Selecting best node from scheduler...", peer_addr);
+        let node = match scheduler.get_best_node().await {
+            Some(node) => node,
+            None => {
+                error!("[{}] No available nodes in scheduler!", peer_addr);
+                let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n").await;
+                return Err(HydraError::ConnectionError("No available nodes".to_string()));
+            }
+        };
+
+        info!("[{}] Selected node: {} (score: {})", peer_addr, node.address, node.calculate_score());
+
+        // 连接到节点
+        info!("[{}] Connecting to node {} via QUIC...", peer_addr, node.address);
+        let transport = match Transport::new_client().await {
+            Ok(t) => t,
+            Err(e) => {
+                error!("[{}] Failed to create QUIC transport: {}", peer_addr, e);
+                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                return Err(e);
+            }
+        };
+
+        let connection = match transport.connect(node.address).await {
+            Ok(c) => {
+                info!("[{}] QUIC connection established to {}", peer_addr, node.address);
+                c
+            }
+            Err(e) => {
+                error!("[{}] Failed to connect to node {}: {}", peer_addr, node.address, e);
+                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                return Err(e);
+            }
+        };
+
+        // 打开双向流
+        info!("[{}] Opening bidirectional stream to node...", peer_addr);
+        let (mut send, mut recv) = match connection.open_bi().await {
+            Ok(stream) => {
+                info!("[{}] Bidirectional stream opened successfully", peer_addr);
+                stream
+            }
+            Err(e) => {
+                error!("[{}] Failed to open bidirectional stream: {}", peer_addr, e);
+                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                return Err(HydraError::ProtocolError(format!("Failed to open stream: {}", e)));
+            }
+        };
+
+        // 发送目标地址到节点
+        let target_addr_str = target_addr.to_string();
+        info!("[{}] Sending target address to node: {}", peer_addr, target_addr_str);
+        if let Err(e) = send.write_all(target_addr_str.as_bytes()).await {
+            error!("[{}] Failed to send target address: {}", peer_addr, e);
+            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+            return Err(HydraError::ProtocolError(format!("Write error: {}", e)));
+        }
+
+        // 读取节点响应
+        info!("[{}] Waiting for response from node...", peer_addr);
+        let mut resp_buf = [0u8; 2];
+        let n = match recv.read(&mut resp_buf).await {
+            Ok(Some(n)) => n,
+            Ok(None) => {
+                error!("[{}] No response received from node (stream closed)", peer_addr);
+                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                return Err(HydraError::ProtocolError("No response from node".to_string()));
+            }
+            Err(e) => {
+                error!("[{}] Failed to read response from node: {}", peer_addr, e);
+                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                return Err(HydraError::ProtocolError(format!("Read error: {}", e)));
+            }
+        };
+
+        info!("[{}] Received {} bytes response from node: {:?}", peer_addr, n, &resp_buf[..n]);
+
+        if n < 2 || resp_buf[0] != 0x00 {
+            error!("[{}] Node returned error response: {:?}", peer_addr, &resp_buf[..n]);
+            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+            return Err(HydraError::ConnectionError("Remote node connection failed".to_string()));
+        }
+
+        // 发送 HTTP 200 成功响应
+        info!("[{}] Sending HTTP 200 success response...", peer_addr);
+        stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+
+        info!("[{}] ✓ Connected to {} via node {}", peer_addr, target_addr, node.address);
+        info!("[{}] Starting bidirectional traffic forwarding...", peer_addr);
+
+        // 转发流量
+        let (mut client_read, mut client_write) = stream.into_split();
+
+        let client_to_node = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match client_read.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if send.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let node_to_client = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match recv.read(&mut buf).await {
+                    Ok(Some(0)) => break,
+                    Ok(Some(n)) => {
+                        if client_write.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        tokio::select! {
+            _ = client_to_node => {},
+            _ = node_to_client => {},
+        }
+
+        info!("[{}] Connection to {} closed", peer_addr, target_addr);
+        Ok(())
+    }
+
+    /// 处理 SOCKS5 代理请求
+    async fn handle_socks5(
+        mut stream: TcpStream,
+        initial_buf: &[u8],
+        initial_len: usize,
+        scheduler: Arc<Scheduler>,
+    ) -> Result<()> {
+        let peer_addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
+        let mut buf = [0u8; 256];
+
+        // 初始数据应该是 SOCKS5 greeting
+        if initial_len < 2 || initial_buf[0] != 0x05 {
+            error!("[{}] Invalid SOCKS5 greeting: {:?}", peer_addr, &initial_buf[..initial_len]);
             let _ = stream.write_all(&[0x05, 0xFF]).await;
             return Err(HydraError::ProtocolError("Invalid SOCKS5 greeting".to_string()));
         }
-        info!("[{}] SOCKS5 greeting received ({} bytes)", peer_addr, n);
 
-        // Send no auth required
+        info!("[{}] SOCKS5 greeting received ({} bytes)", peer_addr, initial_len);
+
+        // 发送无需认证响应
         stream.write_all(&[0x05, 0x00]).await?;
         info!("[{}] Sent no-auth response", peer_addr);
 
-        // Read request
+        // 读取 SOCKS5 请求
         info!("[{}] Reading SOCKS5 request...", peer_addr);
         let n = match stream.read(&mut buf).await {
             Ok(n) => n,
