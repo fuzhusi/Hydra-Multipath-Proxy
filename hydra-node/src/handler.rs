@@ -1,4 +1,6 @@
 use quinn::Connection;
+use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, error};
 use hydra_protocol::{Packet, HydraError, Result};
 use bytes::Bytes;
@@ -36,7 +38,7 @@ impl ConnectionHandler {
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -44,23 +46,78 @@ impl ConnectionHandler {
         mut send: quinn::SendStream,
         mut recv: quinn::RecvStream,
     ) -> Result<()> {
-        let data = recv.read_to_end(65536).await
-            .map_err(|e| HydraError::ProtocolError(format!("Read error: {}", e)))?;
-        
-        let packet: Packet = serde_json::from_slice(&data)?;
-        
-        if !packet.verify_checksum() {
-            return Err(HydraError::ProtocolError("Invalid checksum".to_string()));
+        // Read target address from client
+        let mut buf = vec![0u8; 256];
+        let n = recv.read(&mut buf).await
+            .map_err(|e| HydraError::ProtocolError(format!("Read error: {}", e)))?
+            .ok_or_else(|| HydraError::ProtocolError("No data received".to_string()))?;
+
+        let target_addr_str = String::from_utf8_lossy(&buf[..n]);
+        let target_addr: std::net::SocketAddr = target_addr_str.parse()
+            .map_err(|_| HydraError::ProtocolError(format!("Invalid target address: {}", target_addr_str)))?;
+
+        info!("Connecting to target: {}", target_addr);
+
+        // Connect to target
+        let mut target_stream = match TcpStream::connect(target_addr).await {
+            Ok(stream) => {
+                // Send success response
+                send.write_all(&[0x00, 0x00]).await
+                    .map_err(|e| HydraError::ProtocolError(format!("Write error: {}", e)))?;
+                stream
+            }
+            Err(e) => {
+                error!("Failed to connect to {}: {}", target_addr, e);
+                // Send failure response
+                send.write_all(&[0x01, 0x00]).await
+                    .map_err(|e| HydraError::ProtocolError(format!("Write error: {}", e)))?;
+                return Err(HydraError::ConnectionError(format!("Failed to connect to {}: {}", target_addr, e)));
+            }
+        };
+
+        info!("Connected to target: {}", target_addr);
+
+        // Forward traffic bidirectionally
+        let (mut target_read, mut target_write) = target_stream.into_split();
+
+        let quic_to_target = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match recv.read(&mut buf).await {
+                    Ok(Some(0)) => break,
+                    Ok(Some(n)) => {
+                        if target_write.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let target_to_quic = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match target_read.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if send.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Wait for either direction to finish
+        tokio::select! {
+            _ = quic_to_target => {},
+            _ = target_to_quic => {},
         }
-        
-        info!("Received chunk {} for session {}", packet.chunk_id, packet.session_id);
-        
-        // TODO: Process chunk and forward to destination
-        
-        let response = Bytes::from("OK");
-        send.write_all(&response).await
-            .map_err(|e| HydraError::ProtocolError(format!("Write error: {}", e)))?;
-        
+
+        info!("Connection to {} closed", target_addr);
         Ok(())
     }
 }
