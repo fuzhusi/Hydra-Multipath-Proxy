@@ -163,15 +163,23 @@ impl ProxyServer {
                         let port: u16 = parts[1].parse().unwrap_or(443);
                         info!("[{}] Resolving domain: {}:{}", peer_addr, domain, port);
                         match tokio::net::lookup_host(format!("{}:{}", domain, port)).await {
-                            Ok(mut addrs) => {
-                                match addrs.next() {
-                                    Some(addr) => addr,
-                                    None => {
-                                        error!("[{}] DNS resolution failed for {}", peer_addr, domain);
-                                        let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                                        return Err(HydraError::ProtocolError("DNS resolution failed".to_string()));
+                            Ok(addrs) => {
+                                // 优先使用 IPv4 地址
+                                let addrs_vec: Vec<_> = addrs.collect();
+                                let ipv4_addr = addrs_vec.iter().find(|a| a.is_ipv4());
+                                let addr = match ipv4_addr {
+                                    Some(a) => *a,
+                                    None => match addrs_vec.first() {
+                                        Some(a) => *a,
+                                        None => {
+                                            error!("[{}] DNS resolution failed for {}", peer_addr, domain);
+                                            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                                            return Err(HydraError::ProtocolError("DNS resolution failed".to_string()));
+                                        }
                                     }
-                                }
+                                };
+                                info!("[{}] Resolved to: {}", peer_addr, addr);
+                                addr
                             }
                             Err(e) => {
                                 error!("[{}] DNS resolution failed for {}: {}", peer_addr, domain, e);
@@ -192,13 +200,19 @@ impl ProxyServer {
             let port = 443u16;
             info!("[{}] Resolving domain: {}:{}", peer_addr, domain, port);
             match tokio::net::lookup_host(format!("{}:{}", domain, port)).await {
-                Ok(mut addrs) => {
-                    match addrs.next() {
-                        Some(addr) => addr,
-                        None => {
-                            error!("[{}] DNS resolution failed for {}", peer_addr, domain);
-                            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                            return Err(HydraError::ProtocolError("DNS resolution failed".to_string()));
+                Ok(addrs) => {
+                    // 优先使用 IPv4 地址
+                    let addrs_vec: Vec<_> = addrs.collect();
+                    let ipv4_addr = addrs_vec.iter().find(|a| a.is_ipv4());
+                    match ipv4_addr {
+                        Some(a) => *a,
+                        None => match addrs_vec.first() {
+                            Some(a) => *a,
+                            None => {
+                                error!("[{}] DNS resolution failed for {}", peer_addr, domain);
+                                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                                return Err(HydraError::ProtocolError("DNS resolution failed".to_string()));
+                            }
                         }
                     }
                 }
@@ -429,17 +443,24 @@ impl ProxyServer {
 
                 info!("[{}] Target domain: {}:{} - resolving DNS...", peer_addr, domain, port);
 
-                // DNS resolution - use a simple approach
+                // DNS resolution - prefer IPv4
                 let ip = match tokio::net::lookup_host(format!("{}:{}", domain, port)).await {
-                    Ok(mut addrs) => {
-                        match addrs.next() {
-                            Some(addr) => addr.ip(),
-                            None => {
-                                error!("[{}] DNS resolution failed for {}: no addresses found", peer_addr, domain);
-                                let _ = stream.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
-                                return Err(HydraError::ProtocolError("DNS resolution failed".to_string()));
+                    Ok(addrs) => {
+                        let addrs_vec: Vec<_> = addrs.collect();
+                        // 优先使用 IPv4 地址
+                        let ipv4_addr = addrs_vec.iter().find(|a| a.is_ipv4());
+                        let addr = match ipv4_addr {
+                            Some(a) => *a,
+                            None => match addrs_vec.first() {
+                                Some(a) => *a,
+                                None => {
+                                    error!("[{}] DNS resolution failed for {}: no addresses found", peer_addr, domain);
+                                    let _ = stream.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                                    return Err(HydraError::ProtocolError("DNS resolution failed".to_string()));
+                                }
                             }
-                        }
+                        };
+                        addr.ip()
                     }
                     Err(e) => {
                         error!("[{}] DNS resolution failed for {}: {}", peer_addr, domain, e);
