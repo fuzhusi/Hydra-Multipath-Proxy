@@ -412,15 +412,12 @@ score = bandwidth × 0.5 - latency × 0.3 - loss_rate × 0.2
 
 ## 许可证
 
-版权所有 (c) 2024 fuzhusi。保留所有权利。
-
-未经版权所有者书面许可，不得复制、修改、分发或使用本软件的任何部分。
+本项目采用 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情
 
 ## 联系方式
 
-- 作者: fuzhusi
-- 项目链接: [GitHub Repository](https://github.com/fuzhusi/Hydra-Multipath-Proxy)
-- 问题反馈: [Issues](https://github.com/fuzhusi/Hydra-Multipath-Proxy/issues)
+- 项目链接: [GitHub Repository](https://github.com/yourusername/Hydra-Multipath-Proxy)
+- 问题反馈: [Issues](https://github.com/yourusername/Hydra-Multipath-Proxy/issues)
 
 ## 致谢
 
