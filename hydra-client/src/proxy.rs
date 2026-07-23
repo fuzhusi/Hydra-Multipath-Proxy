@@ -237,8 +237,40 @@ impl ProxyServer {
         };
 
         // 发送目标地址到节点
-        info!("[{}] Sending target address to node: {}", peer_addr, target_with_port);
-        if let Err(e) = send.write_all(target_with_port.as_bytes()).await {
+        // 如果目标是域名，先在客户端解析 DNS，发送 IP 地址到服务器
+        let target_to_send = if target_addr_str.chars().next().map_or(false, |c| c.is_alphabetic()) {
+            // 域名格式，需要解析 DNS
+            info!("[{}] Resolving DNS for {} on client...", peer_addr, target_with_port);
+            match tokio::net::lookup_host(&target_with_port).await {
+                Ok(addrs) => {
+                    let addrs_vec: Vec<_> = addrs.collect();
+                    // 优先使用 IPv4
+                    let ipv4_addr = addrs_vec.iter().find(|a| a.is_ipv4());
+                    match ipv4_addr {
+                        Some(a) => a.to_string(),
+                        None => match addrs_vec.first() {
+                            Some(a) => a.to_string(),
+                            None => {
+                                error!("[{}] DNS resolution failed for {}", peer_addr, target_with_port);
+                                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                                return Err(HydraError::ProtocolError(format!("DNS resolution failed for {}", target_with_port)));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("[{}] DNS resolution failed for {}: {}", peer_addr, target_with_port, e);
+                    let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                    return Err(HydraError::ProtocolError(format!("DNS resolution failed: {}", e)));
+                }
+            }
+        } else {
+            // 已经是 IP 地址格式
+            target_with_port.clone()
+        };
+
+        info!("[{}] Sending target address to node: {}", peer_addr, target_to_send);
+        if let Err(e) = send.write_all(target_to_send.as_bytes()).await {
             error!("[{}] Failed to send target address: {}", peer_addr, e);
             let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
             return Err(HydraError::ProtocolError(format!("Write error: {}", e)));
@@ -360,8 +392,40 @@ impl ProxyServer {
         };
 
         // 发送目标地址到节点
-        info!("[{}] Sending target address to node: {}", peer_addr, target_str);
-        if let Err(e) = send.write_all(target_str.as_bytes()).await {
+        // 如果目标是域名，先在客户端解析 DNS，发送 IP 地址到服务器
+        let target_to_send = if target_str.chars().next().map_or(false, |c| c.is_alphabetic()) {
+            // 域名格式，需要解析 DNS
+            info!("[{}] Resolving DNS for {} on client...", peer_addr, target_str);
+            match tokio::net::lookup_host(&target_str).await {
+                Ok(addrs) => {
+                    let addrs_vec: Vec<_> = addrs.collect();
+                    // 优先使用 IPv4
+                    let ipv4_addr = addrs_vec.iter().find(|a| a.is_ipv4());
+                    match ipv4_addr {
+                        Some(a) => a.to_string(),
+                        None => match addrs_vec.first() {
+                            Some(a) => a.to_string(),
+                            None => {
+                                error!("[{}] DNS resolution failed for {}", peer_addr, target_str);
+                                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                                return Err(HydraError::ProtocolError(format!("DNS resolution failed for {}", target_str)));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("[{}] DNS resolution failed for {}: {}", peer_addr, target_str, e);
+                    let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                    return Err(HydraError::ProtocolError(format!("DNS resolution failed: {}", e)));
+                }
+            }
+        } else {
+            // 已经是 IP 地址格式
+            target_str.clone()
+        };
+
+        info!("[{}] Sending target address to node: {}", peer_addr, target_to_send);
+        if let Err(e) = send.write_all(target_to_send.as_bytes()).await {
             error!("[{}] Failed to send target address: {}", peer_addr, e);
             let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
             return Err(HydraError::ProtocolError(format!("Write error: {}", e)));
@@ -591,7 +655,7 @@ impl ProxyServer {
         };
 
         // Send connect request: [target_addr_str]
-        // 对于域名类型，发送域名而不是 IP 地址
+        // 对于域名类型，在客户端解析 DNS 后发送 IP 地址
         let target_str = if atyp == 0x03 {
             // 域名类型，发送域名:端口格式
             let domain_len = buf[4] as usize;
@@ -601,8 +665,41 @@ impl ProxyServer {
         } else {
             target_addr.to_string()
         };
-        info!("[{}] Sending target address to node: {}", peer_addr, target_str);
-        if let Err(e) = send.write_all(target_str.as_bytes()).await {
+
+        // 如果目标是域名，先在客户端解析 DNS，发送 IP 地址到服务器
+        let target_to_send = if target_str.chars().next().map_or(false, |c| c.is_alphabetic()) {
+            // 域名格式，需要解析 DNS
+            info!("[{}] Resolving DNS for {} on client...", peer_addr, target_str);
+            match tokio::net::lookup_host(&target_str).await {
+                Ok(addrs) => {
+                    let addrs_vec: Vec<_> = addrs.collect();
+                    // 优先使用 IPv4
+                    let ipv4_addr = addrs_vec.iter().find(|a| a.is_ipv4());
+                    match ipv4_addr {
+                        Some(a) => a.to_string(),
+                        None => match addrs_vec.first() {
+                            Some(a) => a.to_string(),
+                            None => {
+                                error!("[{}] DNS resolution failed for {}", peer_addr, target_str);
+                                let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                                return Err(HydraError::ProtocolError(format!("DNS resolution failed for {}", target_str)));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("[{}] DNS resolution failed for {}: {}", peer_addr, target_str, e);
+                    let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                    return Err(HydraError::ProtocolError(format!("DNS resolution failed: {}", e)));
+                }
+            }
+        } else {
+            // 已经是 IP 地址格式
+            target_str.clone()
+        };
+
+        info!("[{}] Sending target address to node: {}", peer_addr, target_to_send);
+        if let Err(e) = send.write_all(target_to_send.as_bytes()).await {
             error!("[{}] Failed to send target address: {}", peer_addr, e);
             let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
             return Err(HydraError::ProtocolError(format!("Write error: {}", e)));

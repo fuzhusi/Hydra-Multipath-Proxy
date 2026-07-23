@@ -517,7 +517,7 @@ gsettings set org.gnome.system.proxy mode none
 
 ### Phase 6: 高级功能 ⏳
 - [ ] NAT 穿透
-- [ ] Web 管理面板
+- [ ] UI 管理面板
 - [ ] 流量统计与监控
 - [ ] BBR 拥塞控制
 - [ ] AI 线路预测
