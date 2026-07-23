@@ -222,9 +222,9 @@ impl ProxyServer {
 
         info!("[{}] Selected node: {} (score: {})", peer_addr, node.address, node.calculate_score());
 
-        // 从连接池获取连接
+        // 从连接池获取连接（带重试）
         info!("[{}] Getting connection from pool for node {}...", peer_addr, node.address);
-        let (mut send, mut recv) = match pool.get_stream(node.address).await {
+        let (mut send, mut recv) = match pool.get_stream_with_retry(node.address, 3).await {
             Ok(streams) => {
                 info!("[{}] Got connection to node {}", peer_addr, node.address);
                 streams
@@ -345,9 +345,9 @@ impl ProxyServer {
 
         info!("[{}] Selected node: {} (score: {})", peer_addr, node.address, node.calculate_score());
 
-        // 从连接池获取连接
+        // 从连接池获取连接（带重试）
         info!("[{}] Getting connection from pool for node {}...", peer_addr, node.address);
-        let (mut send, mut recv) = match pool.get_stream(node.address).await {
+        let (mut send, mut recv) = match pool.get_stream_with_retry(node.address, 3).await {
             Ok(streams) => {
                 info!("[{}] Got connection to node {}", peer_addr, node.address);
                 streams
@@ -576,9 +576,9 @@ impl ProxyServer {
 
         info!("[{}] Selected node: {} (score: {})", peer_addr, node.address, node.calculate_score());
 
-        // 从连接池获取连接
+        // 从连接池获取连接（带重试）
         info!("[{}] Getting connection from pool for node {}...", peer_addr, node.address);
-        let (mut send, mut recv) = match pool.get_stream(node.address).await {
+        let (mut send, mut recv) = match pool.get_stream_with_retry(node.address, 3).await {
             Ok(streams) => {
                 info!("[{}] Got connection to node {}", peer_addr, node.address);
                 streams

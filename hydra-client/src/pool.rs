@@ -135,6 +135,39 @@ impl ConnectionPool {
         Ok(streams)
     }
 
+    /// 从池中获取一条到指定地址的双向流，带重试
+    pub async fn get_stream_with_retry(
+        &self,
+        addr: SocketAddr,
+        max_retries: u32,
+    ) -> Result<(SendStream, RecvStream)> {
+        let mut last_error = None;
+
+        for attempt in 0..max_retries {
+            match self.get_stream(addr).await {
+                Ok(streams) => return Ok(streams),
+                Err(e) => {
+                    warn!("Attempt {}/{} failed for {}: {}", attempt + 1, max_retries, addr, e);
+                    last_error = Some(e);
+                    // 短暂等待后重试
+                    if attempt < max_retries - 1 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| HydraError::ConnectionError("All retries failed".to_string())))
+    }
+
+    /// 移除指定地址的所有连接（当检测到连接问题时调用）
+    pub async fn remove_all(&self, addr: &SocketAddr) {
+        let mut pools = self.pools.write().await;
+        if let Some(conns) = pools.remove(addr) {
+            info!("Removed {} connections to {} from pool", conns.len(), addr);
+        }
+    }
+
     /// 建立新的 QUIC 连接
     async fn connect(&self, addr: SocketAddr) -> Result<Connection> {
         let connecting = self.endpoint.connect(addr, "localhost")?;
