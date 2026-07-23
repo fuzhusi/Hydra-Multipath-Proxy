@@ -149,82 +149,9 @@ impl ProxyServer {
             return Err(HydraError::ProtocolError("Unsupported HTTP method".to_string()));
         }
 
-        // 解析目标地址 (host:port)
-        let target_str = parts[1];
-        let target_addr = if target_str.contains(':') {
-            // 已经有端口
-            match target_str.parse::<SocketAddr>() {
-                Ok(addr) => addr,
-                Err(_) => {
-                    // 可能是域名:端口格式
-                    let parts: Vec<&str> = target_str.splitn(2, ':').collect();
-                    if parts.len() == 2 {
-                        let domain = parts[0];
-                        let port: u16 = parts[1].parse().unwrap_or(443);
-                        info!("[{}] Resolving domain: {}:{}", peer_addr, domain, port);
-                        match tokio::net::lookup_host(format!("{}:{}", domain, port)).await {
-                            Ok(addrs) => {
-                                // 优先使用 IPv4 地址
-                                let addrs_vec: Vec<_> = addrs.collect();
-                                let ipv4_addr = addrs_vec.iter().find(|a| a.is_ipv4());
-                                let addr = match ipv4_addr {
-                                    Some(a) => *a,
-                                    None => match addrs_vec.first() {
-                                        Some(a) => *a,
-                                        None => {
-                                            error!("[{}] DNS resolution failed for {}", peer_addr, domain);
-                                            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                                            return Err(HydraError::ProtocolError("DNS resolution failed".to_string()));
-                                        }
-                                    }
-                                };
-                                info!("[{}] Resolved to: {}", peer_addr, addr);
-                                addr
-                            }
-                            Err(e) => {
-                                error!("[{}] DNS resolution failed for {}: {}", peer_addr, domain, e);
-                                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                                return Err(HydraError::ProtocolError(format!("DNS resolution failed: {}", e)));
-                            }
-                        }
-                    } else {
-                        error!("[{}] Invalid target address: {}", peer_addr, target_str);
-                        let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
-                        return Err(HydraError::ProtocolError("Invalid target address".to_string()));
-                    }
-                }
-            }
-        } else {
-            // 没有端口，默认 443 (HTTPS)
-            let domain = target_str;
-            let port = 443u16;
-            info!("[{}] Resolving domain: {}:{}", peer_addr, domain, port);
-            match tokio::net::lookup_host(format!("{}:{}", domain, port)).await {
-                Ok(addrs) => {
-                    // 优先使用 IPv4 地址
-                    let addrs_vec: Vec<_> = addrs.collect();
-                    let ipv4_addr = addrs_vec.iter().find(|a| a.is_ipv4());
-                    match ipv4_addr {
-                        Some(a) => *a,
-                        None => match addrs_vec.first() {
-                            Some(a) => *a,
-                            None => {
-                                error!("[{}] DNS resolution failed for {}", peer_addr, domain);
-                                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                                return Err(HydraError::ProtocolError("DNS resolution failed".to_string()));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("[{}] DNS resolution failed for {}: {}", peer_addr, domain, e);
-                    let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                    return Err(HydraError::ProtocolError(format!("DNS resolution failed: {}", e)));
-                }
-            }
-        };
-
-        info!("[{}] >>> HTTP CONNECT request to {}", peer_addr, target_addr);
+        // 解析目标地址 (host:port) - 不在客户端解析 DNS，直接发送域名到服务器
+        let target_str = parts[1].to_string();
+        info!("[{}] >>> HTTP CONNECT request to {}", peer_addr, target_str);
 
         // 获取最佳节点
         info!("[{}] Selecting best node from scheduler...", peer_addr);
@@ -276,10 +203,9 @@ impl ProxyServer {
             }
         };
 
-        // 发送目标地址到节点
-        let target_addr_str = target_addr.to_string();
-        info!("[{}] Sending target address to node: {}", peer_addr, target_addr_str);
-        if let Err(e) = send.write_all(target_addr_str.as_bytes()).await {
+        // 发送目标地址到节点（发送域名，让服务器解析 DNS）
+        info!("[{}] Sending target address to node: {}", peer_addr, target_str);
+        if let Err(e) = send.write_all(target_str.as_bytes()).await {
             error!("[{}] Failed to send target address: {}", peer_addr, e);
             let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
             return Err(HydraError::ProtocolError(format!("Write error: {}", e)));
@@ -314,7 +240,7 @@ impl ProxyServer {
         info!("[{}] Sending HTTP 200 success response...", peer_addr);
         stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
-        info!("[{}] ✓ Connected to {} via node {}", peer_addr, target_addr, node.address);
+        info!("[{}] ✓ Connected to {} via node {}", peer_addr, target_str, node.address);
         info!("[{}] Starting bidirectional traffic forwarding...", peer_addr);
 
         // 转发流量
@@ -356,7 +282,7 @@ impl ProxyServer {
             _ = node_to_client => {},
         }
 
-        info!("[{}] Connection to {} closed", peer_addr, target_addr);
+        info!("[{}] Connection to {} closed", peer_addr, target_str);
         Ok(())
     }
 

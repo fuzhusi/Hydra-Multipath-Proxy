@@ -55,8 +55,40 @@ impl ConnectionHandler {
             .ok_or_else(|| HydraError::ProtocolError("No data received".to_string()))?;
 
         let target_addr_str = String::from_utf8_lossy(&buf[..n]);
-        let target_addr: std::net::SocketAddr = target_addr_str.parse()
-            .map_err(|_| HydraError::ProtocolError(format!("Invalid target address: {}", target_addr_str)))?;
+        info!("Received target address: {}", target_addr_str);
+
+        // 尝试解析为 SocketAddr，如果不是则进行 DNS 解析
+        let target_addr: std::net::SocketAddr = if let Ok(addr) = target_addr_str.parse() {
+            addr
+        } else {
+            // 可能是域名:端口格式，进行 DNS 解析
+            info!("Resolving DNS for: {}", target_addr_str);
+            match tokio::net::lookup_host(target_addr_str.to_string()).await {
+                Ok(addrs) => {
+                    let addrs_vec: Vec<_> = addrs.collect();
+                    // 优先使用 IPv4 地址
+                    let ipv4_addr = addrs_vec.iter().find(|a| a.is_ipv4());
+                    match ipv4_addr {
+                        Some(a) => *a,
+                        None => match addrs_vec.first() {
+                            Some(a) => *a,
+                            None => {
+                                error!("DNS resolution failed for {}: no addresses", target_addr_str);
+                                send.write_all(&[0x01, 0x00]).await
+                                    .map_err(|e| HydraError::ProtocolError(format!("Write error: {}", e)))?;
+                                return Err(HydraError::ConnectionError(format!("DNS resolution failed for {}", target_addr_str)));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("DNS resolution failed for {}: {}", target_addr_str, e);
+                    send.write_all(&[0x01, 0x00]).await
+                        .map_err(|e| HydraError::ProtocolError(format!("Write error: {}", e)))?;
+                    return Err(HydraError::ConnectionError(format!("DNS resolution failed for {}: {}", target_addr_str, e)));
+                }
+            }
+        };
 
         info!("Connecting to target: {}", target_addr);
 
