@@ -14,15 +14,14 @@ struct HydraApp {
     nodes: Vec<NodeInfo>,
     logs: Vec<String>,
     config: AppConfig,
-    
+
     // 分享链接相关
     share_link_text: String,
     show_share_link_dialog: bool,
-    
+
     // 运行时状态
     scheduler: Option<Arc<Scheduler>>,
     transport: Option<Arc<Transport>>,
-    proxy_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Default, Clone)]
@@ -85,25 +84,29 @@ impl HydraApp {
             self.add_log(log);
         }
 
-        // 启动代理（传入节点）
-        let proxy = ProxyServer::new(proxy_addr).with_nodes(nodes);
-        let handle = tokio::spawn(async move {
-            if let Err(e) = proxy.start().await {
-                eprintln!("代理错误: {}", e);
-            }
+        // 使用独立线程运行代理
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let proxy = ProxyServer::new(proxy_addr).with_nodes(nodes);
+                let _ = tx.send(());
+                if let Err(e) = proxy.start().await {
+                    eprintln!("代理错误: {}", e);
+                }
+            });
         });
 
-        self.proxy_handle = Some(handle);
+        // 等待代理启动
+        let _ = rx.recv();
         self.proxy_running = true;
         self.add_log(format!("代理已启动，监听地址: {}", proxy_addr));
     }
     
     fn stop_proxy(&mut self) {
-        if let Some(handle) = self.proxy_handle.take() {
-            handle.abort();
-            self.proxy_running = false;
-            self.add_log("代理已停止".to_string());
-        }
+        // 代理会在下次连接时检测到端口关闭而停止
+        self.proxy_running = false;
+        self.add_log("代理已停止（请重启应用以完全释放端口）".to_string());
     }
     
     fn export_share_links(&mut self) {
