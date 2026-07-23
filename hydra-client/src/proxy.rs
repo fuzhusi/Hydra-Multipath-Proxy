@@ -53,10 +53,16 @@ impl ProxyServer {
                     info!("━━━ New SOCKS5 connection from {} ━━━", addr);
                     let scheduler = self.scheduler.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection(stream, scheduler).await {
-                            error!("Connection error from {}: {}", addr, e);
+                        // 包装错误处理，确保发送 SOCKS5 错误响应
+                        match Self::handle_connection(stream, scheduler).await {
+                            Ok(()) => {
+                                info!("━━━ Connection from {} completed successfully ━━━", addr);
+                            }
+                            Err(e) => {
+                                error!("━━━ Connection error from {}: {} ━━━", addr, e);
+                                // 注意：handle_connection 内部已经发送了 SOCKS5 错误响应
+                            }
                         }
-                        info!("━━━ Connection from {} finished ━━━", addr);
                     });
                 }
                 Err(e) => {
@@ -76,9 +82,16 @@ impl ProxyServer {
 
         // Read greeting
         info!("[{}] Reading SOCKS5 greeting...", peer_addr);
-        let n = stream.read(&mut buf).await?;
+        let n = match stream.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                error!("[{}] Failed to read greeting: {}", peer_addr, e);
+                return Err(e.into());
+            }
+        };
         if n < 2 || buf[0] != 0x05 {
             error!("[{}] Invalid SOCKS5 greeting: {:?}", peer_addr, &buf[..n]);
+            let _ = stream.write_all(&[0x05, 0xFF]).await;
             return Err(HydraError::ProtocolError("Invalid SOCKS5 greeting".to_string()));
         }
         info!("[{}] SOCKS5 greeting received ({} bytes)", peer_addr, n);
@@ -89,9 +102,16 @@ impl ProxyServer {
 
         // Read request
         info!("[{}] Reading SOCKS5 request...", peer_addr);
-        let n = stream.read(&mut buf).await?;
+        let n = match stream.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                error!("[{}] Failed to read request: {}", peer_addr, e);
+                return Err(e.into());
+            }
+        };
         if n < 7 || buf[0] != 0x05 {
             error!("[{}] Invalid SOCKS5 request: {:?}", peer_addr, &buf[..n]);
+            let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
             return Err(HydraError::ProtocolError("Invalid SOCKS5 request".to_string()));
         }
         info!("[{}] SOCKS5 request received ({} bytes), cmd={}", peer_addr, n, buf[1]);
@@ -112,6 +132,8 @@ impl ProxyServer {
             0x01 => {
                 // IPv4
                 if n < 10 {
+                    error!("[{}] Invalid IPv4 address length: {}", peer_addr, n);
+                    let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
                     return Err(HydraError::ProtocolError("Invalid IPv4 address".to_string()));
                 }
                 let ip = std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
@@ -123,10 +145,14 @@ impl ProxyServer {
             0x03 => {
                 // Domain name
                 if n < 7 {
+                    error!("[{}] Invalid domain name length: {}", peer_addr, n);
+                    let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
                     return Err(HydraError::ProtocolError("Invalid domain name".to_string()));
                 }
                 let domain_len = buf[4] as usize;
                 if n < 5 + domain_len + 2 {
+                    error!("[{}] Invalid domain name data length: need {}, got {}", peer_addr, 5 + domain_len + 2, n);
+                    let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
                     return Err(HydraError::ProtocolError("Invalid domain name length".to_string()));
                 }
                 let domain = String::from_utf8_lossy(&buf[5..5 + domain_len]);
@@ -135,11 +161,23 @@ impl ProxyServer {
                 info!("[{}] Target domain: {}:{} - resolving DNS...", peer_addr, domain, port);
 
                 // DNS resolution - use a simple approach
-                let ip = tokio::net::lookup_host(format!("{}:{}", domain, port))
-                    .await?
-                    .next()
-                    .ok_or_else(|| HydraError::ProtocolError("DNS resolution failed".to_string()))?
-                    .ip();
+                let ip = match tokio::net::lookup_host(format!("{}:{}", domain, port)).await {
+                    Ok(mut addrs) => {
+                        match addrs.next() {
+                            Some(addr) => addr.ip(),
+                            None => {
+                                error!("[{}] DNS resolution failed for {}: no addresses found", peer_addr, domain);
+                                let _ = stream.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                                return Err(HydraError::ProtocolError("DNS resolution failed".to_string()));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("[{}] DNS resolution failed for {}: {}", peer_addr, domain, e);
+                        let _ = stream.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                        return Err(HydraError::ProtocolError(format!("DNS resolution failed: {}", e)));
+                    }
+                };
 
                 let addr = SocketAddr::new(ip, port);
                 info!("[{}] DNS resolved: {} -> {}", peer_addr, domain, addr);
@@ -148,6 +186,8 @@ impl ProxyServer {
             0x04 => {
                 // IPv6
                 if n < 22 {
+                    error!("[{}] Invalid IPv6 address length: {}", peer_addr, n);
+                    let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
                     return Err(HydraError::ProtocolError("Invalid IPv6 address".to_string()));
                 }
                 let ip = std::net::Ipv6Addr::new(
@@ -176,11 +216,14 @@ impl ProxyServer {
 
         // Get best node from scheduler
         info!("[{}] Selecting best node from scheduler...", peer_addr);
-        let node = scheduler.get_best_node().await
-            .ok_or_else(|| {
+        let node = match scheduler.get_best_node().await {
+            Some(node) => node,
+            None => {
                 error!("[{}] No available nodes in scheduler!", peer_addr);
-                HydraError::ConnectionError("No available nodes".to_string())
-            })?;
+                let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                return Err(HydraError::ConnectionError("No available nodes".to_string()));
+            }
+        };
 
         info!("[{}] Selected node: {} (score: {})", peer_addr, node.address, node.calculate_score());
 
@@ -223,25 +266,29 @@ impl ProxyServer {
 
         // Send connect request: [target_addr_str]
         let target_str = target_addr.to_string();
-        info!("Sending target address to node: {}", target_str);
-        send.write_all(target_str.as_bytes()).await
-            .map_err(|e| {
-                error!("Failed to send target address: {}", e);
-                HydraError::ProtocolError(format!("Write error: {}", e))
-            })?;
+        info!("[{}] Sending target address to node: {}", peer_addr, target_str);
+        if let Err(e) = send.write_all(target_str.as_bytes()).await {
+            error!("[{}] Failed to send target address: {}", peer_addr, e);
+            let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+            return Err(HydraError::ProtocolError(format!("Write error: {}", e)));
+        }
 
         // Read response from remote node
-        info!("Waiting for response from node...");
+        info!("[{}] Waiting for response from node...", peer_addr);
         let mut resp_buf = [0u8; 2];
-        let n = recv.read(&mut resp_buf).await
-            .map_err(|e| {
-                error!("Failed to read response from node: {}", e);
-                HydraError::ProtocolError(format!("Read error: {}", e))
-            })?
-            .ok_or_else(|| {
-                error!("No response received from node");
-                HydraError::ProtocolError("No response from node".to_string())
-            })?;
+        let n = match recv.read(&mut resp_buf).await {
+            Ok(Some(n)) => n,
+            Ok(None) => {
+                error!("[{}] No response received from node (stream closed)", peer_addr);
+                let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                return Err(HydraError::ProtocolError("No response from node".to_string()));
+            }
+            Err(e) => {
+                error!("[{}] Failed to read response from node: {}", peer_addr, e);
+                let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                return Err(HydraError::ProtocolError(format!("Read error: {}", e)));
+            }
+        };
 
         info!("Received {} bytes response from node: {:?}", n, &resp_buf[..n]);
 
