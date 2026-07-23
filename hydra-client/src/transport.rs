@@ -21,7 +21,15 @@ impl Transport {
 
         crypto.alpn_protocols = vec![b"hydra".to_vec()];
 
-        endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
+        let mut client_config = ClientConfig::new(Arc::new(crypto));
+
+        // 设置 QUIC 传输参数，增加超时时间
+        let mut transport_config = quinn::TransportConfig::default();
+        transport_config.max_idle_timeout(Some(quinn::IdleTimeout::try_from(std::time::Duration::from_secs(60)).unwrap()));
+        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        client_config.transport_config(Arc::new(transport_config));
+
+        endpoint.set_default_client_config(client_config);
 
         info!("Created new QUIC client endpoint on {}", endpoint.local_addr()?);
         Ok(Self { endpoint })

@@ -28,15 +28,23 @@ impl HydraServer {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert_der = rustls::Certificate(cert.serialize_der().unwrap());
         let key_der = rustls::PrivateKey(cert.serialize_private_key_der());
-        
+
         let mut server_crypto = rustls::ServerConfig::builder()
             .with_safe_defaults()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der], key_der)?;
-        
+
         server_crypto.alpn_protocols = vec![b"hydra".to_vec()];
-        
-        Ok(quinn::ServerConfig::with_crypto(Arc::new(server_crypto)))
+
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
+
+        // 设置 QUIC 传输参数，增加超时时间
+        let mut transport_config = quinn::TransportConfig::default();
+        transport_config.max_idle_timeout(Some(quinn::IdleTimeout::try_from(std::time::Duration::from_secs(60)).unwrap()));
+        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        server_config.transport_config(Arc::new(transport_config));
+
+        Ok(server_config)
     }
 
     pub async fn start(&self) -> Result<()> {
