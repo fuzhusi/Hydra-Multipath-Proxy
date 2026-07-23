@@ -135,6 +135,11 @@ impl HydraApp {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 self.proxy_running = true;
                 self.add_log(format!("代理已启动，监听地址: {}", proxy_addr));
+
+                // 设置系统全局代理
+                let proxy_url = format!("socks5://{}", proxy_addr);
+                self.set_system_proxy(&proxy_url);
+                self.add_log("已设置系统全局代理".to_string());
             }
             Ok(Err(e)) => {
                 self.add_log(format!("代理启动失败: {}", e));
@@ -144,6 +149,45 @@ impl HydraApp {
             }
         }
     }
+
+    fn set_system_proxy(&self, proxy_url: &str) {
+        // 设置环境变量
+        std::env::set_var("http_proxy", proxy_url);
+        std::env::set_var("https_proxy", proxy_url);
+        std::env::set_var("all_proxy", proxy_url);
+        std::env::set_var("HTTP_PROXY", proxy_url);
+        std::env::set_var("HTTPS_PROXY", proxy_url);
+        std::env::set_var("ALL_PROXY", proxy_url);
+
+        // 设置 GNOME 桌面代理
+        let _ = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.system.proxy", "mode", "manual"])
+            .output();
+
+        // 设置 SOCKS 代理
+        let socks_port = proxy_url.split(':').last().unwrap_or("1080");
+        let _ = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.system.proxy.socks", "host", "127.0.0.1"])
+            .output();
+        let _ = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.system.proxy.socks", "port", socks_port])
+            .output();
+    }
+
+    fn remove_system_proxy(&self) {
+        // 清除环境变量
+        std::env::remove_var("http_proxy");
+        std::env::remove_var("https_proxy");
+        std::env::remove_var("all_proxy");
+        std::env::remove_var("HTTP_PROXY");
+        std::env::remove_var("HTTPS_PROXY");
+        std::env::remove_var("ALL_PROXY");
+
+        // 清除 GNOME 桌面代理
+        let _ = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.system.proxy", "mode", "none"])
+            .output();
+    }
     
     fn stop_proxy(&mut self) {
         if let Some(stop_flag) = &self.stop_flag {
@@ -151,7 +195,10 @@ impl HydraApp {
         }
         self.proxy_running = false;
         self.stop_flag = None;
-        self.add_log("代理已停止".to_string());
+
+        // 移除系统全局代理
+        self.remove_system_proxy();
+        self.add_log("代理已停止，已移除系统代理".to_string());
     }
     
     fn export_share_links(&mut self) {
