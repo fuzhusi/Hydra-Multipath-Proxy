@@ -164,8 +164,6 @@ impl ProxyServer {
         let target_str = target_addr.to_string();
         send.write_all(target_str.as_bytes()).await
             .map_err(|e| HydraError::ProtocolError(format!("Write error: {}", e)))?;
-        send.finish().await
-            .map_err(|e| HydraError::ProtocolError(format!("Finish error: {}", e)))?;
 
         // Read response from remote node
         let mut resp_buf = [0u8; 2];
