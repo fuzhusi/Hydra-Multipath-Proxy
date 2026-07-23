@@ -325,19 +325,55 @@ impl HydraApp {
         std::env::set_var("HTTPS_PROXY", proxy_url);
         std::env::set_var("ALL_PROXY", proxy_url);
 
-        // 设置 GNOME 桌面代理
+        // 解析代理地址和端口
+        let parts: Vec<&str> = proxy_url.split("://").collect();
+        let addr_port = if parts.len() > 1 { parts[1] } else { parts[0] };
+        let addr_parts: Vec<&str> = addr_port.split(':').collect();
+        let proxy_host = addr_parts.get(0).unwrap_or(&"127.0.0.1");
+        let proxy_port = addr_parts.get(1).unwrap_or(&"1080");
+
+        // 设置 GNOME 桌面代理（参考 v2rayN 实现）
         let _ = std::process::Command::new("gsettings")
             .args(["set", "org.gnome.system.proxy", "mode", "manual"])
             .output();
 
-        // 设置 SOCKS 代理
-        let socks_port = proxy_url.split(':').last().unwrap_or("1080");
+        // 设置所有协议的代理（http, https, ftp, socks）
+        for protocol in &["http", "https", "ftp", "socks"] {
+            let _ = std::process::Command::new("gsettings")
+                .args(["set", &format!("org.gnome.system.proxy.{}", protocol), "host", proxy_host])
+                .output();
+            let _ = std::process::Command::new("gsettings")
+                .args(["set", &format!("org.gnome.system.proxy.{}", protocol), "port", proxy_port])
+                .output();
+        }
+
+        // 设置忽略的主机（本地地址不走代理）
         let _ = std::process::Command::new("gsettings")
-            .args(["set", "org.gnome.system.proxy.socks", "host", "127.0.0.1"])
+            .args(["set", "org.gnome.system.proxy", "ignore-hosts",
+                "['localhost', '127.0.0.0/8', '::1', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']"])
             .output();
-        let _ = std::process::Command::new("gsettings")
-            .args(["set", "org.gnome.system.proxy.socks", "port", socks_port])
-            .output();
+
+        // 检测并设置 KDE 代理（如果在 KDE 环境下）
+        if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
+            if desktop.contains("KDE") || desktop.contains("plasma") {
+                let kwriteconfig = if std::env::var("KDE_SESSION_VERSION").unwrap_or_default() == "6" {
+                    "kwriteconfig6"
+                } else {
+                    "kwriteconfig5"
+                };
+                let _ = std::process::Command::new(kwriteconfig)
+                    .args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType", "1"])
+                    .output();
+                let _ = std::process::Command::new(kwriteconfig)
+                    .args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "socksProxy",
+                        &format!("socks://{}:{}", proxy_host, proxy_port)])
+                    .output();
+                // 通知 KDE 重新加载配置
+                let _ = std::process::Command::new("dbus-send")
+                    .args(["--type=signal", "/KIO/Scheduler", "org.kde.KIO.Scheduler.reparseSlaveConfiguration", "string:"])
+                    .output();
+            }
+        }
     }
 
     fn remove_system_proxy_static() {
@@ -353,6 +389,23 @@ impl HydraApp {
         let _ = std::process::Command::new("gsettings")
             .args(["set", "org.gnome.system.proxy", "mode", "none"])
             .output();
+
+        // 清除 KDE 代理
+        if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
+            if desktop.contains("KDE") || desktop.contains("plasma") {
+                let kwriteconfig = if std::env::var("KDE_SESSION_VERSION").unwrap_or_default() == "6" {
+                    "kwriteconfig6"
+                } else {
+                    "kwriteconfig5"
+                };
+                let _ = std::process::Command::new(kwriteconfig)
+                    .args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType", "0"])
+                    .output();
+                let _ = std::process::Command::new("dbus-send")
+                    .args(["--type=signal", "/KIO/Scheduler", "org.kde.KIO.Scheduler.reparseSlaveConfiguration", "string:"])
+                    .output();
+            }
+        }
     }
 
     fn remove_system_proxy(&self) {
