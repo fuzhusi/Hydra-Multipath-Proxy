@@ -796,9 +796,10 @@ impl eframe::App for HydraApp {
                 }
 
                 if let Some(monitor) = &self.traffic_monitor {
-                    // 使用 block_on 获取异步数据
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    let stats = rt.block_on(monitor.get_stats());
+                    // 使用 block_in_place 获取异步数据（在 tokio runtime 内安全阻塞）
+                    let stats = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(monitor.get_stats())
+                    });
 
                     ui.label(format!("上传: {} ({})", format_bytes(stats.bytes_sent), format_speed(stats.upload_speed)));
                     ui.label(format!("下载: {} ({})", format_bytes(stats.bytes_received), format_speed(stats.download_speed)));
