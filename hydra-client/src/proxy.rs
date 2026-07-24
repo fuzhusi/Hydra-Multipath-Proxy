@@ -6,6 +6,7 @@ use hydra_protocol::{Result, HydraError, NodeInfo, NodeStatus};
 use crate::scheduler::Scheduler;
 use crate::transport::Transport;
 use crate::pool::{ConnectionPool, PoolConfig};
+use crate::traffic::TrafficMonitor;
 use std::sync::Arc;
 
 pub struct ProxyServer {
@@ -13,6 +14,7 @@ pub struct ProxyServer {
     scheduler: Arc<Scheduler>,
     nodes: Vec<SocketAddr>,
     pool: Arc<ConnectionPool>,
+    traffic_monitor: Option<Arc<TrafficMonitor>>,
 }
 
 impl ProxyServer {
@@ -27,11 +29,17 @@ impl ProxyServer {
             scheduler: Arc::new(Scheduler::new()),
             nodes: Vec::new(),
             pool: Arc::new(pool),
+            traffic_monitor: None,
         }
     }
 
     pub fn with_nodes(mut self, nodes: Vec<SocketAddr>) -> Self {
         self.nodes = nodes;
+        self
+    }
+
+    pub fn with_traffic_monitor(mut self, monitor: Arc<TrafficMonitor>) -> Self {
+        self.traffic_monitor = Some(monitor);
         self
     }
 

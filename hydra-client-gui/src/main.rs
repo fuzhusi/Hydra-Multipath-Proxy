@@ -1,7 +1,7 @@
 use eframe::egui;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use hydra_client::{Scheduler, ProxyServer, Transport, parse_share_links, generate_share_links};
+use hydra_client::{Scheduler, ProxyServer, Transport, parse_share_links, generate_share_links, TrafficMonitor, format_bytes, format_speed, format_duration};
 use hydra_protocol::{NodeInfo, NodeStatus};
 use std::net::SocketAddr;
 use std::collections::HashMap;
@@ -40,6 +40,10 @@ struct HydraApp {
     node_status: HashMap<String, NodeStatusInfo>,
     last_health_check: Option<std::time::Instant>,
     health_check_receiver: Option<std::sync::mpsc::Receiver<(String, Option<(bool, u64)>)>>,
+
+    // 流量统计
+    traffic_monitor: Option<Arc<TrafficMonitor>>,
+    last_traffic_update: Option<std::time::Instant>,
 }
 
 impl Default for HydraApp {
@@ -61,6 +65,8 @@ impl Default for HydraApp {
             node_status: HashMap::new(),
             last_health_check: None,
             health_check_receiver: None,
+            traffic_monitor: None,
+            last_traffic_update: None,
         }
     }
 }
@@ -116,6 +122,8 @@ impl HydraApp {
             node_status,
             last_health_check: None,
             health_check_receiver: None,
+            traffic_monitor: None,
+            last_traffic_update: None,
         }
     }
 
@@ -280,6 +288,10 @@ impl HydraApp {
             return;
         }
 
+        // 创建流量统计器
+        let traffic_monitor = Arc::new(TrafficMonitor::new());
+        self.traffic_monitor = Some(traffic_monitor.clone());
+
         // 使用独立线程运行代理
         let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), std::io::Error>>();
         let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
@@ -287,11 +299,12 @@ impl HydraApp {
         let nodes_clone = nodes.clone();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = stop_flag.clone();
+        let traffic_monitor_clone = traffic_monitor.clone();
 
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let proxy = ProxyServer::new(proxy_addr_clone).with_nodes(nodes_clone);
+                let proxy = ProxyServer::new(proxy_addr_clone).with_nodes(nodes_clone).with_traffic_monitor(traffic_monitor_clone);
                 // 先绑定端口
                 match tokio::net::TcpListener::bind(proxy_addr_clone).await {
                     Ok(listener) => {
@@ -753,7 +766,7 @@ impl eframe::App for HydraApp {
             });
             
             ui.separator();
-            
+
             // 状态信息
             ui.heading("状态信息");
             ui.label(format!("代理状态: {}", if self.proxy_running { "运行中" } else { "已停止" }));
@@ -765,6 +778,34 @@ impl eframe::App for HydraApp {
             if let Some(last_check) = self.last_health_check {
                 let elapsed = last_check.elapsed().as_secs();
                 ui.label(format!("上次检测: {}秒前", elapsed));
+            }
+
+            // 流量统计
+            if self.proxy_running {
+                ui.separator();
+                ui.heading("流量统计");
+
+                // 更新流量数据（每秒更新一次）
+                let should_update = match self.last_traffic_update {
+                    Some(last) => last.elapsed().as_secs() >= 1,
+                    None => true,
+                };
+
+                if should_update {
+                    self.last_traffic_update = Some(std::time::Instant::now());
+                }
+
+                if let Some(monitor) = &self.traffic_monitor {
+                    // 使用 block_on 获取异步数据
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let stats = rt.block_on(monitor.get_stats());
+
+                    ui.label(format!("上传: {} ({})", format_bytes(stats.bytes_sent), format_speed(stats.upload_speed)));
+                    ui.label(format!("下载: {} ({})", format_bytes(stats.bytes_received), format_speed(stats.download_speed)));
+                    ui.label(format!("活跃连接: {}", stats.active_connections));
+                    ui.label(format!("总连接数: {}", stats.total_connections));
+                    ui.label(format!("运行时间: {}", format_duration(stats.uptime_secs)));
+                }
             }
         });
         

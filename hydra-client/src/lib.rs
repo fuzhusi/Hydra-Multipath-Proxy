@@ -9,6 +9,8 @@ pub mod speedtest;
 pub mod share_link;
 pub mod pool;
 pub mod buf_pool;
+pub mod traffic;
+pub mod nat_traversal;
 
 pub use proxy::*;
 pub use session::*;
@@ -21,3 +23,5 @@ pub use speedtest::*;
 pub use share_link::*;
 pub use pool::*;
 pub use buf_pool::*;
+pub use traffic::*;
+pub use nat_traversal::*;
