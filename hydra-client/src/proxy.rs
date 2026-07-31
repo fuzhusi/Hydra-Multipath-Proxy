@@ -271,7 +271,13 @@ impl ProxyServer {
 
         info!("[{}] Received {} bytes response from node: {:?}", peer_addr, n, &resp_buf[..n]);
 
-        if n < 2 || resp_buf[0] != 0x00 {
+        // 如果服务器 DNS 解析失败（0x02），客户端本地解析后重试
+        if n >= 2 && resp_buf[0] == 0x02 {
+            if !Self::handle_dns_retry(&mut send, &mut recv, &target_with_port, peer_addr).await? {
+                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                return Err(HydraError::ConnectionError("DNS resolution failed".to_string()));
+            }
+        } else if n < 2 || resp_buf[0] != 0x00 {
             error!("[{}] Node returned error response: {:?}", peer_addr, &resp_buf[..n]);
             let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
             return Err(HydraError::ConnectionError("Remote node connection failed".to_string()));
@@ -394,7 +400,13 @@ impl ProxyServer {
 
         info!("[{}] Received {} bytes response from node: {:?}", peer_addr, n, &resp_buf[..n]);
 
-        if n < 2 || resp_buf[0] != 0x00 {
+        // 如果服务器 DNS 解析失败（0x02），客户端本地解析后重试
+        if n >= 2 && resp_buf[0] == 0x02 {
+            if !Self::handle_dns_retry(&mut send, &mut recv, &target_str, peer_addr).await? {
+                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                return Err(HydraError::ConnectionError("DNS resolution failed".to_string()));
+            }
+        } else if n < 2 || resp_buf[0] != 0x00 {
             error!("[{}] Node returned error response: {:?}", peer_addr, &resp_buf[..n]);
             let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
             return Err(HydraError::ConnectionError("Remote node connection failed".to_string()));
@@ -448,6 +460,65 @@ impl ProxyServer {
 
         info!("[{}] Connection to {} closed", peer_addr, target_str);
         Ok(())
+    }
+
+    /// 处理服务器 DNS 解析失败：客户端本地解析并重试
+    /// 返回 true 表示重试成功（连接已建立），false 表示失败
+    async fn handle_dns_retry(
+        send: &mut quinn::SendStream,
+        recv: &mut quinn::RecvStream,
+        target_str: &str,
+        peer_addr: SocketAddr,
+    ) -> Result<bool> {
+        info!("[{}] Server DNS failed for {}, trying client-side DNS...", peer_addr, target_str);
+
+        // 客户端本地解析 DNS
+        let resolved = match tokio::net::lookup_host(target_str).await {
+            Ok(addrs) => {
+                let addrs_vec: Vec<_> = addrs.collect();
+                let ipv4_addr = addrs_vec.iter().find(|a| a.is_ipv4());
+                match ipv4_addr {
+                    Some(a) => Some(a.to_string()),
+                    None => addrs_vec.first().map(|a| a.to_string()),
+                }
+            }
+            Err(_) => None,
+        };
+
+        let resolved = match resolved {
+            Some(r) => r,
+            None => {
+                error!("[{}] Client DNS resolution also failed for {}", peer_addr, target_str);
+                return Ok(false);
+            }
+        };
+
+        info!("[{}] Client DNS resolved: {} -> {}", peer_addr, target_str, resolved);
+
+        // 发送解析后的 IP 地址到服务器
+        if let Err(e) = send.write_all(resolved.as_bytes()).await {
+            error!("[{}] Failed to send resolved address: {}", peer_addr, e);
+            return Ok(false);
+        }
+
+        // 重新读取服务器响应
+        let mut retry_buf = [0u8; 2];
+        let retry_n = match recv.read(&mut retry_buf).await {
+            Ok(Some(n)) => n,
+            _ => {
+                error!("[{}] No response after DNS retry", peer_addr);
+                return Ok(false);
+            }
+        };
+
+        info!("[{}] Received {} bytes response after DNS retry: {:?}", peer_addr, retry_n, &retry_buf[..retry_n]);
+
+        if retry_n >= 2 && retry_buf[0] == 0x00 {
+            Ok(true) // 重试成功
+        } else {
+            error!("[{}] Node returned error after DNS retry: {:?}", peer_addr, &retry_buf[..retry_n]);
+            Ok(false)
+        }
     }
 
     /// 处理 SOCKS5 代理请求
@@ -636,7 +707,13 @@ impl ProxyServer {
 
         info!("Received {} bytes response from node: {:?}", n, &resp_buf[..n]);
 
-        if n < 2 || resp_buf[0] != 0x00 {
+        // 如果服务器 DNS 解析失败（0x02），客户端本地解析后重试
+        if n >= 2 && resp_buf[0] == 0x02 {
+            if !Self::handle_dns_retry(&mut send, &mut recv, &target_str, peer_addr).await? {
+                stream.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+                return Err(HydraError::ConnectionError("DNS resolution failed".to_string()));
+            }
+        } else if n < 2 || resp_buf[0] != 0x00 {
             // Connection failed
             error!("Node returned error response: {:?}", &resp_buf[..n]);
             stream.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;

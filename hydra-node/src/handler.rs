@@ -74,7 +74,8 @@ impl ConnectionHandler {
                             Some(a) => *a,
                             None => {
                                 error!("DNS resolution failed for {}: no addresses", target_addr_str);
-                                send.write_all(&[0x01, 0x00]).await
+                                // 返回特殊错误码 0x02 = DNS 解析失败
+                                send.write_all(&[0x02, 0x00]).await
                                     .map_err(|e| HydraError::ProtocolError(format!("Write error: {}", e)))?;
                                 return Err(HydraError::ConnectionError(format!("DNS resolution failed for {}", target_addr_str)));
                             }
@@ -83,7 +84,8 @@ impl ConnectionHandler {
                 }
                 Err(e) => {
                     error!("DNS resolution failed for {}: {}", target_addr_str, e);
-                    send.write_all(&[0x01, 0x00]).await
+                    // 返回特殊错误码 0x02 = DNS 解析失败
+                    send.write_all(&[0x02, 0x00]).await
                         .map_err(|e| HydraError::ProtocolError(format!("Write error: {}", e)))?;
                     return Err(HydraError::ConnectionError(format!("DNS resolution failed for {}: {}", target_addr_str, e)));
                 }
