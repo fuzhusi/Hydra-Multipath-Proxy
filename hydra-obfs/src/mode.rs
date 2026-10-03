@@ -12,10 +12,11 @@ pub const HYDRA_OBFS_KEY_ENV: &str = "HYDRA_OBFS_KEY";
 /// - [`TransportMode::Masquerade`]（默认）：线缆形态 = 标准 h3 站点，走普通 quinn Endpoint，
 ///   与既有 V2 行为**完全一致零改动**。
 /// - [`TransportMode::Obfs`]（逃生舱）：线缆形态 = 均匀随机字节，走 [`crate::ObfsUdpSocket`]。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportMode {
     /// 伪装模式（默认）：标准 h3 站点形态
+    #[default]
     Masquerade,
     /// 混淆模式（逃生舱，显式开启）：均匀随机字节形态
     Obfs,

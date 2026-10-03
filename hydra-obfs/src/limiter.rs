@@ -68,10 +68,11 @@ impl SourceLimiter {
     pub fn note_garbage(&mut self, src: IpAddr, now_ms: u64) {
         let wid = now_ms / self.window_ms;
         if self.map.len() >= self.capacity && !self.map.contains_key(&src) {
-            // 有界淘汰：先清过期窗口；仍满（全部活跃 = 伪造源泛洪）则整表清空
+            // 有界淘汰：先清过期窗口；仍满（全部活跃 = 伪造源泛洪）则拒绝新源插入。
+            // 不整表清空——那会重置攻击者已消耗的预算，使其可以轮换源无限维持攻击。
             self.map.retain(|_, w| w.id == wid);
             if self.map.len() >= self.capacity {
-                self.map.clear();
+                return;
             }
         }
         let w = self.map.entry(src).or_insert(Window { id: wid, seen: 0 });

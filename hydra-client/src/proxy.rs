@@ -315,8 +315,7 @@ impl ProxyServer {
                     return Err(HydraError::ConnectionError(msg));
                 }
                 Ok(Err(e)) => {
-                    // A3：节点存活的显式应用错误码（RESET_STREAM 携带 0x11-0x13）——
-                    // 目标侧问题，可区分、不降级节点；其余流损坏仍按节点故障切换
+                    // A3：节点存活的显式应用错误码（RESET_STREAM 携带 0x11-0x13）
                     let app_code = match &e {
                         quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)) => {
                             Some(u64::from(*code))
@@ -341,6 +340,18 @@ impl ProxyServer {
                         return Err(HydraError::ConnectionError(format!(
                             "节点 DNS 解析失败: {}",
                             target
+                        )));
+                    }
+                    // 其余应用错误码（含 0x13 转发错误）：节点存活，不降级节点——
+                    // 与 0x11/0x12 的"目标侧问题不切换"原则一致；只有非应用层（传输层）故障才降级
+                    if let Some(code) = app_code {
+                        warn!(
+                            "[{}] Node {} reported app error 0x{:x} for {}, not failing over",
+                            peer_addr, node.address, code, target
+                        );
+                        return Err(HydraError::ConnectionError(format!(
+                            "节点报告转发错误 (0x{:x}): {}",
+                            code, target
                         )));
                     }
                     warn!(
@@ -745,8 +756,12 @@ impl ProxyServer {
             let mut total = 0u64;
             loop {
                 match client_read.read(&mut buf).await {
-                    // 浏览器关写侧：send 随任务结束被 drop——quinn SendStream::drop 即优雅 FIN（半关闭语义）
-                    Ok(0) => return Ok(total),
+                    // 浏览器关写侧：显式优雅 FIN，不依赖 SendStream::drop 的 finish 语义
+                    //（quinn 0.10 drop==finish 已核实，但升级版本时语义可能变化）
+                    Ok(0) => {
+                        let _ = send.finish().await;
+                        return Ok(total);
+                    }
                     Ok(n) => {
                         total += n as u64;
                         if let Err(e) = send.write_all(&buf[..n]).await {

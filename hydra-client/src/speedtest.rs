@@ -57,10 +57,11 @@ pub fn spawn_recovery_probe(scheduler: Arc<Scheduler>, node_certs: Vec<Vec<u8>>,
         );
         let mut consecutive_failures: HashMap<SocketAddr, u32> = HashMap::new();
         loop {
-            // ±最多 20% 随机抖动，避免整周期探测的被动特征
-            let jitter =
-                rand::Rng::gen_range(&mut rand::thread_rng(), 0..=interval.as_millis() as u64 / 5);
-            tokio::time::sleep(interval + Duration::from_millis(jitter)).await;
+            // ±最多 20% 随机抖动（双向，纯正向只会拉长周期），避免整周期探测的被动特征
+            let fifth = (interval.as_millis() as i64) / 5;
+            let offset = rand::Rng::gen_range(&mut rand::thread_rng(), -fifth..=fifth);
+            let sleep_ms = ((interval.as_millis() as i64) + offset).max(500) as u64;
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
 
             for node in scheduler.get_all_nodes().await {
                 // 只探测非 Online 节点

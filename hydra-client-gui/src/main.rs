@@ -170,7 +170,13 @@ impl HydraApp {
         let (tx, rx) = std::sync::mpsc::channel();
         self.add_log(format!("开始测试节点 {}...", addr));
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send((addr, Err(format!("创建 tokio 运行时失败: {}", e))));
+                    return;
+                }
+            };
             let result = rt.block_on(HydraApp::test_node_connection(&addr));
             let _ = tx.send((addr, result));
         });
@@ -181,8 +187,14 @@ impl HydraApp {
     fn poll_node_test_results(&mut self) {
         let mut finished = None;
         if let Some(rx) = &self.node_test_receiver {
-            if let Ok(result) = rx.try_recv() {
-                finished = Some(result);
+            match rx.try_recv() {
+                Ok(result) => finished = Some(result),
+                // 线程 panic 等原因导致 sender 被弃：清空 receiver，允许再次发起测试
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.node_test_receiver = None;
+                    self.add_log("节点测试线程异常退出，已重置".to_string());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
         if let Some((addr, result)) = finished {
@@ -255,13 +267,19 @@ impl HydraApp {
         let mut should_clear = false;
 
         if let Some(rx) = &self.health_check_receiver {
-            // 非阻塞地接收所有可用结果
-            while let Ok((addr, result)) = rx.try_recv() {
-                results.push((addr, result));
-            }
-            // 检查是否所有结果都已接收
-            if rx.try_recv().is_err() {
-                should_clear = true;
+            // 非阻塞地接收所有可用结果。
+            // 必须区分 Empty 与 Disconnected：Empty = 结果尚未产生，保留 receiver 下帧再收；
+            // Disconnected = 发送端已关闭且队列排空，本批即最终结果，才允许清除 receiver。
+            // （此前首次 poll 时 Empty 也置 should_clear，导致 3s 后才到达的结果全部丢失）
+            loop {
+                match rx.try_recv() {
+                    Ok((addr, result)) => results.push((addr, result)),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        should_clear = true;
+                        break;
+                    }
+                }
             }
         }
 
@@ -1175,10 +1193,14 @@ async fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt::init();
 
     // 设置 panic hook，确保代理异常时清除系统代理
+    let main_thread_id = std::thread::current().id();
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        // 清除系统代理
-        HydraApp::remove_system_proxy_static();
+        // 仅主线程（GUI 崩溃路径）panic 才清理系统代理：后台线程 panic 不会终止进程，
+        // 此时清理会让用户的网络在代理仍在运行时被静默断开
+        if std::thread::current().id() == main_thread_id {
+            HydraApp::remove_system_proxy_static();
+        }
         // 调用原始 hook
         original_hook(panic_info);
     }));

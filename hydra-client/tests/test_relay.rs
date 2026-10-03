@@ -11,11 +11,13 @@ use hydra_client::active_relay_count;
 use hydra_protocol::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// 等待活动中继计数归零（中继任务收敛需要一点时间）
-async fn wait_relays_drained(timeout: Duration) -> usize {
+/// 等待活动中继计数回落到目标值（中继任务收敛需要一点时间）。
+/// 计数器是进程级全局量，同二进制的多个 #[tokio::test] 并行运行会互相计入，
+/// 因此断言用"回到本测试开始时的基线值"而非硬编码 0。
+async fn wait_relays_at(timeout: Duration, target: usize) -> usize {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
-        if active_relay_count() == 0 {
+        if active_relay_count() <= target {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -26,6 +28,7 @@ async fn wait_relays_drained(timeout: Duration) -> usize {
 /// A4 半关闭：SOCKS5 客户端关写侧（shutdown write）后，仍能完整收到响应直到 EOF
 #[tokio::test]
 async fn test_half_close_client_can_still_receive_full_response() -> Result<()> {
+    let baseline = active_relay_count();
     let node = common::spawn_node().await;
     let echo_port = common::spawn_echo_server().await;
     let proxy_addr = common::spawn_proxy(vec![(node.addr, node.cert.clone())]).await;
@@ -41,10 +44,9 @@ async fn test_half_close_client_can_still_receive_full_response() -> Result<()> 
     assert_eq!(received, b"half-close-payload");
 
     // 中继完全收敛，无孤儿任务
-    assert_eq!(
-        wait_relays_drained(Duration::from_secs(5)).await,
-        0,
-        "active relay count must return to zero"
+    assert!(
+        wait_relays_at(Duration::from_secs(5), baseline).await <= baseline,
+        "active relay count must return to baseline"
     );
 
     Ok(())
@@ -53,6 +55,7 @@ async fn test_half_close_client_can_still_receive_full_response() -> Result<()> 
 /// A4 计数器：多次连接建立/结束后，活动中继计数归零
 #[tokio::test]
 async fn test_active_relay_counter_returns_to_zero() -> Result<()> {
+    let baseline = active_relay_count();
     let node = common::spawn_node().await;
     let echo_port = common::spawn_echo_server().await;
     let proxy_addr = common::spawn_proxy(vec![(node.addr, node.cert.clone())]).await;
@@ -65,10 +68,9 @@ async fn test_active_relay_counter_returns_to_zero() -> Result<()> {
         assert_eq!(&buf, format!("round-{:02}", i).as_bytes());
     }
 
-    assert_eq!(
-        wait_relays_drained(Duration::from_secs(5)).await,
-        0,
-        "active relay count must return to zero after connections close"
+    assert!(
+        wait_relays_at(Duration::from_secs(5), baseline).await <= baseline,
+        "active relay count must return to baseline after connections close"
     );
 
     Ok(())
@@ -79,6 +81,7 @@ async fn test_active_relay_counter_returns_to_zero() -> Result<()> {
 /// 非 UTF-8 body 字节替换为 U+FFFD 造成损坏，本测试防回归。
 #[tokio::test]
 async fn test_http_binary_body_byte_exact() -> Result<()> {
+    let baseline = active_relay_count();
     let node = common::spawn_node().await;
     let echo_port = common::spawn_echo_server().await;
     let proxy_addr = common::spawn_proxy(vec![(node.addr, node.cert.clone())]).await;
@@ -114,10 +117,9 @@ async fn test_http_binary_body_byte_exact() -> Result<()> {
     assert_eq!(received, expected, "echoed bytes must be identical");
 
     // 中继收敛
-    assert_eq!(
-        wait_relays_drained(Duration::from_secs(5)).await,
-        0,
-        "active relay count must return to zero"
+    assert!(
+        wait_relays_at(Duration::from_secs(5), baseline).await <= baseline,
+        "active relay count must return to baseline"
     );
 
     Ok(())

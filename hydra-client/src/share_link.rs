@@ -28,7 +28,8 @@ pub struct ShareLink {
     pub loss_rate: f64,
     pub load: f64,
     pub status: NodeStatus,
-    /// V3.1 传输模式（缺省 masquerade）
+    /// V3.1 传输模式（缺省 masquerade；serde default 保证旧版持久化数据反序列化兼容）
+    #[serde(default)]
     pub mode: TransportMode,
 }
 

@@ -99,12 +99,14 @@ impl ObfsUdpSocket {
             }
         }
         let sent = self.inner.send((&self.io).into(), state, &wrapped)?;
-        // 保守映射回"已发送的输入 Transmit 数"（尾段未发出则该输入不计入——
-        // quinn 会重发，最多产生重复报文，由内层 QUIC 按包号去重，无害）
+        // 映射回"已完整发出的输入 Transmit 数"：只统计输出累计端点 acc+n <= sent 的输入。
+        // 若 sent 落在某输入的输出中间（该输入尾段未发出），把该输入上报为已发送会静默丢包；
+        // 上报为未完成则 quinn 重发整个输入——最多重复报文，由内层 QUIC 按包号去重，无害。
+        // 原则：宁可多报重复，绝不少报丢失。
         let mut done = 0usize;
         let mut acc = 0usize;
         for n in &outputs_per_input {
-            if acc >= sent {
+            if acc + n > sent {
                 break;
             }
             acc += n;
