@@ -50,19 +50,23 @@ openssl rand -hex 32
 
 ```bash
 export HYDRA_AUTH_KEY="a1b2c3d4..."   # 上一步生成的密钥
-./target/release/hydra-node 0.0.0.0:8080
+./target/release/hydra-node 0.0.0.0:443          # 端口自由指定（推荐 443）
+# 或者用环境变量：HYDRA_LISTEN=0.0.0.0:443 ./target/release/hydra-node
 ```
 
 节点首次启动会生成自签证书并保存（默认当前目录 `hydra-node-cert.der` / `hydra-node-key.der`），日志会打印证书 SHA-256 指纹。**把 `hydra-node-cert.der` 复制到客户端机器。**
 
-> 推荐生产部署监听 UDP 443，与真实 h3/QUIC 网站流量无异。
+> **端口建议**：Hydra 是 QUIC/UDP 协议。与 Hysteria2/TUIC 等开源项目一致，**推荐监听 UDP 443**——443 是 HTTP/3 的标准端口，防火墙和运营商对其有正常流量预期，而 8080 等非常规 UDP 端口容易被重点盯防。注意 Linux 上绑定 443 需要 root 或 `setcap cap_net_bind_service=+ep`。
 
 ### 4. 启动客户端
 
 ```bash
 export HYDRA_AUTH_KEY="a1b2c3d4..."          # 与节点一致
 export HYDRA_NODE_CERT=/path/to/hydra-node-cert.der  # 节点证书文件
-./target/release/hydra-client 1.2.3.4:8080 [更多节点...]
+./target/release/hydra-client 1.2.3.4:443 [更多节点...]
+# 本地监听端口也可自选：
+./target/release/hydra-client --listen 127.0.0.1:2080 1.2.3.4:443
+# 或：HYDRA_LISTEN=127.0.0.1:2080 ./target/release/hydra-client 1.2.3.4:443
 ```
 
 ### 5. 浏览器配置
@@ -105,6 +109,7 @@ curl -x http://127.0.0.1:1080 https://www.google.com
 |---|---|---|
 | `HYDRA_AUTH_KEY` | 双端 | 预共享密钥（hex，解码后 ≥16 字节），**必填** |
 | `HYDRA_NODE_CERT` | 客户端 | 节点证书 .der 文件路径，**必填** |
+| `HYDRA_LISTEN` | 双端 | 监听地址（节点默认 `0.0.0.0:8080`，客户端默认 `127.0.0.1:1080`；也可用命令行参数覆盖） |
 | `HYDRA_CERT_FILE` / `HYDRA_KEY_FILE` | 节点 | 证书/私钥保存路径（默认 `hydra-node-cert.der` / `hydra-node-key.der`） |
 | `HYDRA_CERT_DOMAINS` | 节点 | 证书 SAN，逗号分隔（默认 `hydra.node,localhost`） |
 | `HYDRA_MAX_CONNECTIONS` | 节点 | 最大并发连接数（默认 1000） |
