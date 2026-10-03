@@ -1,565 +1,150 @@
 # Hydra Multipath Proxy
 
-基于 Rust 的多链路聚合代理协议实现，通过多节点并行传输实现带宽聚合和故障恢复。项目是由ai主导完成，其中可能存在多处不合理。
+基于 Rust 的多链路聚合代理协议，通过多个自建节点并行传输实现带宽聚合和故障恢复。
 
-## 项目简介
+> **项目状态**：个人项目，由 AI 辅助开发。2026-10 完成了一轮三维度（稳定性/安全性/防追踪性）专项审查与 Phase A 安全加固，审查报告见 [docs/review/](docs/review/00-审查总览与改进目标.md)。
 
-Hydra 是一个用户态多链路聚合代理协议，旨在解决传统单点代理的带宽限制和单点故障问题。通过将数据分片并通过多个节点并行传输，Hydra 能够实现：
+## 当前真实能力（如实清单）
 
-- **桌面GUI客户端**：基于egui的跨平台桌面应用程序，支持中文界面
-- **带宽聚合**：多个节点的带宽叠加，提升传输速度
-- **故障自动恢复**：节点故障时自动切换到健康节点
-- **智能调度**：基于网络质量动态选择最优节点
-- **加密通信**：基于 QUIC 的端到端加密
+以下特性**已实现并在真实数据路径上可验证**：
 
-## 核心功能
+- **认证传输**：节点必须配置预共享密钥（PSK + HMAC-SHA256 token，30 秒时间窗）。未认证的流被**静默关闭**，不回显任何可区分的错误码，抵御主动探测
+- **证书固定（Pinning）**：节点首次启动生成自签证书并**持久化到磁盘**；客户端将该证书加入本地信任根，执行标准 webpki 校验——链路上的中间人无法解密或篡改
+- **故障切换**：节点连接失败/流损坏/响应超时 → 自动标记 Offline、清空其连接池、**切换下一节点重试**（最多 3 个候选节点）
+- **伪装特征**：ALPN 使用标准 `h3`，SNI 默认 `hydra.node`（可覆盖），keepalive 7–12 秒随机抖动，禁用 TLS 会话恢复（阻断跨连接关联追踪）
+- **DNS 隐私**：客户端不解析目标域名，域名只经 QUIC 加密通道交给节点解析，目标域名永不以明文离开本机
+- **资源上限**：节点用 Semaphore 强制最大并发连接数；认证前每流只接受固定长度的认证块，防止资源耗尽
+- **SOCKS5 + HTTP 代理**：本地 `127.0.0.1:1080`，支持 CONNECT/GET/POST、域名与 IPv4/IPv6 目标
+- **地址帧健壮性**：目标地址带 2 字节长度前缀，双方 `read_exact` 读取，杜绝流式截断
+- **桌面 GUI**（egui，中文界面）：节点管理、健康检查、代理启停、系统代理设置
 
-### 已实现功能 (Phase 1-6)
+**尚未实现**（README 历史版本曾错误声称已实现，审查后如实标注）：
 
-#### Phase 1: 基础通信
-- ✅ QUIC 加密传输（基于 quinn）
-- ✅ 自定义二进制协议
-- ✅ 数据包校验和验证
-- ✅ 基本代理框架
-
-#### Phase 2: 多节点传输
-- ✅ 多节点并行连接
-- ✅ 数据分片（Splitter）
-- ✅ 数据重组（Assembler）
-- ✅ 节点评分调度算法
-
-#### Phase 3: 智能调度
-- ✅ 动态节点选择（基于带宽、延迟、丢包率）
-- ✅ 自动测速（定期测量节点性能）
-- ✅ 故障检测与恢复
-- ✅ 节点状态管理（Online/Degraded/Offline）
-
-#### Phase 4: GUI 与系统集成
-- ✅ 桌面 GUI 客户端（基于 egui，支持中文界面）
-- ✅ 节点连接状态检测与显示
-- ✅ 系统全局代理设置（参考 v2rayN 实现）
-- ✅ 代理异常退出自动清理
-- ✅ 详细连接日志
-- ✅ 分享链接功能
-
-#### Phase 5: 性能优化与安全
-- ✅ **QUIC 连接池** - 共享单个 Endpoint，连接复用
-- ✅ **缓冲池** - 无锁队列，RAII 自动归还
-- ✅ **认证机制** - HMAC Token + PBKDF2 密码哈希
-- ✅ **速率限制** - 基于 IP 的令牌桶算法
-- ✅ **HTTP CONNECT 代理** - 支持 HTTP/HTTPS 浏览器代理
-
-#### Phase 6: 高级功能
-- ✅ **NAT 穿透** - STUN 服务器发现公网地址，UDP 打洞
-- ✅ **流量统计与监控** - 实时上传/下载速度、连接数统计
-- ✅ **桌面 GUI 增强** - 流量统计显示、节点状态监控
-
-### 待实现功能
-
-- ⏳ Web 管理面板（可选）
-- ⏳ BBR 拥塞控制
-
-## 架构设计
-
-```
-┌──────────────────────────────────────────────────────┐
-│                    Application                       │
-│                        │                             │
-│              ┌─────────▼─────────┐                   │
-│              │  SOCKS5/HTTP Proxy │                  │
-│              └─────────┬─────────┘                   │ 
-│                        │                             │
-│              ┌─────────▼─────────┐                   │
-│              │    Hydra Client    │                  │
-│              │  ┌───────────────┐ │                  │
-│              │  │ ConnectionPool│ │  ← QUIC 连接池    │
-│              │  └───────┬───────┘ │                  │
-│              │  ┌───────▼───────┐ │                  │
-│              │  │   Scheduler   │ │                  │
-│              │  └───────┬───────┘ │                  │
-│              │  ┌───────▼───────┐ │                  │
-│              │  │   BufPool     │ │  ← 缓冲池         │
-│              │  └───────┬───────┘ │                  │
-│              │  ┌───────▼───────┐ │                  │
-│              │  │   Splitter    │ │                  │
-│              │  └───────┬───────┘ │                  │
-│              │  ┌───────▼───────┐ │                  │
-│              │  │  Assembler    │ │                  │
-│              │  └───────────────┘ │                  │
-│              └─────────┬─────────┘                   │
-│                        │                             │
-│         ┌──────────────┼──────────────┐              │
-│         │              │              │              │
-│   ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼─────┐        │
-│   │  Node A   │  │  Node B   │  │  Node C   │        │
-│   │  (Auth)   │  │  (Auth)   │  │  (Auth)   │        │
-│   └─────┬─────┘  └─────┬─────┘  └─────┬─────┘        │
-│         │              │              │              │
-│         └──────────────┼──────────────┘              │
-│                        │                             │
-│                    Internet                          │
-└──────────────────────────────────────────────────────┘
-```
-
-## 项目结构
-
-```
-Hydra-Multipath-Proxy/
-├── hydra-protocol/          # 协议定义和共享类型
-│   └── src/
-│       ├── lib.rs           # 模块导出
-│       ├── packet.rs        # 数据包定义
-│       ├── session.rs       # 会话管理
-│       ├── node.rs          # 节点配置
-│       ├── error.rs         # 错误类型
-│       └── auth.rs          # 认证机制
-├── hydra-node/              # 代理节点服务器
-│   └── src/
-│       ├── lib.rs           # 模块导出
-│       ├── server.rs        # QUIC 服务器
-│       ├── handler.rs       # 连接处理
-│       ├── config.rs        # 节点配置
-│       └── main.rs          # 节点启动入口
-├── hydra-client/            # 客户端代理库
-│   └── src/
-│       ├── lib.rs           # 模块导出
-│       ├── proxy.rs         # SOCKS5/HTTP 代理服务器
-│       ├── session.rs       # 会话管理
-│       ├── scheduler.rs     # 多路径调度
-│       ├── splitter.rs      # 数据分片
-│       ├── assembler.rs     # 数据重组
-│       ├── transport.rs     # QUIC 传输层
-│       ├── crypto.rs        # 加密模块
-│       ├── speedtest.rs     # 自动测速
-│       ├── share_link.rs    # 分享链接解析
-│       ├── pool.rs          # QUIC 连接池
-│       ├── buf_pool.rs      # 缓冲池
-│       ├── traffic.rs       # 流量统计 ← 新增
-│       ├── nat_traversal.rs # NAT 穿透 ← 新增
-│       └── main.rs          # 客户端启动入口
-├── hydra-client-gui/        # 桌面GUI客户端
-│   ├── src/
-│   │   └── main.rs          # GUI应用程序入口（含流量统计显示）
-│   └── fonts/
-│       └── NotoSansCJK-Regular.ttc  # 中文字体文件
-├── config/                  # 配置文件
-│   └── default.toml         # 默认配置
-├── Cargo.toml               # 工作空间配置
-└── README.md                # 项目说明
-```
-
-## 技术栈
-
-- **语言**: Rust 2021 Edition
-- **异步运行时**: Tokio
-- **网络协议**: QUIC (quinn)
-- **加密**: rustls + ring
-- **序列化**: serde + serde_json
-- **日志**: tracing + tracing-subscriber
-- **GUI框架**: egui + eframe (桌面客户端，支持中文界面，使用Noto Sans CJK字体)
-- **URL解析**: url crate
-- **Base64编码**: base64 crate
-- **无锁队列**: crossbeam-queue ← 新增
+- ⏳ **多路聚合 / 分片重组**：Splitter/Assembler 代码存在但**未接入数据路径**，当前所有流量走单节点单流。这是下一阶段（Phase C）的核心工作
+- ⏳ **自动测速与动态调度**：旧测速逻辑已删除，测速将在 Phase B 重写
+- ⏳ **流量统计**：模块存在但未接线，GUI 显示恒 0
+- ⏳ **NAT 穿透 / 配置文件 / BBR**：未实现
 
 ## 快速开始
 
 ### 环境要求
 
 - Rust 1.70+
-- Cargo
-- Linux (支持 GNOME/KDE 桌面环境)
+- Windows / Linux / macOS
 
-### 1. 克隆项目
-
-```bash
-git clone https://github.com/fuzhusi/Hydra-Multipath-Proxy.git
-cd Hydra-Multipath-Proxy
-```
-
-### 2. 编译项目
+### 1. 编译
 
 ```bash
-# 编译所有组件
 cargo build --release
-
-# 或仅编译特定组件
-cargo build --release --bin hydra-node
-cargo build --release --bin hydra-client
-cargo build --release --bin hydra-client-gui
 ```
 
-### 3. 运行节点服务器
+### 2. 生成认证密钥（客户端与节点必须一致）
 
 ```bash
-# 终端 1：启动节点服务器（默认监听 0.0.0.0:8080）
-./target/release/hydra-node
+# 任意方式生成 32 字节随机密钥的 hex
+openssl rand -hex 32
+# 输出示例: a1b2c3d4...（64 个 hex 字符）
 ```
 
-### 4. 运行客户端代理
-
-#### 方式一：命令行客户端
+### 3. 启动节点
 
 ```bash
-# 终端 2：启动客户端代理（默认监听 127.0.0.1:1080）
-./target/release/hydra-client
-
-# 指定节点地址
-./target/release/hydra-client 43.130.251.236:8080
+export HYDRA_AUTH_KEY="a1b2c3d4..."   # 上一步生成的密钥
+./target/release/hydra-node 0.0.0.0:8080
 ```
 
-#### 方式二：GUI 客户端（推荐）
+节点首次启动会生成自签证书并保存（默认当前目录 `hydra-node-cert.der` / `hydra-node-key.der`），日志会打印证书 SHA-256 指纹。**把 `hydra-node-cert.der` 复制到客户端机器。**
+
+> 推荐生产部署监听 UDP 443，与真实 h3/QUIC 网站流量无异。
+
+### 4. 启动客户端
 
 ```bash
-# 运行桌面GUI客户端
+export HYDRA_AUTH_KEY="a1b2c3d4..."          # 与节点一致
+export HYDRA_NODE_CERT=/path/to/hydra-node-cert.der  # 节点证书文件
+./target/release/hydra-client 1.2.3.4:8080 [更多节点...]
+```
+
+### 5. 浏览器配置
+
+- SOCKS5: `127.0.0.1:1080`（SOCKS v5）
+- 或 HTTP 代理: `127.0.0.1:1080`
+
+### 6. 验证
+
+```bash
+curl -x socks5h://127.0.0.1:1080 https://www.baidu.com
+curl -x http://127.0.0.1:1080 https://www.google.com
+```
+
+### GUI 客户端
+
+```bash
 ./target/release/hydra-client-gui
 ```
 
-### 5. 配置浏览器
+启动前同样需要设置 `HYDRA_AUTH_KEY` 与 `HYDRA_NODE_CERT` 环境变量；未设置时代理启动会给出明确错误提示。
 
-#### Firefox 设置
+## 协议（v2，客户端 ↔ 节点）
 
-1. 打开 Firefox → 设置 → 常规 → 网络设置
-2. 点击 "设置..."
-3. 选择 "手动代理配置"
-4. 填写：
-   - **SOCKS 主机**: `127.0.0.1`
-   - **端口**: `1080`
-   - 选择 **SOCKS v5**
-   - ✅ 勾选 "为所有协议使用相同代理"
-5. 点击 "确定"
+每条 QUIC 双向流的字节序列：
 
-#### 或使用系统代理
-
-GUI 客户端会自动设置系统代理，支持：
-- GNOME 桌面环境
-- KDE 桌面环境
-- 环境变量 (http_proxy, https_proxy, all_proxy)
-
-### 6. 测试连接
-
-```bash
-# 测试 SOCKS5 代理
-curl -x socks5://127.0.0.1:1080 http://google.com
-
-# 测试 HTTP 代理
-curl -x http://127.0.0.1:1080 http://google.com
-
-# 测试 HTTPS
-curl -x http://127.0.0.1:1080 https://google.com
+```
+[64 字节认证 token]          AuthToken: 时间戳(8) + HMAC-SHA256(32) + nonce(16) + reserved(8)
+[2 字节地址长度（大端）]
+[目标地址 "host:port"]        域名或 IP
+[节点应答 2 字节]             0x00 成功 / 0x01 连接目标失败 / 0x02 节点侧 DNS 失败
+[双向裸转发]                  直至任一方关闭
 ```
 
-## GUI 客户端功能
+认证失败的流被静默关闭（零字节关流）；应答码只出现在**已认证**的流上，探测者无法据此区分节点行为。
 
-### 节点管理
-- **添加节点**: 输入节点地址并点击"添加"
-- **删除节点**: 点击节点列表中的"删除"按钮
-- **测试连接**: 点击"测试"按钮验证节点可达性
-- **测试所有节点**: 一键测试所有节点的连接状态
+## 环境变量
 
-### 连接状态显示
-- 🟢 **已连接**: 节点可达，显示延迟
-- 🔴 **未连接**: 节点不可达
-- ⚪ **未测试**: 尚未测试连接状态
+| 变量 | 端 | 说明 |
+|---|---|---|
+| `HYDRA_AUTH_KEY` | 双端 | 预共享密钥（hex，解码后 ≥16 字节），**必填** |
+| `HYDRA_NODE_CERT` | 客户端 | 节点证书 .der 文件路径，**必填** |
+| `HYDRA_CERT_FILE` / `HYDRA_KEY_FILE` | 节点 | 证书/私钥保存路径（默认 `hydra-node-cert.der` / `hydra-node-key.der`） |
+| `HYDRA_CERT_DOMAINS` | 节点 | 证书 SAN，逗号分隔（默认 `hydra.node,localhost`） |
+| `HYDRA_MAX_CONNECTIONS` | 节点 | 最大并发连接数（默认 1000） |
 
-### 代理控制
-- **启动代理**: 启动 SOCKS5/HTTP 代理服务
-- **停止代理**: 停止代理并清除系统代理设置
+## 项目结构
 
-### 系统代理设置
-参考 v2rayN 实现，支持：
-- 设置所有协议的代理（HTTP/HTTPS/FTP/SOCKS）
-- 自动添加忽略主机列表（本地地址不走代理）
-- 支持 GNOME 和 KDE 桌面环境
-- 代理异常退出时自动清除系统代理
-
-### 安全保护
-- **正常退出**: 点击"停止代理"或"退出"菜单
-- **窗口关闭**: 点击窗口关闭按钮
-- **代理崩溃**: 自动检测并清除系统代理
-- **程序 panic**: panic hook 自动清除系统代理
-
-### 日志显示
-- 实时显示连接日志
-- 显示目标地址（域名/IP + 端口）
-- 显示 DNS 解析过程
-- 显示节点选择和连接过程
-
-## 性能优化
-
-### QUIC 连接池
-
-**优化前**：每个请求创建新的 QUIC 连接
 ```
-请求 1 → 新建连接 → TLS 握手 → 传输 → 关闭
-请求 2 → 新建连接 → TLS 握手 → 传输 → 关闭
-```
-
-**优化后**：共享连接池，复用已有连接
-```
-请求 1 → 从池中获取连接 → 传输 → 归还到池
-请求 2 → 从池中获取连接 → 传输 → 归还到池
-```
-
-**性能提升**：
-- 延迟降低 50-100ms
-- 减少 TLS 握手开销
-- 节省 UDP 端口资源
-
-### 缓冲池
-
-**优化前**：每连接分配 256KB 缓冲区
-```
-连接 1: 4 × 64KB = 256KB
-连接 2: 4 × 64KB = 256KB
-...
-1000 连接: 256MB
-```
-
-**优化后**：使用无锁缓冲池
-```
-缓冲池: 256 个 32KB 缓冲区
-连接从池中借用，用完归还
-1000 连接: 64-96MB
-```
-
-**内存节省**：60-75%
-
-### 认证机制
-
-**HMAC Token 认证**：
-```
-Token = HMAC-SHA256(key, timestamp || client_id || nonce)
-```
-
-**特性**：
-- 时间窗口验证（30秒）
-- Nonce 追踪防重放
-- 常量时间比较防时序攻击
-
-**PBKDF2 密码哈希**：
-```
-hash = PBKDF2-HMAC-SHA256(password, salt, 100000 iterations)
-```
-
-### 性能对比
-
-| 指标 | 优化前 | 优化后 | 提升 |
-|------|--------|--------|------|
-| 每请求延迟 | 100-300ms | 0.5-2ms | 50-100× |
-| 1000连接内存 | 256MB | 64-96MB | 60-75% |
-| UDP Socket | 每请求 1 个 | 全局 1 个 | - |
-| TLS 握手 | 每请求 1 次 | 每连接 1 次 | - |
-
-## 配置说明
-
-### 配置文件位置
-
-- 默认配置: `config/default.toml`
-- 可通过环境变量 `HYDRA_CONFIG` 指定自定义配置路径
-
-### 配置示例
-
-```toml
-[server]
-listen_addr = "0.0.0.0:8080"  # 节点监听地址
-max_connections = 1000         # 最大连接数
-buffer_size = 65536            # 缓冲区大小
-log_level = "info"             # 日志级别
-
-[client]
-proxy_addr = "127.0.0.1:1080"  # 代理监听地址
-nodes = [                      # 节点列表
-    "127.0.0.1:8080",
-    "192.168.1.100:8080",
-    "10.0.0.1:8080"
-]
-```
-
-### 多节点配置
-
-```toml
-[client]
-proxy_addr = "127.0.0.1:1080"
-nodes = [
-    "node1.example.com:8080",
-    "node2.example.com:8080",
-    "node3.example.com:8080"
-]
+Hydra-Multipath-Proxy/
+├── hydra-protocol/          # 协议定义：认证 token、节点状态、错误类型
+├── hydra-node/              # 代理节点：QUIC 服务、认证、证书持久化、连接数上限
+├── hydra-client/            # 客户端库：SOCKS5/HTTP、连接池、故障切换调度
+├── hydra-client-gui/        # 桌面 GUI（egui）
+├── docs/
+│   ├── review/              # 技术团队审查报告（稳定性/安全性/防追踪性）与改进路线图
+│   ├── archive/             # 历史审查文档
+│   └── Hydra-Multipath-Proxy-RFC-v1.md   # 协议设计 RFC
+└── config/                  # （占位，配置系统尚未实现）
 ```
 
 ## 测试
-
-### 运行所有测试
 
 ```bash
 cargo test --workspace
 ```
 
-### 运行特定测试
-
-```bash
-# 测试 QUIC 连接
-cargo test --test test_client
-
-# 测试多节点传输
-cargo test --test test_multipath
-
-# 测试数据分片重组
-cargo test --test test_full_multipath
-
-# 测试故障恢复
-cargo test --test test_failover
-
-# 测试自动测速
-cargo test --test test_speedtest
-```
-
-### 性能测试
-
-```bash
-# 测试连接池性能
-curl -w "Time: %{time_total}s\n" -o /dev/null -s -x http://127.0.0.1:1080 http://google.com
-
-# 压力测试
-ab -n 100 -c 10 -X 127.0.0.1:1080 http://example.com/
-```
-
-## 分享链接
-
-支持节点配置的导入和导出，方便用户分享节点配置。
-
-### 链接格式
-
-```
-hydra://address:port?bandwidth=100&latency=10&loss_rate=0.01&load=0.5&status=online
-```
-
-### 参数说明
-
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| address | 节点地址 | - |
-| port | 节点端口 | - |
-| bandwidth | 带宽 (Mbps) | 100.0 |
-| latency | 延迟 (ms) | 10.0 |
-| loss_rate | 丢包率 (0-1) | 0.01 |
-| load | 负载 (0-1) | 0.5 |
-| status | 节点状态 | online |
-
-## 故障排除
-
-### 代理无法连接
-
-1. 检查代理是否正在运行：
-   ```bash
-   ss -tlnp | grep 1080
-   ```
-
-2. 测试代理连接：
-   ```bash
-   curl -v -x http://127.0.0.1:1080 http://example.com
-   ```
-
-3. 检查节点是否可达：
-   - 在 GUI 中点击"测试所有节点"
-   - 或查看终端日志
-
-### Firefox 不使用代理
-
-1. 打开 Firefox → 设置 → 常规 → 网络设置
-2. 选择 "手动代理配置"
-3. 设置 SOCKS 代理：`127.0.0.1:1080`
-4. 选择 SOCKS v5
-
-### 代理异常退出后系统代理未清除
-
-手动清除系统代理：
-```bash
-gsettings set org.gnome.system.proxy mode none
-```
-
-或重新启动 GUI 并点击"停止代理"。
-
-### 内存使用过高
-
-如果内存使用持续增长：
-1. 检查是否有连接泄漏
-2. 使用 `ps aux | grep hydra` 监控内存
-3. 重启代理释放内存
+测试覆盖：端到端 SOCKS5 → 认证 → 节点 → 回显服务器；**节点故障自动切换**（杀掉节点1 后请求经节点2 成功）；64KB 大块数据完整往返；分片/重组单元逻辑；连接池与缓冲池。
 
 ## 开发路线
 
-### Phase 1: 基础通信 ✅
-- [x] QUIC 加密传输
-- [x] 自定义协议定义
-- [x] 基本代理框架
+- [x] **Phase A（2026-10）**：认证接线、证书固定、故障切换、资源上限、防追踪特征正常化、DNS 隐私、过时测试修复
+- [ ] **Phase B**：测速重写（结果写回调度器）、协议错误显式传播（替代静默 FIN）、nonce 防重放表、SSRF 目标过滤、依赖升级 rustls 0.23
+- [ ] **Phase C**：真多路径聚合（单连接多 stream 架构）、流量整形、BBR
 
-### Phase 2: 多节点传输 ✅
-- [x] 多节点并行连接
-- [x] 数据分片与重组
-- [x] 节点调度算法
-
-### Phase 3: 智能调度 ✅
-- [x] 动态节点选择
-- [x] 自动测速
-- [x] 故障检测与恢复
-
-### Phase 4: GUI 与系统集成 ✅
-- [x] 桌面 GUI 客户端
-- [x] 节点连接状态检测
-- [x] 系统全局代理设置
-- [x] 代理异常退出自动清理
-- [x] 分享链接功能
-
-### Phase 5: 性能优化与安全 ✅
-- [x] QUIC 连接池
-- [x] 缓冲池优化
-- [x] HMAC Token 认证
-- [x] PBKDF2 密码哈希
-- [x] 速率限制
-- [x] HTTP CONNECT 代理
-
-### Phase 6: 高级功能 ✅
-- [x] NAT 穿透（STUN + UDP 打洞）
-- [x] 流量统计与监控（实时速度、连接数）
-- [x] 桌面 GUI 增强（流量统计显示）
-
-### 待实现功能
-- [ ] BBR 拥塞控制
-- [ ] Web 管理面板（可选）
-
-## 贡献指南
-
-欢迎贡献代码！请遵循以下步骤：
-
-1. Fork 项目
-2. 创建功能分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 创建 Pull Request
-
-### 代码规范
-
-- 使用 `cargo fmt` 格式化代码
-- 使用 `cargo clippy` 检查代码质量
-- 确保所有测试通过
-- 添加必要的注释和文档
+详细依据见 [docs/review/00-审查总览与改进目标.md](docs/review/00-审查总览与改进目标.md)。
 
 ## 许可证
 
-本项目采用 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情
+MIT — 见 [LICENSE](LICENSE)。
 
 ## 联系方式
 
-- 项目链接: [GitHub Repository](https://github.com/fuzhusi/Hydra-Multipath-Proxy)
+- 项目: [GitHub Repository](https://github.com/fuzhusi/Hydra-Multipath-Proxy)
 - 问题反馈: [Issues](https://github.com/fuzhusi/Hydra-Multipath-Proxy/issues)
-
-## 致谢
-
-- [quinn](https://github.com/quinn-rs/quinn) - QUIC 协议实现
-- [tokio](https://tokio.rs/) - 异步运行时
-- [rustls](https://github.com/ctz/rustls) - TLS 实现
-- [serde](https://serde.rs/) - 序列化框架
-- [v2rayN](https://github.com/2dust/v2rayN) - 系统代理设置参考
-- [ring](https://github.com/briansmith/ring) - 加密库
-- [crossbeam](https://github.com/crossbeam-rs/crossbeam) - 无锁队列

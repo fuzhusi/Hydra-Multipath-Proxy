@@ -1,10 +1,11 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, error, warn};
 use hydra_protocol::{Result, HydraError, NodeInfo, NodeStatus};
 use crate::scheduler::Scheduler;
-use crate::transport::Transport;
+use crate::transport::{Transport, DEFAULT_SNI};
 use crate::pool::{ConnectionPool, PoolConfig};
 use crate::traffic::TrafficMonitor;
 use std::sync::Arc;
@@ -13,23 +14,24 @@ pub struct ProxyServer {
     listen_addr: SocketAddr,
     scheduler: Arc<Scheduler>,
     nodes: Vec<SocketAddr>,
-    pool: Arc<ConnectionPool>,
     traffic_monitor: Option<Arc<TrafficMonitor>>,
+    auth_key: Vec<u8>,
+    node_certs: Vec<Vec<u8>>,
+    sni: String,
+    bound_addr: Arc<std::sync::OnceLock<SocketAddr>>,
 }
 
 impl ProxyServer {
     pub fn new(listen_addr: SocketAddr) -> Self {
-        let (endpoint, _) = Transport::create_shared_endpoint()
-            .expect("Failed to create QUIC endpoint");
-
-        let pool = ConnectionPool::new(endpoint, PoolConfig::default());
-
         Self {
             listen_addr,
             scheduler: Arc::new(Scheduler::new()),
             nodes: Vec::new(),
-            pool: Arc::new(pool),
             traffic_monitor: None,
+            auth_key: Vec::new(),
+            node_certs: Vec::new(),
+            sni: DEFAULT_SNI.to_string(),
+            bound_addr: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -38,18 +40,52 @@ impl ProxyServer {
         self
     }
 
+    /// 节点预共享认证密钥（必填：没有认证的节点是公网开放代理）
+    pub fn with_auth_key(mut self, key: Vec<u8>) -> Self {
+        self.auth_key = key;
+        self
+    }
+
+    /// 节点证书 DER 列表，加入客户端信任根执行标准校验（必填：防中间人）
+    pub fn with_node_certs(mut self, certs: Vec<Vec<u8>>) -> Self {
+        self.node_certs = certs;
+        self
+    }
+
+    /// 覆盖 SNI 伪装域名（默认 hydra.node）
+    pub fn with_sni(mut self, sni: String) -> Self {
+        self.sni = sni;
+        self
+    }
+
+    /// 代理监听地址（start 绑定后可查询）
+    pub fn bound_addr(&self) -> Option<SocketAddr> {
+        self.bound_addr.get().copied()
+    }
+
     pub fn with_traffic_monitor(mut self, monitor: Arc<TrafficMonitor>) -> Self {
         self.traffic_monitor = Some(monitor);
         self
     }
 
     pub async fn start(&self) -> Result<()> {
-        // Add nodes to scheduler
+        if self.auth_key.is_empty() {
+            return Err(HydraError::ConnectionError(
+                "未设置认证密钥：请设置 HYDRA_AUTH_KEY 环境变量（或调用 with_auth_key）".to_string(),
+            ));
+        }
+        if self.node_certs.is_empty() {
+            return Err(HydraError::ConnectionError(
+                "未提供节点证书：请设置 HYDRA_NODE_CERT 环境变量（或调用 with_node_certs）".to_string(),
+            ));
+        }
+
+        // Add nodes to scheduler（按加入顺序递减初始评分，测速上线后由实测数据取代）
         info!("Initializing proxy with {} nodes...", self.nodes.len());
-        for addr in &self.nodes {
+        for (idx, addr) in self.nodes.iter().enumerate() {
             let node = NodeInfo {
                 address: *addr,
-                bandwidth: 100.0,
+                bandwidth: 100.0 - idx as f64 * 10.0,
                 latency: 10.0,
                 loss_rate: 0.01,
                 load: 0.5,
@@ -59,14 +95,32 @@ impl ProxyServer {
             info!("Added node to scheduler: {}", addr);
         }
 
+        let (endpoint, client_config) =
+            Transport::create_shared_endpoint(self.node_certs.clone(), &self.sni)?;
+        let pool = Arc::new(ConnectionPool::new(
+            endpoint,
+            PoolConfig {
+                max_idle_per_node: 4,
+                idle_timeout: Duration::from_secs(300),
+                cleanup_interval: Duration::from_secs(60),
+                connect_timeout: Duration::from_secs(5),
+                auth_key: self.auth_key.clone(),
+                sni: self.sni.clone(),
+                client_config,
+            },
+        ));
+
         // 预热连接池
         info!("Warming up connection pool...");
         for addr in &self.nodes {
-            self.pool.warm_up(*addr, 2).await;
+            pool.warm_up(*addr, 2).await;
         }
 
         info!("Binding proxy listener to {}...", self.listen_addr);
         let listener = TcpListener::bind(self.listen_addr).await?;
+        if let Ok(local) = listener.local_addr() {
+            let _ = self.bound_addr.set(local);
+        }
         info!("✓ Proxy server listening on {}", self.listen_addr);
 
         loop {
@@ -74,7 +128,7 @@ impl ProxyServer {
                 Ok((stream, addr)) => {
                     info!("━━━ New SOCKS5 connection from {} ━━━", addr);
                     let scheduler = self.scheduler.clone();
-                    let pool = self.pool.clone();
+                    let pool = pool.clone();
                     tokio::spawn(async move {
                         // 包装错误处理，确保发送 SOCKS5 错误响应
                         match Self::handle_connection(stream, scheduler, pool).await {
@@ -101,7 +155,7 @@ impl ProxyServer {
         pool: Arc<ConnectionPool>,
     ) -> Result<()> {
         let mut buf = [0u8; 4096];
-        let peer_addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
+        let peer_addr = stream.peer_addr().unwrap_or_else(|_| SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0));
 
         // 读取第一个字节来判断协议类型
         info!("[{}] Reading first byte to detect protocol...", peer_addr);
@@ -133,6 +187,86 @@ impl ProxyServer {
         }
     }
 
+    /// 统一的节点连接入口：按优先级尝试候选节点。
+    /// - 传输失败（连接断开/流损坏/响应超时）→ 标记节点 Offline、清空其连接池、切换下一节点
+    /// - 节点存活但目标不可达（0x01）或节点侧 DNS 失败（0x02）→ 不切换节点，直接向调用方报错
+    /// 返回的流已完成认证并收到节点 0x00 成功应答，可直接双向转发。
+    async fn open_target(
+        scheduler: &Scheduler,
+        pool: &ConnectionPool,
+        target: &str,
+        peer_addr: SocketAddr,
+    ) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+        const MAX_NODE_ATTEMPTS: usize = 3;
+        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let candidates = scheduler.get_nodes_by_priority().await;
+        if candidates.is_empty() {
+            error!("[{}] No available nodes in scheduler!", peer_addr);
+            return Err(HydraError::ConnectionError("No available nodes".to_string()));
+        }
+
+        // 目标地址带 2 字节大端长度前缀，节点侧 read_exact 读取，杜绝流式截断
+        let addr_bytes = target.as_bytes();
+        if addr_bytes.len() > 256 {
+            return Err(HydraError::ProtocolError("Target address too long".to_string()));
+        }
+        let mut request = Vec::with_capacity(2 + addr_bytes.len());
+        request.extend_from_slice(&(addr_bytes.len() as u16).to_be_bytes());
+        request.extend_from_slice(addr_bytes);
+
+        let mut last_err: Option<HydraError> = None;
+        for node in candidates.iter().take(MAX_NODE_ATTEMPTS) {
+            let (mut send, mut recv) = match pool.get_stream(node.address).await {
+                Ok(streams) => streams,
+                Err(e) => {
+                    warn!("[{}] Node {} unreachable ({}), failing over to next node", peer_addr, node.address, e);
+                    scheduler.mark_node_offline(&node.address).await;
+                    pool.remove_all(&node.address).await;
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+
+            if let Err(e) = send.write_all(&request).await {
+                warn!("[{}] Node {} failed to accept target address ({}), failing over", peer_addr, node.address, e);
+                scheduler.mark_node_offline(&node.address).await;
+                pool.remove_all(&node.address).await;
+                last_err = Some(HydraError::ProtocolError(format!("Write error: {}", e)));
+                continue;
+            }
+
+            let mut resp = [0u8; 2];
+            match tokio::time::timeout(RESPONSE_TIMEOUT, recv.read_exact(&mut resp)).await {
+                Ok(Ok(())) if resp[0] == 0x00 => {
+                    info!("[{}] ✓ Connected to {} via node {}", peer_addr, target, node.address);
+                    return Ok((send, recv));
+                }
+                // 节点存活：目标连接失败/DNS 失败属于目标侧问题，不降级节点
+                Ok(Ok(())) => {
+                    error!("[{}] Node {} reported status {} for target {}", peer_addr, node.address, resp[0], target);
+                    let msg = if resp[0] == 0x02 {
+                        format!("节点 DNS 解析失败: {}", target)
+                    } else {
+                        format!("节点无法连接目标: {}", target)
+                    };
+                    return Err(HydraError::ConnectionError(msg));
+                }
+                Ok(Err(e)) => {
+                    warn!("[{}] Node {} stream broken ({}), failing over", peer_addr, node.address, e);
+                }
+                Err(_) => {
+                    warn!("[{}] Node {} response timeout, failing over", peer_addr, node.address);
+                }
+            }
+            scheduler.mark_node_offline(&node.address).await;
+            pool.remove_all(&node.address).await;
+            last_err = Some(HydraError::ConnectionError(format!("Node {} failed", node.address)));
+        }
+
+        Err(last_err.unwrap_or_else(|| HydraError::ConnectionError("All nodes failed".to_string())))
+    }
+
     /// 处理 HTTP CONNECT 代理请求
     async fn handle_http(
         mut stream: TcpStream,
@@ -141,7 +275,7 @@ impl ProxyServer {
         scheduler: Arc<Scheduler>,
         pool: Arc<ConnectionPool>,
     ) -> Result<()> {
-        let peer_addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
+        let peer_addr = stream.peer_addr().unwrap_or_else(|_| SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0));
 
         // 将初始数据转换为字符串
         let mut request = String::from_utf8_lossy(&initial_buf[..initial_len]).to_string();
@@ -189,9 +323,8 @@ impl ProxyServer {
         // 普通 HTTP 请求 (GET, POST, etc.)
         // 对于 HTTP GET/POST，我们需要将请求转发到目标服务器
         // 从 URL 或 Host header 中提取主机名
-        let target_host = if url.starts_with("http://") {
+        let target_host = if let Some(without_protocol) = url.strip_prefix("http://") {
             // 从 http://host/path 中提取 host
-            let without_protocol = &url[7..];
             match without_protocol.find('/') {
                 Some(pos) => without_protocol[..pos].to_string(),
                 None => without_protocol.to_string(),
@@ -217,71 +350,15 @@ impl ProxyServer {
         // 发送目标地址到服务器（包含端口）
         let target_with_port = format!("{}:{}", target_addr_str, default_port);
 
-        // 连接到节点
-        info!("[{}] Selecting best node from scheduler...", peer_addr);
-        let node = match scheduler.get_best_node().await {
-            Some(node) => node,
-            None => {
-                error!("[{}] No available nodes in scheduler!", peer_addr);
-                let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n").await;
-                return Err(HydraError::ConnectionError("No available nodes".to_string()));
-            }
-        };
-
-        info!("[{}] Selected node: {} (score: {})", peer_addr, node.address, node.calculate_score());
-
-        // 从连接池获取连接（带重试）
-        info!("[{}] Getting connection from pool for node {}...", peer_addr, node.address);
-        let (mut send, mut recv) = match pool.get_stream_with_retry(node.address, 3).await {
-            Ok(streams) => {
-                info!("[{}] Got connection to node {}", peer_addr, node.address);
-                streams
-            }
+        // 连接到节点（带故障切换）
+        let (mut send, mut recv) = match Self::open_target(&scheduler, &pool, &target_with_port, peer_addr).await {
+            Ok(streams) => streams,
             Err(e) => {
-                error!("[{}] Failed to get connection to node {}: {}", peer_addr, node.address, e);
+                error!("[{}] Failed to connect via any node: {}", peer_addr, e);
                 let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 return Err(e);
             }
         };
-
-        // 发送目标地址到节点（发送域名，让服务器解析 DNS）
-        info!("[{}] Sending target address to node: {}", peer_addr, target_with_port);
-        if let Err(e) = send.write_all(target_with_port.as_bytes()).await {
-            error!("[{}] Failed to send target address: {}", peer_addr, e);
-            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-            return Err(HydraError::ProtocolError(format!("Write error: {}", e)));
-        }
-
-        // 读取节点响应
-        info!("[{}] Waiting for response from node...", peer_addr);
-        let mut resp_buf = [0u8; 2];
-        let n = match recv.read(&mut resp_buf).await {
-            Ok(Some(n)) => n,
-            Ok(None) => {
-                error!("[{}] No response received from node (stream closed)", peer_addr);
-                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                return Err(HydraError::ProtocolError("No response from node".to_string()));
-            }
-            Err(e) => {
-                error!("[{}] Failed to read response from node: {}", peer_addr, e);
-                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                return Err(HydraError::ProtocolError(format!("Read error: {}", e)));
-            }
-        };
-
-        info!("[{}] Received {} bytes response from node: {:?}", peer_addr, n, &resp_buf[..n]);
-
-        // 如果服务器 DNS 解析失败（0x02），客户端本地解析后重试
-        if n >= 2 && resp_buf[0] == 0x02 {
-            if !Self::handle_dns_retry(&mut send, &mut recv, &target_with_port, peer_addr).await? {
-                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                return Err(HydraError::ConnectionError("DNS resolution failed".to_string()));
-            }
-        } else if n < 2 || resp_buf[0] != 0x00 {
-            error!("[{}] Node returned error response: {:?}", peer_addr, &resp_buf[..n]);
-            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-            return Err(HydraError::ConnectionError("Remote node connection failed".to_string()));
-        }
 
         // 发送原始 HTTP 请求到节点（转发完整的 HTTP 请求）
         info!("[{}] Forwarding HTTP request to node...", peer_addr);
@@ -291,7 +368,7 @@ impl ProxyServer {
             return Err(HydraError::ProtocolError(format!("Write error: {}", e)));
         }
 
-        info!("[{}] ✓ HTTP {} request forwarded to {} via node {}", peer_addr, method, target_host, node.address);
+        info!("[{}] ✓ HTTP {} request forwarded to {}", peer_addr, method, target_host);
         info!("[{}] Starting bidirectional traffic forwarding...", peer_addr);
 
         // 转发流量
@@ -344,79 +421,22 @@ impl ProxyServer {
         scheduler: Arc<Scheduler>,
         pool: Arc<ConnectionPool>,
     ) -> Result<()> {
-        let peer_addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
+        let peer_addr = stream.peer_addr().unwrap_or_else(|_| SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0));
 
-        // 连接到节点
-        info!("[{}] Selecting best node from scheduler...", peer_addr);
-        let node = match scheduler.get_best_node().await {
-            Some(node) => node,
-            None => {
-                error!("[{}] No available nodes in scheduler!", peer_addr);
-                let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n").await;
-                return Err(HydraError::ConnectionError("No available nodes".to_string()));
-            }
-        };
-
-        info!("[{}] Selected node: {} (score: {})", peer_addr, node.address, node.calculate_score());
-
-        // 从连接池获取连接（带重试）
-        info!("[{}] Getting connection from pool for node {}...", peer_addr, node.address);
-        let (mut send, mut recv) = match pool.get_stream_with_retry(node.address, 3).await {
-            Ok(streams) => {
-                info!("[{}] Got connection to node {}", peer_addr, node.address);
-                streams
-            }
+        // 连接到节点（带故障切换）
+        let (mut send, mut recv) = match Self::open_target(&scheduler, &pool, &target_str, peer_addr).await {
+            Ok(streams) => streams,
             Err(e) => {
-                error!("[{}] Failed to get connection to node {}: {}", peer_addr, node.address, e);
+                error!("[{}] Failed to connect via any node: {}", peer_addr, e);
                 let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 return Err(e);
             }
         };
 
-        // 发送目标地址到节点（发送域名，让服务器解析 DNS）
-        info!("[{}] Sending target address to node: {}", peer_addr, target_str);
-        if let Err(e) = send.write_all(target_str.as_bytes()).await {
-            error!("[{}] Failed to send target address: {}", peer_addr, e);
-            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-            return Err(HydraError::ProtocolError(format!("Write error: {}", e)));
-        }
-
-        // 读取节点响应
-        info!("[{}] Waiting for response from node...", peer_addr);
-        let mut resp_buf = [0u8; 2];
-        let n = match recv.read(&mut resp_buf).await {
-            Ok(Some(n)) => n,
-            Ok(None) => {
-                error!("[{}] No response received from node (stream closed)", peer_addr);
-                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                return Err(HydraError::ProtocolError("No response from node".to_string()));
-            }
-            Err(e) => {
-                error!("[{}] Failed to read response from node: {}", peer_addr, e);
-                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                return Err(HydraError::ProtocolError(format!("Read error: {}", e)));
-            }
-        };
-
-        info!("[{}] Received {} bytes response from node: {:?}", peer_addr, n, &resp_buf[..n]);
-
-        // 如果服务器 DNS 解析失败（0x02），客户端本地解析后重试
-        if n >= 2 && resp_buf[0] == 0x02 {
-            if !Self::handle_dns_retry(&mut send, &mut recv, &target_str, peer_addr).await? {
-                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                return Err(HydraError::ConnectionError("DNS resolution failed".to_string()));
-            }
-        } else if n < 2 || resp_buf[0] != 0x00 {
-            error!("[{}] Node returned error response: {:?}", peer_addr, &resp_buf[..n]);
-            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-            return Err(HydraError::ConnectionError("Remote node connection failed".to_string()));
-        }
-
         // 发送 HTTP 200 成功响应
         info!("[{}] Sending HTTP 200 success response...", peer_addr);
         stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
-        info!("[{}] ✓ Connected to {} via node {}", peer_addr, target_str, node.address);
         info!("[{}] Starting bidirectional traffic forwarding...", peer_addr);
 
         // 转发流量
@@ -462,65 +482,6 @@ impl ProxyServer {
         Ok(())
     }
 
-    /// 处理服务器 DNS 解析失败：客户端本地解析并重试
-    /// 返回 true 表示重试成功（连接已建立），false 表示失败
-    async fn handle_dns_retry(
-        send: &mut quinn::SendStream,
-        recv: &mut quinn::RecvStream,
-        target_str: &str,
-        peer_addr: SocketAddr,
-    ) -> Result<bool> {
-        info!("[{}] Server DNS failed for {}, trying client-side DNS...", peer_addr, target_str);
-
-        // 客户端本地解析 DNS
-        let resolved = match tokio::net::lookup_host(target_str).await {
-            Ok(addrs) => {
-                let addrs_vec: Vec<_> = addrs.collect();
-                let ipv4_addr = addrs_vec.iter().find(|a| a.is_ipv4());
-                match ipv4_addr {
-                    Some(a) => Some(a.to_string()),
-                    None => addrs_vec.first().map(|a| a.to_string()),
-                }
-            }
-            Err(_) => None,
-        };
-
-        let resolved = match resolved {
-            Some(r) => r,
-            None => {
-                error!("[{}] Client DNS resolution also failed for {}", peer_addr, target_str);
-                return Ok(false);
-            }
-        };
-
-        info!("[{}] Client DNS resolved: {} -> {}", peer_addr, target_str, resolved);
-
-        // 发送解析后的 IP 地址到服务器
-        if let Err(e) = send.write_all(resolved.as_bytes()).await {
-            error!("[{}] Failed to send resolved address: {}", peer_addr, e);
-            return Ok(false);
-        }
-
-        // 重新读取服务器响应
-        let mut retry_buf = [0u8; 2];
-        let retry_n = match recv.read(&mut retry_buf).await {
-            Ok(Some(n)) => n,
-            _ => {
-                error!("[{}] No response after DNS retry", peer_addr);
-                return Ok(false);
-            }
-        };
-
-        info!("[{}] Received {} bytes response after DNS retry: {:?}", peer_addr, retry_n, &retry_buf[..retry_n]);
-
-        if retry_n >= 2 && retry_buf[0] == 0x00 {
-            Ok(true) // 重试成功
-        } else {
-            error!("[{}] Node returned error after DNS retry: {:?}", peer_addr, &retry_buf[..retry_n]);
-            Ok(false)
-        }
-    }
-
     /// 处理 SOCKS5 代理请求
     async fn handle_socks5(
         mut stream: TcpStream,
@@ -529,7 +490,7 @@ impl ProxyServer {
         scheduler: Arc<Scheduler>,
         pool: Arc<ConnectionPool>,
     ) -> Result<()> {
-        let peer_addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
+        let peer_addr = stream.peer_addr().unwrap_or_else(|_| SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0));
         let mut buf = [0u8; 256];
 
         // 初始数据应该是 SOCKS5 greeting
@@ -573,7 +534,7 @@ impl ProxyServer {
         let atyp = buf[3];
         info!("[{}] Address type: 0x{:02x}", peer_addr, atyp);
 
-        let target_addr = match atyp {
+        let target_str = match atyp {
             0x01 => {
                 // IPv4
                 if n < 10 {
@@ -583,12 +544,11 @@ impl ProxyServer {
                 }
                 let ip = std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
                 let port = u16::from_be_bytes([buf[8], buf[9]]);
-                let addr = SocketAddr::new(ip.into(), port);
-                info!("[{}] Target IPv4: {}", peer_addr, addr);
-                addr
+                info!("[{}] Target IPv4: {}:{}", peer_addr, ip, port);
+                format!("{}:{}", ip, port)
             }
             0x03 => {
-                // Domain name - 发送域名到服务器，让服务器解析 DNS
+                // Domain name - 发送域名到节点，由节点解析 DNS（域名不明文离开加密通道）
                 if n < 7 {
                     error!("[{}] Invalid domain name length: {}", peer_addr, n);
                     let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
@@ -603,13 +563,8 @@ impl ProxyServer {
                 let domain = String::from_utf8_lossy(&buf[5..5 + domain_len]);
                 let port = u16::from_be_bytes([buf[5 + domain_len], buf[5 + domain_len + 1]]);
 
-                info!("[{}] Target domain: {}:{} - sending to server for DNS resolution", peer_addr, domain, port);
-
-                // 直接返回域名格式的地址，让服务器解析 DNS
-                // 使用一个特殊的 SocketAddr 来表示域名
-                // 这里我们用 0.0.0.0:0 作为占位符，实际发送域名到服务器
-                // 服务器会解析域名并连接
-                SocketAddr::new(std::net::Ipv4Addr::new(0, 0, 0, 0).into(), 0)
+                info!("[{}] Target domain: {}:{} - sending to node for DNS resolution", peer_addr, domain, port);
+                format!("{}:{}", domain, port)
             }
             0x04 => {
                 // IPv6
@@ -629,9 +584,8 @@ impl ProxyServer {
                     u16::from_be_bytes([buf[18], buf[19]]),
                 );
                 let port = u16::from_be_bytes([buf[20], buf[21]]);
-                let addr = SocketAddr::new(ip.into(), port);
-                info!("[{}] Target IPv6: {}", peer_addr, addr);
-                addr
+                info!("[{}] Target IPv6: [{}]:{}", peer_addr, ip, port);
+                format!("[{}]:{}", ip, port)
             }
             _ => {
                 error!("[{}] Unsupported address type: 0x{:02x}", peer_addr, atyp);
@@ -640,91 +594,22 @@ impl ProxyServer {
             }
         };
 
-        info!("[{}] >>> SOCKS5 CONNECT request to {}", peer_addr, target_addr);
+        info!("[{}] >>> SOCKS5 CONNECT request to {}", peer_addr, target_str);
 
-        // Get best node from scheduler
-        info!("[{}] Selecting best node from scheduler...", peer_addr);
-        let node = match scheduler.get_best_node().await {
-            Some(node) => node,
-            None => {
-                error!("[{}] No available nodes in scheduler!", peer_addr);
-                let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
-                return Err(HydraError::ConnectionError("No available nodes".to_string()));
-            }
-        };
-
-        info!("[{}] Selected node: {} (score: {})", peer_addr, node.address, node.calculate_score());
-
-        // 从连接池获取连接（带重试）
-        info!("[{}] Getting connection from pool for node {}...", peer_addr, node.address);
-        let (mut send, mut recv) = match pool.get_stream_with_retry(node.address, 3).await {
-            Ok(streams) => {
-                info!("[{}] Got connection to node {}", peer_addr, node.address);
-                streams
-            }
+        // 连接到节点（带故障切换）
+        let (mut send, mut recv) = match Self::open_target(&scheduler, &pool, &target_str, peer_addr).await {
+            Ok(streams) => streams,
             Err(e) => {
-                error!("[{}] Failed to get connection to node {}: {}", peer_addr, node.address, e);
+                error!("[{}] Failed to connect via any node: {}", peer_addr, e);
                 stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
                 return Err(e);
             }
         };
 
-        // Send connect request: [target_addr_str]
-        // 对于域名类型，发送域名到服务器（让服务器解析 DNS）
-        let target_str = if atyp == 0x03 {
-            // 域名类型，发送域名:端口格式
-            let domain_len = buf[4] as usize;
-            let domain = String::from_utf8_lossy(&buf[5..5 + domain_len]);
-            let port = u16::from_be_bytes([buf[5 + domain_len], buf[5 + domain_len + 1]]);
-            format!("{}:{}", domain, port)
-        } else {
-            target_addr.to_string()
-        };
-
-        info!("[{}] Sending target address to node: {}", peer_addr, target_str);
-        if let Err(e) = send.write_all(target_str.as_bytes()).await {
-            error!("[{}] Failed to send target address: {}", peer_addr, e);
-            let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
-            return Err(HydraError::ProtocolError(format!("Write error: {}", e)));
-        }
-
-        // Read response from remote node
-        info!("[{}] Waiting for response from node...", peer_addr);
-        let mut resp_buf = [0u8; 2];
-        let n = match recv.read(&mut resp_buf).await {
-            Ok(Some(n)) => n,
-            Ok(None) => {
-                error!("[{}] No response received from node (stream closed)", peer_addr);
-                let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
-                return Err(HydraError::ProtocolError("No response from node".to_string()));
-            }
-            Err(e) => {
-                error!("[{}] Failed to read response from node: {}", peer_addr, e);
-                let _ = stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
-                return Err(HydraError::ProtocolError(format!("Read error: {}", e)));
-            }
-        };
-
-        info!("Received {} bytes response from node: {:?}", n, &resp_buf[..n]);
-
-        // 如果服务器 DNS 解析失败（0x02），客户端本地解析后重试
-        if n >= 2 && resp_buf[0] == 0x02 {
-            if !Self::handle_dns_retry(&mut send, &mut recv, &target_str, peer_addr).await? {
-                stream.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-                return Err(HydraError::ConnectionError("DNS resolution failed".to_string()));
-            }
-        } else if n < 2 || resp_buf[0] != 0x00 {
-            // Connection failed
-            error!("Node returned error response: {:?}", &resp_buf[..n]);
-            stream.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-            return Err(HydraError::ConnectionError("Remote node connection failed".to_string()));
-        }
-
         // Send success response to client
         info!("[{}] Sending SOCKS5 success response to client...", peer_addr);
         stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
 
-        info!("[{}] ✓ Connected to {} via node {}", peer_addr, target_addr, node.address);
         info!("[{}] Starting bidirectional traffic forwarding...", peer_addr);
 
         // Forward traffic bidirectionally
@@ -767,7 +652,7 @@ impl ProxyServer {
             _ = node_to_client => {},
         }
 
-        info!("Connection to {} closed", target_addr);
+        info!("Connection to {} closed", target_str);
         Ok(())
     }
 }

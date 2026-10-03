@@ -134,8 +134,14 @@ impl HydraApp {
             Err(_) => return None,
         };
 
+        // 需要节点证书才能建立经过校验的连接
+        let certs = match hydra_client::node_certs_from_env() {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+
         let start = std::time::Instant::now();
-        let transport = match Transport::new_client().await {
+        let transport = match Transport::new_client(certs, hydra_client::DEFAULT_SNI).await {
             Ok(t) => t,
             Err(_) => return None,
         };
@@ -304,7 +310,22 @@ impl HydraApp {
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let proxy = ProxyServer::new(proxy_addr_clone).with_nodes(nodes_clone).with_traffic_monitor(traffic_monitor_clone);
+                let proxy = match (move || -> std::result::Result<ProxyServer, String> {
+                    let auth_key = hydra_client::auth_key_from_env()?;
+                    let node_certs = hydra_client::node_certs_from_env()?;
+                    Ok(ProxyServer::new(proxy_addr_clone)
+                        .with_nodes(nodes_clone)
+                        .with_traffic_monitor(traffic_monitor_clone)
+                        .with_auth_key(auth_key)
+                        .with_node_certs(node_certs))
+                })() {
+                    Ok(p) => p,
+                    Err(msg) => {
+                        eprintln!("[Proxy Thread] 代理启动失败: {}", msg);
+                        let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)));
+                        return;
+                    }
+                };
                 // 先绑定端口
                 match tokio::net::TcpListener::bind(proxy_addr_clone).await {
                     Ok(listener) => {

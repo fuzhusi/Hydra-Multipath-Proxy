@@ -31,18 +31,21 @@ impl PooledConnection {
         self.connection.close_reason().is_none()
     }
 
-    /// 获取一条双向流，同时更新使用记录
-    async fn open_bi(&mut self) -> Result<(SendStream, RecvStream)> {
-        let streams = self.connection.open_bi().await
+    /// 获取一条双向流并完成每流认证（首块写入一次性 HMAC token），同时更新使用记录
+    async fn open_bi(&mut self, auth_key: &[u8]) -> Result<(SendStream, RecvStream)> {
+        let (mut send, recv) = self.connection.open_bi().await
             .map_err(|e| HydraError::ProtocolError(format!("Failed to open stream: {}", e)))?;
+        let token = hydra_protocol::AuthToken::generate(auth_key, hydra_protocol::CLIENT_ID);
+        send.write_all(&token).await
+            .map_err(HydraError::QuinnWriteError)?;
         self.last_used = Instant::now();
         self.use_count += 1;
-        Ok(streams)
+        Ok((send, recv))
     }
 }
 
 /// 连接池配置
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PoolConfig {
     /// 每个远端地址最多保留的空闲连接数
     pub max_idle_per_node: usize,
@@ -52,17 +55,12 @@ pub struct PoolConfig {
     pub cleanup_interval: Duration,
     /// 新连接的握手超时
     pub connect_timeout: Duration,
-}
-
-impl Default for PoolConfig {
-    fn default() -> Self {
-        Self {
-            max_idle_per_node: 4,
-            idle_timeout: Duration::from_secs(300),  // 5 分钟
-            cleanup_interval: Duration::from_secs(60), // 每分钟清理一次
-            connect_timeout: Duration::from_secs(10),
-        }
-    }
+    /// 节点预共享密钥（每条流发送一次性 HMAC 认证 token）
+    pub auth_key: Vec<u8>,
+    /// SNI 伪装域名
+    pub sni: String,
+    /// 客户端 QUIC/TLS 配置（含节点证书信任根）
+    pub client_config: quinn::ClientConfig,
 }
 
 /// QUIC 连接池
@@ -98,7 +96,7 @@ impl ConnectionPool {
                 // 从尾部取（LIFO），优先复用最近活跃的连接
                 while let Some(mut pc) = conns.pop() {
                     if pc.is_alive() {
-                        match pc.open_bi().await {
+                        match pc.open_bi(&self.config.auth_key).await {
                             Ok(streams) => {
                                 // 将连接放回池中（它还在使用中）
                                 conns.push(pc);
@@ -120,7 +118,7 @@ impl ConnectionPool {
         let connection = self.connect(addr).await?;
 
         let mut pc = PooledConnection::new(connection);
-        let streams = pc.open_bi().await?;
+        let streams = pc.open_bi(&self.config.auth_key).await?;
 
         // 将连接放入池中
         {
@@ -168,9 +166,11 @@ impl ConnectionPool {
         }
     }
 
-    /// 建立新的 QUIC 连接
+    /// 建立新的 QUIC 连接（使用证书 pinning 配置与伪装 SNI）
     async fn connect(&self, addr: SocketAddr) -> Result<Connection> {
-        let connecting = self.endpoint.connect(addr, "localhost")?;
+        let connecting = self
+            .endpoint
+            .connect_with(self.config.client_config.clone(), addr, &self.config.sni)?;
         match tokio::time::timeout(self.config.connect_timeout, connecting).await {
             Ok(Ok(conn)) => {
                 info!("New QUIC connection established to {}", addr);
@@ -227,7 +227,7 @@ impl ConnectionPool {
         let now = Instant::now();
         let mut total_removed = 0;
 
-        for (_addr, conns) in pools.iter_mut() {
+        for conns in pools.values_mut() {
             conns.retain(|pc| {
                 let alive = pc.is_alive();
                 let fresh = now.duration_since(pc.last_used) < idle_timeout;

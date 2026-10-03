@@ -42,6 +42,28 @@ impl Scheduler {
             .cloned()
     }
 
+    /// 按优先级返回全部节点：Online 优先（按评分降序），其后 Degraded，最后 Offline。
+    /// Offline 节点仍保留在候选尾部，用于自动恢复探测。
+    pub async fn get_nodes_by_priority(&self) -> Vec<NodeInfo> {
+        let nodes = self.nodes.read().await;
+        let rank = |n: &NodeInfo| match n.status {
+            NodeStatus::Online => 0u8,
+            NodeStatus::Degraded => 1,
+            NodeStatus::Offline => 2,
+        };
+        let mut list: Vec<NodeInfo> = nodes.values().cloned().collect();
+        list.sort_by(|a, b| {
+            rank(a)
+                .cmp(&rank(b))
+                .then_with(|| {
+                    b.calculate_score()
+                        .partial_cmp(&a.calculate_score())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        list
+    }
+
     pub async fn update_node_stats(
         &self,
         addr: &std::net::SocketAddr,

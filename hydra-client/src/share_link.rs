@@ -47,7 +47,7 @@ impl ShareLink {
     pub fn to_node_info(&self) -> Result<NodeInfo> {
         let address: SocketAddr = format!("{}:{}", self.address, self.port)
             .parse()
-            .map_err(|e| HydraError::AddrParseError(e))?;
+            .map_err(HydraError::AddrParseError)?;
 
         Ok(NodeInfo {
             address,

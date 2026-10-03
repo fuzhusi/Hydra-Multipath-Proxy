@@ -23,8 +23,11 @@ pub struct StoredCredential {
 /// 认证令牌
 pub struct AuthToken;
 
+/// 所有客户端使用的固定 client_id（单租户自用场景）
+pub const CLIENT_ID: &str = "hydra";
+
 impl AuthToken {
-    const TOKEN_LEN: usize = 64;
+    pub const TOKEN_LEN: usize = 64;
     // [8 bytes: timestamp] [32 bytes: HMAC] [16 bytes: nonce] [8 bytes: reserved]
 
     /// 生成认证令牌
@@ -193,11 +196,17 @@ pub fn create_credential(password: &str) -> StoredCredential {
     StoredCredential { salt, hash }
 }
 
-/// Hex 解码
-pub fn hex_decode(hex: &str) -> Vec<u8> {
+/// Hex 解码（非法输入返回错误而不是 panic）
+pub fn hex_decode(hex: &str) -> std::result::Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err("hex 字符串长度必须为偶数".to_string());
+    }
     (0..hex.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16)
+                .map_err(|e| format!("第 {} 个字节不是合法的 hex: {}", i / 2, e))
+        })
         .collect()
 }
 

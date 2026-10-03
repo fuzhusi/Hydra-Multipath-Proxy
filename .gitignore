@@ -23,3 +23,10 @@ release/
 # Temporary
 tmp/
 temp/
+.e2e/
+
+# 节点证书与私钥（切勿提交到仓库）
+hydra-node-cert.der
+hydra-node-key.der
+*.der
+*.pem

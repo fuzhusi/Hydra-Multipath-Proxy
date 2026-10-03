@@ -1,85 +1,101 @@
-use quinn::{Endpoint, ServerConfig, ClientConfig, Connection};
+use quinn::{Endpoint, ClientConfig, Connection};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
-use hydra_protocol::Result;
+use std::time::Duration;
 use tracing::{info, error};
+use hydra_protocol::{Result, HydraError};
+
+/// 默认 SNI（伪装域名，同时是节点证书的默认 SAN）
+pub const DEFAULT_SNI: &str = "hydra.node";
 
 pub struct Transport {
     endpoint: Endpoint,
+    sni: String,
 }
 
 impl Transport {
-    pub async fn new_client() -> Result<Self> {
-        let (endpoint, _) = Self::create_shared_endpoint()?;
-        Ok(Self { endpoint })
+    pub async fn new_client(node_certs: Vec<Vec<u8>>, sni: &str) -> Result<Self> {
+        let (endpoint, _) = Self::create_shared_endpoint(node_certs, sni)?;
+        Ok(Self {
+            endpoint,
+            sni: sni.to_string(),
+        })
     }
 
-    /// 创建可共享的客户端 Endpoint 和配置
-    pub fn create_shared_endpoint() -> Result<(Endpoint, ClientConfig)> {
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+    /// 创建共享的客户端 Endpoint 与 ClientConfig。
+    ///
+    /// node_certs 中的节点自签证书会被加入本地信任根，执行标准 webpki 校验
+    /// （证书 pinning），替代曾经的 SkipVerification——那是零门槛的中间人。
+    pub fn create_shared_endpoint(
+        node_certs: Vec<Vec<u8>>,
+        sni: &str,
+    ) -> Result<(Endpoint, ClientConfig)> {
+        if node_certs.is_empty() {
+            return Err(HydraError::ConnectionError(
+                "未提供节点证书，拒绝建立不经验证的连接".to_string(),
+            ));
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        for der in &node_certs {
+            roots
+                .add(&rustls::Certificate(der.clone()))
+                .map_err(|e| HydraError::ProtocolError(format!("无效的节点证书: {:?}", e)))?;
+        }
 
-        // Configure crypto
         let mut crypto = rustls::ClientConfig::builder()
             .with_safe_defaults()
-            .with_custom_certificate_verifier(Arc::new(SkipVerification))
+            .with_root_certificates(roots)
             .with_no_client_auth();
 
-        crypto.alpn_protocols = vec![b"hydra".to_vec()];
+        // ALPN 与节点侧一致，使用标准 h3（QUIC Initial 明文可见，非标 ALPN 是单规则 DPI 指纹）
+        crypto.alpn_protocols = vec![b"h3".to_vec()];
+        // 禁用会话恢复：防止 session ticket 被用于跨连接关联追踪
+        crypto.resumption = rustls::client::Resumption::disabled();
 
         let mut client_config = ClientConfig::new(Arc::new(crypto));
 
-        // 设置 QUIC 传输参数，增加超时时间
+        // 设置 QUIC 传输参数：keepalive 加随机抖动，避免整周期 beacon 特征
         let mut transport_config = quinn::TransportConfig::default();
-        transport_config.max_idle_timeout(Some(quinn::IdleTimeout::try_from(std::time::Duration::from_secs(60)).unwrap()));
-        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        transport_config.max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(Duration::from_secs(60)).unwrap(),
+        ));
+        transport_config
+            .keep_alive_interval(Some(Duration::from_secs(jittered_keepalive_secs())));
         client_config.transport_config(Arc::new(transport_config));
 
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())?;
         endpoint.set_default_client_config(client_config.clone());
 
-        info!("Created shared QUIC client endpoint on {}", endpoint.local_addr()?);
+        info!(
+            "Created shared QUIC client endpoint on {} (sni={}, trusted_certs={})",
+            endpoint.local_addr()?,
+            sni,
+            node_certs.len()
+        );
         Ok((endpoint, client_config))
     }
 
-    pub async fn new_server(addr: SocketAddr) -> Result<Self> {
-        let server_config = Self::configure_server()?;
-        let endpoint = Endpoint::server(server_config, addr)?;
-        info!("Created QUIC server endpoint on {}", addr);
-        Ok(Self { endpoint })
-    }
-
-    fn configure_server() -> Result<ServerConfig> {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let cert_der = Certificate(cert.serialize_der().unwrap());
-        let key_der = PrivateKey(cert.serialize_private_key_der());
-
-        let mut server_crypto = RustlsServerConfig::builder()
-            .with_safe_defaults()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key_der)?;
-
-        server_crypto.alpn_protocols = vec![b"hydra".to_vec()];
-
-        Ok(ServerConfig::with_crypto(Arc::new(server_crypto)))
-    }
-
+    /// 连接到节点（带 5 秒超时，避免死节点挂起调用方）
     pub async fn connect(&self, addr: SocketAddr) -> Result<Connection> {
         info!("Attempting QUIC connection to {}...", addr);
-        let connecting = self.endpoint.connect(addr, "localhost")?;
-        match connecting.await {
-            Ok(connection) => {
+        let connecting = self.endpoint.connect(addr, &self.sni)?;
+        match tokio::time::timeout(Duration::from_secs(5), connecting).await {
+            Ok(Ok(connection)) => {
                 info!("QUIC connection established to {}", addr);
                 Ok(connection)
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!("QUIC connection failed to {}: {}", addr, e);
                 Err(e.into())
             }
+            Err(_) => {
+                error!("QUIC connection to {} timed out", addr);
+                Err(HydraError::ConnectionError(format!(
+                    "Connection to {} timed out",
+                    addr
+                )))
+            }
         }
-    }
-
-    pub async fn accept(&self) -> Option<Connection> {
-        self.endpoint.accept().await?.await.ok()
     }
 
     /// Test connectivity to a node with timeout
@@ -105,18 +121,11 @@ impl Transport {
     }
 }
 
-struct SkipVerification;
-
-impl rustls::client::ServerCertVerifier for SkipVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &Certificate,
-        _intermediates: &[Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
-    }
+/// 7..=12 秒随机 keepalive 间隔（防固定周期心跳的被动检测）
+fn jittered_keepalive_secs() -> u64 {
+    use ring::rand::SecureRandom;
+    let rng = ring::rand::SystemRandom::new();
+    let mut buf = [0u8; 4];
+    let _ = rng.fill(&mut buf);
+    7 + (u32::from_be_bytes(buf) % 6) as u64
 }

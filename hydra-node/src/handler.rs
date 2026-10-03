@@ -1,21 +1,22 @@
 use quinn::Connection;
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, error};
-use hydra_protocol::{Packet, HydraError, Result};
-use bytes::Bytes;
+use tracing::{info, error, warn};
+use hydra_protocol::{AuthToken, CLIENT_ID, HydraError, Result};
 
-pub struct ConnectionHandler;
+/// 认证失败时静默关闭（不回显任何可区分的错误码，抵御主动探测）
+const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// 单个流允许的最大目标地址长度
+const MAX_ADDR_LEN: usize = 256;
 
-impl Default for ConnectionHandler {
-    fn default() -> Self {
-        Self::new()
-    }
+pub struct ConnectionHandler {
+    auth_key: Vec<u8>,
 }
 
 impl ConnectionHandler {
-    pub fn new() -> Self {
-        Self
+    pub fn new(auth_key: Vec<u8>) -> Self {
+        Self { auth_key }
     }
 
     pub async fn handle_connection(&self, connection: Connection) -> Result<()> {
@@ -24,8 +25,9 @@ impl ConnectionHandler {
             match connection.accept_bi().await {
                 Ok((send, recv)) => {
                     info!("Accepted bidirectional stream, spawning handler");
+                    let auth_key = self.auth_key.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_stream(send, recv).await {
+                        if let Err(e) = Self::handle_stream(send, recv, auth_key).await {
                             error!("Stream error: {}", e);
                         }
                     });
@@ -47,21 +49,46 @@ impl ConnectionHandler {
     async fn handle_stream(
         mut send: quinn::SendStream,
         mut recv: quinn::RecvStream,
+        auth_key: Vec<u8>,
     ) -> Result<()> {
-        // Read target address from client
-        let mut buf = vec![0u8; 256];
-        let n = recv.read(&mut buf).await
-            .map_err(|e| HydraError::ProtocolError(format!("Read error: {}", e)))?
-            .ok_or_else(|| HydraError::ProtocolError("No data received".to_string()))?;
+        // ── 第 1 步：认证。固定 64 字节 token，超时或验证失败一律静默关流。
+        let mut token = [0u8; AuthToken::TOKEN_LEN];
+        let authed = match tokio::time::timeout(AUTH_TIMEOUT, recv.read_exact(&mut token)).await {
+            Ok(Ok(())) => AuthToken::verify(&auth_key, &token, CLIENT_ID, 30).is_ok(),
+            _ => false,
+        };
+        if !authed {
+            warn!("Stream failed authentication, closing silently");
+            return Ok(());
+        }
 
-        let target_addr_str = String::from_utf8_lossy(&buf[..n]);
+        // ── 第 2 步：读取目标地址（2 字节大端长度前缀 + 内容），修复单次 read 可能截断的问题。
+        let mut len_buf = [0u8; 2];
+        if tokio::time::timeout(AUTH_TIMEOUT, recv.read_exact(&mut len_buf))
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+        let addr_len = u16::from_be_bytes(len_buf) as usize;
+        if addr_len == 0 || addr_len > MAX_ADDR_LEN {
+            warn!("Invalid address length: {}", addr_len);
+            return Ok(());
+        }
+        let mut addr_buf = vec![0u8; addr_len];
+        if tokio::time::timeout(AUTH_TIMEOUT, recv.read_exact(&mut addr_buf))
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+        let target_addr_str = String::from_utf8_lossy(&addr_buf).to_string();
         info!("Received target address: {}", target_addr_str);
 
-        // 尝试解析为 SocketAddr，如果不是则进行 DNS 解析
+        // ── 第 3 步：解析为 SocketAddr，否则节点侧 DNS 解析
         let target_addr: std::net::SocketAddr = if let Ok(addr) = target_addr_str.parse() {
             addr
         } else {
-            // 可能是域名:端口格式，进行 DNS 解析
             info!("Resolving DNS for: {}", target_addr_str);
             match tokio::net::lookup_host(target_addr_str.to_string()).await {
                 Ok(addrs) => {
