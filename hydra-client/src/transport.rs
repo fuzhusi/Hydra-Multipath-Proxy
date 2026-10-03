@@ -1,9 +1,18 @@
+use hydra_obfs::TransportMode;
 use hydra_protocol::{HydraError, Result};
 use quinn::{ClientConfig, Connection, Endpoint};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{error, info};
+
+/// B1 流控窗口调优实现迁入 hydra-obfs（节点侧不可依赖 hydra-client，见 hydra-obfs::tuning）。
+/// 此处 re-export 保持既有公开 API 与单测路径不变。
+pub use hydra_obfs::tuning::{
+    apply_transport_tuning, resolve_transport_tuning, window_varint, TransportTuning,
+    DEFAULT_CONN_WINDOW_MB, DEFAULT_STREAM_WINDOW_MB, MAX_STREAM_WINDOW_MB, MIB,
+    MIN_STREAM_WINDOW_MB,
+};
 
 /// 默认 SNI（伪装域名，同时是节点证书的默认 SAN）
 pub const DEFAULT_SNI: &str = "hydra.node";
@@ -22,13 +31,38 @@ impl Transport {
         })
     }
 
+    /// 用给定 endpoint 构造 Transport（C2 双模式显式构造用，如测试/工具）。
+    pub fn from_endpoint(endpoint: Endpoint, sni: &str) -> Self {
+        Self {
+            endpoint,
+            sni: sni.to_string(),
+        }
+    }
+
     /// 创建共享的客户端 Endpoint 与 ClientConfig。
+    ///
+    /// C2 双模式：模式经 `HYDRA_MODE` env 解析（未设置 = masquerade = 本项目 V2 行为零改动）。
+    /// 显式指定模式请用 [`Self::create_shared_endpoint_in_mode`]。
     ///
     /// node_certs 中的节点自签证书会被加入本地信任根，执行标准 webpki 校验
     /// （证书 pinning），替代曾经的 SkipVerification——那是零门槛的中间人。
     pub fn create_shared_endpoint(
         node_certs: Vec<Vec<u8>>,
         sni: &str,
+    ) -> Result<(Endpoint, ClientConfig)> {
+        let mode = TransportMode::from_env().map_err(HydraError::ProtocolError)?;
+        Self::create_shared_endpoint_in_mode(node_certs, sni, mode)
+    }
+
+    /// 以显式模式创建共享的客户端 Endpoint 与 ClientConfig（env 无关）。
+    ///
+    /// QUIC/TLS 配置两种模式完全一致（ALPN=h3、SPKI pinning、窗口调优）；差异只在
+    /// UDP socket：masquerade 走普通 `Endpoint::client` 原路径，obfs 走
+    /// [`hydra_obfs::new_obfs_endpoint`]（线缆 = `[12B salt][ChaCha20 XOR]`）。
+    pub fn create_shared_endpoint_in_mode(
+        node_certs: Vec<Vec<u8>>,
+        sni: &str,
+        mode: TransportMode,
     ) -> Result<(Endpoint, ClientConfig)> {
         if node_certs.is_empty() {
             return Err(HydraError::ConnectionError(
@@ -65,14 +99,36 @@ impl Transport {
         transport_config.keep_alive_interval(Some(Duration::from_secs(jittered_keepalive_secs())));
         client_config.transport_config(Arc::new(transport_config));
 
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())?;
-        endpoint.set_default_client_config(client_config.clone());
+        // C2 双模式接线：masquerade 走原路径（零改动）；obfs 走抽象 socket
+        let endpoint = match mode {
+            TransportMode::Masquerade => {
+                let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+                endpoint.set_default_client_config(client_config.clone());
+                endpoint
+            }
+            TransportMode::Obfs => {
+                // obfs 模式要求独立第二密码（HYDRA_OBFS_KEY），未设置 → 启动失败
+                let obfs = hydra_obfs::ObfsCrypto::from_env()
+                    .map_err(|e| HydraError::ProtocolError(format!("obfs 模式启动失败: {}", e)))?;
+                let mut endpoint = hydra_obfs::new_obfs_endpoint(
+                    "0.0.0.0:0".parse().unwrap(),
+                    None,
+                    Arc::new(obfs),
+                )
+                .map_err(|e| {
+                    HydraError::ConnectionError(format!("创建 obfs 客户端 endpoint 失败: {}", e))
+                })?;
+                endpoint.set_default_client_config(client_config.clone());
+                endpoint
+            }
+        };
 
         info!(
-            "Created shared QUIC client endpoint on {} (sni={}, trusted_certs={})",
+            "Created shared QUIC client endpoint on {} (sni={}, trusted_certs={}, mode={})",
             endpoint.local_addr()?,
             sni,
-            node_certs.len()
+            node_certs.len(),
+            mode.as_str()
         );
         Ok((endpoint, client_config))
     }
@@ -132,141 +188,6 @@ fn jittered_keepalive_secs() -> u64 {
     let mut buf = [0u8; 4];
     let _ = rng.fill(&mut buf);
     7 + (u32::from_be_bytes(buf) % 6) as u64
-}
-
-// ===================== B1 QUIC 流控窗口调优 =====================
-
-const MIB: u64 = 1024 * 1024;
-
-/// 单流接收窗口默认值（MB）。
-/// 这是吞吐杠杆：quinn 默认 1.25MB 在 150ms RTT 下仅≈66Mbps，不够 4K 视频，提至 8MB。
-pub const DEFAULT_STREAM_WINDOW_MB: u64 = 8;
-
-/// 连接级接收窗口默认值（MB）。
-/// quinn 默认 `VarInt::MAX`（无上限）；调 32MB 是**内存封顶**，不是吞吐提升。
-pub const DEFAULT_CONN_WINDOW_MB: u64 = 32;
-
-/// 单流窗口下限（MB）
-pub const MIN_STREAM_WINDOW_MB: u64 = 1;
-/// 单流窗口上限（MB）
-pub const MAX_STREAM_WINDOW_MB: u64 = 64;
-
-/// B1 解析结果（字节数），独立结构便于单测断言（quinn 0.10 的 TransportConfig 无 getter）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TransportTuning {
-    /// 单流接收窗口（字节）
-    pub stream_receive_window: u64,
-    /// 连接级接收窗口（字节）
-    pub receive_window: u64,
-}
-
-/// 解析单个 MB 单位窗口 env 值（纯函数）：
-/// 未设置/空白 → 默认值（不告警）；非整数 → 告警 + 默认值；越界 → 告警 + clamp 到 [min, max]。
-fn parse_window_mb(
-    name: &str,
-    raw: Option<&str>,
-    default_mb: u64,
-    min_mb: u64,
-    max_mb: u64,
-) -> u64 {
-    let raw = match raw.map(str::trim) {
-        Some(s) if !s.is_empty() => s,
-        _ => return default_mb,
-    };
-    match raw.parse::<u64>() {
-        Ok(v) if v < min_mb => {
-            warn!("{name}={raw} 低于下限 {min_mb}MB，取 {min_mb}MB");
-            min_mb
-        }
-        Ok(v) if v > max_mb => {
-            warn!("{name}={raw} 高于上限 {max_mb}MB，取 {max_mb}MB");
-            max_mb
-        }
-        Ok(v) => v,
-        Err(_) => {
-            warn!("{name}={raw} 不是合法的 MB 整数，回退默认 {default_mb}MB");
-            default_mb
-        }
-    }
-}
-
-/// 依据环境变量解析 B1 流控窗口（纯函数；env 以闭包注入，避免全局 env 污染单测）。
-///
-/// # env 语义（client 与节点侧共用同一份，MB 单位）
-/// - `HYDRA_STREAM_WINDOW`：单流接收窗口，clamp 1..=64，默认 8
-/// - `HYDRA_CONN_WINDOW`：连接级接收窗口，下限 = 生效的单流窗口（保证 receive_window ≥ stream_receive_window），默认 32
-///
-/// 内存上界：每条连接最坏接收内存 = min(单流窗口 × 活跃流数, 连接级窗口)。
-pub fn resolve_transport_tuning(getenv: impl Fn(&str) -> Option<String>) -> TransportTuning {
-    let stream_mb = parse_window_mb(
-        "HYDRA_STREAM_WINDOW",
-        getenv("HYDRA_STREAM_WINDOW").as_deref(),
-        DEFAULT_STREAM_WINDOW_MB,
-        MIN_STREAM_WINDOW_MB,
-        MAX_STREAM_WINDOW_MB,
-    );
-    // 连接级下限取“生效后的”单流窗口，天然满足 receive_window ≥ stream_receive_window
-    let conn_mb = parse_window_mb(
-        "HYDRA_CONN_WINDOW",
-        getenv("HYDRA_CONN_WINDOW").as_deref(),
-        DEFAULT_CONN_WINDOW_MB,
-        stream_mb,
-        u64::MAX,
-    );
-    TransportTuning {
-        stream_receive_window: stream_mb.saturating_mul(MIB),
-        receive_window: conn_mb.saturating_mul(MIB),
-    }
-}
-
-/// 字节数 → VarInt；越界（≥2^62，仅极端 env 值可达）回退默认并告警。
-/// fallback 来自常量，必然可表示。
-fn window_varint(bytes: u64, fallback_mb: u64, source: &str) -> quinn::VarInt {
-    match quinn::VarInt::from_u64(bytes) {
-        Ok(v) => v,
-        Err(_) => {
-            warn!(
-                "{source} 窗口值 {bytes} 字节超出 VarInt 表示范围（≥2^62），回退默认 {fallback_mb}MB"
-            );
-            quinn::VarInt::from_u32((fallback_mb * MIB) as u32)
-        }
-    }
-}
-
-/// 将 B1 流控窗口调优应用到 [`quinn::TransportConfig`]。
-///
-/// **两侧复用**：客户端（`create_shared_endpoint`）与节点侧（WS-C C2 改 server.rs 的
-/// TransportConfig 时）都调用本函数，保证两端窗口语义一致。本函数只设置接收窗口，
-/// 不触碰 ALPN / idle timeout / keepalive 等其它传输参数，可在任意已配置的
-/// TransportConfig 上叠加调用。
-///
-/// # env 语义（详见 [`resolve_transport_tuning`]）
-/// - `HYDRA_STREAM_WINDOW`：单流接收窗口（MB），clamp 1..=64，默认 8
-/// - `HYDRA_CONN_WINDOW`：连接级接收窗口（MB），≥ 单流窗口，默认 32
-///
-/// # quinn 事实（总则 6）
-/// - `stream_receive_window` 是唯一的吞吐杠杆（quinn 默认 1.25MB ≈ 150ms RTT 下 66Mbps）
-/// - 连接级 `receive_window` 默认 `VarInt::MAX` 无上限，设 32MB 是内存封顶
-/// - 每条连接最坏接收内存 = min(单流窗口 × 活跃流数, 连接级窗口)
-pub fn apply_transport_tuning(transport: &mut quinn::TransportConfig) {
-    let tuning = resolve_transport_tuning(|name| std::env::var(name).ok());
-    let stream_win = window_varint(
-        tuning.stream_receive_window,
-        DEFAULT_STREAM_WINDOW_MB,
-        "HYDRA_STREAM_WINDOW",
-    );
-    let conn_win = window_varint(
-        tuning.receive_window,
-        DEFAULT_CONN_WINDOW_MB,
-        "HYDRA_CONN_WINDOW",
-    );
-    transport.stream_receive_window(stream_win);
-    transport.receive_window(conn_win);
-    info!(
-        "QUIC flow control tuned: stream_receive_window={}MiB receive_window={}MiB",
-        tuning.stream_receive_window / MIB,
-        tuning.receive_window / MIB
-    );
 }
 
 #[cfg(test)]
@@ -349,5 +270,45 @@ mod tests {
         // 这里只断言真实应用路径（含默认 env）不 panic
         let mut cfg = quinn::TransportConfig::default();
         apply_transport_tuning(&mut cfg);
+    }
+
+    // ===================== C2 双模式接线 =====================
+
+    fn test_cert_der() -> Vec<u8> {
+        let cert = rcgen::generate_simple_self_signed(vec!["hydra.node".to_string()]).unwrap();
+        cert.serialize_der().unwrap()
+    }
+
+    #[tokio::test]
+    async fn c2_explicit_masquerade_endpoint_builds() {
+        let (ep, _cfg) = Transport::create_shared_endpoint_in_mode(
+            vec![test_cert_der()],
+            DEFAULT_SNI,
+            TransportMode::Masquerade,
+        )
+        .unwrap();
+        assert_ne!(ep.local_addr().unwrap().port(), 0);
+    }
+
+    #[tokio::test]
+    async fn c2_obfs_mode_requires_and_honors_independent_key() {
+        let certs = vec![test_cert_der()];
+        // 未设置 HYDRA_OBFS_KEY → 启动必须报错（任务书 C2 规格）。
+        // 本测试独占该 env 变量（同进程内无其他测试读取它；集成测试为独立进程）。
+        std::env::remove_var(hydra_obfs::HYDRA_OBFS_KEY_ENV);
+        let result = Transport::create_shared_endpoint_in_mode(
+            certs.clone(),
+            DEFAULT_SNI,
+            TransportMode::Obfs,
+        );
+        assert!(result.is_err(), "无独立密码时 obfs 必须拒绝启用");
+
+        // 有 key → endpoint 构造成功
+        std::env::set_var(hydra_obfs::HYDRA_OBFS_KEY_ENV, "c2-unit-test-key");
+        let (ep, _cfg) =
+            Transport::create_shared_endpoint_in_mode(certs, DEFAULT_SNI, TransportMode::Obfs)
+                .unwrap();
+        assert_ne!(ep.local_addr().unwrap().port(), 0);
+        let _ = _cfg;
     }
 }

@@ -10,7 +10,10 @@
 
 - **认证传输**：节点必须配置预共享密钥（PSK + HMAC-SHA256 token，30 秒时间窗）。未认证的流被**静默关闭**，不回显任何可区分的错误码，抵御主动探测
 - **证书固定（Pinning）**：节点首次启动生成自签证书并**持久化到磁盘**；客户端将该证书加入本地信任根，执行标准 webpki 校验——链路上的中间人无法解密或篡改
-- **故障切换**：节点连接失败/流损坏/响应超时 → 自动标记 Offline、清空其连接池、**切换下一节点重试**（最多 3 个候选节点）
+- **故障切换与自愈**：节点连接失败/流损坏/响应超时 → 自动标记 Offline、清空其连接池、**切换下一节点重试**（最多 3 个候选节点）；后台恢复探测器周期探测 Offline 节点，节点恢复后自动重新上线
+- **双模式线缆**：`masquerade`（默认：伪装成标准 h3 网站流量）与 `obfs`（可选：QUIC 全包 ChaCha20 变换为均匀随机字节，重度审查环境逃生舱；独立第二密码，不与认证密钥混用）
+- **Windows 系统代理**：GUI 一键写注册表 + WinINet 刷新立即生效，停止/崩溃自动恢复原值
+- **节点错误显式传播**：节点故障不再伪装成正常关闭——错误码（0x11/0x12/0x13）经 QUIC reset/stop 传播，浏览器得到明确失败
 - **伪装特征**：ALPN 使用标准 `h3`，SNI 默认 `hydra.node`（可覆盖），keepalive 7–12 秒随机抖动，禁用 TLS 会话恢复（阻断跨连接关联追踪）
 - **DNS 隐私**：客户端不解析目标域名，域名只经 QUIC 加密通道交给节点解析，目标域名永不以明文离开本机
 - **资源上限**：节点用 Semaphore 强制最大并发连接数；认证前每流只接受固定长度的认证块，防止资源耗尽
@@ -114,6 +117,10 @@ curl -x http://127.0.0.1:1080 https://www.google.com
 | `HYDRA_CERT_FILE` / `HYDRA_KEY_FILE` | 节点 | 证书/私钥保存路径（默认 `hydra-node-cert.der` / `hydra-node-key.der`） |
 | `HYDRA_CERT_DOMAINS` | 节点 | 证书 SAN，逗号分隔（默认 `hydra.node,localhost`） |
 | `HYDRA_MAX_CONNECTIONS` | 节点 | 最大并发连接数（默认 1000） |
+| `HYDRA_MODE` | 双端 | 线缆模式：`masquerade`（默认，伪装标准 h3 站点）\|`obfs`（均匀随机字节流逃生舱，重度审查地区用） |
+| `HYDRA_OBFS_KEY` | 双端 | obfs 模式独立第二密码（两端一致；未设置则拒绝启用 obfs 模式） |
+| `HYDRA_STREAM_WINDOW` / `HYDRA_CONN_WINDOW` | 双端 | QUIC 流控窗口（MB，默认 8/32；视频高码率慢链路可调大） |
+| `HYDRA_PROBE_INTERVAL_SECS` | 客户端 | Offline 节点恢复探测周期（默认 30s） |
 
 ## 项目结构
 
@@ -142,6 +149,7 @@ cargo test --workspace
 
 - [x] **Phase A（2026-10）**：认证接线、证书固定、故障切换、资源上限、防追踪特征正常化、DNS 隐私、过时测试修复
 - [x] **Phase A 复审（2026-10-04）**：两评审组交叉复审，修复认证宽限看门狗（防未认证连接占满配额的 DoS）、时钟偏移容差、超时不对称、连接池锁竞争等 11 项（见 [docs/review/04](docs/review/04-PhaseA代码复审报告.md)）
+- [x] **改进计划 Wave1+2（2026-10-04）**：按 [项目改进计划报告](docs/improvement/项目改进计划报告.md)（技术团队双评审后执行）完成——稳定性：Windows 系统代理、Offline 自动恢复探测、节点错误码显式传播、转发收敛、GUI 修复、二进制转发修复；性能：QUIC 流控窗口调优（4K 视频慢链路）、预热抖动；防追踪：V3.1 双模式线缆（hydra-obfs crate，masquerade 默认 + obfs 逃生舱）。测试 37→64 全绿
 - [ ] **Phase B**：测速重写（结果写回调度器）、协议错误显式传播（替代静默 FIN）、nonce 防重放表、SSRF 目标过滤、依赖升级 rustls 0.23
 - [ ] **Phase C**：真多路径聚合（单连接多 stream 架构）、流量整形、BBR
 

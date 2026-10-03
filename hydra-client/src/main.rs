@@ -22,6 +22,13 @@ fn parse_args() -> (Option<SocketAddr>, Vec<SocketAddr>) {
                 println!("  HYDRA_AUTH_KEY   节点预共享密钥（hex，必填）");
                 println!("  HYDRA_NODE_CERT  节点证书文件路径（必填）");
                 println!("  HYDRA_LISTEN     本地代理监听地址（默认 127.0.0.1:1080）");
+                println!(
+                    "  HYDRA_SNI        SNI 伪装域名（默认 hydra.node，须与节点证书 SAN 匹配）"
+                );
+                println!("  HYDRA_MODE       传输模式 masquerade|obfs (默认 masquerade；V3.1 双模式，两端须一致)");
+                println!(
+                    "  HYDRA_OBFS_KEY   obfs 模式独立混淆密码（两端一致；masquerade 模式无需设置）"
+                );
                 std::process::exit(0);
             }
             other => {

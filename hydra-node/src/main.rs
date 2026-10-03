@@ -1,6 +1,6 @@
-use std::net::SocketAddr;
 use hydra_node::{HydraServer, NodeOptions};
 use hydra_protocol::Result;
+use std::net::SocketAddr;
 use tracing::info;
 
 fn parse_args() -> (Option<SocketAddr>, Option<String>) {
@@ -23,6 +23,8 @@ fn parse_args() -> (Option<SocketAddr>, Option<String>) {
                 println!("  HYDRA_KEY_FILE        私钥保存路径 (默认 hydra-node-key.der)");
                 println!("  HYDRA_CERT_DOMAINS    证书 SAN，逗号分隔 (默认 hydra.node,localhost)");
                 println!("  HYDRA_MAX_CONNECTIONS 最大并发连接数 (默认 1000)");
+                println!("  HYDRA_MODE            传输模式 masquerade|obfs (默认 masquerade；V3.1 双模式，两端须一致)");
+                println!("  HYDRA_OBFS_KEY        obfs 模式独立混淆密码（两端一致；masquerade 模式无需设置）");
                 std::process::exit(0);
             }
             other => {
@@ -78,10 +80,11 @@ async fn main() -> Result<()> {
     let opts = NodeOptions::from_env();
 
     info!(
-        "Starting Hydra node: listen={}, max_connections={}, cert={}",
+        "Starting Hydra node: listen={}, max_connections={}, cert={}, mode={}",
         listen_addr,
         opts.max_connections,
-        opts.cert_file.display()
+        opts.cert_file.display(),
+        opts.mode.as_str()
     );
 
     let server = HydraServer::new(listen_addr, auth_key, opts).await?;

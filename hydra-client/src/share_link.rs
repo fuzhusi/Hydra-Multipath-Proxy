@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use hydra_obfs::TransportMode;
 use hydra_protocol::{HydraError, NodeInfo, NodeStatus, Result};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -6,7 +7,7 @@ use url::Url;
 
 /// Hydra节点分享链接格式
 ///
-/// 格式: hydra://address:port?bandwidth=100&latency=10&loss_rate=0.01&status=online&load=0.5
+/// 格式: hydra://address:port?bandwidth=100&latency=10&loss_rate=0.01&status=online&load=0.5[&mode=obfs]
 ///
 /// 参数说明:
 /// - address: 节点地址
@@ -16,6 +17,8 @@ use url::Url;
 /// - loss_rate: 丢包率 (0-1)
 /// - load: 负载 (0-1)
 /// - status: 节点状态 (online/degraded/offline)
+/// - mode: 传输模式 (masquerade|obfs；V3.1，缺省 masquerade——不带 mode 参数的
+///   既有链接照常解析为 masquerade。**不带密钥本体**，混淆密码经 HYDRA_OBFS_KEY 带外约定)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareLink {
     pub address: String,
@@ -25,6 +28,8 @@ pub struct ShareLink {
     pub loss_rate: f64,
     pub load: f64,
     pub status: NodeStatus,
+    /// V3.1 传输模式（缺省 masquerade）
+    pub mode: TransportMode,
 }
 
 impl ShareLink {
@@ -37,7 +42,21 @@ impl ShareLink {
             loss_rate: node_info.loss_rate,
             load: node_info.load,
             status: node_info.status.clone(),
+            mode: TransportMode::Masquerade,
         }
+    }
+
+    /// 以显式传输模式构造（obfs 节点分享链接用）
+    pub fn new_with_mode(node_info: &NodeInfo, mode: TransportMode) -> Self {
+        let mut link = Self::new(node_info);
+        link.mode = mode;
+        link
+    }
+
+    /// 覆盖传输模式（builder 风格）
+    pub fn with_mode(mut self, mode: TransportMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     pub fn from_node_info(node_info: &NodeInfo) -> Self {
@@ -66,7 +85,7 @@ impl ShareLink {
             NodeStatus::Offline => "offline",
         };
 
-        format!(
+        let mut url = format!(
             "hydra://{}:{}?bandwidth={}&latency={}&loss_rate={}&load={}&status={}",
             self.address,
             self.port,
@@ -75,7 +94,12 @@ impl ShareLink {
             self.loss_rate,
             self.load,
             status_str
-        )
+        );
+        // 缺省 masquerade 不写 mode 参数：既有链接/生成方零改动，GUI 不需要感知
+        if self.mode == TransportMode::Obfs {
+            url.push_str("&mode=obfs");
+        }
+        url
     }
 
     pub fn from_share_url(url: &str) -> Result<Self> {
@@ -102,6 +126,7 @@ impl ShareLink {
         let mut loss_rate = 0.01;
         let mut load = 0.5;
         let mut status = NodeStatus::Online;
+        let mut mode = None;
 
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
@@ -133,6 +158,13 @@ impl ShareLink {
                         _ => NodeStatus::Online,
                     };
                 }
+                "mode" => {
+                    // 非法值显式报错：静默回落 masquerade = 用户以为的 obfs 变成黑洞
+                    mode =
+                        Some(TransportMode::parse(&value).map_err(|e| {
+                            HydraError::ProtocolError(format!("Invalid mode: {}", e))
+                        })?);
+                }
                 _ => {}
             }
         }
@@ -145,6 +177,7 @@ impl ShareLink {
             loss_rate,
             load,
             status,
+            mode: mode.unwrap_or(TransportMode::Masquerade),
         })
     }
 
@@ -237,7 +270,6 @@ pub fn parse_base64_share_links(text: &str) -> Result<Vec<ShareLink>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddr;
 
     #[test]
     fn test_share_link_roundtrip() {
@@ -297,5 +329,85 @@ hydra://192.168.1.100:8080?bandwidth=80&latency=15&loss_rate=0.02&status=online
         assert_eq!(parsed.latency, 10.0);
         assert_eq!(parsed.loss_rate, 0.01);
         assert_eq!(parsed.load, 0.5);
+    }
+
+    // ===================== C4 V3.1 mode 字段 =====================
+
+    fn sample_node() -> NodeInfo {
+        NodeInfo {
+            address: "127.0.0.1:8080".parse().unwrap(),
+            bandwidth: 100.0,
+            latency: 10.0,
+            loss_rate: 0.01,
+            load: 0.5,
+            status: NodeStatus::Online,
+        }
+    }
+
+    #[test]
+    fn c4_default_links_stay_masquerade_and_unchanged() {
+        // 缺省构造/解析 = masquerade；masquerade 不写 mode 参数（既有链接零改动）
+        let link = ShareLink::from_node_info(&sample_node());
+        assert_eq!(link.mode, TransportMode::Masquerade);
+        let url = link.to_share_url();
+        assert!(
+            !url.contains("mode="),
+            "masquerade 链接不应出现 mode 参数: {url}"
+        );
+        let parsed = ShareLink::from_share_url(&url).unwrap();
+        assert_eq!(parsed.mode, TransportMode::Masquerade);
+
+        // 无 mode 参数的存量链接照常解析
+        let legacy = "hydra://10.0.0.1:443?bandwidth=80&latency=15&loss_rate=0.02&status=online";
+        assert_eq!(
+            ShareLink::from_share_url(legacy).unwrap().mode,
+            TransportMode::Masquerade
+        );
+    }
+
+    #[test]
+    fn c4_obfs_link_roundtrip_url_and_base64_and_serde() {
+        let link = ShareLink::new_with_mode(&sample_node(), TransportMode::Obfs);
+        let url = link.to_share_url();
+        assert!(
+            url.contains("mode=obfs"),
+            "obfs 链接必须带 mode=obfs: {url}"
+        );
+        assert!(!url.contains("key="), "分享链接绝不携带混淆密钥本体");
+
+        // URL 往返
+        let parsed = ShareLink::from_share_url(&url).unwrap();
+        assert_eq!(parsed.mode, TransportMode::Obfs);
+        assert_eq!(parsed.address, "127.0.0.1");
+        assert_eq!(parsed.port, 8080);
+
+        // Base64 往返
+        let parsed = ShareLink::from_base64(&link.to_base64()).unwrap();
+        assert_eq!(parsed.mode, TransportMode::Obfs);
+
+        // serde JSON 往返
+        let json = serde_json::to_string(&link).unwrap();
+        assert!(json.contains("\"mode\":\"obfs\""));
+        let parsed: ShareLink = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.mode, TransportMode::Obfs);
+    }
+
+    #[test]
+    fn c4_invalid_mode_is_rejected() {
+        // 非法 mode 显式报错——静默回落 masquerade 会让用户以为的 obfs 变成黑洞
+        let bad = "hydra://127.0.0.1:8080?mode=stealth";
+        assert!(ShareLink::from_share_url(bad).is_err());
+    }
+
+    #[test]
+    fn c4_builder_mode_roundtrip_via_parse_share_links() {
+        let links = parse_share_links(
+            "hydra://127.0.0.1:8080?bandwidth=100&latency=10&loss_rate=0.01&status=online&mode=obfs\n\
+             hydra://192.168.1.100:8080?bandwidth=80&latency=15&loss_rate=0.02&status=online",
+        )
+        .unwrap();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].mode, TransportMode::Obfs);
+        assert_eq!(links[1].mode, TransportMode::Masquerade);
     }
 }

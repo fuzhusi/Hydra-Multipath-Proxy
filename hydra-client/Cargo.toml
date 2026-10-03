@@ -25,6 +25,7 @@ base64 = "0.22"
 crossbeam-queue = "0.3"
 rand = "0.8"
 hydra-protocol = { path = "../hydra-protocol" }
+hydra-obfs = { path = "../hydra-obfs" }
 
 [dev-dependencies]
 hydra-node = { path = "../hydra-node" }

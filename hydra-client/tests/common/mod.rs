@@ -40,7 +40,24 @@ pub async fn spawn_node_on(addr: SocketAddr) -> TestNode {
         max_connections: 100,
         cert_file: dir.join("cert.der"),
         key_file: dir.join("key.der"),
-        cert_domains: vec!["hydra.node".to_string(), "localhost".to_string()],
+        ..NodeOptions::default()
+    };
+    spawn_node_with_opts(addr, opts).await
+}
+
+/// C2：在指定传输模式下启动节点（mode 显式传入，不依赖进程 env；
+/// obfs 模式的混淆密码仍经 HYDRA_OBFS_KEY env——由 E2E 在进程内统一设置）
+pub async fn spawn_node_in_mode(addr: SocketAddr, mode: hydra_obfs::TransportMode) -> TestNode {
+    let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("hydra-obfs-test-{}-{}", std::process::id(), seq));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let opts = NodeOptions {
+        max_connections: 100,
+        cert_file: dir.join("cert.der"),
+        key_file: dir.join("key.der"),
+        mode,
+        ..NodeOptions::default()
     };
     spawn_node_with_opts(addr, opts).await
 }

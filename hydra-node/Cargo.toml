@@ -21,3 +21,4 @@ anyhow = "1"
 thiserror = "1"
 rcgen = "0.10"
 hydra-protocol = { path = "../hydra-protocol" }
+hydra-obfs = { path = "../hydra-obfs" }
