@@ -15,3 +15,8 @@ tracing-subscriber = "0.3"
 chrono = "0.4"
 hydra-client = { path = "../hydra-client" }
 hydra-protocol = { path = "../hydra-protocol" }
+
+# A1：Windows 系统代理（注册表写入 + WinINet 刷新），target-gated
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+windows-sys = { version = "0.52", features = ["Win32_Networking_WinInet", "Win32_Foundation"] }

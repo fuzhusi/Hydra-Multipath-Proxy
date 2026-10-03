@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use crossbeam_queue::ArrayQueue;
+use std::sync::Arc;
 
 /// 无锁缓冲池
 #[derive(Clone)]

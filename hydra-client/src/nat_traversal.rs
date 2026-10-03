@@ -1,7 +1,7 @@
+use hydra_protocol::{HydraError, Result};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
-use tracing::{info, warn, error};
-use hydra_protocol::{Result, HydraError};
+use tracing::{error, info, warn};
 
 /// STUN 服务器地址
 const STUN_SERVERS: &[&str] = &[
@@ -68,10 +68,12 @@ impl NatTraversal {
         info!("Starting NAT traversal on {}", self.local_addr);
 
         // 绑定本地 UDP 端口
-        let socket = UdpSocket::bind(self.local_addr)
-            .map_err(|e| HydraError::ConnectionError(format!("Failed to bind UDP socket: {}", e)))?;
+        let socket = UdpSocket::bind(self.local_addr).map_err(|e| {
+            HydraError::ConnectionError(format!("Failed to bind UDP socket: {}", e))
+        })?;
 
-        socket.set_read_timeout(Some(Duration::from_secs(3)))
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
             .map_err(|e| HydraError::ConnectionError(format!("Failed to set timeout: {}", e)))?;
 
         // 尝试通过 STUN 获取公网地址
@@ -110,20 +112,23 @@ impl NatTraversal {
 
     /// 查询 STUN 服务器
     fn query_stun_server(&self, socket: &UdpSocket, server: &str) -> Result<SocketAddr> {
-        let server_addr: SocketAddr = server.parse()
-            .map_err(|_| HydraError::ConnectionError(format!("Invalid STUN server address: {}", server)))?;
+        let server_addr: SocketAddr = server.parse().map_err(|_| {
+            HydraError::ConnectionError(format!("Invalid STUN server address: {}", server))
+        })?;
 
         // 构建 STUN Binding Request
         let request = self.build_stun_request();
-        
+
         // 发送请求
-        socket.send_to(&request, server_addr)
-            .map_err(|e| HydraError::ConnectionError(format!("Failed to send STUN request: {}", e)))?;
+        socket.send_to(&request, server_addr).map_err(|e| {
+            HydraError::ConnectionError(format!("Failed to send STUN request: {}", e))
+        })?;
 
         // 接收响应
         let mut buf = [0u8; 1024];
-        let (len, _) = socket.recv_from(&mut buf)
-            .map_err(|e| HydraError::ConnectionError(format!("Failed to receive STUN response: {}", e)))?;
+        let (len, _) = socket.recv_from(&mut buf).map_err(|e| {
+            HydraError::ConnectionError(format!("Failed to receive STUN response: {}", e))
+        })?;
 
         // 解析响应
         self.parse_stun_response(&buf[..len])
@@ -153,19 +158,26 @@ impl NatTraversal {
     /// 解析 STUN Binding Response
     fn parse_stun_response(&self, data: &[u8]) -> Result<SocketAddr> {
         if data.len() < 20 {
-            return Err(HydraError::ProtocolError("STUN response too short".to_string()));
+            return Err(HydraError::ProtocolError(
+                "STUN response too short".to_string(),
+            ));
         }
 
         // 检查消息类型 (0x0101 = Binding Response)
         let msg_type = u16::from_be_bytes([data[0], data[1]]);
         if msg_type != 0x0101 {
-            return Err(HydraError::ProtocolError(format!("Unexpected STUN message type: 0x{:04x}", msg_type)));
+            return Err(HydraError::ProtocolError(format!(
+                "Unexpected STUN message type: 0x{:04x}",
+                msg_type
+            )));
         }
 
         // 检查 Magic Cookie
         let magic = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         if magic != 0x2112A442 {
-            return Err(HydraError::ProtocolError("Invalid STUN magic cookie".to_string()));
+            return Err(HydraError::ProtocolError(
+                "Invalid STUN magic cookie".to_string(),
+            ));
         }
 
         // 解析属性
@@ -182,7 +194,10 @@ impl NatTraversal {
 
             // MAPPED-ADDRESS (0x0001) 或 XOR-MAPPED-ADDRESS (0x0020)
             if attr_type == 0x0001 || attr_type == 0x0020 {
-                return self.parse_mapped_address(&data[offset + 4..offset + 4 + attr_len], attr_type == 0x0020);
+                return self.parse_mapped_address(
+                    &data[offset + 4..offset + 4 + attr_len],
+                    attr_type == 0x0020,
+                );
             }
 
             offset += 4 + attr_len;
@@ -190,13 +205,17 @@ impl NatTraversal {
             offset = (offset + 3) & !3;
         }
 
-        Err(HydraError::ProtocolError("No MAPPED-ADDRESS attribute found".to_string()))
+        Err(HydraError::ProtocolError(
+            "No MAPPED-ADDRESS attribute found".to_string(),
+        ))
     }
 
     /// 解析 MAPPED-ADDRESS 属性
     fn parse_mapped_address(&self, data: &[u8], is_xor: bool) -> Result<SocketAddr> {
         if data.len() < 8 {
-            return Err(HydraError::ProtocolError("MAPPED-ADDRESS too short".to_string()));
+            return Err(HydraError::ProtocolError(
+                "MAPPED-ADDRESS too short".to_string(),
+            ));
         }
 
         let family = data[1];
@@ -221,7 +240,9 @@ impl NatTraversal {
             0x02 => {
                 // IPv6
                 if data.len() < 20 {
-                    return Err(HydraError::ProtocolError("IPv6 MAPPED-ADDRESS too short".to_string()));
+                    return Err(HydraError::ProtocolError(
+                        "IPv6 MAPPED-ADDRESS too short".to_string(),
+                    ));
                 }
                 let mut ip = [0u8; 16];
                 ip.copy_from_slice(&data[4..20]);
@@ -232,7 +253,10 @@ impl NatTraversal {
                 }
                 Ok(SocketAddr::new(ip.into(), port))
             }
-            _ => Err(HydraError::ProtocolError(format!("Unknown address family: {}", family)))
+            _ => Err(HydraError::ProtocolError(format!(
+                "Unknown address family: {}",
+                family
+            ))),
         }
     }
 
@@ -275,20 +299,28 @@ impl UdpHolePuncher {
 
     /// 执行 UDP 打洞
     pub fn punch(&self) -> Result<UdpSocket> {
-        info!("Starting UDP hole punching from {} to {}", self.local_addr, self.target_addr);
+        info!(
+            "Starting UDP hole punching from {} to {}",
+            self.local_addr, self.target_addr
+        );
 
-        let socket = UdpSocket::bind(self.local_addr)
-            .map_err(|e| HydraError::ConnectionError(format!("Failed to bind UDP socket: {}", e)))?;
+        let socket = UdpSocket::bind(self.local_addr).map_err(|e| {
+            HydraError::ConnectionError(format!("Failed to bind UDP socket: {}", e))
+        })?;
 
-        socket.set_read_timeout(Some(Duration::from_secs(5)))
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
             .map_err(|e| HydraError::ConnectionError(format!("Failed to set timeout: {}", e)))?;
 
         // 发送打洞包
         let punch_packet = b"HYDRA_PUNCH";
         for _ in 0..5 {
-            socket.send_to(punch_packet, self.target_addr)
-                .map_err(|e| HydraError::ConnectionError(format!("Failed to send punch packet: {}", e)))?;
-            
+            socket
+                .send_to(punch_packet, self.target_addr)
+                .map_err(|e| {
+                    HydraError::ConnectionError(format!("Failed to send punch packet: {}", e))
+                })?;
+
             // 短暂等待
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -307,7 +339,9 @@ impl UdpHolePuncher {
             }
         }
 
-        Err(HydraError::ConnectionError("UDP hole punching failed".to_string()))
+        Err(HydraError::ConnectionError(
+            "UDP hole punching failed".to_string(),
+        ))
     }
 }
 
@@ -319,7 +353,7 @@ mod tests {
     fn test_stun_request() {
         let traversal = NatTraversal::new("0.0.0.0:0".parse().unwrap());
         let request = traversal.build_stun_request();
-        
+
         assert_eq!(request.len(), 20);
         assert_eq!(request[0], 0x00); // Message Type high byte
         assert_eq!(request[1], 0x01); // Message Type low byte

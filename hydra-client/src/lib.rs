@@ -1,28 +1,30 @@
-pub mod proxy;
-pub mod session;
-pub mod scheduler;
-pub mod splitter;
 pub mod assembler;
-pub mod transport;
-pub mod crypto;
-pub mod share_link;
-pub mod pool;
 pub mod buf_pool;
-pub mod traffic;
+pub mod crypto;
 pub mod nat_traversal;
+pub mod pool;
+pub mod proxy;
+pub mod scheduler;
+pub mod session;
+pub mod share_link;
+pub mod speedtest;
+pub mod splitter;
+pub mod traffic;
+pub mod transport;
 
-pub use proxy::*;
-pub use session::*;
-pub use scheduler::*;
-pub use splitter::*;
 pub use assembler::*;
-pub use transport::*;
-pub use crypto::*;
-pub use share_link::*;
-pub use pool::*;
 pub use buf_pool::*;
-pub use traffic::*;
+pub use crypto::*;
 pub use nat_traversal::*;
+pub use pool::*;
+pub use proxy::*;
+pub use scheduler::*;
+pub use session::*;
+pub use share_link::*;
+pub use speedtest::*;
+pub use splitter::*;
+pub use traffic::*;
+pub use transport::*;
 
 /// 默认 SNI（伪装域名，同时是节点证书的默认 SAN）
 pub const DEFAULT_SNI: &str = "hydra.node";

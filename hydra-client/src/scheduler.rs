@@ -32,12 +32,15 @@ impl Scheduler {
 
     pub async fn get_best_node(&self) -> Option<NodeInfo> {
         let nodes = self.nodes.read().await;
-        nodes.values()
+        nodes
+            .values()
             .filter(|n| matches!(n.status, NodeStatus::Online))
             .max_by(|a, b| {
                 let score_a = a.calculate_score();
                 let score_b = b.calculate_score();
-                score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+                score_a
+                    .partial_cmp(&score_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .cloned()
     }
@@ -53,13 +56,11 @@ impl Scheduler {
         };
         let mut list: Vec<NodeInfo> = nodes.values().cloned().collect();
         list.sort_by(|a, b| {
-            rank(a)
-                .cmp(&rank(b))
-                .then_with(|| {
-                    b.calculate_score()
-                        .partial_cmp(&a.calculate_score())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+            rank(a).cmp(&rank(b)).then_with(|| {
+                b.calculate_score()
+                    .partial_cmp(&a.calculate_score())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
         list
     }
@@ -81,11 +82,7 @@ impl Scheduler {
         }
     }
 
-    pub async fn update_node_status(
-        &self,
-        addr: &std::net::SocketAddr,
-        status: NodeStatus,
-    ) {
+    pub async fn update_node_status(&self, addr: &std::net::SocketAddr, status: NodeStatus) {
         let mut nodes = self.nodes.write().await;
         if let Some(node) = nodes.get_mut(addr) {
             node.status = status;
@@ -98,7 +95,8 @@ impl Scheduler {
 
     pub async fn get_online_nodes(&self) -> Vec<NodeInfo> {
         let nodes = self.nodes.read().await;
-        nodes.values()
+        nodes
+            .values()
             .filter(|n| matches!(n.status, NodeStatus::Online))
             .cloned()
             .collect()

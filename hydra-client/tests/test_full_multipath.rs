@@ -1,7 +1,7 @@
 mod common;
 
-use hydra_client::{Splitter, Assembler};
 use bytes::Bytes;
+use hydra_client::{Assembler, Splitter};
 use hydra_protocol::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

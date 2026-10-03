@@ -8,8 +8,7 @@ use hydra_client::ProxyServer;
 use hydra_node::{HydraServer, NodeOptions};
 
 /// 测试用预共享密钥（hex 解码后 32 字节）
-pub const TEST_KEY_HEX: &str =
-    "3031323334353637383961626364656630313233343536373839616263646566";
+pub const TEST_KEY_HEX: &str = "3031323334353637383961626364656630313233343536373839616263646566";
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -22,10 +21,17 @@ pub struct TestNode {
     pub cert: Vec<u8>,
     /// 保存 endpoint 以便测试中主动关闭节点（模拟故障）
     pub endpoint: quinn::Endpoint,
+    /// 节点配置（证书目录等），供同端口重启（A2 恢复探测测试）
+    pub opts: NodeOptions,
 }
 
 /// 启动一个监听随机端口的节点服务器（带认证；证书持久化到独立临时目录）
 pub async fn spawn_node() -> TestNode {
+    spawn_node_on("127.0.0.1:0".parse().unwrap()).await
+}
+
+/// 在指定地址启动节点服务器（指定 127.0.0.1:0 则随机端口）
+pub async fn spawn_node_on(addr: SocketAddr) -> TestNode {
     let seq = SEQ.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("hydra-test-{}-{}", std::process::id(), seq));
     std::fs::create_dir_all(&dir).unwrap();
@@ -36,10 +42,15 @@ pub async fn spawn_node() -> TestNode {
         key_file: dir.join("key.der"),
         cert_domains: vec!["hydra.node".to_string(), "localhost".to_string()],
     };
-    let server = HydraServer::new("127.0.0.1:0".parse().unwrap(), test_auth_key(), opts)
+    spawn_node_with_opts(addr, opts).await
+}
+
+/// 用既有配置（证书目录）启动节点服务器——重启后证书不变，客户端 pinning 仍有效
+pub async fn spawn_node_with_opts(addr: SocketAddr, opts: NodeOptions) -> TestNode {
+    let server = HydraServer::new(addr, test_auth_key(), opts.clone())
         .await
         .unwrap();
-    let addr = server.endpoint.local_addr().unwrap();
+    let bound = server.endpoint.local_addr().unwrap();
     let cert = server.cert_der().to_vec();
     let endpoint = server.endpoint.clone();
     tokio::spawn(async move {
@@ -47,7 +58,12 @@ pub async fn spawn_node() -> TestNode {
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    TestNode { addr, cert, endpoint }
+    TestNode {
+        addr: bound,
+        cert,
+        endpoint,
+        opts,
+    }
 }
 
 /// 启动一个 TCP 回显服务器，返回端口
@@ -81,6 +97,13 @@ pub async fn spawn_echo_server() -> u16 {
 /// 启动完整代理（SOCKS5/HTTP）。nodes 为 (节点地址, 节点证书) 列表，
 /// 按顺序递减初始评分，保证第一个节点被优先选中。
 pub async fn spawn_proxy(nodes: Vec<(SocketAddr, Vec<u8>)>) -> SocketAddr {
+    spawn_proxy_with_handle(nodes).await.0
+}
+
+/// 同 spawn_proxy，但一并返回 ProxyServer 句柄（供测试读取调度器状态，如 A2 恢复验证）
+pub async fn spawn_proxy_with_handle(
+    nodes: Vec<(SocketAddr, Vec<u8>)>,
+) -> (SocketAddr, std::sync::Arc<ProxyServer>) {
     let node_addrs: Vec<SocketAddr> = nodes.iter().map(|(a, _)| *a).collect();
     let certs: Vec<Vec<u8>> = nodes.iter().map(|(_, c)| c.clone()).collect();
 
@@ -95,11 +118,23 @@ pub async fn spawn_proxy(nodes: Vec<(SocketAddr, Vec<u8>)>) -> SocketAddr {
     });
     for _ in 0..50 {
         if let Some(addr) = proxy.bound_addr() {
-            return addr;
+            return (addr, proxy);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("proxy failed to bind");
+}
+
+/// 等待 UDP 端口释放（节点 endpoint 关闭后 server 任务退出需短暂时间）
+pub async fn wait_udp_port_free(port: u16, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
 }
 
 /// 通过代理发起 SOCKS5 CONNECT（域名类型交给节点解析），返回已就绪的 TCP 流
@@ -130,4 +165,29 @@ pub async fn socks5_connect(
     s.read_exact(&mut reply).await?;
     assert_eq!(reply[1], 0x00, "SOCKS5 connect failed: status={}", reply[1]);
     Ok(s)
+}
+
+/// SOCKS5 CONNECT 的宽松版本：不断言成功，返回应答码（供故障路径测试）
+pub async fn socks5_connect_lenient(
+    proxy_addr: SocketAddr,
+    target: &str,
+) -> std::io::Result<(tokio::net::TcpStream, u8)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut s = tokio::net::TcpStream::connect(proxy_addr).await?;
+    s.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut resp = [0u8; 2];
+    s.read_exact(&mut resp).await?;
+    assert_eq!(resp, [0x05, 0x00], "greeting reply mismatch");
+
+    let (host, port_str) = target.rsplit_once(':').unwrap();
+    let port: u16 = port_str.parse().unwrap();
+    let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+    req.extend_from_slice(host.as_bytes());
+    req.extend_from_slice(&port.to_be_bytes());
+    s.write_all(&req).await?;
+
+    let mut reply = [0u8; 10];
+    s.read_exact(&mut reply).await?;
+    Ok((s, reply[1]))
 }

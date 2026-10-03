@@ -1,10 +1,13 @@
 use eframe::egui;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use hydra_client::{Scheduler, ProxyServer, Transport, parse_share_links, generate_share_links, TrafficMonitor, format_bytes, format_speed, format_duration};
+use hydra_client::{
+    format_bytes, format_duration, format_speed, generate_share_links, parse_share_links,
+    ProxyServer, Scheduler, TrafficMonitor, Transport,
+};
 use hydra_protocol::{NodeInfo, NodeStatus};
-use std::net::SocketAddr;
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 struct NodeStatusInfo {
@@ -39,7 +42,11 @@ struct HydraApp {
     // 节点连接状态
     node_status: HashMap<String, NodeStatusInfo>,
     last_health_check: Option<std::time::Instant>,
-    health_check_receiver: Option<std::sync::mpsc::Receiver<(String, Option<(bool, u64)>)>>,
+    health_check_receiver:
+        Option<std::sync::mpsc::Receiver<(String, std::result::Result<u64, String>)>>,
+    /// 单节点手动测试（A5：后台线程+通道，UI 线程零阻塞）
+    node_test_receiver:
+        Option<std::sync::mpsc::Receiver<(String, std::result::Result<u64, String>)>>,
 
     // 流量统计
     traffic_monitor: Option<Arc<TrafficMonitor>>,
@@ -65,6 +72,7 @@ impl Default for HydraApp {
             node_status: HashMap::new(),
             last_health_check: None,
             health_check_receiver: None,
+            node_test_receiver: None,
             traffic_monitor: None,
             last_traffic_update: None,
         }
@@ -94,12 +102,15 @@ impl HydraApp {
         let node_addrs = vec!["127.0.0.1:8080".to_string()];
         let mut node_status = HashMap::new();
         for addr in &node_addrs {
-            node_status.insert(addr.clone(), NodeStatusInfo {
-                addr: addr.clone(),
-                connected: false,
-                last_check: None,
-                latency_ms: None,
-            });
+            node_status.insert(
+                addr.clone(),
+                NodeStatusInfo {
+                    addr: addr.clone(),
+                    connected: false,
+                    last_check: None,
+                    latency_ms: None,
+                },
+            );
         }
 
         Self {
@@ -122,34 +133,88 @@ impl HydraApp {
             node_status,
             last_health_check: None,
             health_check_receiver: None,
+            node_test_receiver: None,
             traffic_monitor: None,
             last_traffic_update: None,
         }
     }
 
-    /// Test connectivity to a single node
-    async fn test_node_connection(addr_str: &str) -> Option<(bool, u64)> {
-        let addr: SocketAddr = match addr_str.parse() {
-            Ok(a) => a,
-            Err(_) => return None,
-        };
+    /// Test connectivity to a single node（A5：失败根因以 Err 透出，不再吞掉）
+    async fn test_node_connection(addr_str: &str) -> std::result::Result<u64, String> {
+        let addr: SocketAddr = addr_str
+            .parse()
+            .map_err(|e| format!("地址解析失败: {}", e))?;
 
-        // 需要节点证书才能建立经过校验的连接
-        let certs = match hydra_client::node_certs_from_env() {
-            Ok(c) => c,
-            Err(_) => return None,
-        };
+        // 需要节点证书才能建立经过校验的连接；证书缺失/不可读的根因直接透出
+        let certs =
+            hydra_client::node_certs_from_env().map_err(|e| format!("证书加载失败: {}", e))?;
+
+        let transport = Transport::new_client(certs, hydra_client::DEFAULT_SNI)
+            .await
+            .map_err(|e| format!("创建 QUIC 传输失败: {}", e))?;
 
         let start = std::time::Instant::now();
-        let transport = match Transport::new_client(certs, hydra_client::DEFAULT_SNI).await {
-            Ok(t) => t,
-            Err(_) => return None,
-        };
+        if transport.test_connection(addr, 3000).await {
+            Ok(start.elapsed().as_millis() as u64)
+        } else {
+            Err(format!("QUIC 连接失败或超时（3s）: {}", addr))
+        }
+    }
 
-        let connected = transport.test_connection(addr, 3000).await;
-        let elapsed = start.elapsed().as_millis() as u64;
+    /// 发起单节点手动测试：后台线程 + 通道，结果在 update 循环中非阻塞收集
+    fn start_node_test(&mut self, addr: String) {
+        if self.node_test_receiver.is_some() {
+            self.add_log("已有节点测试正在进行，请稍候".to_string());
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.add_log(format!("开始测试节点 {}...", addr));
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(HydraApp::test_node_connection(&addr));
+            let _ = tx.send((addr, result));
+        });
+        self.node_test_receiver = Some(rx);
+    }
 
-        Some((connected, elapsed))
+    /// 在 update 循环中非阻塞地收取单节点测试结果
+    fn poll_node_test_results(&mut self) {
+        let mut finished = None;
+        if let Some(rx) = &self.node_test_receiver {
+            if let Ok(result) = rx.try_recv() {
+                finished = Some(result);
+            }
+        }
+        if let Some((addr, result)) = finished {
+            self.node_test_receiver = None;
+            let now = std::time::Instant::now();
+            match result {
+                Ok(latency) => {
+                    self.node_status.insert(
+                        addr.clone(),
+                        NodeStatusInfo {
+                            addr: addr.clone(),
+                            connected: true,
+                            last_check: Some(now),
+                            latency_ms: Some(latency),
+                        },
+                    );
+                    self.add_log(format!("节点 {} 连接成功 ({}ms)", addr, latency));
+                }
+                Err(reason) => {
+                    self.node_status.insert(
+                        addr.clone(),
+                        NodeStatusInfo {
+                            addr: addr.clone(),
+                            connected: false,
+                            last_check: Some(now),
+                            latency_ms: None,
+                        },
+                    );
+                    self.add_log(format!("节点 {} 测试失败: {}", addr, reason));
+                }
+            }
+        }
     }
 
     /// Test all nodes and update status (non-blocking)
@@ -202,28 +267,32 @@ impl HydraApp {
 
         // 处理收集到的结果
         for (addr, result) in results {
+            let now = std::time::Instant::now();
             match result {
-                Some((connected, latency)) => {
-                    self.node_status.insert(addr.clone(), NodeStatusInfo {
-                        addr: addr.clone(),
-                        connected,
-                        last_check: Some(std::time::Instant::now()),
-                        latency_ms: Some(latency),
-                    });
-                    if connected {
-                        self.add_log(format!("节点 {} 连接成功 ({}ms)", addr, latency));
-                    } else {
-                        self.add_log(format!("节点 {} 连接失败", addr));
-                    }
+                Ok(latency) => {
+                    self.node_status.insert(
+                        addr.clone(),
+                        NodeStatusInfo {
+                            addr: addr.clone(),
+                            connected: true,
+                            last_check: Some(now),
+                            latency_ms: Some(latency),
+                        },
+                    );
+                    self.add_log(format!("节点 {} 连接成功 ({}ms)", addr, latency));
                 }
-                None => {
-                    self.node_status.insert(addr.clone(), NodeStatusInfo {
-                        addr: addr.clone(),
-                        connected: false,
-                        last_check: Some(std::time::Instant::now()),
-                        latency_ms: None,
-                    });
-                    self.add_log(format!("节点 {} 测试失败", addr));
+                Err(reason) => {
+                    self.node_status.insert(
+                        addr.clone(),
+                        NodeStatusInfo {
+                            addr: addr.clone(),
+                            connected: false,
+                            last_check: Some(now),
+                            latency_ms: None,
+                        },
+                    );
+                    // A5：把失败根因（含证书错误）完整显示
+                    self.add_log(format!("节点 {} 测试失败: {}", addr, reason));
                 }
             }
         }
@@ -233,15 +302,19 @@ impl HydraApp {
             self.health_check_receiver = None;
         }
     }
-    
+
     fn add_log(&mut self, message: String) {
-        self.logs.push(format!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), message));
+        self.logs.push(format!(
+            "[{}] {}",
+            chrono::Local::now().format("%H:%M:%S"),
+            message
+        ));
         // 保持日志数量在合理范围
         if self.logs.len() > 100 {
             self.logs.remove(0);
         }
     }
-    
+
     fn start_proxy(&mut self) {
         if self.proxy_running {
             self.add_log("代理已经在运行".to_string());
@@ -268,29 +341,29 @@ impl HydraApp {
             self.add_log(format!("有 {} 个节点可用", online_count));
         }
 
-        // 解析节点地址（只使用可达的节点）
+        // 解析节点地址。
+        // P1-14 修复：首启时健康检查尚未返回、node_status 全是初始"未连接"值，
+        // 据此过滤节点会导致首次启动必然"没有可用节点"而取消。
+        // 现不再按可能过期的健康状态拦截，仅过滤非法地址；不可达节点
+        // 由代理自身的故障切换与调度器 Offline 标记处理。
         let mut nodes = Vec::new();
         let node_addrs = self.config.node_addrs.clone();
         for node_addr in &node_addrs {
             if let Ok(addr) = node_addr.parse::<SocketAddr>() {
-                // 如果节点状态显示已连接，添加到节点列表
-                if let Some(status) = self.node_status.get(node_addr.as_str()) {
-                    if status.connected {
-                        nodes.push(addr);
-                        self.add_log(format!("添加节点: {} (已验证)", addr));
-                    } else {
-                        self.add_log(format!("跳过节点: {} (不可达)", addr));
-                    }
-                } else {
-                    // 未测试的节点也添加（向后兼容）
-                    nodes.push(addr);
-                    self.add_log(format!("添加节点: {} (未验证)", addr));
-                }
+                let state = match self.node_status.get(node_addr.as_str()) {
+                    Some(st) if st.connected => "已验证",
+                    Some(st) if st.last_check.is_some() => "上次检测不可达，仍尝试",
+                    _ => "未验证",
+                };
+                nodes.push(addr);
+                self.add_log(format!("添加节点: {} ({})", addr, state));
+            } else {
+                self.add_log(format!("跳过无效节点地址: {}", node_addr));
             }
         }
 
         if nodes.is_empty() {
-            self.add_log("错误: 没有可用节点，代理启动取消".to_string());
+            self.add_log("错误: 没有有效的节点地址，代理启动取消".to_string());
             return;
         }
 
@@ -322,7 +395,10 @@ impl HydraApp {
                     Ok(p) => p,
                     Err(msg) => {
                         eprintln!("[Proxy Thread] 代理启动失败: {}", msg);
-                        let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)));
+                        let _ = tx.send(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            msg,
+                        )));
                         return;
                     }
                 };
@@ -392,7 +468,7 @@ impl HydraApp {
         }
     }
 
-    fn set_system_proxy(&self, proxy_url: &str) {
+    fn set_system_proxy(&mut self, proxy_url: &str) {
         // 设置环境变量
         std::env::set_var("http_proxy", proxy_url);
         std::env::set_var("https_proxy", proxy_url);
@@ -408,48 +484,98 @@ impl HydraApp {
         let proxy_host = addr_parts.get(0).unwrap_or(&"127.0.0.1");
         let proxy_port = addr_parts.get(1).unwrap_or(&"1080");
 
-        // 设置 GNOME 桌面代理（参考 v2rayN 实现）
-        let _ = std::process::Command::new("gsettings")
-            .args(["set", "org.gnome.system.proxy", "mode", "manual"])
-            .output();
-
-        // 设置所有协议的代理（http, https, ftp, socks）
-        for protocol in &["http", "https", "ftp", "socks"] {
-            let _ = std::process::Command::new("gsettings")
-                .args(["set", &format!("org.gnome.system.proxy.{}", protocol), "host", proxy_host])
-                .output();
-            let _ = std::process::Command::new("gsettings")
-                .args(["set", &format!("org.gnome.system.proxy.{}", protocol), "port", proxy_port])
-                .output();
-        }
-
-        // 设置忽略的主机（本地地址不走代理）
-        let _ = std::process::Command::new("gsettings")
-            .args(["set", "org.gnome.system.proxy", "ignore-hosts",
-                "['localhost', '127.0.0.0/8', '::1', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']"])
-            .output();
-
-        // 检测并设置 KDE 代理（如果在 KDE 环境下）
-        if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
-            if desktop.contains("KDE") || desktop.contains("plasma") {
-                let kwriteconfig = if std::env::var("KDE_SESSION_VERSION").unwrap_or_default() == "6" {
-                    "kwriteconfig6"
-                } else {
-                    "kwriteconfig5"
-                };
-                let _ = std::process::Command::new(kwriteconfig)
-                    .args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType", "1"])
-                    .output();
-                let _ = std::process::Command::new(kwriteconfig)
-                    .args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "socksProxy",
-                        &format!("socks://{}:{}", proxy_host, proxy_port)])
-                    .output();
-                // 通知 KDE 重新加载配置
-                let _ = std::process::Command::new("dbus-send")
-                    .args(["--type=signal", "/KIO/Scheduler", "org.kde.KIO.Scheduler.reparseSlaveConfiguration", "string:"])
-                    .output();
+        // A1：Windows 注册表真实实现（HKCU Internet Settings + WinINet 刷新）
+        #[cfg(windows)]
+        {
+            match windows_proxy::enable(addr_port) {
+                Ok(()) => {}
+                Err(e) => self.add_log(format!("设置 Windows 系统代理失败: {}", e)),
             }
         }
+
+        // Linux 桌面代理（gsettings / KDE），Windows 下不执行
+        #[cfg(unix)]
+        {
+            // 设置 GNOME 桌面代理（参考 v2rayN 实现）
+            let _ = std::process::Command::new("gsettings")
+                .args(["set", "org.gnome.system.proxy", "mode", "manual"])
+                .output();
+
+            // 设置所有协议的代理（http, https, ftp, socks）
+            for protocol in &["http", "https", "ftp", "socks"] {
+                let _ = std::process::Command::new("gsettings")
+                    .args([
+                        "set",
+                        &format!("org.gnome.system.proxy.{}", protocol),
+                        "host",
+                        proxy_host,
+                    ])
+                    .output();
+                let _ = std::process::Command::new("gsettings")
+                    .args([
+                        "set",
+                        &format!("org.gnome.system.proxy.{}", protocol),
+                        "port",
+                        proxy_port,
+                    ])
+                    .output();
+            }
+
+            // 设置忽略的主机（本地地址不走代理）
+            let _ = std::process::Command::new("gsettings")
+                .args([
+                    "set",
+                    "org.gnome.system.proxy",
+                    "ignore-hosts",
+                    "['localhost', '127.0.0.0/8', '::1', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']",
+                ])
+                .output();
+
+            // 检测并设置 KDE 代理（如果在 KDE 环境下）
+            if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
+                if desktop.contains("KDE") || desktop.contains("plasma") {
+                    let kwriteconfig =
+                        if std::env::var("KDE_SESSION_VERSION").unwrap_or_default() == "6" {
+                            "kwriteconfig6"
+                        } else {
+                            "kwriteconfig5"
+                        };
+                    let _ = std::process::Command::new(kwriteconfig)
+                        .args([
+                            "--file",
+                            "kioslaverc",
+                            "--group",
+                            "Proxy Settings",
+                            "--key",
+                            "ProxyType",
+                            "1",
+                        ])
+                        .output();
+                    let _ = std::process::Command::new(kwriteconfig)
+                        .args([
+                            "--file",
+                            "kioslaverc",
+                            "--group",
+                            "Proxy Settings",
+                            "--key",
+                            "socksProxy",
+                            &format!("socks://{}:{}", proxy_host, proxy_port),
+                        ])
+                        .output();
+                    // 通知 KDE 重新加载配置
+                    let _ = std::process::Command::new("dbus-send")
+                        .args([
+                            "--type=signal",
+                            "/KIO/Scheduler",
+                            "org.kde.KIO.Scheduler.reparseSlaveConfiguration",
+                            "string:",
+                        ])
+                        .output();
+                }
+            }
+        }
+
+        let _ = (proxy_host, proxy_port);
     }
 
     fn remove_system_proxy_static() {
@@ -461,25 +587,47 @@ impl HydraApp {
         std::env::remove_var("HTTPS_PROXY");
         std::env::remove_var("ALL_PROXY");
 
-        // 清除 GNOME 桌面代理
-        let _ = std::process::Command::new("gsettings")
-            .args(["set", "org.gnome.system.proxy", "mode", "none"])
-            .output();
+        // A1：Windows 恢复旧值（stop/panic/Drop 三条清理路径都经此静态函数）
+        #[cfg(windows)]
+        windows_proxy::disable();
 
-        // 清除 KDE 代理
-        if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
-            if desktop.contains("KDE") || desktop.contains("plasma") {
-                let kwriteconfig = if std::env::var("KDE_SESSION_VERSION").unwrap_or_default() == "6" {
-                    "kwriteconfig6"
-                } else {
-                    "kwriteconfig5"
-                };
-                let _ = std::process::Command::new(kwriteconfig)
-                    .args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType", "0"])
-                    .output();
-                let _ = std::process::Command::new("dbus-send")
-                    .args(["--type=signal", "/KIO/Scheduler", "org.kde.KIO.Scheduler.reparseSlaveConfiguration", "string:"])
-                    .output();
+        // Linux 桌面代理清理，Windows 下不执行
+        #[cfg(unix)]
+        {
+            // 清除 GNOME 桌面代理
+            let _ = std::process::Command::new("gsettings")
+                .args(["set", "org.gnome.system.proxy", "mode", "none"])
+                .output();
+
+            // 清除 KDE 代理
+            if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
+                if desktop.contains("KDE") || desktop.contains("plasma") {
+                    let kwriteconfig =
+                        if std::env::var("KDE_SESSION_VERSION").unwrap_or_default() == "6" {
+                            "kwriteconfig6"
+                        } else {
+                            "kwriteconfig5"
+                        };
+                    let _ = std::process::Command::new(kwriteconfig)
+                        .args([
+                            "--file",
+                            "kioslaverc",
+                            "--group",
+                            "Proxy Settings",
+                            "--key",
+                            "ProxyType",
+                            "0",
+                        ])
+                        .output();
+                    let _ = std::process::Command::new("dbus-send")
+                        .args([
+                            "--type=signal",
+                            "/KIO/Scheduler",
+                            "org.kde.KIO.Scheduler.reparseSlaveConfiguration",
+                            "string:",
+                        ])
+                        .output();
+                }
             }
         }
     }
@@ -487,7 +635,7 @@ impl HydraApp {
     fn remove_system_proxy(&self) {
         Self::remove_system_proxy_static();
     }
-    
+
     fn stop_proxy(&mut self) {
         if let Some(stop_flag) = &self.stop_flag {
             stop_flag.store(true, Ordering::Relaxed);
@@ -507,7 +655,7 @@ impl HydraApp {
         self.remove_system_proxy();
         self.add_log("代理已停止，已移除系统代理".to_string());
     }
-    
+
     fn export_share_links(&mut self) {
         // 将当前节点配置转换为NodeInfo列表
         let mut nodes = Vec::new();
@@ -524,14 +672,14 @@ impl HydraApp {
                 nodes.push(node_info);
             }
         }
-        
+
         // 生成分享链接
         let share_links = generate_share_links(&nodes);
         self.share_link_text = share_links;
         self.show_share_link_dialog = true;
         self.add_log("已生成分享链接".to_string());
     }
-    
+
     fn import_share_links(&mut self) {
         let links = parse_share_links(&self.share_link_text);
         match links {
@@ -609,6 +757,8 @@ impl eframe::App for HydraApp {
 
         // 非阻塞地处理健康检查结果
         self.poll_health_check_results();
+        // 非阻塞地处理单节点手动测试结果（A5）
+        self.poll_node_test_results();
 
         // 分享链接对话框
         if self.show_share_link_dialog {
@@ -618,7 +768,7 @@ impl eframe::App for HydraApp {
                 .show(ctx, |ui| {
                     ui.label("分享链接内容:");
                     ui.text_edit_multiline(&mut self.share_link_text);
-                    
+
                     ui.horizontal(|ui| {
                         if ui.button("导入").clicked() {
                             self.import_share_links();
@@ -629,7 +779,7 @@ impl eframe::App for HydraApp {
                     });
                 });
         }
-        
+
         // 顶部面板
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
@@ -649,12 +799,12 @@ impl eframe::App for HydraApp {
                 });
             });
         });
-        
+
         // 左侧面板 - 节点管理
         egui::SidePanel::left("side_panel").show(ctx, |ui| {
             ui.heading("节点管理");
             ui.separator();
-            
+
             // 添加节点
             ui.horizontal(|ui| {
                 ui.label("节点地址:");
@@ -663,12 +813,15 @@ impl eframe::App for HydraApp {
                     if !self.new_node_input.is_empty() {
                         let new_node = self.new_node_input.clone();
                         // 初始化节点状态
-                        self.node_status.insert(new_node.clone(), NodeStatusInfo {
-                            addr: new_node.clone(),
-                            connected: false,
-                            last_check: None,
-                            latency_ms: None,
-                        });
+                        self.node_status.insert(
+                            new_node.clone(),
+                            NodeStatusInfo {
+                                addr: new_node.clone(),
+                                connected: false,
+                                last_check: None,
+                                latency_ms: None,
+                            },
+                        );
                         self.config.node_addrs.push(new_node.clone());
                         self.add_log(format!("添加节点配置: {}", new_node));
                         self.new_node_input.clear();
@@ -680,9 +833,9 @@ impl eframe::App for HydraApp {
             if ui.button("测试所有节点").clicked() {
                 self.test_all_nodes();
             }
-            
+
             ui.separator();
-            
+
             // 分享链接功能
             ui.heading("分享链接");
             ui.horizontal(|ui| {
@@ -693,9 +846,9 @@ impl eframe::App for HydraApp {
                     self.export_share_links();
                 }
             });
-            
+
             ui.separator();
-            
+
             // 节点列表
             ui.heading("节点列表");
             let mut indices_to_remove = Vec::new();
@@ -703,7 +856,8 @@ impl eframe::App for HydraApp {
             for (i, node_addr) in node_addrs_clone.iter().enumerate() {
                 ui.horizontal(|ui| {
                     // 显示连接状态图标
-                    let status_icon = if let Some(status) = self.node_status.get(node_addr.as_str()) {
+                    let status_icon = if let Some(status) = self.node_status.get(node_addr.as_str())
+                    {
                         if status.connected {
                             "🟢" // 已连接
                         } else {
@@ -715,7 +869,8 @@ impl eframe::App for HydraApp {
                     ui.label(status_icon);
 
                     // 显示节点地址和延迟
-                    let label_text = if let Some(status) = self.node_status.get(node_addr.as_str()) {
+                    let label_text = if let Some(status) = self.node_status.get(node_addr.as_str())
+                    {
                         if let Some(latency) = status.latency_ms {
                             format!("{}. {} ({}ms)", i + 1, node_addr, latency)
                         } else {
@@ -727,29 +882,9 @@ impl eframe::App for HydraApp {
                     ui.label(label_text);
 
                     if ui.button("测试").clicked() {
-                        let addr = node_addr.clone();
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        std::thread::spawn(move || {
-                            let rt = tokio::runtime::Runtime::new().unwrap();
-                            let result = rt.block_on(async {
-                                Self::test_node_connection(&addr).await
-                            });
-                            let _ = tx.send((addr, result));
-                        });
-                        // 收集结果
-                        if let Ok((addr, Some((connected, latency)))) = rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                            self.node_status.insert(addr.clone(), NodeStatusInfo {
-                                addr: addr.clone(),
-                                connected,
-                                last_check: Some(std::time::Instant::now()),
-                                latency_ms: Some(latency),
-                            });
-                            if connected {
-                                self.add_log(format!("节点 {} 连接成功 ({}ms)", addr, latency));
-                            } else {
-                                self.add_log(format!("节点 {} 连接失败", addr));
-                            }
-                        }
+                        // A5：后台线程 + 通道模式（对齐 test_all_nodes），UI 线程零阻塞，
+                        // 测试期间窗口可正常拖动/重绘
+                        self.start_node_test(node_addr.clone());
                     }
 
                     if ui.button("删除").clicked() {
@@ -757,23 +892,23 @@ impl eframe::App for HydraApp {
                     }
                 });
             }
-            
+
             // 删除节点并添加日志
             for &i in indices_to_remove.iter().rev() {
                 let removed = self.config.node_addrs.remove(i);
                 self.node_status.remove(&removed);
                 self.add_log(format!("删除节点: {}", removed));
             }
-            
+
             ui.separator();
-            
+
             // 代理控制
             ui.heading("代理控制");
             ui.horizontal(|ui| {
                 ui.label("监听地址:");
                 ui.text_edit_singleline(&mut self.proxy_addr);
             });
-            
+
             ui.horizontal(|ui| {
                 if self.proxy_running {
                     if ui.button("停止代理").clicked() {
@@ -785,16 +920,26 @@ impl eframe::App for HydraApp {
                     }
                 }
             });
-            
+
             ui.separator();
 
             // 状态信息
             ui.heading("状态信息");
-            ui.label(format!("代理状态: {}", if self.proxy_running { "运行中" } else { "已停止" }));
+            ui.label(format!(
+                "代理状态: {}",
+                if self.proxy_running {
+                    "运行中"
+                } else {
+                    "已停止"
+                }
+            ));
 
             let connected_count = self.node_status.values().filter(|s| s.connected).count();
             let total_count = self.config.node_addrs.len();
-            ui.label(format!("节点数量: {} / {} 可用", connected_count, total_count));
+            ui.label(format!(
+                "节点数量: {} / {} 可用",
+                connected_count, total_count
+            ));
 
             if let Some(last_check) = self.last_health_check {
                 let elapsed = last_check.elapsed().as_secs();
@@ -822,29 +967,37 @@ impl eframe::App for HydraApp {
                         tokio::runtime::Handle::current().block_on(monitor.get_stats())
                     });
 
-                    ui.label(format!("上传: {} ({})", format_bytes(stats.bytes_sent), format_speed(stats.upload_speed)));
-                    ui.label(format!("下载: {} ({})", format_bytes(stats.bytes_received), format_speed(stats.download_speed)));
+                    ui.label(format!(
+                        "上传: {} ({})",
+                        format_bytes(stats.bytes_sent),
+                        format_speed(stats.upload_speed)
+                    ));
+                    ui.label(format!(
+                        "下载: {} ({})",
+                        format_bytes(stats.bytes_received),
+                        format_speed(stats.download_speed)
+                    ));
                     ui.label(format!("活跃连接: {}", stats.active_connections));
                     ui.label(format!("总连接数: {}", stats.total_connections));
                     ui.label(format!("运行时间: {}", format_duration(stats.uptime_secs)));
                 }
             }
         });
-        
+
         // 中央面板 - 日志显示
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("运行日志");
             ui.separator();
-            
+
             // 日志显示区域
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for log in &self.logs {
                     ui.label(log);
                 }
             });
-            
+
             ui.separator();
-            
+
             // 底部控制栏
             ui.horizontal(|ui| {
                 if ui.button("清空日志").clicked() {
@@ -860,7 +1013,7 @@ impl eframe::App for HydraApp {
 
 fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    
+
     // 添加中文字体支持
     // 尝试加载Noto Sans CJK字体
     let font_data = include_bytes!("../fonts/NotoSansCJK-Regular.ttc");
@@ -868,19 +1021,152 @@ fn setup_custom_fonts(ctx: &egui::Context) {
         "noto_sans_cjk".to_owned(),
         egui::FontData::from_owned(font_data.to_vec()),
     );
-    
+
     // 将中文字体添加到字体族中
-    fonts.families
+    fonts
+        .families
         .entry(egui::FontFamily::Proportional)
         .or_default()
         .push("noto_sans_cjk".to_owned());
-    
-    fonts.families
+
+    fonts
+        .families
         .entry(egui::FontFamily::Monospace)
         .or_default()
         .push("noto_sans_cjk".to_owned());
-    
+
     ctx.set_fonts(fonts);
+}
+
+// ═══════════════ A1：Windows 系统代理真实实现 ═══════════════
+//
+// 写 HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings：
+//   ProxyEnable(DWORD)=1、ProxyServer="127.0.0.1:port"（裸 host:port）、
+//   ProxyOverride（Windows 不支持 CIDR，用通配符）、删除 AutoConfigURL（PAC 会覆盖手动代理）。
+// 停止时恢复旧值而非清除（enable 前先读旧值）；刷新用 windows-sys InternetSetOptionW(39/37)。
+// 恢复所需旧值存放在全局槽位：panic hook / Drop / stop_proxy 三条清理路径都是静态函数。
+#[cfg(windows)]
+mod windows_proxy {
+    use std::sync::Mutex;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
+    use winreg::RegKey;
+
+    const INTERNET_SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    /// Windows 不支持 CIDR，使用通配符；<local> 覆盖裸主机名
+    const PROXY_OVERRIDE: &str = "localhost;127.*;192.168.*;172.*;10.*;<local>";
+
+    /// enable 之前的注册表旧值（disable 时恢复）
+    #[derive(Debug, Default, Clone)]
+    pub struct SavedProxyState {
+        pub proxy_enable: Option<u32>,
+        pub proxy_server: Option<String>,
+        pub proxy_override: Option<String>,
+        pub autoconfig_url: Option<String>,
+    }
+
+    /// 全局旧值槽位：清理路径（panic hook 等）无法访问 GUI 状态，经此恢复。
+    /// Mutex 中毒时直接取回内部数据——panic 清理路径本身必须可用。
+    static SAVED_STATE: Mutex<Option<SavedProxyState>> = Mutex::new(None);
+
+    fn lock_saved() -> std::sync::MutexGuard<'static, Option<SavedProxyState>> {
+        SAVED_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn open_settings_key() -> std::io::Result<RegKey> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        hkcu.open_subkey_with_flags(INTERNET_SETTINGS, KEY_READ | KEY_SET_VALUE)
+    }
+
+    /// 开启系统代理。返回 Err 时 GUI 侧显式报错，不静默。
+    pub fn enable(proxy_addr: &str) -> std::io::Result<()> {
+        let key = open_settings_key()?;
+        let saved = SavedProxyState {
+            proxy_enable: key.get_value("ProxyEnable").ok(),
+            proxy_server: key.get_value("ProxyServer").ok(),
+            proxy_override: key.get_value("ProxyOverride").ok(),
+            autoconfig_url: key.get_value("AutoConfigURL").ok(),
+        };
+        *lock_saved() = Some(saved);
+
+        key.set_value("ProxyEnable", &1u32)?;
+        // 裸 host:port（不带协议前缀；WinINet 对 SOCKS 可用 "socks=host:port" 形式，
+        // 裸 host:port 表示所有协议的 HTTP 代理，浏览器按需升级 CONNECT）
+        key.set_value("ProxyServer", &proxy_addr.to_string())?;
+        key.set_value("ProxyOverride", &PROXY_OVERRIDE)?;
+        // PAC 会覆盖手动代理，必须删除
+        let _ = key.delete_value("AutoConfigURL");
+        refresh();
+        Ok(())
+    }
+
+    /// 恢复 enable 之前的注册表状态（旧值恢复而非一律清除；原先不存在的键值则删除）。
+    /// 从未 enable 过时不做任何事。
+    pub fn disable() {
+        let saved = match lock_saved().take() {
+            Some(s) => s,
+            None => return,
+        };
+        if let Ok(key) = open_settings_key() {
+            match saved.proxy_enable {
+                Some(v) => {
+                    let _ = key.set_value("ProxyEnable", &v);
+                }
+                None => {
+                    let _ = key.delete_value("ProxyEnable");
+                }
+            }
+            match saved.proxy_server {
+                Some(v) => {
+                    let _ = key.set_value("ProxyServer", &v);
+                }
+                None => {
+                    let _ = key.delete_value("ProxyServer");
+                }
+            }
+            match saved.proxy_override {
+                Some(v) => {
+                    let _ = key.set_value("ProxyOverride", &v);
+                }
+                None => {
+                    let _ = key.delete_value("ProxyOverride");
+                }
+            }
+            match saved.autoconfig_url {
+                Some(v) => {
+                    let _ = key.set_value("AutoConfigURL", &v);
+                }
+                None => {
+                    let _ = key.delete_value("AutoConfigURL");
+                }
+            }
+        }
+        refresh();
+    }
+
+    /// 通知 WinINet 设置已更改并立即刷新：
+    /// InternetSetOptionW(NULL, 39=INTERNET_OPTION_SETTINGS_CHANGED) +
+    /// InternetSetOptionW(NULL, 37=INTERNET_OPTION_REFRESH)
+    fn refresh() {
+        use windows_sys::Win32::Networking::WinInet::{
+            InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
+        };
+        unsafe {
+            InternetSetOptionW(
+                std::ptr::null(),
+                INTERNET_OPTION_SETTINGS_CHANGED,
+                std::ptr::null_mut(),
+                0,
+            );
+            InternetSetOptionW(
+                std::ptr::null(),
+                INTERNET_OPTION_REFRESH,
+                std::ptr::null_mut(),
+                0,
+            );
+        }
+    }
 }
 
 #[tokio::main]

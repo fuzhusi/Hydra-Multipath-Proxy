@@ -1,13 +1,13 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use hydra_protocol::{HydraError, NodeInfo, NodeStatus, Result};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use url::Url;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use hydra_protocol::{NodeInfo, NodeStatus, Result, HydraError};
 
 /// Hydra节点分享链接格式
-/// 
+///
 /// 格式: hydra://address:port?bandwidth=100&latency=10&loss_rate=0.01&status=online&load=0.5
-/// 
+///
 /// 参数说明:
 /// - address: 节点地址
 /// - port: 节点端口
@@ -68,7 +68,13 @@ impl ShareLink {
 
         format!(
             "hydra://{}:{}?bandwidth={}&latency={}&loss_rate={}&load={}&status={}",
-            self.address, self.port, self.bandwidth, self.latency, self.loss_rate, self.load, status_str
+            self.address,
+            self.port,
+            self.bandwidth,
+            self.latency,
+            self.loss_rate,
+            self.load,
+            status_str
         )
     }
 
@@ -77,14 +83,18 @@ impl ShareLink {
             .map_err(|e| HydraError::ProtocolError(format!("Invalid URL: {}", e)))?;
 
         if url.scheme() != "hydra" {
-            return Err(HydraError::ProtocolError("Invalid scheme, expected 'hydra'".to_string()));
+            return Err(HydraError::ProtocolError(
+                "Invalid scheme, expected 'hydra'".to_string(),
+            ));
         }
 
-        let address = url.host_str()
+        let address = url
+            .host_str()
             .ok_or_else(|| HydraError::ProtocolError("Missing host".to_string()))?
             .to_string();
 
-        let port = url.port()
+        let port = url
+            .port()
             .ok_or_else(|| HydraError::ProtocolError("Missing port".to_string()))?;
 
         let mut bandwidth = 100.0;
@@ -96,19 +106,23 @@ impl ShareLink {
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
                 "bandwidth" => {
-                    bandwidth = value.parse::<f64>()
-                        .map_err(|e| HydraError::ProtocolError(format!("Invalid bandwidth: {}", e)))?;
+                    bandwidth = value.parse::<f64>().map_err(|e| {
+                        HydraError::ProtocolError(format!("Invalid bandwidth: {}", e))
+                    })?;
                 }
                 "latency" => {
-                    latency = value.parse::<f64>()
-                        .map_err(|e| HydraError::ProtocolError(format!("Invalid latency: {}", e)))?;
+                    latency = value.parse::<f64>().map_err(|e| {
+                        HydraError::ProtocolError(format!("Invalid latency: {}", e))
+                    })?;
                 }
                 "loss_rate" => {
-                    loss_rate = value.parse::<f64>()
-                        .map_err(|e| HydraError::ProtocolError(format!("Invalid loss_rate: {}", e)))?;
+                    loss_rate = value.parse::<f64>().map_err(|e| {
+                        HydraError::ProtocolError(format!("Invalid loss_rate: {}", e))
+                    })?;
                 }
                 "load" => {
-                    load = value.parse::<f64>()
+                    load = value
+                        .parse::<f64>()
                         .map_err(|e| HydraError::ProtocolError(format!("Invalid load: {}", e)))?;
                 }
                 "status" => {
@@ -142,7 +156,8 @@ impl ShareLink {
 
     /// 从Base64编码解析分享链接
     pub fn from_base64(encoded: &str) -> Result<Self> {
-        let decoded = BASE64.decode(encoded)
+        let decoded = BASE64
+            .decode(encoded)
             .map_err(|e| HydraError::ProtocolError(format!("Invalid base64: {}", e)))?;
         let url = String::from_utf8(decoded)
             .map_err(|e| HydraError::ProtocolError(format!("Invalid UTF-8: {}", e)))?;
@@ -153,58 +168,58 @@ impl ShareLink {
 /// 解析多个分享链接（每行一个）
 pub fn parse_share_links(text: &str) -> Result<Vec<ShareLink>> {
     let mut links = Vec::new();
-    
+
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        
+
         if line.starts_with("hydra://") {
             let link = ShareLink::from_share_url(line)?;
             links.push(link);
         }
     }
-    
+
     Ok(links)
 }
 
 /// 生成多个分享链接
 pub fn generate_share_links(nodes: &[NodeInfo]) -> String {
     let mut result = String::new();
-    
+
     for node in nodes {
         let link = ShareLink::from_node_info(node);
         result.push_str(&link.to_share_url());
         result.push('\n');
     }
-    
+
     result
 }
 
 /// 生成多个Base64编码的分享链接
 pub fn generate_base64_share_links(nodes: &[NodeInfo]) -> String {
     let mut result = String::new();
-    
+
     for node in nodes {
         let link = ShareLink::from_node_info(node);
         result.push_str(&link.to_base64());
         result.push('\n');
     }
-    
+
     result
 }
 
 /// 解析多个Base64编码的分享链接
 pub fn parse_base64_share_links(text: &str) -> Result<Vec<ShareLink>> {
     let mut links = Vec::new();
-    
+
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        
+
         // 尝试解析为Base64
         if let Ok(link) = ShareLink::from_base64(line) {
             links.push(link);
@@ -215,7 +230,7 @@ pub fn parse_base64_share_links(text: &str) -> Result<Vec<ShareLink>> {
             links.push(link);
         }
     }
-    
+
     Ok(links)
 }
 

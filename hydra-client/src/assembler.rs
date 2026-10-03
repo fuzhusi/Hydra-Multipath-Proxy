@@ -37,7 +37,9 @@ impl Assembler {
         let mut current_offset = self.expected_offset;
 
         loop {
-            let found = self.chunks.values()
+            let found = self
+                .chunks
+                .values()
                 .find(|p| p.offset == current_offset)
                 .cloned();
 

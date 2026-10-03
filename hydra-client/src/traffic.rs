@@ -1,8 +1,8 @@
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
-use serde::{Serialize, Deserialize};
 
 /// 流量统计信息
 #[derive(Debug, Clone, Serialize, Deserialize)]

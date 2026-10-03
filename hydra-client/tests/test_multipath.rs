@@ -31,32 +31,38 @@ async fn test_node_selection() -> Result<()> {
     let scheduler = Scheduler::new();
 
     // 添加节点
-    scheduler.add_node(NodeInfo {
-        address: "127.0.0.1:8081".parse().unwrap(),
-        bandwidth: 100.0,
-        latency: 10.0,
-        loss_rate: 0.01,
-        load: 0.5,
-        status: NodeStatus::Online,
-    }).await;
+    scheduler
+        .add_node(NodeInfo {
+            address: "127.0.0.1:8081".parse().unwrap(),
+            bandwidth: 100.0,
+            latency: 10.0,
+            loss_rate: 0.01,
+            load: 0.5,
+            status: NodeStatus::Online,
+        })
+        .await;
 
-    scheduler.add_node(NodeInfo {
-        address: "127.0.0.1:8082".parse().unwrap(),
-        bandwidth: 80.0,
-        latency: 15.0,
-        loss_rate: 0.02,
-        load: 0.3,
-        status: NodeStatus::Online,
-    }).await;
+    scheduler
+        .add_node(NodeInfo {
+            address: "127.0.0.1:8082".parse().unwrap(),
+            bandwidth: 80.0,
+            latency: 15.0,
+            loss_rate: 0.02,
+            load: 0.3,
+            status: NodeStatus::Online,
+        })
+        .await;
 
-    scheduler.add_node(NodeInfo {
-        address: "127.0.0.1:8083".parse().unwrap(),
-        bandwidth: 120.0,
-        latency: 20.0,
-        loss_rate: 0.03,
-        load: 0.7,
-        status: NodeStatus::Online,
-    }).await;
+    scheduler
+        .add_node(NodeInfo {
+            address: "127.0.0.1:8083".parse().unwrap(),
+            bandwidth: 120.0,
+            latency: 20.0,
+            loss_rate: 0.03,
+            load: 0.7,
+            status: NodeStatus::Online,
+        })
+        .await;
 
     // 测试节点选择
     let best_node = scheduler.get_best_node().await.unwrap();

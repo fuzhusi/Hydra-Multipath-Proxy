@@ -1,7 +1,7 @@
 use hydra_client::ProxyServer;
 use hydra_protocol::Result;
-use tracing::{info, error};
 use std::net::SocketAddr;
+use tracing::{error, info};
 
 fn parse_args() -> (Option<SocketAddr>, Vec<SocketAddr>) {
     let args: Vec<String> = std::env::args().collect();
@@ -15,7 +15,9 @@ fn parse_args() -> (Option<SocketAddr>, Vec<SocketAddr>) {
                 i += 2;
             }
             "--help" | "-h" => {
-                println!("用法: hydra-client [--listen <监听地址:端口>] <节点地址:端口> [更多节点...]");
+                println!(
+                    "用法: hydra-client [--listen <监听地址:端口>] <节点地址:端口> [更多节点...]"
+                );
                 println!("环境变量:");
                 println!("  HYDRA_AUTH_KEY   节点预共享密钥（hex，必填）");
                 println!("  HYDRA_NODE_CERT  节点证书文件路径（必填）");

@@ -1,7 +1,7 @@
+use hydra_protocol::{HydraError, Result, Session, SessionStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use hydra_protocol::{Session, SessionStatus, HydraError, Result};
 
 pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<u64, Session>>>,
@@ -42,7 +42,8 @@ impl SessionManager {
 
     pub async fn get_session(&self, id: u64) -> Result<Session> {
         let sessions = self.sessions.read().await;
-        sessions.get(&id)
+        sessions
+            .get(&id)
             .cloned()
             .ok_or_else(|| HydraError::SessionError(format!("Session {} not found", id)))
     }
@@ -53,7 +54,10 @@ impl SessionManager {
             session.status = status;
             Ok(())
         } else {
-            Err(HydraError::SessionError(format!("Session {} not found", id)))
+            Err(HydraError::SessionError(format!(
+                "Session {} not found",
+                id
+            )))
         }
     }
 
