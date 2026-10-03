@@ -84,33 +84,42 @@ impl ConnectionPool {
         pool
     }
 
-    /// 从池中获取一条到指定地址的双向流
+    /// 从池中获取一条到指定地址的双向流。
+    /// 锁只保护取/还连接本身，网络 I/O（open_bi + token 写入）在锁外执行，
+    /// 避免慢连接把其它节点的取流请求全部串行化。
     pub async fn get_stream(
         &self,
         addr: SocketAddr,
     ) -> Result<(SendStream, RecvStream)> {
-        // 尝试从池中获取现有连接
-        {
+        // 从池中取出一条候选连接（LIFO，优先复用最近活跃的）
+        let mut candidate = {
             let mut pools = self.pools.write().await;
-            if let Some(conns) = pools.get_mut(&addr) {
-                // 从尾部取（LIFO），优先复用最近活跃的连接
-                while let Some(mut pc) = conns.pop() {
-                    if pc.is_alive() {
-                        match pc.open_bi(&self.config.auth_key).await {
-                            Ok(streams) => {
-                                // 将连接放回池中（它还在使用中）
-                                conns.push(pc);
-                                return Ok(streams);
-                            }
-                            Err(e) => {
-                                warn!("Failed to open stream on pooled connection to {}: {}", addr, e);
-                                // 连接可能已损坏，丢弃它
-                            }
+            pools.get_mut(&addr).and_then(|conns| conns.pop())
+        };
+
+        while let Some(mut pc) = candidate {
+            if pc.is_alive() {
+                match pc.open_bi(&self.config.auth_key).await {
+                    Ok(streams) => {
+                        // 连接仍在使用中，放回池中
+                        let mut pools = self.pools.write().await;
+                        let conns = pools.entry(addr).or_default();
+                        if conns.len() < self.config.max_idle_per_node {
+                            conns.push(pc);
                         }
+                        return Ok(streams);
                     }
-                    // 连接已死或无法打开流，丢弃
+                    Err(e) => {
+                        warn!("Failed to open stream on pooled connection to {}: {}", addr, e);
+                        // 连接可能已损坏，丢弃并尝试下一条
+                    }
                 }
             }
+            // 连接已死或无法打开流，取下一条候选
+            candidate = {
+                let mut pools = self.pools.write().await;
+                pools.get_mut(&addr).and_then(|conns| conns.pop())
+            };
         }
 
         // 没有可用连接，建立新连接

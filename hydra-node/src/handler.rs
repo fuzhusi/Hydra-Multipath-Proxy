@@ -1,12 +1,17 @@
 use quinn::Connection;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, error, warn};
+use tracing::{debug, info, error};
 use hydra_protocol::{AuthToken, CLIENT_ID, HydraError, Result};
 
 /// 认证失败时静默关闭（不回显任何可区分的错误码，抵御主动探测）
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// 连接级认证宽限：宽限期内没有任何流完成认证则强制断开，
+/// 防止未认证连接靠 keepalive 永久占用连接数配额
+const AUTH_GRACE: Duration = Duration::from_secs(10);
 /// 单个流允许的最大目标地址长度
 const MAX_ADDR_LEN: usize = 256;
 
@@ -20,20 +25,34 @@ impl ConnectionHandler {
     }
 
     pub async fn handle_connection(&self, connection: Connection) -> Result<()> {
-        info!("Waiting for bidirectional stream from client...");
+        debug!("Waiting for bidirectional stream from client...");
+        let authed = Arc::new(AtomicBool::new(false));
+        let watchdog = {
+            let authed = authed.clone();
+            let conn = connection.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(AUTH_GRACE).await;
+                if !authed.load(Ordering::Relaxed) {
+                    info!("Connection failed to authenticate within grace period, closing");
+                    conn.close(0u32.into(), b"auth timeout");
+                }
+            })
+        };
+
         loop {
             match connection.accept_bi().await {
                 Ok((send, recv)) => {
-                    info!("Accepted bidirectional stream, spawning handler");
+                    debug!("Accepted bidirectional stream, spawning handler");
                     let auth_key = self.auth_key.clone();
+                    let authed = authed.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_stream(send, recv, auth_key).await {
+                        if let Err(e) = Self::handle_stream(send, recv, auth_key, authed).await {
                             error!("Stream error: {}", e);
                         }
                     });
                 }
                 Err(quinn::ConnectionError::ApplicationClosed(_)) => {
-                    info!("Connection closed by client");
+                    debug!("Connection closed by client");
                     break;
                 }
                 Err(e) => {
@@ -43,6 +62,7 @@ impl ConnectionHandler {
             }
         }
 
+        watchdog.abort();
         Ok(())
     }
 
@@ -50,17 +70,19 @@ impl ConnectionHandler {
         mut send: quinn::SendStream,
         mut recv: quinn::RecvStream,
         auth_key: Vec<u8>,
+        authed: Arc<AtomicBool>,
     ) -> Result<()> {
         // ── 第 1 步：认证。固定 64 字节 token，超时或验证失败一律静默关流。
         let mut token = [0u8; AuthToken::TOKEN_LEN];
-        let authed = match tokio::time::timeout(AUTH_TIMEOUT, recv.read_exact(&mut token)).await {
+        let valid = match tokio::time::timeout(AUTH_TIMEOUT, recv.read_exact(&mut token)).await {
             Ok(Ok(())) => AuthToken::verify(&auth_key, &token, CLIENT_ID, 30).is_ok(),
             _ => false,
         };
-        if !authed {
-            warn!("Stream failed authentication, closing silently");
+        if !valid {
+            debug!("Stream failed authentication, closing silently");
             return Ok(());
         }
+        authed.store(true, Ordering::Relaxed);
 
         // ── 第 2 步：读取目标地址（2 字节大端长度前缀 + 内容），修复单次 read 可能截断的问题。
         let mut len_buf = [0u8; 2];
@@ -72,7 +94,7 @@ impl ConnectionHandler {
         }
         let addr_len = u16::from_be_bytes(len_buf) as usize;
         if addr_len == 0 || addr_len > MAX_ADDR_LEN {
-            warn!("Invalid address length: {}", addr_len);
+            debug!("Invalid address length: {}", addr_len);
             return Ok(());
         }
         let mut addr_buf = vec![0u8; addr_len];
@@ -119,12 +141,12 @@ impl ConnectionHandler {
             }
         };
 
-        info!("Connecting to target: {} (with 60s timeout)", target_addr);
+        info!("Connecting to target: {} (with 15s timeout)", target_addr);
         let connect_start = std::time::Instant::now();
 
-        // Connect to target with timeout
+        // Connect to target with timeout（须小于客户端 20s 应答超时，否则慢目标被误判为节点故障）
         let target_stream = match tokio::time::timeout(
-            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(15),
             TcpStream::connect(target_addr)
         ).await {
             Ok(Ok(stream)) => {

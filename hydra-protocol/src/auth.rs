@@ -78,7 +78,11 @@ impl AuthToken {
             .unwrap()
             .as_secs();
 
-        if now < timestamp || now - timestamp > max_age_secs {
+        // 允许 ±5s 时钟偏移：客户端与节点跨机部署时时钟差会把健康节点误判为故障
+        const CLOCK_SKEW_TOLERANCE: u64 = 5;
+        if timestamp > now + CLOCK_SKEW_TOLERANCE
+            || now.saturating_sub(timestamp) > max_age_secs
+        {
             return Err(AuthError::TokenExpired);
         }
 

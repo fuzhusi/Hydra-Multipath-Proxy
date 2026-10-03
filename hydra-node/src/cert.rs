@@ -13,7 +13,17 @@ pub fn load_or_generate(
     key_file: &Path,
     domains: &[String],
 ) -> Result<(rustls::Certificate, rustls::PrivateKey)> {
-    if cert_file.exists() && key_file.exists() {
+    if cert_file.exists() || key_file.exists() {
+        // 只剩其一时拒绝启动：静默重新生成会让客户端 pin 的证书指纹失效
+        if !(cert_file.exists() && key_file.exists()) {
+            return Err(HydraError::NodeError(format!(
+                "证书/私钥不完整（{}: {}，{}: {}），拒绝重新生成以免客户端证书固定失效。请补齐或同时删除两者。",
+                cert_file.display(),
+                cert_file.exists(),
+                key_file.display(),
+                key_file.exists()
+            )));
+        }
         let cert_der = fs::read(cert_file)?;
         let key_der = fs::read(key_file)?;
         info!(

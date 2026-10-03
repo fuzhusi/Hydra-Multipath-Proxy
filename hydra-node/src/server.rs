@@ -79,7 +79,7 @@ impl HydraServer {
         Ok(Self {
             endpoint,
             handler,
-            max_connections: opts.max_connections,
+            max_connections: opts.max_connections.max(1),
             cert_der: cert_der.0,
         })
     }

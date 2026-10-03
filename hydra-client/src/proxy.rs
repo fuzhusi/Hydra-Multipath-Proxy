@@ -198,7 +198,8 @@ impl ProxyServer {
         peer_addr: SocketAddr,
     ) -> Result<(quinn::SendStream, quinn::RecvStream)> {
         const MAX_NODE_ATTEMPTS: usize = 3;
-        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+        // 应答等待须大于节点侧目标连接超时（15s），否则慢目标会被误判为节点故障
+        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 
         let candidates = scheduler.get_nodes_by_priority().await;
         if candidates.is_empty() {
@@ -339,13 +340,16 @@ impl ProxyServer {
 
         info!("[{}] >>> HTTP {} request to {}", peer_addr, method, target_host);
 
-        // 解析主机名和端口
-        let (target_addr_str, default_port) = if target_host.contains(':') {
-            let parts: Vec<&str> = target_host.splitn(2, ':').collect();
-            (parts[0].to_string(), parts[1].parse::<u16>().unwrap_or(80))
-        } else {
-            (target_host.clone(), 80u16)
-        };
+        // 解析主机名和端口（兼容 IPv6 字面量 "[::1]:8080"）
+        let (target_addr_str, default_port) =
+            if let Ok(addr) = target_host.parse::<std::net::SocketAddr>() {
+                (addr.ip().to_string(), addr.port())
+            } else if target_host.contains(':') {
+                let parts: Vec<&str> = target_host.splitn(2, ':').collect();
+                (parts[0].to_string(), parts[1].parse::<u16>().unwrap_or(80))
+            } else {
+                (target_host.clone(), 80u16)
+            };
 
         // 发送目标地址到服务器（包含端口）
         let target_with_port = format!("{}:{}", target_addr_str, default_port);
@@ -491,7 +495,7 @@ impl ProxyServer {
         pool: Arc<ConnectionPool>,
     ) -> Result<()> {
         let peer_addr = stream.peer_addr().unwrap_or_else(|_| SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0));
-        let mut buf = [0u8; 256];
+        let mut buf = [0u8; 320];
 
         // 初始数据应该是 SOCKS5 greeting
         if initial_len < 2 || initial_buf[0] != 0x05 {

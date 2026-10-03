@@ -109,6 +109,7 @@ curl -x http://127.0.0.1:1080 https://www.google.com
 |---|---|---|
 | `HYDRA_AUTH_KEY` | 双端 | 预共享密钥（hex，解码后 ≥16 字节），**必填** |
 | `HYDRA_NODE_CERT` | 客户端 | 节点证书 .der 文件路径，**必填** |
+| `HYDRA_SNI` | 客户端 | SNI 伪装域名覆盖（默认 `hydra.node`；须与节点证书 SAN 匹配） |
 | `HYDRA_LISTEN` | 双端 | 监听地址（节点默认 `0.0.0.0:8080`，客户端默认 `127.0.0.1:1080`；也可用命令行参数覆盖） |
 | `HYDRA_CERT_FILE` / `HYDRA_KEY_FILE` | 节点 | 证书/私钥保存路径（默认 `hydra-node-cert.der` / `hydra-node-key.der`） |
 | `HYDRA_CERT_DOMAINS` | 节点 | 证书 SAN，逗号分隔（默认 `hydra.node,localhost`） |
@@ -140,6 +141,7 @@ cargo test --workspace
 ## 开发路线
 
 - [x] **Phase A（2026-10）**：认证接线、证书固定、故障切换、资源上限、防追踪特征正常化、DNS 隐私、过时测试修复
+- [x] **Phase A 复审（2026-10-04）**：两评审组交叉复审，修复认证宽限看门狗（防未认证连接占满配额的 DoS）、时钟偏移容差、超时不对称、连接池锁竞争等 11 项（见 [docs/review/04](docs/review/04-PhaseA代码复审报告.md)）
 - [ ] **Phase B**：测速重写（结果写回调度器）、协议错误显式传播（替代静默 FIN）、nonce 防重放表、SSRF 目标过滤、依赖升级 rustls 0.23
 - [ ] **Phase C**：真多路径聚合（单连接多 stream 架构）、流量整形、BBR
 

@@ -73,10 +73,16 @@ async fn main() -> Result<()> {
     info!("Starting Hydra client proxy on {}", listen_addr);
     info!("Configured nodes: {:?}", nodes);
 
-    let proxy = ProxyServer::new(listen_addr)
+    // SNI 伪装域名可覆盖（须与节点证书 SAN 匹配；默认 hydra.node）
+    let sni = std::env::var("HYDRA_SNI").ok();
+
+    let mut proxy = ProxyServer::new(listen_addr)
         .with_nodes(nodes)
         .with_auth_key(auth_key)
         .with_node_certs(node_certs);
+    if let Some(s) = sni {
+        proxy = proxy.with_sni(s);
+    }
     proxy.start().await?;
 
     Ok(())
