@@ -20,6 +20,7 @@
 //! 故本模块以「配置非空 → 覆盖写进程 env」实现同样的优先级，见 [`apply_env_overrides`]。
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// 配置目录名（各平台一致）
@@ -95,6 +96,9 @@ pub struct GuiConfig {
     /// false = 直接退出（停止代理并清理系统代理）。
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
+    /// Team-UI：节点备注名（地址 "host:port" → 展示名）。缺项 = 无备注，显示地址本身。
+    #[serde(default)]
+    pub node_names: HashMap<String, String>,
 }
 
 /// serde 默认值：true（关窗默认隐藏到托盘）
@@ -116,6 +120,7 @@ impl Default for GuiConfig {
             probe_interval_secs: None,
             subscriptions: Vec::new(),
             close_to_tray: true,
+            node_names: HashMap::new(),
         }
     }
 }
@@ -139,6 +144,48 @@ impl GuiConfig {
             .iter()
             .flat_map(|s| s.nodes.iter().cloned())
             .collect()
+    }
+
+    /// Team-UI：节点展示名——有备注名返回备注名，否则返回地址本身。
+    pub fn node_display_name(&self, addr: &str) -> String {
+        match self.node_names.get(addr).map(|s| s.trim()) {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => addr.to_string(),
+        }
+    }
+
+    /// Team-UI：设置/清除节点备注名（trim 后为空 = 清除该条目，不存空串）。
+    pub fn set_node_name(&mut self, addr: &str, name: &str) {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            self.node_names.remove(addr);
+        } else {
+            self.node_names
+                .insert(addr.to_string(), trimmed.to_string());
+        }
+    }
+
+    /// Team-UI：编辑对话框修改节点地址后的迁移——同步 node_addrs、订阅认领列表与备注名。
+    /// 新地址已存在时不迁移（调用方应先拒绝），此处仅做幂等迁移。
+    pub fn rename_node(&mut self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        for a in self.node_addrs.iter_mut() {
+            if a == old {
+                *a = new.to_string();
+            }
+        }
+        for sub in self.subscriptions.iter_mut() {
+            for n in sub.nodes.iter_mut() {
+                if n == old {
+                    *n = new.to_string();
+                }
+            }
+        }
+        if let Some(name) = self.node_names.remove(old) {
+            self.node_names.entry(new.to_string()).or_insert(name);
+        }
     }
 }
 
@@ -302,6 +349,7 @@ mod tests {
             probe_interval_secs: Some(15),
             subscriptions: Vec::new(),
             close_to_tray: true,
+            node_names: Default::default(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: GuiConfig = serde_json::from_str(&json).unwrap();
@@ -354,6 +402,7 @@ mod tests {
             probe_interval_secs: Some(30),
             subscriptions: Vec::new(),
             close_to_tray: true,
+            node_names: Default::default(),
         };
         save_to_file(&path, &cfg).expect("保存应成功");
         let loaded = load_from_file(&path)
@@ -581,5 +630,69 @@ mod tests {
 
         let owned = cfg.subscription_owned_addrs();
         assert_eq!(owned, vec!["10.0.0.1:4433".to_string()]);
+    }
+
+    // ===================== Team-UI：节点备注名与地址编辑 =====================
+
+    #[test]
+    fn test_node_names_serde_roundtrip_and_default() {
+        let mut cfg = GuiConfig::default();
+        cfg.set_node_name("10.0.0.1:4433", "  家里节点 ");
+        assert_eq!(cfg.node_names.get("10.0.0.1:4433").unwrap(), "家里节点");
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: GuiConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+
+        // 旧版本配置文件（无 node_names 字段）→ 空 map
+        let old: GuiConfig = serde_json::from_str(r#"{"auth_key":"ff"}"#).unwrap();
+        assert!(old.node_names.is_empty());
+    }
+
+    #[test]
+    fn test_node_display_name() {
+        let mut cfg = GuiConfig::default();
+        assert_eq!(cfg.node_display_name("1.2.3.4:1"), "1.2.3.4:1");
+        cfg.set_node_name("1.2.3.4:1", "A 节点");
+        assert_eq!(cfg.node_display_name("1.2.3.4:1"), "A 节点");
+        // 空串备注 = 清除，回落地址
+        cfg.set_node_name("1.2.3.4:1", "   ");
+        assert!(cfg.node_names.get("1.2.3.4:1").is_none());
+        assert_eq!(cfg.node_display_name("1.2.3.4:1"), "1.2.3.4:1");
+    }
+
+    #[test]
+    fn test_rename_node_migrates_everywhere() {
+        let mut cfg = GuiConfig {
+            node_addrs: vec!["10.0.0.1:4433".into(), "10.0.0.2:4433".into()],
+            subscriptions: vec![SubscriptionConfig {
+                name: "主订阅".into(),
+                source: "https://e/s".into(),
+                last_updated_secs: None,
+                nodes: vec!["10.0.0.1:4433".into()],
+            }],
+            ..Default::default()
+        };
+        cfg.set_node_name("10.0.0.1:4433", "旧名");
+
+        cfg.rename_node("10.0.0.1:4433", "10.0.0.9:9999");
+        // node_addrs 保序替换
+        assert_eq!(
+            cfg.node_addrs,
+            vec!["10.0.0.9:9999".to_string(), "10.0.0.2:4433".to_string()]
+        );
+        // 订阅认领同步迁移（来源标记不丢）
+        assert_eq!(
+            cfg.subscriptions[0].nodes,
+            vec!["10.0.0.9:9999".to_string()]
+        );
+        // 备注名随地址迁移
+        assert!(cfg.node_names.get("10.0.0.1:4433").is_none());
+        assert_eq!(cfg.node_names.get("10.0.0.9:9999").unwrap(), "旧名");
+        assert_eq!(cfg.node_source_label("10.0.0.9:9999"), "订阅:主订阅");
+
+        // 相同地址幂等
+        cfg.rename_node("10.0.0.9:9999", "10.0.0.9:9999");
+        assert_eq!(cfg.node_addrs[0], "10.0.0.9:9999");
     }
 }

@@ -20,22 +20,21 @@ mod subscription;
 mod tray;
 use tray::TrayCommand;
 
-/// T2：左侧导航六区（状态总览 / 节点管理 / 订阅 / 分享 / 设置 / 日志）
+/// T2：左侧导航五区（状态总览 / 节点管理 / 分享 / 设置 / 日志）
+/// Team-UI：订阅管理并入「节点管理」（统一节点列表 + 来源标记，消除功能重叠页面）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     Overview,
     Nodes,
-    Subscriptions,
     Share,
     Settings,
     Logs,
 }
 
 impl Tab {
-    const ALL: [Tab; 6] = [
+    const ALL: [Tab; 5] = [
         Tab::Overview,
         Tab::Nodes,
-        Tab::Subscriptions,
         Tab::Share,
         Tab::Settings,
         Tab::Logs,
@@ -45,7 +44,6 @@ impl Tab {
         match self {
             Tab::Overview => "📊 状态总览",
             Tab::Nodes => "🌐 节点管理",
-            Tab::Subscriptions => "📥 订阅",
             Tab::Share => "🔗 分享",
             Tab::Settings => "⚙️ 设置",
             Tab::Logs => "📜 运行日志",
@@ -102,6 +100,19 @@ struct HydraApp {
     // 密钥明文显示开关（默认掩码显示）
     show_auth_key: bool,
     show_obfs_key: bool,
+
+    // ── Team-UI：节点编辑对话框（备注名/地址 + 全局安全参数，实时校验）──
+    node_edit_open: bool,
+    /// 被编辑节点的原始地址（保存时的迁移键）
+    edit_orig_addr: String,
+    edit_name: String,
+    edit_addr: String,
+    edit_auth_key: String,
+    edit_show_auth: bool,
+    edit_cert_path: String,
+    edit_obfs_key: String,
+    edit_obfs: bool,
+    edit_show_obfs: bool,
 
     // 运行时状态
     scheduler: Option<Arc<Scheduler>>,
@@ -160,6 +171,16 @@ impl Default for HydraApp {
             import_status: None,
             show_auth_key: false,
             show_obfs_key: false,
+            node_edit_open: false,
+            edit_orig_addr: String::new(),
+            edit_name: String::new(),
+            edit_addr: String::new(),
+            edit_auth_key: String::new(),
+            edit_show_auth: false,
+            edit_cert_path: String::new(),
+            edit_obfs_key: String::new(),
+            edit_obfs: false,
+            edit_show_obfs: false,
             scheduler: None,
             transport: None,
             stop_flag: None,
@@ -270,6 +291,16 @@ impl HydraApp {
             import_status: None,
             show_auth_key: false,
             show_obfs_key: false,
+            node_edit_open: false,
+            edit_orig_addr: String::new(),
+            edit_name: String::new(),
+            edit_addr: String::new(),
+            edit_auth_key: String::new(),
+            edit_show_auth: false,
+            edit_cert_path: String::new(),
+            edit_obfs_key: String::new(),
+            edit_obfs: false,
+            edit_show_obfs: false,
             scheduler: None,
             transport: None,
             stop_flag: None,
@@ -317,12 +348,13 @@ impl HydraApp {
             .unwrap_or_else(|| "(配置目录不可用)".to_string());
         vec![
             "═══ 首次使用向导 ═══".to_string(),
-            "① 填写认证密钥：左侧「安全与传输设置」→ 认证密钥 → 点「编辑/显示」输入 hex 密钥"
+            "① 填写认证密钥：左侧「⚙ 设置」→「安全与传输」→ 认证密钥 → 点「编辑/显示」输入 hex 密钥"
                 .to_string(),
             "② 选择节点证书文件：同区「节点证书」→ 点「浏览...」选择节点生成的 hydra-node-cert.der"
                 .to_string(),
-            "③ 添加节点：左上「节点地址」输入 host:port 后点「添加」".to_string(),
-            "④ 点「启动代理」即可使用".to_string(),
+            "③ 添加节点：「🌐 节点管理」页顶部输入框填 host:port 后点「添加」"
+                .to_string(),
+            "④ 点「▶ 启动代理」即可使用（也可直接点状态总览页的大按钮）".to_string(),
             format!(
                 "完成一次后配置自动保存到 {}，以后双击本程序即可直接使用",
                 cfg_path
@@ -1741,11 +1773,15 @@ impl eframe::App for HydraApp {
         egui::CentralPanel::default().show(ctx, |ui| match self.current_tab {
             Tab::Overview => self.ui_overview(ui),
             Tab::Nodes => self.ui_nodes(ui),
-            Tab::Subscriptions => self.ui_subscriptions(ui),
             Tab::Share => self.ui_share(ui),
             Tab::Settings => self.ui_settings(ui),
             Tab::Logs => self.ui_logs(ui),
         });
+
+        // ── Team-UI：节点编辑对话框 ──
+        if self.node_edit_open {
+            self.ui_node_edit_dialog(ctx);
+        }
 
         // T2：托盘 tooltip 随代理状态同步；隐藏到托盘后仍需周期重绘
         // （轮询代理退出通道 / 托盘命令 / 实时速率刷新）
@@ -2054,38 +2090,151 @@ impl HydraApp {
         }
     }
 
-    /// 节点管理：添加/测试/列表 + 导入节点（粘贴/二维码/文件）
+    /// 节点管理（Team-UI 合并版）：统一节点列表（手动+订阅同列，来源标记）
+    /// + 导入节点 + 订阅管理（订阅页已并入本页）+ 每行「编辑」
     fn ui_nodes(&mut self, ui: &mut egui::Ui) {
         ui.heading("节点管理");
         ui.separator();
 
-        // 添加节点
+        // 添加节点（实时校验 host:port，非法地址直接提示不再静默入库）
         ui.horizontal(|ui| {
             ui.label("节点地址:");
-            ui.text_edit_singleline(&mut self.new_node_input);
-            if ui.button("添加").clicked() {
-                if !self.new_node_input.is_empty() {
-                    let new_node = self.new_node_input.clone();
-                    // 初始化节点状态
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.new_node_input)
+                    .desired_width(220.0)
+                    .hint_text("host:port，如 1.2.3.4:4433"),
+            );
+            let add_clicked = ui.button("➕ 添加节点").clicked();
+            if add_clicked {
+                let input = self.new_node_input.trim().to_string();
+                if input.is_empty() {
+                    self.add_log("请先输入节点地址（host:port）".to_string());
+                } else if input.parse::<SocketAddr>().is_err() {
+                    self.add_log(format!(
+                        "「{}」不是有效的 地址:端口（示例 1.2.3.4:4433 / [::1]:4433），未添加",
+                        input
+                    ));
+                } else {
                     self.node_status.insert(
-                        new_node.clone(),
+                        input.clone(),
                         NodeStatusInfo {
-                            addr: new_node.clone(),
+                            addr: input.clone(),
                             connected: false,
                             last_check: None,
                             latency_ms: None,
                         },
                     );
-                    self.config.node_addrs.push(new_node.clone());
-                    self.add_log(format!("添加节点配置: {}", new_node));
+                    self.config.node_addrs.push(input.clone());
+                    self.add_log(format!("已添加节点: {}", input));
                     self.new_node_input.clear();
                 }
             }
+            if !self.new_node_input.trim().is_empty()
+                && self.new_node_input.trim().parse::<SocketAddr>().is_err()
+            {
+                response.on_hover_text("尚未输入完整的 地址:端口");
+            }
         });
 
-        // 测试所有节点按钮
-        if ui.button("测试所有节点").clicked() {
+        if ui.button("🔁 测试所有节点").clicked() {
             self.test_all_nodes();
+        }
+
+        // ── 统一节点列表（Team-UI：手动 + 订阅节点同一列，来源标记区分）──
+        ui.add_space(4.0);
+        ui.heading(format!(
+            "节点列表（手动 {} / 订阅 {} / 共 {}）",
+            self.config
+                .node_addrs
+                .iter()
+                .filter(|a| self.config.node_source_label(a) == config::NODE_SOURCE_MANUAL)
+                .count(),
+            self.config.node_addrs.len()
+                - self
+                    .config
+                    .node_addrs
+                    .iter()
+                    .filter(|a| self.config.node_source_label(a) == config::NODE_SOURCE_MANUAL)
+                    .count(),
+            self.config.node_addrs.len()
+        ));
+        if self.config.node_addrs.is_empty() {
+            ui.weak(
+                "还没有节点。请在上方添加，或用「导入节点」粘贴分享链接，或在下方订阅自动拉取。",
+            );
+        }
+        let mut indices_to_remove = Vec::new();
+        let mut edit_target: Option<String> = None;
+        let node_addrs_clone = self.config.node_addrs.clone();
+        for (i, node_addr) in node_addrs_clone.iter().enumerate() {
+            ui.horizontal(|ui| {
+                // 连接状态图标
+                let status_icon = match self.node_status.get(node_addr.as_str()) {
+                    Some(status) => {
+                        if status.connected {
+                            "🟢"
+                        } else {
+                            "🔴"
+                        }
+                    }
+                    None => "⚪",
+                };
+                ui.label(status_icon);
+
+                // 备注 + 地址 + 延迟
+                let name = self.config.node_display_name(node_addr);
+                let latency_text = match self.node_status.get(node_addr.as_str()) {
+                    Some(status) => match status.latency_ms {
+                        Some(latency) => format!("{}ms", latency),
+                        None if status.last_check.is_some() => "超时".to_string(),
+                        None => "未测试".to_string(),
+                    },
+                    None => "未测试".to_string(),
+                };
+                if name == node_addr.as_str() {
+                    ui.label(format!("{}. {}", i + 1, node_addr));
+                } else {
+                    ui.label(format!("{}. {}", i + 1, name))
+                        .on_hover_text(node_addr.as_str());
+                    ui.weak(node_addr.as_str());
+                }
+                ui.weak(format!("({})", latency_text));
+
+                // 来源标记（手动 / 订阅名）——不同来源着色区分
+                let source = self.config.node_source_label(node_addr);
+                ui.colored_label(
+                    if source == config::NODE_SOURCE_MANUAL {
+                        egui::Color32::from_rgb(0xA8, 0xB0, 0xBC)
+                    } else {
+                        egui::Color32::from_rgb(0x7A, 0xB3, 0xFF)
+                    },
+                    format!("[{}]", source),
+                );
+
+                if ui.small_button("测试").clicked() {
+                    self.start_node_test(node_addr.clone());
+                }
+                if ui.small_button("分享").clicked() {
+                    self.open_share_dialog(node_addr.clone());
+                }
+                if ui.small_button("✏ 编辑").clicked() {
+                    edit_target = Some(node_addr.clone());
+                }
+                if ui.small_button("删除").clicked() {
+                    indices_to_remove.push(i);
+                }
+            });
+        }
+
+        // 删除节点并添加日志
+        for &i in indices_to_remove.iter().rev() {
+            let removed = self.config.node_addrs.remove(i);
+            self.node_status.remove(&removed);
+            self.config.node_names.remove(&removed);
+            self.add_log(format!("已删除节点: {}", removed));
+        }
+        if let Some(addr) = edit_target {
+            self.open_node_edit(&addr);
         }
 
         ui.separator();
@@ -2098,7 +2247,7 @@ impl HydraApp {
                 .hint_text("粘贴 hydra:// 分享链接（支持多行）"),
         );
         ui.horizontal(|ui| {
-            if ui.button("导入粘贴").clicked() {
+            if ui.button("导入粘贴的链接").clicked() {
                 self.import_pasted_links();
             }
             if ui.button("从二维码图片导入").clicked() {
@@ -2111,78 +2260,24 @@ impl HydraApp {
         if let Some((ok, msg)) = &self.import_status {
             ui.colored_label(
                 if *ok {
-                    egui::Color32::LIGHT_GREEN
+                    egui::Color32::from_rgb(0x7D, 0xE2, 0x97)
                 } else {
-                    egui::Color32::RED
+                    egui::Color32::from_rgb(0xFF, 0x8A, 0x80)
                 },
                 format!("{} {}", if *ok { "✓" } else { "✗" }, msg),
             );
         }
         ui.small("完整分享含密钥/证书，导入后自动配置，无需再填密钥与证书文件");
 
+        // ── Team-UI：订阅管理并入本页（原先与节点管理功能重叠的独立「订阅」页）──
         ui.separator();
-
-        // 节点列表
-        ui.heading("节点列表");
-        let mut indices_to_remove = Vec::new();
-        let node_addrs_clone = self.config.node_addrs.clone();
-        for (i, node_addr) in node_addrs_clone.iter().enumerate() {
-            ui.horizontal(|ui| {
-                // 显示连接状态图标
-                let status_icon = if let Some(status) = self.node_status.get(node_addr.as_str()) {
-                    if status.connected {
-                        "🟢" // 已连接
-                    } else {
-                        "🔴" // 未连接
-                    }
-                } else {
-                    "⚪" // 未测试
-                };
-                ui.label(status_icon);
-
-                // 显示节点地址和延迟
-                let label_text = if let Some(status) = self.node_status.get(node_addr.as_str()) {
-                    if let Some(latency) = status.latency_ms {
-                        format!("{}. {} ({}ms)", i + 1, node_addr, latency)
-                    } else {
-                        format!("{}. {} (超时)", i + 1, node_addr)
-                    }
-                } else {
-                    format!("{}. {} (未测试)", i + 1, node_addr)
-                };
-                ui.label(label_text);
-
-                // Exec-C：节点来源标记（手动 / 订阅名）
-                ui.small(format!("[{}]", self.config.node_source_label(node_addr)));
-
-                if ui.button("测试").clicked() {
-                    // A5：后台线程 + 通道模式，UI 线程零阻塞
-                    self.start_node_test(node_addr.clone());
-                }
-
-                // Team-Q v2：单节点分享（二维码 + 密钥链接）
-                if ui.button("分享").clicked() {
-                    self.open_share_dialog(node_addr.clone());
-                }
-
-                if ui.button("删除").clicked() {
-                    indices_to_remove.push(i);
-                }
-            });
-        }
-
-        // 删除节点并添加日志
-        for &i in indices_to_remove.iter().rev() {
-            let removed = self.config.node_addrs.remove(i);
-            self.node_status.remove(&removed);
-            self.add_log(format!("删除节点: {}", removed));
-        }
+        self.ui_subscription_section(ui);
     }
 
-    /// 订阅（Exec-C）：添加 / 更新 / 删除，后台串行拉取
-    fn ui_subscriptions(&mut self, ui: &mut egui::Ui) {
-        ui.heading("订阅");
-        ui.separator();
+    /// 订阅管理（Exec-C，Team-UI 并入节点管理页）：添加 / 更新 / 删除，后台串行拉取
+    fn ui_subscription_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading("订阅管理");
+        ui.small("订阅来源拉取的节点会自动加入上方节点列表，并以订阅名作为来源标记");
         ui.horizontal(|ui| {
             ui.label("名称:");
             ui.add(
@@ -2209,10 +2304,10 @@ impl HydraApp {
             }
         });
         ui.horizontal(|ui| {
-            if ui.button("添加订阅").clicked() {
+            if ui.button("➕ 添加订阅").clicked() {
                 self.add_subscription();
             }
-            if ui.button("更新全部订阅").clicked() {
+            if ui.button("🔄 更新全部订阅").clicked() {
                 self.update_all_subscriptions();
             }
             if self.sub_update_receiver.is_some() {
@@ -2240,10 +2335,10 @@ impl HydraApp {
                     sub.nodes.len(),
                     updated
                 ));
-                if ui.button("更新").clicked() {
+                if ui.small_button("更新").clicked() {
                     self.queue_subscription_update(sub.name.clone(), sub.source.clone());
                 }
-                if ui.button("删除").clicked() {
+                if ui.small_button("删除").clicked() {
                     subs_to_remove.push(i);
                 }
             });
@@ -2264,11 +2359,282 @@ impl HydraApp {
         }
         ui.separator();
         ui.heading("使用说明");
-        ui.small("• 单节点分享：节点管理 → 节点列表 →「分享」，可生成二维码与完整/紧凑链接");
+        ui.small("• 单节点分享：「🌐 节点管理」→ 节点列表 →「分享」，可生成二维码与完整/紧凑链接");
         ui.small("• 完整链接含认证密钥与证书，对方导入即用；仅限可信渠道发送");
         ui.small("• 紧凑链接仅含证书指纹，需另行发送证书文件");
-        ui.small("• 导入：节点管理 →「导入节点」，支持粘贴链接 / 二维码图片 / 链接文件");
-        ui.small("• 订阅节点：订阅页添加 http(s)/文件来源后点「更新」自动拉取");
+        ui.small("• 导入：「🌐 节点管理」→「导入节点」，支持粘贴链接 / 二维码图片 / 链接文件");
+        ui.small(
+            "• 订阅节点：「🌐 节点管理」→「订阅管理」添加 http(s)/文件来源后点「更新」自动拉取",
+        );
+    }
+
+    // ═══════════════ Team-UI：节点编辑对话框 ═══════════════
+
+    /// 打开节点编辑对话框（备注名/地址 + 全局安全与传输参数）
+    fn open_node_edit(&mut self, addr: &str) {
+        self.edit_orig_addr = addr.to_string();
+        self.edit_name = self
+            .config
+            .node_names
+            .get(addr)
+            .cloned()
+            .unwrap_or_default();
+        self.edit_addr = addr.to_string();
+        self.edit_auth_key = self.config.auth_key.clone();
+        self.edit_show_auth = false;
+        self.edit_cert_path = self.config.cert_path.clone();
+        self.edit_obfs_key = self.config.obfs_key.clone();
+        self.edit_obfs = self.config.is_obfs();
+        self.edit_show_obfs = false;
+        self.node_edit_open = true;
+    }
+
+    /// 编辑对话框中证书区域的当前状态描述：文件路径（存在性）或内嵌 DER 指纹短哈希
+    fn cert_status_text(cfg: &GuiConfig) -> String {
+        let path = cfg.cert_path.trim();
+        if !path.is_empty() {
+            return if std::path::Path::new(path).exists() {
+                format!("✓ 证书文件: {}", path)
+            } else {
+                format!("✗ 证书文件不存在: {}", path)
+            };
+        }
+        let b64 = cfg.cert_der_b64.trim();
+        if !b64.is_empty() {
+            use base64::Engine as _;
+            return match base64::engine::general_purpose::STANDARD.decode(b64) {
+                Ok(der) => format!(
+                    "✓ 内嵌证书 DER（sha256 前 16 位: {}）",
+                    &sha256_hex(&der)[..16]
+                ),
+                Err(_) => "✗ 内嵌证书数据损坏（base64 解码失败）".to_string(),
+            };
+        }
+        "未设置（将回落 HYDRA_NODE_CERT 环境变量）".to_string()
+    }
+
+    /// 保存节点编辑：先全量校验（任一失败不改配置），再写回 + 迁移地址 + 提示重启代理
+    fn save_node_edit(&mut self) {
+        // ── 校验阶段 ──
+        let new_addr = self.edit_addr.trim().to_string();
+        if new_addr.parse::<SocketAddr>().is_err() {
+            self.add_log(format!(
+                "节点编辑保存失败:「{}」不是有效的 地址:端口（示例 1.2.3.4:4433）",
+                new_addr
+            ));
+            return;
+        }
+        let addr_changed = new_addr != self.edit_orig_addr;
+        if addr_changed && self.config.node_addrs.contains(&new_addr) {
+            self.add_log(format!("节点编辑保存失败: 地址 {} 已存在于列表", new_addr));
+            return;
+        }
+        let key = self.edit_auth_key.trim().to_string();
+        if !key.is_empty() {
+            if let Err(e) = hydra_client::auth_key_from_hex(&key) {
+                self.add_log(format!("节点编辑保存失败: 认证密钥无效 — {}", e));
+                return;
+            }
+        }
+        let cert_path = self.edit_cert_path.trim().to_string();
+        if !cert_path.is_empty() && !std::path::Path::new(&cert_path).exists() {
+            self.add_log(format!(
+                "节点编辑保存失败: 证书文件不存在 {}（可清空路径改用内嵌证书）",
+                cert_path
+            ));
+            return;
+        }
+        let obfs_key = self.edit_obfs_key.trim().to_string();
+        let obfs = self.edit_obfs;
+
+        // ── 写回阶段（不会再失败）──
+        let orig = self.edit_orig_addr.clone();
+        if addr_changed {
+            self.config.rename_node(&orig, &new_addr);
+            // 运行时状态表同步换键
+            if let Some(st) = self.node_status.remove(&orig) {
+                self.node_status.insert(new_addr.clone(), st);
+            }
+        }
+        self.config.set_node_name(&new_addr, &self.edit_name.trim());
+        self.config.auth_key = key;
+        self.config.cert_path = cert_path;
+        self.config.obfs_key = obfs_key;
+        self.config.hydra_mode = if obfs {
+            "obfs".to_string()
+        } else {
+            "masquerade".to_string()
+        };
+        self.node_edit_open = false;
+        self.add_log(format!("节点 {} 已保存", new_addr));
+        // 全局参数（密钥/证书/模式）只在代理启动时读取，运行中修改必须重启才生效
+        if self.proxy_running {
+            self.add_log(
+                "⚠ 代理正在运行：本次修改（密钥/证书/模式/地址）需停止并重新启动代理后才生效"
+                    .to_string(),
+            );
+        }
+    }
+
+    /// 节点编辑对话框 UI（egui::Window，实时校验提示）
+    fn ui_node_edit_dialog(&mut self, ctx: &egui::Context) {
+        let mut save_clicked = false;
+        egui::Window::new(format!("编辑节点 {}", self.edit_orig_addr))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label("节点信息（仅本节点）");
+                egui::Grid::new("node_edit_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("备注名:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.edit_name)
+                                .desired_width(260.0)
+                                .hint_text("可选，如「家里节点」"),
+                        );
+                        ui.end_row();
+                        ui.label("地址:端口:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.edit_addr)
+                                .desired_width(260.0)
+                                .hint_text("1.2.3.4:4433"),
+                        );
+                        ui.end_row();
+                    });
+                if !self.edit_addr.trim().is_empty()
+                    && self.edit_addr.trim().parse::<SocketAddr>().is_err()
+                {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xFF, 0x8A, 0x80),
+                        "✗ 地址格式应为 host:port（示例 1.2.3.4:4433 / [::1]:4433）",
+                    );
+                }
+
+                ui.separator();
+                ui.label("安全与传输（当前全局配置，所有节点共用）");
+
+                // 认证密钥（默认掩码）
+                ui.horizontal(|ui| {
+                    ui.label("认证密钥:");
+                    if self.edit_show_auth {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.edit_auth_key)
+                                .desired_width(240.0),
+                        );
+                        if ui.small_button("隐藏").clicked() {
+                            self.edit_show_auth = false;
+                        }
+                    } else {
+                        let shown = if self.edit_auth_key.trim().is_empty() {
+                            "（未设置）".to_string()
+                        } else {
+                            config::mask_secret(self.edit_auth_key.trim())
+                        };
+                        ui.monospace(shown);
+                        if ui.small_button("编辑/显示").clicked() {
+                            self.edit_show_auth = true;
+                        }
+                    }
+                });
+                if self.edit_show_auth && !self.edit_auth_key.trim().is_empty() {
+                    match hydra_client::auth_key_from_hex(self.edit_auth_key.trim()) {
+                        Ok(_) => ui.colored_label(
+                            egui::Color32::from_rgb(0x7D, 0xE2, 0x97),
+                            "✓ 密钥格式有效",
+                        ),
+                        Err(e) => ui.colored_label(
+                            egui::Color32::from_rgb(0xFF, 0x8A, 0x80),
+                            format!("✗ {}", e),
+                        ),
+                    };
+                }
+
+                // 证书：当前状态（路径/内嵌指纹短哈希）+ 浏览替换
+                ui.label("节点证书:");
+                ui.small(Self::cert_status_text(&self.config));
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.edit_cert_path)
+                            .desired_width(320.0)
+                            .hint_text("证书文件路径（清空则使用内嵌证书）"),
+                    );
+                    if ui.small_button("浏览替换...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("证书文件", &["der", "pem", "crt", "cer"])
+                            .add_filter("全部文件", &["*"])
+                            .pick_file()
+                        {
+                            self.edit_cert_path = path.display().to_string();
+                        }
+                    }
+                });
+
+                // 传输模式 + obfs 密码
+                ui.horizontal(|ui| {
+                    ui.label("传输模式:");
+                    if ui.radio(!self.edit_obfs, "伪装 masquerade").clicked() && self.edit_obfs {
+                        self.edit_obfs = false;
+                    }
+                    if ui.radio(self.edit_obfs, "混淆 obfs").clicked() && !self.edit_obfs {
+                        self.edit_obfs = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("obfs 密码:");
+                    if self.edit_show_obfs {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.edit_obfs_key)
+                                .desired_width(240.0),
+                        );
+                        if ui.small_button("隐藏").clicked() {
+                            self.edit_show_obfs = false;
+                        }
+                    } else {
+                        let shown = if self.edit_obfs_key.is_empty() {
+                            "（未设置）".to_string()
+                        } else {
+                            config::mask_secret(self.edit_obfs_key.trim())
+                        };
+                        ui.monospace(shown);
+                        if ui.small_button("编辑/显示").clicked() {
+                            self.edit_show_obfs = true;
+                        }
+                    }
+                });
+                if self.edit_obfs && self.edit_obfs_key.trim().is_empty() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xFF, 0xD6, 0x66),
+                        "⚠ obfs 模式要求独立第二密码，否则代理无法启动",
+                    );
+                }
+
+                if self.proxy_running {
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xFF, 0xD6, 0x66),
+                        "⚠ 代理正在运行：保存后需停止并重新启动代理，修改才会生效",
+                    );
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("💾 保存").strong()))
+                        .clicked()
+                    {
+                        save_clicked = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        self.node_edit_open = false;
+                    }
+                });
+            });
+        if save_clicked {
+            self.save_node_edit();
+        }
     }
 
     /// 设置：代理监听 / 安全与传输 / 托盘行为 / 密钥证书 / 退出
@@ -2474,19 +2840,53 @@ impl HydraApp {
     }
 }
 
-/// T2：统一暗色主题（圆角 6 / 行间距 / 强调蓝）
+/// Team-UI：统一深色主题。
+///
+/// 根因说明：旧版 `apply_dark_theme` 从 egui 默认 style（**浅色 Visuals**）出发，
+/// 只改了圆角/选中色/个别 fg_stroke，从未设置 `Visuals::dark()`——
+/// 因此面板背景保持白色，而按深底设计的淡灰文字落在白底上不可读。
+/// 修复：以 `Visuals::dark()` 为基底整体替换，再叠加高对比配色与圆角/间距；
+/// SidePanel/CentralPanel/Window 均未单独设置 fill，全部走 visuals，一处生效全局生效。
+///
+/// 对比度清单（正文对各自背景，WCAG 相对亮度计算）：
+/// - 正文 TEXT   #E8EAED（相对亮度≈0.79）on 面板底 #1B1E24（≈0.012）→ ≈13.5:1
+/// - 次要 WEAK   #A8B0BC（≈0.43）on #1B1E24 → ≈7.7:1（ui.small/来源标记仍达标）
+/// - 强调 ACCENT #7AB3FF（≈0.44）on #1B1E24 → ≈7.9:1
+/// - 成功 GREEN  #7DE297（≈0.63）on #1B1E24 → ≈11:1
+/// - 警告 YELLOW #FFD666（≈0.70）on #1B1E24 → ≈12:1
+/// - 错误 RED    #FF8A80（≈0.42）on #1B1E24 → ≈7.6:1
+/// - 输入框文字  #E8EAED on 输入框底 #121418（≈0.006）→ ≈14.6:1
 fn apply_dark_theme(ctx: &egui::Context) {
-    const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x4C, 0x8B, 0xFF);
+    const BG_PANEL: egui::Color32 = egui::Color32::from_rgb(0x1B, 0x1E, 0x24);
+    const BG_WINDOW: egui::Color32 = egui::Color32::from_rgb(0x22, 0x26, 0x2E);
+    const BG_EXTREME: egui::Color32 = egui::Color32::from_rgb(0x12, 0x14, 0x18);
+    const TEXT: egui::Color32 = egui::Color32::from_rgb(0xE8, 0xEA, 0xED);
+    const WEAK: egui::Color32 = egui::Color32::from_rgb(0xA8, 0xB0, 0xBC);
+    const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x5C, 0x9D, 0xFF);
+
     let mut style = (*ctx.style()).clone();
+    // 关键修复：以深色 Visuals 为基底（默认是 light = 白底）
+    style.visuals = egui::Visuals::dark();
     let vis = &mut style.visuals;
-    vis.window_rounding = egui::Rounding::same(6.0);
-    vis.menu_rounding = egui::Rounding::same(6.0);
-    vis.selection.bg_fill = ACCENT;
-    vis.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+    // 面板/窗口/输入框背景统一深色
+    vis.panel_fill = BG_PANEL;
+    vis.window_fill = BG_WINDOW;
+    vis.extreme_bg_color = BG_EXTREME; // TextEdit / 折叠区背景
+    vis.faint_bg_color = egui::Color32::from_rgb(0x24, 0x28, 0x30); // 斑马纹/弱分隔
+                                                                    // 文字：正文高对比，次要文字（ui.small / weak）仍 ≥7:1
+    vis.override_text_color = Some(TEXT);
+    vis.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, WEAK); // 分隔线文字等
+    vis.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
     vis.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, ACCENT);
     vis.widgets.active.fg_stroke = egui::Stroke::new(1.5_f32, ACCENT);
-    vis.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(220));
-    // 行间距
+    vis.widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, ACCENT);
+    vis.hyperlink_color = ACCENT;
+    // 选中态
+    vis.selection.bg_fill = ACCENT.gamma_multiply(0.45);
+    vis.selection.stroke = egui::Stroke::new(1.0_f32, ACCENT);
+    // 圆角 / 行间距
+    vis.window_rounding = egui::Rounding::same(6.0);
+    vis.menu_rounding = egui::Rounding::same(6.0);
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     ctx.set_style(style);
 }
