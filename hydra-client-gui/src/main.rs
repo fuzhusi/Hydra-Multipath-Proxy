@@ -1,3 +1,6 @@
+// Windows 下隐藏随 GUI 弹出的终端窗口（仅 release；debug 保留控制台便于看日志）
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use eframe::egui;
 use hydra_client::{
     format_bytes, format_duration, format_speed, generate_share_links, hex_encode_lower,
