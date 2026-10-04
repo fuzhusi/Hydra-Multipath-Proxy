@@ -709,43 +709,51 @@ impl HydraApp {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
                 // 认证密钥/证书已由 GUI 线程按「配置文件 > 环境变量」解析完毕（见上）
-                let proxy = ProxyServer::new(proxy_addr_clone)
-                    .with_nodes(nodes_clone)
-                    .with_traffic_monitor(traffic_monitor_clone)
-                    .with_auth_key(auth_key)
-                    .with_node_certs(node_certs);
-                // 先绑定端口
-                match tokio::net::TcpListener::bind(proxy_addr_clone).await {
-                    Ok(listener) => {
-                        // 端口绑定成功，发送信号
-                        let _ = tx.send(Ok(()));
-                        // 关闭测试 listener
-                        drop(listener);
-                        // 启动代理
-                        println!("[Proxy Thread] Starting proxy server...");
-                        tokio::select! {
-                            result = proxy.start() => {
-                                match result {
-                                    Ok(()) => {
-                                        println!("[Proxy Thread] Proxy server exited normally");
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[Proxy Thread] Proxy server error: {}", e);
-                                    }
-                                }
+                let proxy = std::sync::Arc::new(
+                    ProxyServer::new(proxy_addr_clone)
+                        .with_nodes(nodes_clone)
+                        .with_traffic_monitor(traffic_monitor_clone)
+                        .with_auth_key(auth_key)
+                        .with_node_certs(node_certs),
+                );
+                println!("[Proxy Thread] Starting proxy server...");
+                // 就绪信号以真实 bound_addr 置位为准（start 内部含 endpoint 创建与节点预热，
+                // 可能数十秒）——不再用"测试绑定后丢弃"的 TOCTOU 假信号
+                let p2 = proxy.clone();
+                let ready_tx = tx.clone();
+                let watcher = tokio::spawn(async move {
+                    for _ in 0..600 {
+                        if p2.bound_addr().is_some() {
+                            let _ = ready_tx.send(Ok(()));
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    let _ = ready_tx.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "代理监听 60s 内未就绪（地址被占用或节点预热超时）",
+                    )));
+                });
+                let _ = watcher.await;
+                tokio::select! {
+                    result = proxy.start() => {
+                        match result {
+                            Ok(()) => {
+                                println!("[Proxy Thread] Proxy server exited normally");
                             }
-                            _ = async {
-                                while !stop_flag_clone.load(Ordering::Relaxed) {
-                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                }
-                            } => {
-                                println!("[Proxy Thread] Received stop signal");
+                            Err(e) => {
+                                eprintln!("[Proxy Thread] Proxy server error: {}", e);
+                                // release 版无控制台：失败必须回传 UI 可见
+                                let _ = tx.send(Err(std::io::Error::other(format!("代理异常退出: {e}"))));
                             }
                         }
                     }
-                    Err(e) => {
-                        eprintln!("[Proxy Thread] Failed to bind port: {}", e);
-                        let _ = tx.send(Err(e));
+                    _ = async {
+                        while !stop_flag_clone.load(Ordering::Relaxed) {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    } => {
+                        println!("[Proxy Thread] Received stop signal");
                     }
                 }
             });
@@ -2725,7 +2733,15 @@ impl HydraApp {
             self.delete_subscription(i);
         }
 
-        // 订阅编辑对话框（名称重复校验与添加同一套规则）
+        // 订阅编辑对话框（名称重复校验与添加同一套规则）。
+        // 对话框打开期间订阅可能被删除（同页删除按钮）→ 索引失效时静默关闭对话框，
+        // 否则 subs_clone[idx] 越界 panic 崩溃整个 UI 线程
+        if let Some(idx) = self.sub_edit_idx {
+            if subs_clone.get(idx).is_none() {
+                self.sub_edit_idx = None;
+                self.add_log("编辑的订阅已被删除，对话框已关闭".to_string());
+            }
+        }
         if let Some(idx) = self.sub_edit_idx {
             let mut save_clicked = false;
             egui::Window::new(format!("编辑订阅「{}」", subs_clone[idx].name))
