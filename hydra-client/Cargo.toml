@@ -31,3 +31,6 @@ hydra-obfs = { path = "../hydra-obfs" }
 
 [dev-dependencies]
 hydra-node = { path = "../hydra-node" }
+# test_handshake_v3：snow 官方 API 直造 msg1（篡改测试）；rustls 用于 peer cert 下cast
+snow = { version = "0.9", default-features = false, features = ["default-resolver", "ring-resolver"] }
+rustls = "0.21"

@@ -55,12 +55,18 @@
 //! 逃生舱模式的定位是**特征匹配下不可识别**（不被精准封禁），不是统计下不可疑
 //! （可能被整段限速）——"活着比好看重要"。
 
+pub mod cc;
 pub mod crypto;
 pub mod limiter;
 pub mod mode;
 pub mod socket;
 pub mod tuning;
 
+pub use cc::{
+    apply_bbr_congestion_control, apply_brutal_congestion_control,
+    apply_congestion_control_from_env, resolve_congestion_control, Brutal, BrutalConfig,
+    CongestionControlChoice, HYDRA_BRUTAL_MBPS_ENV, HYDRA_CC_ENV,
+};
 pub use crypto::{derive_day_key, looks_like_quic, ObfsCrypto, SALT_LEN};
 pub use limiter::SourceLimiter;
 pub use mode::{TransportMode, HYDRA_MODE_ENV, HYDRA_OBFS_KEY_ENV};

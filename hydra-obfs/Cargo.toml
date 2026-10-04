@@ -9,6 +9,8 @@ chacha20 = "0.9"
 # HKDF-SHA256 日派生密钥 + SecureRandom 盐源（与全 workspace 同一 ring 0.16，不引双版本）
 ring = "0.16"
 quinn = "0.10"
+# 拥塞控制实现（Brutal Controller trait）——与 quinn 0.10 同一 0.10.x 实例
+quinn-proto = "0.10"
 tokio = { version = "1", features = ["net", "rt"] }
 bytes = "1"
 serde = { version = "1", features = ["derive"] }

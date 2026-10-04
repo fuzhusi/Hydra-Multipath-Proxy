@@ -21,6 +21,8 @@ fast_qr = "0.12"
 rqrr = "0.7"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 base64 = "0.22"
+# T2：系统托盘（Tauri 官方库；Windows 下事件经全局通道投递，GUI 线程轮询即可）
+tray-icon = "0.19"
 hydra-client = { path = "../hydra-client" }
 hydra-protocol = { path = "../hydra-protocol" }
 

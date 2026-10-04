@@ -63,6 +63,8 @@ pub struct ProxyServer {
     auth_key: Vec<u8>,
     node_certs: Vec<Vec<u8>>,
     sni: String,
+    /// 认证版本（V3.2）：None=随 HYDRA_AUTH_MODE env（默认 auto）
+    auth_mode: Option<hydra_protocol::handshake::AuthMode>,
     bound_addr: Arc<std::sync::OnceLock<SocketAddr>>,
 }
 
@@ -76,6 +78,7 @@ impl ProxyServer {
             auth_key: Vec::new(),
             node_certs: Vec::new(),
             sni: DEFAULT_SNI.to_string(),
+            auth_mode: None,
             bound_addr: Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -100,6 +103,16 @@ impl ProxyServer {
     /// 覆盖 SNI 伪装域名（默认 hydra.node）
     pub fn with_sni(mut self, sni: String) -> Self {
         self.sni = sni;
+        self
+    }
+
+    /// V3.2 认证版本（auto|v2|v3）。不调用则读 HYDRA_AUTH_MODE env（默认 auto：
+    /// 优先 v3 Noise 握手，v2-only 旧节点自动回落 HMAC token）。
+    pub fn with_auth_mode(
+        mut self,
+        mode: hydra_protocol::handshake::AuthMode,
+    ) -> Self {
+        self.auth_mode = Some(mode);
         self
     }
 
@@ -157,6 +170,9 @@ impl ProxyServer {
                 cleanup_interval: Duration::from_secs(60),
                 connect_timeout: Duration::from_secs(5),
                 auth_key: self.auth_key.clone(),
+                auth_mode: self.auth_mode.unwrap_or_else(
+                    hydra_protocol::handshake::AuthMode::from_env,
+                ),
                 sni: self.sni.clone(),
                 client_config,
             },

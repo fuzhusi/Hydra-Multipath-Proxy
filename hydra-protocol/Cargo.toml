@@ -13,3 +13,8 @@ tokio = { version = "1", features = ["full"] }
 quinn = "0.10"
 rustls = { version = "0.21", features = ["dangerous_configuration"] }
 ring = "0.16"
+# V3.2 Noise-PSK 握手 v2：Noise_NNpsk2_25519_ChaChaPoly_SHA256。
+# 注意：snow 0.9 的 ring-resolver 绑 ring 0.17（任务指定）；在 quinn 0.10 完成向
+# rustls 0.23/ring 0.17 收敛前，工作区暂时并存 ring 0.16（quinn/rustls 栈）与
+# ring 0.17（仅 snow 内部用）——升级阻塞原因见任务书 T3 降级授权与 README。
+snow = { version = "0.9", default-features = false, features = ["default-resolver", "ring-resolver"] }

@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod error;
+pub mod handshake;
 pub mod log;
 pub mod node;
 pub mod packet;

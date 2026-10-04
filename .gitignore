@@ -30,3 +30,4 @@ hydra-node-cert.der
 hydra-node-key.der
 *.der
 *.pem
+reg.log

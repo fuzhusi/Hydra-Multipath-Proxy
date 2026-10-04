@@ -1,3 +1,4 @@
+use hydra_protocol::handshake::{self, AuthMode};
 use hydra_protocol::{mask_target, AuthToken, HydraError, Result, CLIENT_ID};
 use quinn::{Connection, VarInt};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -470,17 +471,29 @@ type ChannelRegistry = Arc<Mutex<HashMap<u64, Arc<ChannelShared>>>>;
 
 pub struct ConnectionHandler {
     auth_key: Vec<u8>,
+    /// 本节点证书 SHA-256 指纹：v3 握手 confirm 通道绑定材料（server.rs 注入）
+    cert_fp: [u8; 32],
 }
 
 impl ConnectionHandler {
-    pub fn new(auth_key: Vec<u8>) -> Self {
-        Self { auth_key }
+    pub fn new(auth_key: Vec<u8>, cert_fp: [u8; 32]) -> Self {
+        Self { auth_key, cert_fp }
     }
 
     pub async fn handle_connection(&self, connection: Connection) -> Result<()> {
         debug!("Waiting for bidirectional stream from client...");
         let authed = Arc::new(AtomicBool::new(false));
         let channels: ChannelRegistry = Arc::new(Mutex::new(HashMap::new()));
+        // v3 通道绑定材料：QUIC/TLS exporter（quinn 0.10 支持 export_keying_material；
+        // 两端同 label/context 即同值）。失败置零 → 握手 confirm 必不匹配，安全退化。
+        let mut exporter = [0u8; handshake::EXPORTER_LEN];
+        if connection
+            .export_keying_material(&mut exporter, handshake::EXPORTER_LABEL, b"")
+            .is_err()
+        {
+            warn!("export_keying_material unavailable; v3 handshake will reject clients");
+            exporter = [0u8; handshake::EXPORTER_LEN];
+        }
         let watchdog = {
             let authed = authed.clone();
             let conn = connection.clone();
@@ -498,11 +511,13 @@ impl ConnectionHandler {
                 Ok((send, recv)) => {
                     debug!("Accepted bidirectional stream, spawning handler");
                     let auth_key = self.auth_key.clone();
+                    let cert_fp = self.cert_fp;
                     let authed = authed.clone();
                     let channels = channels.clone();
+                    let exporter = exporter;
                     tokio::spawn(async move {
                         if let Err(e) =
-                            Self::handle_stream(send, recv, auth_key, authed, channels).await
+                            Self::handle_stream(send, recv, auth_key, cert_fp, exporter, authed, channels).await
                         {
                             error!("Stream error: {}", e);
                         }
@@ -524,17 +539,60 @@ impl ConnectionHandler {
     }
 
     async fn handle_stream(
-        send: quinn::SendStream,
+        mut send: quinn::SendStream,
         mut recv: quinn::RecvStream,
         auth_key: Vec<u8>,
+        cert_fp: [u8; 32],
+        exporter: [u8; 32],
         authed: Arc<AtomicBool>,
         channels: ChannelRegistry,
     ) -> Result<()> {
-        // ── 第 1 步：认证。固定 64 字节 token，超时或验证失败一律静默关流。
-        let mut token = [0u8; AuthToken::TOKEN_LEN];
-        let valid = match tokio::time::timeout(AUTH_TIMEOUT, recv.read_exact(&mut token)).await {
-            Ok(Ok(())) => AuthToken::verify(&auth_key, &token, CLIENT_ID, 30).is_ok(),
+        // ── 第 1 步：认证。V3.2 双栈版本判别：流首字节 0x00=legacy v2（64B HMAC
+        // token，现网 token 首字节即时间戳大端最高字节，2106 年前恒为 0x00）、
+        // 0x03=v3 Noise 握手；其他值一律静默关流（防探测语义不变）。
+        let auth_mode = AuthMode::from_env();
+        let mut version = [0u8; 1];
+        let read_ok = match tokio::time::timeout(AUTH_TIMEOUT, recv.read_exact(&mut version)).await
+        {
+            Ok(Ok(())) => true,
             _ => false,
+        };
+        let valid = if !read_ok {
+            false
+        } else {
+            match version[0] {
+                0x00 if auth_mode.accepts_v2() => {
+                    // 补读剩余 63B 还原完整 64B token，走原 HMAC 验证路径
+                    let mut rest = [0u8; AuthToken::TOKEN_LEN - 1];
+                    match tokio::time::timeout(AUTH_TIMEOUT, recv.read_exact(&mut rest)).await {
+                        Ok(Ok(())) => {
+                            let mut token = [0u8; AuthToken::TOKEN_LEN];
+                            token[0] = 0x00;
+                            token[1..].copy_from_slice(&rest);
+                            AuthToken::verify(&auth_key, &token, CLIENT_ID, 30).is_ok()
+                        }
+                        _ => false,
+                    }
+                }
+                handshake::HANDSHAKE_VERSION_BYTE if auth_mode.accepts_v3() => {
+                    // v3 Noise 握手（msg1 已在流中）；失败（含重放/篡改/PSK 不一致）静默关流
+                    tokio::time::timeout(
+                        AUTH_TIMEOUT,
+                        handshake::server_side(&mut send, &mut recv, &auth_key, &cert_fp, &exporter),
+                    )
+                    .await
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false)
+                }
+                other => {
+                    debug!(
+                        "Unknown auth version byte 0x{:02x} (mode {}), closing silently",
+                        other,
+                        auth_mode.as_str()
+                    );
+                    false
+                }
+            }
         };
         if !valid {
             debug!("Stream failed authentication, closing silently");

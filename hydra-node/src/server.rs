@@ -106,7 +106,10 @@ impl HydraServer {
                 )?
             }
         };
-        let handler = Arc::new(ConnectionHandler::new(auth_key));
+        let handler = Arc::new(ConnectionHandler::new(
+            auth_key,
+            hydra_protocol::handshake::cert_fingerprint(&cert_der.0),
+        ));
 
         Ok(Self {
             endpoint,
@@ -140,6 +143,28 @@ impl HydraServer {
         // C2 顺带（B1 收尾）：节点侧复用与客户端同一份流控窗口调优——
         // 连接级 receive_window 32MB 内存封顶 + 单流窗口 8MB 吞吐杠杆（env 可调）
         hydra_obfs::tuning::apply_transport_tuning(&mut transport_config);
+        // T1 节点侧 Brutal 接线：下行（节点→客户端，用户下载主方向）拥塞控制，
+        // 与客户端同一 env 语义（HYDRA_CC / HYDRA_BRUTAL_MBPS）。非法 HYDRA_CC 或
+        // brutal 缺带宽 → 启动报错（与客户端一致，不静默回退）。configure_server
+        // 是 masquerade / obfs 两条 endpoint 构造路径的共同入口，一处接线两模式都生效。
+        let cc_choice = hydra_obfs::cc::resolve_congestion_control(|name| std::env::var(name).ok());
+        hydra_obfs::cc::apply_congestion_control_from_env(&mut transport_config, |name| {
+            std::env::var(name).ok()
+        })
+        .map_err(hydra_protocol::HydraError::ProtocolError)?;
+        match cc_choice {
+            Ok(hydra_obfs::cc::CongestionControlChoice::Brutal(cfg)) => info!(
+                "Node congestion control: Brutal (target {} Mbps)",
+                cfg.bandwidth_bytes_per_sec() as f64 * 8.0 / 1_000_000.0
+            ),
+            Ok(hydra_obfs::cc::CongestionControlChoice::Bbr) => {
+                info!("Node congestion control: BBR (quinn builtin, experimental)")
+            }
+            Ok(hydra_obfs::cc::CongestionControlChoice::Cubic) => {
+                info!("Node congestion control: CUBIC (quinn default, zero change)")
+            }
+            Err(_) => {} // apply_congestion_control_from_env 已带原错误返回，启动即失败
+        }
         transport_config.max_idle_timeout(Some(
             quinn::IdleTimeout::try_from(std::time::Duration::from_secs(60)).unwrap(),
         ));

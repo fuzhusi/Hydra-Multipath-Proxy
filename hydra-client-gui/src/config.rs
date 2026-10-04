@@ -59,7 +59,8 @@ pub struct SubscriptionConfig {
 }
 
 /// GUI 持久化配置。所有字段带 `serde(default)`：缺字段 / 旧版本文件 → 各字段默认值。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Default 手工实现（close_to_tray 默认 true，与 serde 默认一致）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuiConfig {
     /// 代理本地监听地址（如 "127.0.0.1:1080"）
     #[serde(default)]
@@ -90,6 +91,33 @@ pub struct GuiConfig {
     /// 订阅列表（Exec-C v1；旧版本配置文件缺此字段 → 空列表）
     #[serde(default)]
     pub subscriptions: Vec<SubscriptionConfig>,
+    /// T2：关闭窗口时的行为——true（默认）= 隐藏到系统托盘（代理继续运行）；
+    /// false = 直接退出（停止代理并清理系统代理）。
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
+}
+
+/// serde 默认值：true（关窗默认隐藏到托盘）
+fn default_true() -> bool {
+    true
+}
+
+/// 手工 Default：close_to_tray = true（与 serde `default = "default_true"` 保持一致）
+impl Default for GuiConfig {
+    fn default() -> Self {
+        Self {
+            proxy_listen_addr: String::new(),
+            node_addrs: Vec::new(),
+            auth_key: String::new(),
+            cert_path: String::new(),
+            cert_der_b64: String::new(),
+            hydra_mode: String::new(),
+            obfs_key: String::new(),
+            probe_interval_secs: None,
+            subscriptions: Vec::new(),
+            close_to_tray: true,
+        }
+    }
 }
 
 impl GuiConfig {
@@ -273,6 +301,7 @@ mod tests {
             obfs_key: "second-password".into(),
             probe_interval_secs: Some(15),
             subscriptions: Vec::new(),
+            close_to_tray: true,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: GuiConfig = serde_json::from_str(&json).unwrap();
@@ -324,6 +353,7 @@ mod tests {
             obfs_key: String::new(),
             probe_interval_secs: Some(30),
             subscriptions: Vec::new(),
+            close_to_tray: true,
         };
         save_to_file(&path, &cfg).expect("保存应成功");
         let loaded = load_from_file(&path)

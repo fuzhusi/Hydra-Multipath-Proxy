@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
+use hydra_protocol::handshake::{self, AuthMode};
 use hydra_protocol::{HydraError, Result};
 
 /// 池中单条连接的包装
@@ -15,6 +16,9 @@ struct PooledConnection {
     last_used: Instant,
     /// 此连接已被用于打开流的次数
     use_count: u64,
+    /// 首条流协商出的节点认证版本：Some(true)=v3、Some(false)=v2；
+    /// None=未协商（Auto 模式下首条流优先试 v3，失败回落 v2 并记忆）
+    negotiated_v3: Option<bool>,
 }
 
 impl PooledConnection {
@@ -23,6 +27,7 @@ impl PooledConnection {
             connection,
             last_used: Instant::now(),
             use_count: 0,
+            negotiated_v3: None,
         }
     }
 
@@ -31,8 +36,58 @@ impl PooledConnection {
         self.connection.close_reason().is_none()
     }
 
-    /// 获取一条双向流并完成每流认证（首块写入一次性 HMAC token），同时更新使用记录
-    async fn open_bi(&mut self, auth_key: &[u8]) -> Result<(SendStream, RecvStream)> {
+    /// v3 通道绑定材料：节点证书 SHA-256 指纹（peer_identity → rustls 0.21
+    /// Vec<Certificate>）+ QUIC/TLS exporter（quinn 0.10 export_keying_material）。
+    fn binding_material(&self) -> Result<([u8; 32], [u8; 32])> {
+        let cert_fp = match self.connection.peer_identity() {
+            Some(any) => {
+                let certs = any
+                    .downcast::<Vec<rustls::Certificate>>()
+                    .map_err(|_| HydraError::ProtocolError("peer_identity 类型异常".into()))?;
+                certs
+                    .first()
+                    .map(|c| handshake::cert_fingerprint(&c.0))
+                    .ok_or_else(|| {
+                        HydraError::ProtocolError("节点未提供证书（无法通道绑定）".into())
+                    })?
+            }
+            None => {
+                return Err(HydraError::ProtocolError(
+                    "连接未完成 TLS 握手（无 peer 证书）".into(),
+                ))
+            }
+        };
+        let mut exporter = [0u8; handshake::EXPORTER_LEN];
+        self.connection
+            .export_keying_material(&mut exporter, handshake::EXPORTER_LABEL, b"")
+            .map_err(|e| {
+                HydraError::ProtocolError(format!("export_keying_material 失败: {e:?}"))
+            })?;
+        Ok((cert_fp, exporter))
+    }
+
+    /// v3 路径：open_bi + Noise_NNpsk2 握手（0x03 版本字节由 client_side 写入）
+    async fn open_bi_v3(&mut self, auth_key: &[u8]) -> Result<(SendStream, RecvStream)> {
+        let (mut send, mut recv) = self
+            .connection
+            .open_bi()
+            .await
+            .map_err(|e| HydraError::ProtocolError(format!("Failed to open stream: {}", e)))?;
+        let (cert_fp, exporter) = self.binding_material()?;
+        match tokio::time::timeout(
+            handshake::HANDSHAKE_TIMEOUT,
+            handshake::client_side(&mut send, &mut recv, auth_key, &cert_fp, &exporter),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Ok((send, recv)),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(HydraError::ProtocolError("v3 握手超时".into())),
+        }
+    }
+
+    /// v2 路径：open_bi + 一次性 HMAC token（行为与 V2 逐字节一致）
+    async fn open_bi_v2(&mut self, auth_key: &[u8]) -> Result<(SendStream, RecvStream)> {
         let (mut send, recv) = self
             .connection
             .open_bi()
@@ -42,9 +97,41 @@ impl PooledConnection {
         send.write_all(&token)
             .await
             .map_err(HydraError::QuinnWriteError)?;
-        self.last_used = Instant::now();
-        self.use_count += 1;
         Ok((send, recv))
+    }
+
+    /// 获取一条已完成认证的双向流。
+    /// Auto：优先 v3，v3 被拒（旧节点）自动回落 v2 并在本连接上记忆，后续流直达。
+    async fn open_bi(&mut self, auth_key: &[u8], auth_mode: AuthMode) -> Result<(SendStream, RecvStream)> {
+        let prefer_v3 = match self.negotiated_v3 {
+            Some(v) => v,
+            None => auth_mode.accepts_v3(),
+        };
+        let result = if prefer_v3 {
+            match self.open_bi_v3(auth_key).await {
+                Ok(r) => {
+                    self.negotiated_v3 = Some(true);
+                    Ok(r)
+                }
+                Err(e) if auth_mode == AuthMode::V3 => Err(e),
+                Err(_) => {
+                    // v3 被拒（v2-only 节点首字节 0x03 不合 legacy token → 静默关流）
+                    warn!("v3 handshake rejected/failed; falling back to v2 token auth");
+                    let r = self.open_bi_v2(auth_key).await;
+                    if r.is_ok() && auth_mode == AuthMode::Auto {
+                        self.negotiated_v3 = Some(false);
+                    }
+                    r
+                }
+            }
+        } else {
+            self.open_bi_v2(auth_key).await
+        };
+        if result.is_ok() {
+            self.last_used = Instant::now();
+            self.use_count += 1;
+        }
+        result
     }
 }
 
@@ -59,8 +146,10 @@ pub struct PoolConfig {
     pub cleanup_interval: Duration,
     /// 新连接的握手超时
     pub connect_timeout: Duration,
-    /// 节点预共享密钥（每条流发送一次性 HMAC 认证 token）
+    /// 节点预共享密钥（每条流认证：v2 HMAC token 或 v3 Noise 握手）
     pub auth_key: Vec<u8>,
+    /// 认证版本（HYDRA_AUTH_MODE=auto|v2|v3；默认 auto：优先 v3、旧节点回落 v2）
+    pub auth_mode: AuthMode,
     /// SNI 伪装域名
     pub sni: String,
     /// 客户端 QUIC/TLS 配置（含节点证书信任根）
@@ -100,7 +189,7 @@ impl ConnectionPool {
 
         while let Some(mut pc) = candidate {
             if pc.is_alive() {
-                match pc.open_bi(&self.config.auth_key).await {
+                match pc.open_bi(&self.config.auth_key, self.config.auth_mode).await {
                     Ok(streams) => {
                         // 连接仍在使用中，放回池中
                         let mut pools = self.pools.write().await;
@@ -131,7 +220,9 @@ impl ConnectionPool {
         let connection = self.connect(addr).await?;
 
         let mut pc = PooledConnection::new(connection);
-        let streams = pc.open_bi(&self.config.auth_key).await?;
+        let streams = pc
+            .open_bi(&self.config.auth_key, self.config.auth_mode)
+            .await?;
 
         // 将连接放入池中
         {
