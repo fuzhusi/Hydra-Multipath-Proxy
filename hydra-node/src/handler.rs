@@ -1,11 +1,12 @@
 use hydra_protocol::{mask_target, AuthToken, HydraError, Result, CLIENT_ID};
 use quinn::{Connection, VarInt};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// 认证失败时静默关闭（不回显任何可区分的错误码，抵御主动探测）
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,6 +33,181 @@ fn abort_stream(send: &mut quinn::SendStream, recv: &mut quinn::RecvStream, code
     let var_code = VarInt::from_u32(code);
     let _ = send.reset(var_code);
     let _ = recv.stop(var_code);
+}
+
+// ── SSRF 目标过滤（遗留 P1-3）──
+// 已认证客户端可能把节点当跳板攻击内网服务或云元数据端点（169.254.169.254）。
+// 对字面 IP 与 DNS 解析结果统一在 TCP 连接前检查，命中即拒绝。
+
+/// `HYDRA_ALLOW_PRIVATE_TARGETS=1` 时放开私有目标（测试基线依赖 127.0.0.1 回显服务器）。
+/// 默认拒绝。每次调用读取 env（per-stream 一次，相对网络 IO 开销可忽略），
+/// 使测试可在进程内随时打开，无初始化顺序陷阱。
+fn private_targets_allowed() -> bool {
+    matches!(
+        std::env::var("HYDRA_ALLOW_PRIVATE_TARGETS"),
+        Ok(v) if v == "1"
+    )
+}
+
+/// SSRF 黑名单判定：命中返回原因（供脱敏日志），未命中返回 None。
+/// 覆盖：loopback（127.0.0.0/8、::1）、链路本地（169.254.0.0/16、fe80::/10）、
+/// RFC1918 私网（10/8、172.16/12、192.168/16）、0.0.0.0/8、IPv6 未指定地址（::）
+/// 与 IPv6 ULA（fc00::/7，RFC1918 的 IPv6 对应物）；
+/// IPv4 映射地址（::ffff:a.b.c.d）与 NAT64（64:ff9b::/96）内嵌 IPv4 一并复查，防绕过。
+fn classify_blocked_ip(ip: IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.octets()[0] == 0 {
+                Some("this-network 0.0.0.0/8")
+            } else if v4.is_loopback() {
+                Some("loopback")
+            } else if v4.is_link_local() {
+                Some("link-local")
+            } else if v4.is_private() {
+                Some("RFC1918 private")
+            } else {
+                None
+            }
+        }
+        IpAddr::V6(v6) => {
+            // ::ffff:a.b.c.d 等价于对应 IPv4 目标，按 IPv4 规则复查
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return classify_blocked_ip(IpAddr::V4(v4));
+            }
+            // NAT64 64:ff9b::/96：尾 4 字节内嵌 IPv4，按 IPv4 规则复查
+            let seg = v6.segments();
+            if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6].iter().all(|&s| s == 0) {
+                let v4 = Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    (seg[6] & 0xff) as u8,
+                    (seg[7] >> 8) as u8,
+                    (seg[7] & 0xff) as u8,
+                );
+                return classify_blocked_ip(IpAddr::V4(v4));
+            }
+            if v6.is_loopback() {
+                Some("loopback")
+            } else if (seg[0] & 0xffc0) == 0xfe80 {
+                Some("link-local")
+            } else if (seg[0] & 0xfe00) == 0xfc00 {
+                Some("IPv6 ULA private")
+            } else if v6.is_unspecified() {
+                Some("unspecified ::")
+            } else {
+                None
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::*;
+
+    #[test]
+    fn loopback_blocked() {
+        assert_eq!(
+            classify_blocked_ip("127.0.0.1".parse().unwrap()),
+            Some("loopback")
+        );
+        // 127.0.0.0/8 全段
+        assert_eq!(
+            classify_blocked_ip("127.9.9.9".parse().unwrap()),
+            Some("loopback")
+        );
+        assert_eq!(
+            classify_blocked_ip("::1".parse().unwrap()),
+            Some("loopback")
+        );
+    }
+
+    #[test]
+    fn link_local_blocked() {
+        assert_eq!(
+            classify_blocked_ip("169.254.169.254".parse().unwrap()),
+            Some("link-local")
+        );
+        assert_eq!(
+            classify_blocked_ip("fe80::1".parse().unwrap()),
+            Some("link-local")
+        );
+    }
+
+    #[test]
+    fn rfc1918_blocked() {
+        assert_eq!(
+            classify_blocked_ip("10.1.2.3".parse().unwrap()),
+            Some("RFC1918 private")
+        );
+        assert_eq!(
+            classify_blocked_ip("172.16.0.1".parse().unwrap()),
+            Some("RFC1918 private")
+        );
+        assert_eq!(
+            classify_blocked_ip("172.31.255.255".parse().unwrap()),
+            Some("RFC1918 private")
+        );
+        assert_eq!(
+            classify_blocked_ip("192.168.1.1".parse().unwrap()),
+            Some("RFC1918 private")
+        );
+        // 172.16/12 边界外不误伤
+        assert_eq!(classify_blocked_ip("172.32.0.1".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn unspecified_blocked() {
+        assert_eq!(
+            classify_blocked_ip("0.0.0.0".parse().unwrap()),
+            Some("this-network 0.0.0.0/8")
+        );
+        assert_eq!(
+            classify_blocked_ip("::".parse().unwrap()),
+            Some("unspecified ::")
+        );
+    }
+
+    #[test]
+    fn ipv6_ula_blocked() {
+        assert_eq!(
+            classify_blocked_ip("fd00::1".parse().unwrap()),
+            Some("IPv6 ULA private")
+        );
+        assert_eq!(
+            classify_blocked_ip("fc00::1".parse().unwrap()),
+            Some("IPv6 ULA private")
+        );
+    }
+
+    #[test]
+    fn embedded_ipv4_rechecked() {
+        // IPv4 映射：内嵌回环/私网/链路本地必须被拦下（绕过向量）
+        assert_eq!(
+            classify_blocked_ip("::ffff:127.0.0.1".parse().unwrap()),
+            Some("loopback")
+        );
+        assert_eq!(
+            classify_blocked_ip("::ffff:169.254.169.254".parse().unwrap()),
+            Some("link-local")
+        );
+        // NAT64 内嵌
+        assert_eq!(
+            classify_blocked_ip("64:ff9b::a00:1".parse().unwrap()),
+            Some("RFC1918 private")
+        );
+        // 内嵌公网 IPv4 不拦
+        assert_eq!(classify_blocked_ip("::ffff:8.8.8.8".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn public_targets_pass() {
+        assert_eq!(classify_blocked_ip("8.8.8.8".parse().unwrap()), None);
+        assert_eq!(classify_blocked_ip("1.1.1.1".parse().unwrap()), None);
+        assert_eq!(
+            classify_blocked_ip("2606:4700::1111".parse().unwrap()),
+            None
+        );
+    }
 }
 
 pub struct ConnectionHandler {
@@ -173,6 +349,26 @@ impl ConnectionHandler {
             "Connecting to target: {} (with 15s timeout)",
             mask_target(&target_addr.to_string())
         );
+
+        // ── SSRF 目标过滤（遗留 P1-3）：字面 IP 与 DNS 解析结果统一复查，命中即拒绝。
+        // 默认拒绝；HYDRA_ALLOW_PRIVATE_TARGETS=1 放开（测试基线依赖 127.0.0.1 回显服务器）。
+        if !private_targets_allowed() {
+            if let Some(reason) = classify_blocked_ip(target_addr.ip()) {
+                // 脱敏日志：只记短哈希，不落目标明文
+                warn!(
+                    "Blocked SSRF target (private/reserved: {}): {}",
+                    reason,
+                    mask_target(&target_addr.to_string())
+                );
+                // 走既有 0x11 错误路径（与"无法连接目标"同码，不给探测者额外指纹）
+                abort_stream(&mut send, &mut recv, ERR_TARGET_CONNECT);
+                return Err(HydraError::ConnectionError(format!(
+                    "Target blocked (private/reserved: {})",
+                    reason
+                )));
+            }
+        }
+
         let connect_start = std::time::Instant::now();
 
         // Connect to target with timeout（须小于客户端 20s 应答超时，否则慢目标被误判为节点故障）
@@ -328,7 +524,8 @@ impl ConnectionHandler {
         info!(
             "Connection to {} closed (QUIC->Target: {} bytes, Target->QUIC: {} bytes)",
             mask_target(&target_addr.to_string()),
-            quic_bytes, target_bytes
+            quic_bytes,
+            target_bytes
         );
         Ok(())
     }

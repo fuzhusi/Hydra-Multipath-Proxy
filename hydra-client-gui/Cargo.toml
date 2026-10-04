@@ -14,6 +14,8 @@ rfd = "0.15"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 chrono = "0.4"
+# Exec-C：订阅拉取（轻量阻塞 HTTP，含 rustls https；GUI 后台线程调用，不进解析层依赖）
+ureq = "2"
 hydra-client = { path = "../hydra-client" }
 hydra-protocol = { path = "../hydra-protocol" }
 

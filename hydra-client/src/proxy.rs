@@ -256,13 +256,18 @@ impl ProxyServer {
             peer_addr, target
         );
 
-        let candidates = scheduler.get_nodes_by_priority().await;
+        let mut candidates = scheduler.get_nodes_by_priority().await;
         if candidates.is_empty() {
             error!("[{}] No available nodes in scheduler!", peer_addr);
             return Err(HydraError::ConnectionError(
                 "No available nodes".to_string(),
             ));
         }
+
+        // V3.3 方案 B（连接级多路径分发，默认关闭）：HYDRA_AGGREGATE=1 且 Online
+        // 节点 ≥2 时，把评分加权选中的节点换到候选首位，其余候选保持评分降序作为
+        // 故障切换后备；未启用/单节点时本调用是空操作，候选顺序与启用前逐位一致。
+        crate::aggregate::maybe_reorder_candidates(&mut candidates, peer_addr, target);
 
         // 目标地址带 2 字节大端长度前缀，节点侧 read_exact 读取，杜绝流式截断
         let addr_bytes = target.as_bytes();
@@ -311,6 +316,8 @@ impl ProxyServer {
                         mask_target(target),
                         node.address
                     );
+                    // V3.3：按实际承接节点计数（聚合观测/测试断言"两节点都收到流量"）
+                    crate::aggregate::record_node_served(node.address);
                     return Ok((send, recv));
                 }
                 // 节点存活：目标连接失败/DNS 失败属于目标侧问题，不降级节点（兼容旧版节点状态字节路径）

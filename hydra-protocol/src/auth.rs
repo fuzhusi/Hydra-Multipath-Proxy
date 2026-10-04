@@ -80,9 +80,7 @@ impl AuthToken {
 
         // 允许 ±5s 时钟偏移：客户端与节点跨机部署时时钟差会把健康节点误判为故障
         const CLOCK_SKEW_TOLERANCE: u64 = 5;
-        if timestamp > now + CLOCK_SKEW_TOLERANCE
-            || now.saturating_sub(timestamp) > max_age_secs
-        {
+        if timestamp > now + CLOCK_SKEW_TOLERANCE || now.saturating_sub(timestamp) > max_age_secs {
             return Err(AuthError::TokenExpired);
         }
 
@@ -94,9 +92,8 @@ impl AuthToken {
         message.extend_from_slice(nonce);
 
         let expected = hmac::sign(&hmac_key, &message);
-        ring::constant_time::verify_slices_are_equal(
-            expected.as_ref(), received_hmac
-        ).map_err(|_| AuthError::InvalidToken)
+        ring::constant_time::verify_slices_are_equal(expected.as_ref(), received_hmac)
+            .map_err(|_| AuthError::InvalidToken)
     }
 }
 
@@ -117,39 +114,6 @@ impl std::fmt::Display for AuthError {
             AuthError::InvalidCredentials => write!(f, "Invalid credentials"),
             AuthError::AuthRequired => write!(f, "Authentication required"),
         }
-    }
-}
-
-/// 速率限制器
-pub struct AuthRateLimiter {
-    attempts: std::sync::Mutex<HashMap<std::net::IpAddr, Vec<std::time::Instant>>>,
-    max_attempts: usize,
-    window: std::time::Duration,
-}
-
-impl AuthRateLimiter {
-    pub fn new(max_attempts: usize, window_secs: u64) -> Self {
-        Self {
-            attempts: std::sync::Mutex::new(HashMap::new()),
-            max_attempts,
-            window: std::time::Duration::from_secs(window_secs),
-        }
-    }
-
-    /// 检查是否允许请求，返回 true 表示允许
-    pub fn check(&self, addr: std::net::IpAddr) -> bool {
-        let mut attempts = self.attempts.lock().unwrap();
-        let now = std::time::Instant::now();
-
-        let entry = attempts.entry(addr).or_default();
-        entry.retain(|t| now.duration_since(*t) < self.window);
-
-        if entry.len() >= self.max_attempts {
-            return false; // 速率限制
-        }
-
-        entry.push(now);
-        true
     }
 }
 
@@ -187,7 +151,8 @@ pub fn verify_password(password: &str, stored: &StoredCredential) -> bool {
         &stored.salt,
         password.as_bytes(),
         &stored.hash,
-    ).is_ok()
+    )
+    .is_ok()
 }
 
 /// 创建新的凭据

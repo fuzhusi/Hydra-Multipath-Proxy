@@ -10,6 +10,8 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 quinn = "0.10"
+# 直接依赖 quinn-proto 以实现 congestion::Controller trait（与 quinn 0.10 同一 0.10.x 实例）
+quinn-proto = "0.10"
 rustls = "0.21"
 ring = "0.16"
 serde = { version = "1", features = ["derive"] }

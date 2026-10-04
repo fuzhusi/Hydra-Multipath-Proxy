@@ -33,6 +33,31 @@ pub const HYDRA_MODE_ENV: &str = "HYDRA_MODE";
 pub const HYDRA_OBFS_KEY_ENV: &str = "HYDRA_OBFS_KEY";
 pub const HYDRA_PROBE_INTERVAL_ENV: &str = "HYDRA_PROBE_INTERVAL_SECS";
 
+/// 手动添加节点的来源标记文案（节点来源：手动 | 订阅名，见 [`SubscriptionConfig`]）
+pub const NODE_SOURCE_MANUAL: &str = "手动";
+
+/// 订阅项配置（Exec-C 订阅格式 v1）。
+///
+/// 订阅来源支持 http(s) URL 或本地文件路径（`hydra-sub://` 前缀可选），
+/// 拉取与解析见 `subscription.rs` / `hydra-client::parse_subscription`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SubscriptionConfig {
+    /// 订阅名称（展示用，同时作为该订阅节点的来源标记）
+    #[serde(default)]
+    pub name: String,
+    /// 订阅来源：http(s) URL 或本地文件路径（支持 `hydra-sub://` 前缀）
+    #[serde(default)]
+    pub source: String,
+    /// 上次成功更新的 Unix 时间戳（秒）；None = 从未成功更新
+    #[serde(default)]
+    pub last_updated_secs: Option<u64>,
+    /// 该订阅上次拉取成功归属到节点列表的地址（"host:port"）。
+    /// 用于「更新订阅」时替换旧节点、删除订阅时连带清理，以及节点来源标记；
+    /// 与手动添加/其他订阅冲突的地址不记入（保持原来源）。
+    #[serde(default)]
+    pub nodes: Vec<String>,
+}
+
 /// GUI 持久化配置。所有字段带 `serde(default)`：缺字段 / 旧版本文件 → 各字段默认值。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct GuiConfig {
@@ -57,6 +82,31 @@ pub struct GuiConfig {
     /// Offline 恢复探测间隔（秒，对应 HYDRA_PROBE_INTERVAL_SECS）；None = 用库默认（30）
     #[serde(default)]
     pub probe_interval_secs: Option<u64>,
+    /// 订阅列表（Exec-C v1；旧版本配置文件缺此字段 → 空列表）
+    #[serde(default)]
+    pub subscriptions: Vec<SubscriptionConfig>,
+}
+
+impl GuiConfig {
+    /// 节点来源标记（单一事实来源 = 各订阅的 `nodes` 列表，避免平行账本漂移）：
+    /// 地址出现在某订阅的 nodes 中 → "订阅:<名>"；否则 → [`NODE_SOURCE_MANUAL`]。
+    /// 多个订阅含同一地址时取先匹配者。
+    pub fn node_source_label(&self, addr: &str) -> String {
+        for sub in &self.subscriptions {
+            if sub.nodes.iter().any(|n| n == addr) {
+                return format!("订阅:{}", sub.name);
+            }
+        }
+        NODE_SOURCE_MANUAL.to_string()
+    }
+
+    /// 所有订阅已认领的节点地址集合（更新订阅/删除订阅时用于"保留手动节点"判定）
+    pub fn subscription_owned_addrs(&self) -> Vec<String> {
+        self.subscriptions
+            .iter()
+            .flat_map(|s| s.nodes.iter().cloned())
+            .collect()
+    }
 }
 
 impl GuiConfig {
@@ -207,6 +257,7 @@ mod tests {
             hydra_mode: "obfs".into(),
             obfs_key: "second-password".into(),
             probe_interval_secs: Some(15),
+            subscriptions: Vec::new(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: GuiConfig = serde_json::from_str(&json).unwrap();
@@ -256,6 +307,7 @@ mod tests {
             hydra_mode: "masquerade".into(),
             obfs_key: String::new(),
             probe_interval_secs: Some(30),
+            subscriptions: Vec::new(),
         };
         save_to_file(&path, &cfg).expect("保存应成功");
         let loaded = load_from_file(&path)
@@ -370,5 +422,83 @@ mod tests {
             ..Default::default()
         }
         .is_obfs());
+    }
+
+    // ===================== Exec-C：订阅字段持久化 =====================
+
+    #[test]
+    fn test_subscriptions_serde_roundtrip() {
+        // 含订阅的完整往返
+        let cfg = GuiConfig {
+            subscriptions: vec![
+                SubscriptionConfig {
+                    name: "主订阅".into(),
+                    source: "https://example.com/hydra-sub.txt".into(),
+                    last_updated_secs: Some(1_700_000_000),
+                    nodes: vec!["10.0.0.1:4433".into(), "10.0.0.2:4433".into()],
+                },
+                SubscriptionConfig {
+                    name: "本地文件".into(),
+                    source: "hydra-sub://D:\\subs\\a.txt".into(),
+                    last_updated_secs: None,
+                    nodes: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: GuiConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn test_old_config_without_subscriptions_field() {
+        // 旧版本配置文件（无 subscriptions 字段）→ 空列表，不报错（向后兼容）
+        let old: GuiConfig = serde_json::from_str(r#"{"auth_key":"ff"}"#).unwrap();
+        assert!(old.subscriptions.is_empty());
+
+        // 订阅项缺字段 → 补默认（None / 空列表）
+        let partial: GuiConfig =
+            serde_json::from_str(r#"{"subscriptions":[{"name":"a","source":"s.txt"}]}"#).unwrap();
+        assert_eq!(partial.subscriptions.len(), 1);
+        assert_eq!(partial.subscriptions[0].name, "a");
+        assert_eq!(partial.subscriptions[0].last_updated_secs, None);
+        assert!(partial.subscriptions[0].nodes.is_empty());
+
+        // 未知字段忽略
+        let cfg: GuiConfig = serde_json::from_str(r#"{"subscriptions":[],"unknown":1}"#).unwrap();
+        assert!(cfg.subscriptions.is_empty());
+    }
+
+    #[test]
+    fn test_node_source_label_and_owned_addrs() {
+        let cfg = GuiConfig {
+            subscriptions: vec![
+                SubscriptionConfig {
+                    name: "主订阅".into(),
+                    source: "https://example.com/s".into(),
+                    last_updated_secs: None,
+                    nodes: vec!["10.0.0.1:4433".into()],
+                },
+                SubscriptionConfig {
+                    name: "备份订阅".into(),
+                    source: "file:///x".into(),
+                    last_updated_secs: None,
+                    nodes: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        // 订阅节点 → 订阅名标记；其余 → 手动
+        assert_eq!(cfg.node_source_label("10.0.0.1:4433"), "订阅:主订阅");
+        assert_eq!(cfg.node_source_label("1.2.3.4:1"), NODE_SOURCE_MANUAL);
+        // 空配置全部手动
+        assert_eq!(
+            GuiConfig::default().node_source_label("1.2.3.4:1"),
+            NODE_SOURCE_MANUAL
+        );
+
+        let owned = cfg.subscription_owned_addrs();
+        assert_eq!(owned, vec!["10.0.0.1:4433".to_string()]);
     }
 }

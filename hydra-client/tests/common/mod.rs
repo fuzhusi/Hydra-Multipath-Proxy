@@ -32,6 +32,9 @@ pub async fn spawn_node() -> TestNode {
 
 /// 在指定地址启动节点服务器（指定 127.0.0.1:0 则随机端口）
 pub async fn spawn_node_on(addr: SocketAddr) -> TestNode {
+    // 测试全部使用 127.0.0.1 回显与回环目标：放宽节点侧 SSRF 过滤
+    // （生产默认拒绝私有目标；见 hydra-node/src/handler.rs 与 docs/guides/部署指南.md）
+    std::env::set_var("HYDRA_ALLOW_PRIVATE_TARGETS", "1");
     let seq = SEQ.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("hydra-test-{}-{}", std::process::id(), seq));
     std::fs::create_dir_all(&dir).unwrap();
@@ -48,6 +51,8 @@ pub async fn spawn_node_on(addr: SocketAddr) -> TestNode {
 /// C2：在指定传输模式下启动节点（mode 显式传入，不依赖进程 env；
 /// obfs 模式的混淆密码仍经 HYDRA_OBFS_KEY env——由 E2E 在进程内统一设置）
 pub async fn spawn_node_in_mode(addr: SocketAddr, mode: hydra_obfs::TransportMode) -> TestNode {
+    // 同 spawn_node_on：测试回环目标需放宽节点侧 SSRF 过滤
+    std::env::set_var("HYDRA_ALLOW_PRIVATE_TARGETS", "1");
     let seq = SEQ.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("hydra-obfs-test-{}-{}", std::process::id(), seq));
     std::fs::create_dir_all(&dir).unwrap();

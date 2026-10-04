@@ -1,11 +1,8 @@
-pub mod server;
-pub mod handler;
-pub mod config;
 pub mod cert;
+pub mod handler;
 pub mod health;
+pub mod server;
 
-pub use server::*;
 pub use handler::*;
-pub use config::*;
 pub use health::*;
-
+pub use server::*;

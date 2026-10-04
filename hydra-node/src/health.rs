@@ -41,7 +41,12 @@ pub fn health_addr_from_env() -> Result<Option<SocketAddr>, String> {
 pub fn build_response(method: &str, path: &str, mode: &str, uptime_secs: u64) -> String {
     if path == "/health" {
         if !method.eq_ignore_ascii_case("GET") {
-            return simple_response(405, "Method Not Allowed", "text/plain", "method not allowed\n");
+            return simple_response(
+                405,
+                "Method Not Allowed",
+                "text/plain",
+                "method not allowed\n",
+            );
         }
         // mode/version 均为受控静态字符串，无需 JSON 转义
         let body = format!(
@@ -112,19 +117,12 @@ impl HealthServer {
     }
 
     /// 处理单个连接：只读首行请求行，写响应即关闭（不处理 body/keep-alive）
-    async fn serve_one(
-        mut stream: tokio::net::TcpStream,
-        mode: String,
-        started: Instant,
-    ) {
+    async fn serve_one(mut stream: tokio::net::TcpStream, mode: String, started: Instant) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         // 首行足够；上限 1KB 防御异常客户端
         let mut buf = vec![0u8; 1024];
-        let n = match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            stream.read(&mut buf),
-        )
-        .await
+        let n = match tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
+            .await
         {
             Ok(Ok(n)) if n > 0 => n,
             _ => return,

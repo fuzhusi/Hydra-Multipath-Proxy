@@ -1,3 +1,4 @@
+pub mod aggregate;
 pub mod assembler;
 pub mod buf_pool;
 pub mod crypto;
@@ -10,9 +11,11 @@ pub mod session;
 pub mod share_link;
 pub mod speedtest;
 pub mod splitter;
+pub mod subscription;
 pub mod traffic;
 pub mod transport;
 
+pub use aggregate::*;
 pub use assembler::*;
 pub use buf_pool::*;
 pub use crypto::*;
@@ -25,6 +28,7 @@ pub use session::*;
 pub use share_link::*;
 pub use speedtest::*;
 pub use splitter::*;
+pub use subscription::*;
 pub use traffic::*;
 pub use transport::*;
 

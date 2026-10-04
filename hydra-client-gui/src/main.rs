@@ -1,16 +1,17 @@
 use eframe::egui;
 use hydra_client::{
     format_bytes, format_duration, format_speed, generate_share_links, parse_share_links,
-    ProxyServer, Scheduler, TrafficMonitor, Transport,
+    ProxyServer, Scheduler, ShareLink, TrafficMonitor, Transport,
 };
 use hydra_protocol::{NodeInfo, NodeStatus};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 mod config;
-use config::GuiConfig;
+use config::{GuiConfig, SubscriptionConfig};
+mod subscription;
 
 #[derive(Clone, Debug)]
 struct NodeStatusInfo {
@@ -33,6 +34,15 @@ struct HydraApp {
 
     // 输入状态
     new_node_input: String,
+
+    // 订阅（Exec-C v1）：新订阅输入 + 后台更新线程/队列
+    new_sub_name: String,
+    new_sub_source: String,
+    sub_update_receiver: Option<
+        std::sync::mpsc::Receiver<std::result::Result<subscription::SubscriptionOutcome, String>>,
+    >,
+    /// 待更新订阅队列（"更新全部订阅"与单条更新共用一条后台通道，逐个串行拉取）
+    pending_sub_updates: VecDeque<(String, String)>,
 
     // 分享链接相关
     share_link_text: String,
@@ -73,6 +83,10 @@ impl Default for HydraApp {
             saved_snapshot: GuiConfig::default(),
             last_config_save: None,
             new_node_input: String::new(),
+            new_sub_name: String::new(),
+            new_sub_source: String::new(),
+            sub_update_receiver: None,
+            pending_sub_updates: VecDeque::new(),
             share_link_text: String::new(),
             show_share_link_dialog: false,
             show_auth_key: false,
@@ -157,6 +171,10 @@ impl HydraApp {
             last_config_save: None,
             config: cfg,
             new_node_input: String::new(),
+            new_sub_name: String::new(),
+            new_sub_source: String::new(),
+            sub_update_receiver: None,
+            pending_sub_updates: VecDeque::new(),
             share_link_text: String::new(),
             show_share_link_dialog: false,
             show_auth_key: false,
@@ -850,6 +868,260 @@ impl HydraApp {
             }
         }
     }
+
+    // ═══════════════ Exec-C：订阅（hydra-sub v1）═══════════════
+    //
+    // 数据流：UI 线程 queue_subscription_update → 后台线程 fetch_and_parse_subscription
+    // （ureq 阻塞拉取/文件读取 + parse_subscription）→ mpsc → UI 线程
+    // poll_subscription_updates → apply_subscription_update 合并替换。
+    // 单条后台通道 + 待更新队列：多订阅串行拉取，UI 零阻塞。
+
+    /// 添加订阅（名称可留空自动编号；名称重复拒绝——名称是来源标记与更新对号的键）
+    fn add_subscription(&mut self) {
+        let source = self.new_sub_source.trim().to_string();
+        if source.is_empty() {
+            self.add_log(
+                "订阅来源不能为空（http(s) URL、文件路径或 hydra-sub:// 前缀）".to_string(),
+            );
+            return;
+        }
+        let name = if self.new_sub_name.trim().is_empty() {
+            format!("订阅{}", self.config.subscriptions.len() + 1)
+        } else {
+            self.new_sub_name.trim().to_string()
+        };
+        if self.config.subscriptions.iter().any(|s| s.name == name) {
+            self.add_log(format!("订阅名称「{}」已存在，请换一个名称", name));
+            return;
+        }
+        self.config.subscriptions.push(SubscriptionConfig {
+            name: name.clone(),
+            source,
+            last_updated_secs: None,
+            nodes: Vec::new(),
+        });
+        self.add_log(format!("已添加订阅「{}」，点「更新」拉取节点", name));
+        self.new_sub_name.clear();
+        self.new_sub_source.clear();
+    }
+
+    /// 删除订阅：连带清理仅该订阅认领的节点（手动/其他订阅认领的保留）
+    fn delete_subscription(&mut self, idx: usize) {
+        if idx >= self.config.subscriptions.len() {
+            return;
+        }
+        let sub = self.config.subscriptions.remove(idx);
+        let others_owned: HashSet<String> =
+            self.config.subscription_owned_addrs().into_iter().collect();
+        let removed: Vec<String> = sub
+            .nodes
+            .iter()
+            .filter(|a| !others_owned.contains(*a))
+            .cloned()
+            .collect();
+        self.config.node_addrs.retain(|a| !removed.contains(a));
+        for a in &removed {
+            self.node_status.remove(a);
+        }
+        self.add_log(format!(
+            "删除订阅「{}」，连带移除其节点 {} 个",
+            sub.name,
+            removed.len()
+        ));
+    }
+
+    /// 排队更新一个订阅（后台串行）
+    fn queue_subscription_update(&mut self, name: String, source: String) {
+        self.pending_sub_updates.push_back((name, source));
+        self.start_next_subscription_update();
+    }
+
+    /// 更新全部订阅
+    fn update_all_subscriptions(&mut self) {
+        if self.config.subscriptions.is_empty() {
+            self.add_log("没有订阅可更新，请先在「订阅」区添加".to_string());
+            return;
+        }
+        for s in &self.config.subscriptions {
+            self.pending_sub_updates
+                .push_back((s.name.clone(), s.source.clone()));
+        }
+        self.start_next_subscription_update();
+    }
+
+    /// 启动队列中的下一个订阅更新（已有更新在跑则返回；已删除的订阅跳过）
+    fn start_next_subscription_update(&mut self) {
+        if self.sub_update_receiver.is_some() {
+            return;
+        }
+        loop {
+            let Some((name, source)) = self.pending_sub_updates.pop_front() else {
+                return;
+            };
+            if !self.config.subscriptions.iter().any(|s| s.name == name) {
+                self.add_log(format!("订阅「{}」已删除，跳过更新", name));
+                continue;
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.add_log(format!("开始更新订阅「{}」...", name));
+            std::thread::spawn(move || {
+                let result = subscription::fetch_and_parse_subscription(
+                    name.clone(),
+                    source.clone(),
+                    subscription::SUBSCRIPTION_FETCH_TIMEOUT,
+                );
+                let _ = tx.send(result);
+            });
+            self.sub_update_receiver = Some(rx);
+            return;
+        }
+    }
+
+    /// 在 update 循环中非阻塞地收取订阅更新结果并启动下一个排队更新
+    fn poll_subscription_updates(&mut self) {
+        let mut finished = None;
+        if let Some(rx) = &self.sub_update_receiver {
+            match rx.try_recv() {
+                Ok(result) => finished = Some(result),
+                // 线程 panic 等导致 sender 被弃：重置，允许再次发起
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.sub_update_receiver = None;
+                    self.add_log("订阅更新线程异常退出，已重置".to_string());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(result) = finished {
+            self.sub_update_receiver = None;
+            match result {
+                Ok(outcome) => {
+                    // 安全约定：明文 http 允许但必须提示（订阅可被中间人注入任意节点地址）
+                    if outcome.plaintext_http {
+                        self.add_log(format!(
+                            "⚠ 订阅「{}」使用明文 HTTP 拉取，内容可能被篡改，建议改用 https",
+                            outcome.name
+                        ));
+                    }
+                    self.apply_subscription_update(&outcome.name, outcome.links, outcome.errors);
+                }
+                Err(e) => self.add_log(format!("订阅更新失败: {}", e)),
+            }
+        }
+        self.start_next_subscription_update();
+    }
+
+    /// 订阅更新成功后的节点合并替换：
+    /// - 手动节点与其它订阅的节点全部保留；
+    /// - 本订阅旧节点被新列表替换（仅移除"仅本订阅认领"的地址）；
+    /// - 与手动/其它订阅冲突的地址不重复添加，归属保持原状（单一事实来源 =
+    ///   各订阅 nodes 列表，见 GuiConfig::node_source_label）。
+    fn apply_subscription_update(
+        &mut self,
+        name: &str,
+        links: Vec<ShareLink>,
+        errors: Vec<String>,
+    ) {
+        let Some(idx) = self
+            .config
+            .subscriptions
+            .iter()
+            .position(|s| s.name == name)
+        else {
+            self.add_log(format!("订阅「{}」已在更新期间被删除，丢弃更新结果", name));
+            return;
+        };
+
+        // 新地址列表（去重保序）
+        let mut new_addrs: Vec<String> = Vec::new();
+        for link in links {
+            let addr = format!("{}:{}", link.address, link.port);
+            if !new_addrs.contains(&addr) {
+                new_addrs.push(addr);
+            }
+        }
+
+        let old_sub_nodes = self.config.subscriptions[idx].nodes.clone();
+        let owned_before: HashSet<String> =
+            self.config.subscription_owned_addrs().into_iter().collect();
+        let manual_set: HashSet<String> = self
+            .config
+            .node_addrs
+            .iter()
+            .filter(|a| !owned_before.contains(*a))
+            .cloned()
+            .collect();
+        let others_set: HashSet<String> = self
+            .config
+            .subscriptions
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx)
+            .flat_map(|(_, s)| s.nodes.iter().cloned())
+            .collect();
+        let new_set: HashSet<String> = new_addrs.iter().cloned().collect();
+
+        // 1) 移除：仅本订阅认领、且新列表不再包含的旧节点
+        let to_remove: Vec<String> = old_sub_nodes
+            .iter()
+            .filter(|a| {
+                !new_set.contains(*a) && !manual_set.contains(*a) && !others_set.contains(*a)
+            })
+            .cloned()
+            .collect();
+        self.config.node_addrs.retain(|a| !to_remove.contains(a));
+        for a in &to_remove {
+            self.node_status.remove(a);
+        }
+
+        // 2) 追加：新地址中尚未在列表、且不被其他订阅认领的
+        let mut added = 0usize;
+        for a in &new_addrs {
+            if self.config.node_addrs.contains(a) || others_set.contains(a) {
+                continue;
+            }
+            self.node_status.entry(a.clone()).or_insert(NodeStatusInfo {
+                addr: a.clone(),
+                connected: false,
+                last_check: None,
+                latency_ms: None,
+            });
+            self.config.node_addrs.push(a.clone());
+            added += 1;
+        }
+
+        // 3) 本订阅新认领列表：最终在列表中、非手动、非其他订阅的地址
+        let claimed: Vec<String> = new_addrs
+            .iter()
+            .filter(|a| {
+                self.config.node_addrs.contains(*a)
+                    && !manual_set.contains(*a)
+                    && !others_set.contains(*a)
+            })
+            .cloned()
+            .collect();
+        self.config.subscriptions[idx].nodes = claimed;
+        self.config.subscriptions[idx].last_updated_secs = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
+
+        self.add_log(format!(
+            "订阅「{}」更新成功：{} 个节点（坏行 {} 条跳过，新增 {}、移除 {}）",
+            name,
+            new_addrs.len(),
+            errors.len(),
+            added,
+            to_remove.len()
+        ));
+        for e in errors.iter().take(3) {
+            self.add_log(format!("  订阅坏行: {}", e));
+        }
+        if errors.len() > 3 {
+            self.add_log(format!("  ...另有 {} 条坏行省略", errors.len() - 3));
+        }
+    }
 }
 
 impl eframe::App for HydraApp {
@@ -911,6 +1183,8 @@ impl eframe::App for HydraApp {
         self.poll_health_check_results();
         // 非阻塞地处理单节点手动测试结果（A5）
         self.poll_node_test_results();
+        // 非阻塞地处理订阅更新结果（Exec-C，串行驱动排队更新）
+        self.poll_subscription_updates();
 
         // 分享链接对话框
         if self.show_share_link_dialog {
@@ -1001,6 +1275,81 @@ impl eframe::App for HydraApp {
 
             ui.separator();
 
+            // ── Exec-C：订阅（hydra-sub v1：多行 hydra:// 链接，支持 base64 与
+            //    http(s)/文件来源；内容不含密钥本体）──
+            ui.heading("订阅");
+            ui.horizontal(|ui| {
+                ui.label("名称:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_sub_name)
+                        .desired_width(110.0)
+                        .hint_text("可留空自动编号"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("来源:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_sub_source)
+                        .desired_width(ui.available_width() - 80.0)
+                        .hint_text("https://… / 文件路径 / hydra-sub://…"),
+                );
+                if ui.button("浏览...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("订阅文件", &["txt", "sub"])
+                        .add_filter("全部文件", &["*"])
+                        .pick_file()
+                    {
+                        self.new_sub_source = path.display().to_string();
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("添加订阅").clicked() {
+                    self.add_subscription();
+                }
+                if ui.button("更新全部订阅").clicked() {
+                    self.update_all_subscriptions();
+                }
+                if self.sub_update_receiver.is_some() {
+                    ui.label("⏳ 更新中...");
+                }
+            });
+
+            // 订阅列表：名称 / 节点数 / 上次更新 + 单条更新/删除
+            let subs_clone = self.config.subscriptions.clone();
+            let mut subs_to_remove: Vec<usize> = Vec::new();
+            for (i, sub) in subs_clone.iter().enumerate() {
+                let updated = sub
+                    .last_updated_secs
+                    .and_then(|s| chrono::DateTime::from_timestamp(s as i64, 0))
+                    .map(|dt| {
+                        dt.with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "从未".to_string());
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "{}（{} 节点，更新: {}）",
+                        sub.name,
+                        sub.nodes.len(),
+                        updated
+                    ));
+                    if ui.button("更新").clicked() {
+                        self.queue_subscription_update(sub.name.clone(), sub.source.clone());
+                    }
+                    if ui.button("删除").clicked() {
+                        subs_to_remove.push(i);
+                    }
+                });
+                ui.small(&sub.source);
+            }
+            for &i in subs_to_remove.iter().rev() {
+                self.delete_subscription(i);
+            }
+
+            ui.separator();
+
             // 节点列表
             ui.heading("节点列表");
             let mut indices_to_remove = Vec::new();
@@ -1032,6 +1381,9 @@ impl eframe::App for HydraApp {
                         format!("{}. {} (未测试)", i + 1, node_addr)
                     };
                     ui.label(label_text);
+
+                    // Exec-C：节点来源标记（手动 / 订阅名）
+                    ui.small(format!("[{}]", self.config.node_source_label(node_addr)));
 
                     if ui.button("测试").clicked() {
                         // A5：后台线程 + 通道模式（对齐 test_all_nodes），UI 线程零阻塞，
