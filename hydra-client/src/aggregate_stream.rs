@@ -9,8 +9,14 @@
 //!   各自写 auth token + `[0x01][channel_id 8B][role=1]`；目标地址声明只由
 //!   创建流（role=0）携带。数据帧格式 `[channel_id 8B][seq 4B][len 2B][payload]`。
 //! - **上行**：按 chunk 轮转分发到可用流并分配单调 seq；本端维护 replay
-//!   窗口（≤4MB），流死亡时把窗口内未确认块按原 seq 重发到存活流，
+//!   窗口（≤4MB 注：现为 CHANNEL_WINDOW=32MB），流死亡时把窗口内未确认块按原 seq 重发到存活流，
 //!   节点按 seq 去重（`seq < next` 忽略、pending 同 seq 覆盖同内容）。
+//!   **V3.4 v2 上行 ACK/NACK 重传协议**：节点每次上行推进后经下行帧通道发
+//!   ACK（保留 seq=0xFFFFFFFF，payload=8B 大端 ack_next 累计确认），客户端
+//!   弹出已确认 replay 条目并对 sent 超时（300ms）未确认帧按序重发；
+//!   finish 半关闭前先排空确认（全部 ACK 或 5s 超时 → 显式 Err(Transport)），
+//!   修复高容量偶发单帧永久丢失。下行数据帧 seq 从 0 递增，4B 空间内与
+//!   ACK_SEQ 无碰撞。
 //! - **下行**：按 seq 重排（有界窗口 4MB + 5s 空洞超时兜底），重复 seq 丢弃；
 //!   节点流死亡时以窗口缓存重发补齐在途丢帧。
 //! - **接管（验收②）**：任一流 reset/失败 → 该流摘除、双向在途丢帧由
@@ -57,6 +63,17 @@ pub const CHANNEL_WINDOW: usize = 32 * 1024 * 1024;
 pub const CHANNEL_HOLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 节点转发阶段 IO 错误码（与 hydra-node 0x13 / proxy::NODE_ERR_FORWARD_IO 一致）
 const NODE_ERR_FORWARD_IO: u64 = 0x13;
+/// 上行 ACK 控制帧保留 seq（节点→客户端，借道现有下行帧通道）。
+/// 节点下行数据帧 seq 从 0 递增，4B 空间需 ~42 亿帧才回绕至此，无碰撞。
+pub const ACK_SEQ: u32 = u32::MAX;
+/// ACK 帧 payload 长度：8 字节大端 ack_next
+const ACK_PAYLOAD: usize = 8;
+/// 未确认帧重传判定：sent 距今超过此时长且尚未被 ACK → 按序重发
+const RETRANSMIT_AFTER: Duration = Duration::from_millis(300);
+/// finish 排空确认总时限：超时仍未全部 ACK → Err(Transport)（显式失败，不静默截断）
+const DRAIN_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+/// ACK 排空期间轮询/等待粒度
+const ACK_POLL: Duration = Duration::from_millis(20);
 /// 客户端主动 reset 数据流时使用的应用错误码（测试钩子用，非 A3 语义码）
 const SELF_RESET_CODE: u32 = 0x16;
 
@@ -178,23 +195,51 @@ impl std::fmt::Display for ChannelError {
 
 // ── 上行：多流写入器（write_all 语义 + seq 轮转 + replay 重发）──────────
 
-/// replay 窗口：最近已写 chunk（seq, bytes），容量有界（强制门④：有界性单测）
+/// replay 窗口：最近已写 chunk（seq, bytes, sent），容量有界（强制门④：有界性单测）。
+/// V3.4 v2：每条目记录最近一次发送时刻，支撑"ACK 确认 + 超时重发"。
 #[derive(Default)]
 struct ReplayBuf {
-    items: VecDeque<(u32, Vec<u8>)>,
+    items: VecDeque<(u32, Vec<u8>, std::time::Instant)>,
     bytes: usize,
 }
 
 impl ReplayBuf {
     fn push(&mut self, seq: u32, chunk: &[u8]) {
         self.bytes += chunk.len();
-        self.items.push_back((seq, chunk.to_vec()));
+        self.items
+            .push_back((seq, chunk.to_vec(), std::time::Instant::now()));
         while self.bytes > CHANNEL_WINDOW {
             match self.items.pop_front() {
-                Some((_, old)) => self.bytes -= old.len(),
+                Some((_, old, _)) => self.bytes -= old.len(),
                 None => break,
             }
         }
+    }
+
+    /// ACK 确认：弹出所有 seq < ack_next 的条目（节点已按序交付目标 TCP）。
+    /// 条目按 seq 升序存放，故只需从队首弹出；窗口驱逐导致的缺失无害。
+    fn ack(&mut self, ack_next: u32) {
+        while let Some((seq, chunk, _)) = self.items.front() {
+            if *seq >= ack_next {
+                break;
+            }
+            self.bytes -= chunk.len();
+            self.items.pop_front();
+        }
+    }
+
+    /// 取出过期未确认条目（sent 距今 > 超时），同时刷新其 sent 时间戳（防重复风暴）。
+    /// 返回 (seq, chunk) 列表供上层按序重发；节点按 seq 去重，误重发无害。
+    fn take_expired(&mut self, older_than: Duration) -> Vec<(u32, Vec<u8>)> {
+        let now = std::time::Instant::now();
+        let mut out = Vec::new();
+        for (seq, chunk, sent) in self.items.iter_mut() {
+            if now.duration_since(*sent) > older_than {
+                *sent = now;
+                out.push((*seq, chunk.clone()));
+            }
+        }
+        out
     }
 }
 
@@ -204,6 +249,7 @@ struct UpSlot {
 }
 
 /// 通道上行写端：实现 write_all 语义，内部把 chunk 轮转分发到可用流。
+/// V3.4 v2：接收节点 ACK（累计确认），驱动未确认帧超时重发与 finish 排空确认。
 pub struct ChannelUpWriter {
     cid: u64,
     slots: Vec<UpSlot>,
@@ -211,6 +257,10 @@ pub struct ChannelUpWriter {
     seq: u32,
     replay: ReplayBuf,
     kill_rx: watch::Receiver<Option<usize>>,
+    /// 节点 ACK 汇入点（各 down_read_task → 本写端）
+    ack_rx: mpsc::Receiver<u32>,
+    /// 已确认水位：ack_next（该 channel 所有 seq < ack_next 已被节点按序交付）
+    acked: u32,
 }
 
 impl ChannelUpWriter {
@@ -239,8 +289,43 @@ impl ChannelUpWriter {
     /// 把 replay 窗口内未确认块按原 seq 重发到存活流（节点按 seq 去重）
     async fn resend_replay(&mut self) -> std::result::Result<(), ChannelError> {
         // 先克隆窗口（write 需要可变借用自身）
-        let items: Vec<(u32, Vec<u8>)> = self.replay.items.iter().cloned().collect();
+        let items: Vec<(u32, Vec<u8>)> = self
+            .replay
+            .items
+            .iter()
+            .map(|(s, c, _)| (*s, c.clone()))
+            .collect();
         for (seq, chunk) in items.iter() {
+            let frame = encode_frame(self.cid, *seq, chunk);
+            self.write_frame_on_alive(&frame).await?;
+        }
+        Ok(())
+    }
+
+    /// 非阻塞消费 ACK 通道，推进确认水位并弹出已确认条目（try_recv，不另 spawn 任务）
+    fn process_acks(&mut self) {
+        while let Ok(ack_next) = self.ack_rx.try_recv() {
+            if ack_next > self.acked {
+                self.acked = ack_next;
+            }
+            self.replay.ack(self.acked);
+        }
+    }
+
+    /// 重发过期未确认帧（sent 距今 > RETRANSMIT_AFTER 且尚未被 ACK）
+    async fn retransmit_expired(&mut self) -> std::result::Result<(), ChannelError> {
+        let expired = self.replay.take_expired(RETRANSMIT_AFTER);
+        if expired.is_empty() {
+            return Ok(());
+        }
+        debug!(
+            "channel {:016x}: retransmitting {} unacked frame(s), acked={} seq={}",
+            self.cid,
+            expired.len(),
+            self.acked,
+            self.seq
+        );
+        for (seq, chunk) in expired.iter() {
             let frame = encode_frame(self.cid, *seq, chunk);
             self.write_frame_on_alive(&frame).await?;
         }
@@ -282,13 +367,16 @@ impl ChannelUpWriter {
         Err(ChannelError::NodeApp(NODE_ERR_FORWARD_IO))
     }
 
-    /// write_all 语义：把浏览器上行数据按 ≤64KB chunk 编帧轮转写出
+    /// write_all 语义：把浏览器上行数据按 ≤64KB chunk 编帧轮转写出。
+    /// 每轮先消费 ACK 并重发过期未确认帧（V3.4 v2 上行丢帧自愈）。
     pub(crate) async fn write_all(
         &mut self,
         mut data: &[u8],
     ) -> std::result::Result<(), ChannelError> {
         while !data.is_empty() {
             self.consume_kill().await?;
+            self.process_acks();
+            self.retransmit_expired().await?;
             let n = data.len().min(MAX_FRAME);
             // 首帧 seq=0（节点 UpOrderer next 从 0 起等；先取值后自增）
             let seq = self.seq;
@@ -301,13 +389,39 @@ impl ChannelUpWriter {
         Ok(())
     }
 
-    /// 半关闭：上行写端 finish 全部存活流（A4 语义保真）
-    pub(crate) async fn finish(&mut self) {
+    /// 半关闭：先排空确认（V3.4 v2 关键）——循环重传未确认帧直至全部被节点
+    /// ACK（累计水位追平已发送 seq），再对全部存活流 finish。
+    /// 超过 [`DRAIN_ACK_TIMEOUT`] 仍未全部确认 → 返回 Err(Transport)，
+    /// 让上层走显式失败而非静默截断（正修复"上行关闭仍有洞"场景）。
+    pub(crate) async fn finish(&mut self) -> std::result::Result<(), ChannelError> {
+        let deadline = tokio::time::Instant::now() + DRAIN_ACK_TIMEOUT;
+        loop {
+            self.process_acks();
+            if self.acked == self.seq {
+                break; // 全部上行帧已按序交付目标 TCP
+            }
+            self.retransmit_expired().await?;
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                warn!(
+                    "channel {:016x}: finish drain timeout, acked={} seq={} -> Transport",
+                    self.cid, self.acked, self.seq
+                );
+                return Err(ChannelError::Transport);
+            }
+            // 等待下一个 ACK 或短轮询（重发后 300ms 到期再次触发）
+            let wake = (now + ACK_POLL).min(deadline);
+            tokio::select! {
+                _ = self.ack_rx.recv() => {}
+                _ = tokio::time::sleep_until(wake) => {}
+            }
+        }
         for slot in self.slots.iter_mut() {
             if slot.alive {
                 let _ = slot.send.finish().await;
             }
         }
+        Ok(())
     }
 }
 
@@ -420,11 +534,14 @@ impl DownCore {
 }
 
 /// 单条通道流的下行帧读取任务：解析帧 → 重排核心；EOF/死亡/失败分流。
+/// V3.4 v2：seq == [`ACK_SEQ`] 的帧为节点上行 ACK 控制帧（payload=8B 大端
+/// ack_next），转发给 UpWriter 的 ack 通道，不进重排器。
 async fn down_read_task(
     idx: usize,
     mut recv: CountingStream<RecvStream>,
     core: Arc<DownCore>,
     mut kill_rx: watch::Receiver<Option<usize>>,
+    ack_tx: mpsc::Sender<u32>,
 ) {
     let mut acc: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 16 * 1024];
@@ -450,6 +567,19 @@ async fn down_read_task(
                         let payload = acc[FRAME_HEADER..FRAME_HEADER + len].to_vec();
                         acc.drain(..FRAME_HEADER + len);
                         let _ = cid; // 通道绑定由建流头确立，帧内 cid 由节点保证一致
+                        if seq == ACK_SEQ {
+                            // ACK 控制帧（节点→客户端上行确认）：payload=8B 大端，
+                            // ack_next u32 位于 [4..8]；len!=8 为协议失步
+                            if len != ACK_PAYLOAD {
+                                core.fail(ChannelError::Transport);
+                                return;
+                            }
+                            let ack_next =
+                                u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                            // 通道满则丢弃：ACK 为累计语义，后续 ACK 自然覆盖
+                            let _ = ack_tx.try_send(ack_next);
+                            continue;
+                        }
                         if len == 0 {
                             core.fail(ChannelError::Transport);
                             return;
@@ -664,10 +794,11 @@ pub(crate) async fn build_channel(
         );
     }
 
-    // 下行机制：每流一个读帧任务 + 一个装配任务
+    // 下行机制：每流一个读帧任务 + 一个装配任务；ACK 汇入点归 UpWriter
     let core = Arc::new(DownCore::new(streams));
     let (kill_tx, _) = watch::channel(None::<usize>);
     let (out_tx, out_rx) = mpsc::channel(64);
+    let (ack_tx, ack_rx) = mpsc::channel::<u32>(64);
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for (i, recv) in recvs.into_iter().enumerate() {
         handles.push(tokio::spawn(down_read_task(
@@ -675,8 +806,10 @@ pub(crate) async fn build_channel(
             recv,
             core.clone(),
             kill_tx.subscribe(),
+            ack_tx.clone(),
         )));
     }
+    drop(ack_tx); // 全部克隆归各读任务；写端全灭时 UpWriter recv 返回 None（无害）
     handles.push(tokio::spawn(down_assemble_task(
         core,
         CHANNEL_HOLE_TIMEOUT,
@@ -693,6 +826,8 @@ pub(crate) async fn build_channel(
         seq: 0,
         replay: ReplayBuf::default(),
         kill_rx: kill_tx.subscribe(),
+        ack_rx,
+        acked: 0,
     };
     let down = ChannelDownReader {
         rx: out_rx,
@@ -762,6 +897,70 @@ mod tests {
         assert_eq!(rb.items.front().unwrap().0, expect_front);
         assert_eq!(rb.items.back().unwrap().0, PUSHED - 1);
         assert_eq!(rb.items.len() as u32, kept);
+    }
+
+    /// V3.4 v2 门③：ACK 累计确认弹出 replay 条目（含重复 ACK/过界 ACK 幂等）
+    #[test]
+    fn replay_buf_ack_pops_confirmed() {
+        let mut rb = ReplayBuf::default();
+        for i in 0..5u32 {
+            rb.push(i, &[i as u8]);
+        }
+        assert_eq!(rb.items.len(), 5);
+        rb.ack(2); // seq 0、1 已确认
+        assert_eq!(rb.items.front().unwrap().0, 2);
+        assert_eq!(rb.bytes, 3);
+        rb.ack(2); // 重复 ACK：幂等
+        assert_eq!(rb.items.len(), 3);
+        rb.ack(u32::MAX); // 过界 ACK：全部弹出
+        assert!(rb.items.is_empty());
+        assert_eq!(rb.bytes, 0);
+    }
+
+    /// V3.4 v2 门③：重传触发——未过期不触发；过期（>300ms）按序取出并刷新 sent
+    #[test]
+    fn replay_buf_take_expired_retransmit_trigger() {
+        let mut rb = ReplayBuf::default();
+        for i in 0..3u32 {
+            rb.push(i, &[i as u8]);
+        }
+        // 刚发送：无过期
+        assert!(rb.take_expired(RETRANSMIT_AFTER).is_empty());
+        // 人工把前 2 条 sent 拨回过去
+        let old = std::time::Instant::now() - RETRANSMIT_AFTER - Duration::from_millis(10);
+        for item in rb.items.iter_mut().take(2) {
+            item.2 = old;
+        }
+        let expired = rb.take_expired(RETRANSMIT_AFTER);
+        assert_eq!(
+            expired.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![0, 1],
+            "应按序取出过期的 seq 0、1"
+        );
+        // sent 已刷新：立刻再取为空（防重复风暴）
+        assert!(rb.take_expired(RETRANSMIT_AFTER).is_empty());
+    }
+
+    /// V3.4 v2 门③：ACK 控制帧解析（复用帧格式：seq=0xFFFFFFFF + 8B payload，
+    /// ack_next u32 位于 payload[4..8]）
+    #[test]
+    fn ack_frame_parse() {
+        let frame = encode_frame(0xdeadbeef, ACK_SEQ, &u64::from(7u32).to_be_bytes());
+        assert_eq!(frame.len(), FRAME_HEADER + ACK_PAYLOAD);
+        let seq = u32::from_be_bytes(frame[8..12].try_into().unwrap());
+        let len = u16::from_be_bytes(frame[12..14].try_into().unwrap()) as usize;
+        assert_eq!(seq, u32::MAX);
+        assert_eq!(len, ACK_PAYLOAD);
+        assert_eq!(
+            u32::from_be_bytes(
+                frame[FRAME_HEADER + 4..FRAME_HEADER + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            7
+        );
+        // 下行数据帧 seq 与 ACK_SEQ 无碰撞：节点 seq 从 0 递增，仅在 2^32-1 帧后回绕
+        assert_ne!(0u32, ACK_SEQ);
     }
 
     #[test]

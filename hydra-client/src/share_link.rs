@@ -1,24 +1,34 @@
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use hydra_obfs::TransportMode;
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64URL},
+    Engine as _,
+};
+pub use hydra_obfs::TransportMode;
 use hydra_protocol::{HydraError, NodeInfo, NodeStatus, Result};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use url::Url;
 
-/// Hydra节点分享链接格式
+/// Hydra节点分享链接格式（Team-Q 分享体系 v2）
 ///
-/// 格式: hydra://address:port?bandwidth=100&latency=10&loss_rate=0.01&status=online&load=0.5[&mode=obfs]
+/// 旧格式（v1，继续兼容解析与生成）:
+/// `hydra://address:port?bandwidth=100&latency=10&loss_rate=0.01&status=online&load=0.5[&mode=obfs]`
 ///
-/// 参数说明:
-/// - address: 节点地址
-/// - port: 节点端口
-/// - bandwidth: 带宽 (Mbps)
-/// - latency: 延迟 (ms)
-/// - loss_rate: 丢包率 (0-1)
-/// - load: 负载 (0-1)
-/// - status: 节点状态 (online/degraded/offline)
-/// - mode: 传输模式 (masquerade|obfs；V3.1，缺省 masquerade——不带 mode 参数的
-///   既有链接照常解析为 masquerade。**不带密钥本体**，混淆密码经 HYDRA_OBFS_KEY 带外约定)
+/// v2 格式（携带密钥信息，`v=3` 标记）:
+/// `hydra://addr:port?v=3&k=<base64url(auth_key)>&cc=<base64url(cert_der)>&mode=obfs&ok=<base64url(obfs_key)>`
+///
+/// v2 参数说明（编码一律 base64url 无填充）:
+/// - `v=3`: 分享格式版本标记；含任一密钥字段时生成方必须携带，旧客户端会忽略未知参数
+/// - `k`: 节点预共享认证密钥原始字节（必带于完整分享 = 对方导入即用）
+/// - `cc`: 节点证书 DER 原始字节（完整模式；对方无需另行导入证书文件）
+/// - `cf`: 节点证书 SHA-256 指纹（64 位小写 hex；**紧凑模式**：省略 cc 时携带，
+///   对方需另行导入证书并核对指纹）
+/// - `ok`: obfs 模式独立第二混淆密码 UTF-8 字节（仅 obfs 模式携带）
+/// - `mode`: 传输模式（masquerade|obfs），语义同 v1
+///
+/// **安全声明**：完整链接（含 `k`/`cc`）= 持有该节点，等同账号密码。
+/// 仅限二维码当面扫描 / 近场 / 其他可信通道分享，**严禁**粘贴到不可信的
+/// 公开渠道（群聊、公开网页、明文 http 订阅）。仅含 `cf` 指纹的紧凑链接
+/// 不泄露密钥，可走普通渠道。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareLink {
     pub address: String,
@@ -31,6 +41,18 @@ pub struct ShareLink {
     /// V3.1 传输模式（缺省 masquerade；serde default 保证旧版持久化数据反序列化兼容）
     #[serde(default)]
     pub mode: TransportMode,
+    /// v2 认证密钥（base64url(auth_key 原始字节)，无填充）；None = 不携带
+    #[serde(default)]
+    pub auth_key: Option<String>,
+    /// v2 节点证书 DER（base64url）；None = 不携带（紧凑模式走 cert_fp）
+    #[serde(default)]
+    pub cert_der: Option<String>,
+    /// v2 节点证书 SHA-256 指纹（小写 hex，64 字符）；紧凑模式供核对
+    #[serde(default)]
+    pub cert_fp: Option<String>,
+    /// v2 obfs 独立第二密码（base64url(UTF-8 字节)）；仅 obfs 模式
+    #[serde(default)]
+    pub obfs_key: Option<String>,
 }
 
 impl ShareLink {
@@ -44,7 +66,86 @@ impl ShareLink {
             load: node_info.load,
             status: node_info.status.clone(),
             mode: TransportMode::Masquerade,
+            auth_key: None,
+            cert_der: None,
+            cert_fp: None,
+            obfs_key: None,
         }
+    }
+
+    // ═══════════ v2 密钥字段 builder（Team-Q）═══════════
+
+    /// 携带认证密钥原始字节（生成完整分享）
+    pub fn with_auth_key_bytes(mut self, key: &[u8]) -> Self {
+        self.auth_key = Some(BASE64URL.encode(key));
+        self
+    }
+
+    /// 携带节点证书 DER（完整模式），同时自动写入证书指纹
+    pub fn with_cert_der(mut self, der: &[u8]) -> Self {
+        self.cert_fp = Some(sha256_hex(der));
+        self.cert_der = Some(BASE64URL.encode(der));
+        self
+    }
+
+    /// 仅携带证书指纹（紧凑模式：对方需另行导入证书并核对指纹）
+    pub fn with_cert_fp(mut self, fp: String) -> Self {
+        self.cert_fp = Some(fp);
+        self
+    }
+
+    /// 携带 obfs 独立第二密码（仅 obfs 模式）
+    pub fn with_obfs_key(mut self, key: &str) -> Self {
+        self.obfs_key = Some(BASE64URL.encode(key.as_bytes()));
+        self
+    }
+
+    /// 是否完整分享（同时携带认证密钥与节点证书 = 对方导入即用 = 等同持有节点）
+    pub fn is_full_share(&self) -> bool {
+        self.auth_key.is_some() && self.cert_der.is_some()
+    }
+
+    /// 是否携带任一密钥字段（生成方据此写入 `v=3` 版本标记）
+    fn has_secret_fields(&self) -> bool {
+        self.auth_key.is_some() || self.cert_der.is_some() || self.obfs_key.is_some()
+    }
+
+    /// 解码认证密钥原始字节（None = 未携带）
+    pub fn auth_key_bytes(&self) -> std::result::Result<Option<Vec<u8>>, HydraError> {
+        self.auth_key
+            .as_ref()
+            .map(|s| {
+                BASE64URL
+                    .decode(s)
+                    .map_err(|e| HydraError::ProtocolError(format!("Invalid k (auth key): {}", e)))
+            })
+            .transpose()
+    }
+
+    /// 解码节点证书 DER 字节（None = 未携带）
+    pub fn cert_der_bytes(&self) -> std::result::Result<Option<Vec<u8>>, HydraError> {
+        self.cert_der
+            .as_ref()
+            .map(|s| {
+                BASE64URL
+                    .decode(s)
+                    .map_err(|e| HydraError::ProtocolError(format!("Invalid cc (cert): {}", e)))
+            })
+            .transpose()
+    }
+
+    /// 解码 obfs 第二密码字符串（None = 未携带）
+    pub fn obfs_key_string(&self) -> std::result::Result<Option<String>, HydraError> {
+        self.obfs_key
+            .as_ref()
+            .map(|s| {
+                let bytes = BASE64URL.decode(s).map_err(|e| {
+                    HydraError::ProtocolError(format!("Invalid ok (obfs key): {}", e))
+                })?;
+                String::from_utf8(bytes)
+                    .map_err(|e| HydraError::ProtocolError(format!("Invalid ok encoding: {}", e)))
+            })
+            .transpose()
     }
 
     /// 以显式传输模式构造（obfs 节点分享链接用）
@@ -86,6 +187,7 @@ impl ShareLink {
             NodeStatus::Offline => "offline",
         };
 
+        // v1 字段保持既有顺序与格式（不带密钥时输出与旧版逐字节一致）
         let mut url = format!(
             "hydra://{}:{}?bandwidth={}&latency={}&loss_rate={}&load={}&status={}",
             self.address,
@@ -99,6 +201,23 @@ impl ShareLink {
         // 缺省 masquerade 不写 mode 参数：既有链接/生成方零改动，GUI 不需要感知
         if self.mode == TransportMode::Obfs {
             url.push_str("&mode=obfs");
+        }
+        // v2 密钥字段：携带任一密钥信息时写 v=3 版本标记（旧解析端忽略未知参数）
+        if self.has_secret_fields() {
+            url.push_str("&v=3");
+            if let Some(k) = &self.auth_key {
+                url.push_str(&format!("&k={}", k));
+            }
+            if let Some(cc) = &self.cert_der {
+                url.push_str(&format!("&cc={}", cc));
+            }
+            if let Some(ok) = &self.obfs_key {
+                url.push_str(&format!("&ok={}", ok));
+            }
+        }
+        // 证书指纹独立于 has_secret_fields：紧凑模式仅带 cf（不泄露密钥，可走普通渠道）
+        if let Some(cf) = &self.cert_fp {
+            url.push_str(&format!("&cf={}", cf));
         }
         url
     }
@@ -128,9 +247,43 @@ impl ShareLink {
         let mut load = 0.5;
         let mut status = NodeStatus::Online;
         let mut mode = None;
+        let mut auth_key: Option<String> = None;
+        let mut cert_der: Option<String> = None;
+        let mut cert_fp: Option<String> = None;
+        let mut obfs_key: Option<String> = None;
 
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
+                // v2 密钥字段（base64url 无填充；坏字段显式报错，不静默丢弃）
+                "k" => {
+                    BASE64URL.decode(value.as_bytes()).map_err(|e| {
+                        HydraError::ProtocolError(format!("Invalid k (auth key): {}", e))
+                    })?;
+                    auth_key = Some(value.to_string());
+                }
+                "cc" => {
+                    BASE64URL.decode(value.as_bytes()).map_err(|e| {
+                        HydraError::ProtocolError(format!("Invalid cc (cert): {}", e))
+                    })?;
+                    cert_der = Some(value.to_string());
+                }
+                "ok" => {
+                    BASE64URL.decode(value.as_bytes()).map_err(|e| {
+                        HydraError::ProtocolError(format!("Invalid ok (obfs key): {}", e))
+                    })?;
+                    obfs_key = Some(value.to_string());
+                }
+                "cf" => {
+                    let v = value.as_ref();
+                    if v.len() != 64 || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err(HydraError::ProtocolError(
+                            "Invalid cf (cert fingerprint): expected 64 hex chars".to_string(),
+                        ));
+                    }
+                    cert_fp = Some(v.to_ascii_lowercase());
+                }
+                // v=3：版本标记，当前仅识别不校验（未来版本升级入口）
+                "v" => {}
                 "bandwidth" => {
                     bandwidth = value.parse::<f64>().map_err(|e| {
                         HydraError::ProtocolError(format!("Invalid bandwidth: {}", e))
@@ -179,6 +332,10 @@ impl ShareLink {
             load,
             status,
             mode: mode.unwrap_or(TransportMode::Masquerade),
+            auth_key,
+            cert_der,
+            cert_fp,
+            obfs_key,
         })
     }
 
@@ -197,6 +354,21 @@ impl ShareLink {
             .map_err(|e| HydraError::ProtocolError(format!("Invalid UTF-8: {}", e)))?;
         Self::from_share_url(&url)
     }
+}
+
+/// SHA-256 摘要的小写 hex 编码（v2 证书指纹 `cf` 用）
+pub fn sha256_hex(data: &[u8]) -> String {
+    use ring::digest::{digest, SHA256};
+    hex_encode_lower(digest(&SHA256, data).as_ref())
+}
+
+/// 字节 → 小写 hex 字符串（GUI 导入 v2 链接时密钥入库用）
+pub fn hex_encode_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }
 
 /// 解析多个分享链接（每行一个）
@@ -410,5 +582,117 @@ hydra://192.168.1.100:8080?bandwidth=80&latency=15&loss_rate=0.02&status=online
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].mode, TransportMode::Obfs);
         assert_eq!(links[1].mode, TransportMode::Masquerade);
+    }
+
+    // ===================== Team-Q 分享体系 v2（密钥 + 二维码）=====================
+
+    #[test]
+    fn tq_v2_full_link_roundtrip_keeps_secrets() {
+        let auth_key: Vec<u8> = (0u8..32).collect();
+        let cert_der: Vec<u8> = vec![0x30, 0x82, 0x01, 0xAB, 0xCD, 0xEF];
+        let link = ShareLink::new_with_mode(&sample_node(), TransportMode::Obfs)
+            .with_auth_key_bytes(&auth_key)
+            .with_cert_der(&cert_der)
+            .with_obfs_key("second-password-密");
+
+        let url = link.to_share_url();
+        assert!(url.contains("v=3"), "完整分享必须带 v=3: {url}");
+        assert!(url.contains("&k="));
+        assert!(url.contains("&cc="));
+        assert!(url.contains("&ok="));
+        assert!(url.contains("&cf="), "完整分享同时带证书指纹供核对");
+        assert!(url.contains("mode=obfs"));
+
+        let parsed = ShareLink::from_share_url(&url).unwrap();
+        assert_eq!(parsed.address, "127.0.0.1");
+        assert_eq!(parsed.port, 8080);
+        assert_eq!(parsed.mode, TransportMode::Obfs);
+        assert_eq!(parsed.auth_key, link.auth_key);
+        assert_eq!(parsed.cert_der, link.cert_der);
+        assert_eq!(parsed.cert_fp, link.cert_fp);
+        assert_eq!(parsed.obfs_key, link.obfs_key);
+
+        // 解码后的字节与输入一致
+        assert_eq!(parsed.auth_key_bytes().unwrap(), Some(auth_key));
+        assert_eq!(parsed.cert_der_bytes().unwrap(), Some(cert_der));
+        assert_eq!(
+            parsed.obfs_key_string().unwrap(),
+            Some("second-password-密".to_string())
+        );
+        assert!(parsed.is_full_share());
+
+        // serde JSON 往返（旧版 JSON 缺 v2 字段 → None）
+        let json = serde_json::to_string(&parsed).unwrap();
+        let back: ShareLink = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.address, parsed.address);
+        assert_eq!(back.auth_key, parsed.auth_key);
+        assert_eq!(back.cert_der, parsed.cert_der);
+        assert_eq!(back.cert_fp, parsed.cert_fp);
+        assert_eq!(back.obfs_key, parsed.obfs_key);
+        assert_eq!(back.mode, parsed.mode);
+    }
+
+    #[test]
+    fn tq_v2_compact_link_only_carries_fingerprint() {
+        let link = ShareLink::from_node_info(&sample_node()).with_cert_fp(sha256_hex(b"fake cert"));
+        let url = link.to_share_url();
+        assert!(url.contains("&cf="));
+        assert!(!url.contains("&cc="), "紧凑模式不带证书本体: {url}");
+        assert!(!url.contains("v=3"), "无密钥字段不写版本标记: {url}");
+
+        let parsed = ShareLink::from_share_url(&url).unwrap();
+        assert_eq!(parsed.cert_fp, link.cert_fp);
+        assert_eq!(parsed.cert_der, None);
+        assert_eq!(parsed.auth_key, None);
+        assert!(!parsed.is_full_share());
+    }
+
+    #[test]
+    fn tq_v2_legacy_format_still_parses() {
+        // 旧格式（无 v=3、无密钥字段）继续兼容，v2 字段为 None
+        let legacy =
+            "hydra://10.0.0.1:443?bandwidth=80&latency=15&loss_rate=0.02&status=online&mode=obfs";
+        let parsed = ShareLink::from_share_url(legacy).unwrap();
+        assert_eq!(parsed.auth_key, None);
+        assert_eq!(parsed.cert_der, None);
+        assert_eq!(parsed.cert_fp, None);
+        assert_eq!(parsed.obfs_key, None);
+        assert_eq!(parsed.mode, TransportMode::Obfs);
+
+        // 旧格式生成输出与旧版逐字节一致（无密钥时）
+        let plain = ShareLink::from_node_info(&sample_node());
+        assert_eq!(
+            plain.to_share_url(),
+            "hydra://127.0.0.1:8080?bandwidth=100&latency=10&loss_rate=0.01&load=0.5&status=online"
+        );
+    }
+
+    #[test]
+    fn tq_v2_bad_secret_fields_are_rejected() {
+        // k/cc/ok 非 base64url → 显式报错
+        assert!(
+            ShareLink::from_share_url("hydra://127.0.0.1:8080?k=!!!not-base64")
+                .unwrap_err()
+                .to_string()
+                .contains("k")
+        );
+        assert!(ShareLink::from_share_url("hydra://127.0.0.1:8080?cc=@@bad@@").is_err());
+        assert!(ShareLink::from_share_url("hydra://127.0.0.1:8080?ok=***").is_err());
+        // cf 非 64 位 hex → 报错
+        assert!(ShareLink::from_share_url("hydra://127.0.0.1:8080?cf=abc").is_err());
+        assert!(ShareLink::from_share_url(
+            "hydra://127.0.0.1:8080?cf=zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn tq_v2_parse_share_links_text_with_secrets() {
+        let url = ShareLink::new_with_mode(&sample_node(), TransportMode::Masquerade)
+            .with_auth_key_bytes(&[9u8; 16])
+            .to_share_url();
+        let links = parse_share_links(&format!("# 注释\n{}\n", url)).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].auth_key_bytes().unwrap(), Some(vec![9u8; 16]));
     }
 }

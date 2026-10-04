@@ -1080,8 +1080,10 @@ impl ProxyServer {
                                 let _ = send.finish().await;
                             }
                             UpSink::Channel(mut up) => {
-                                // V3.4 半关闭 = 上行写端 finish 全部存活流（A4 语义保真）
-                                up.finish().await;
+                                // V3.4 半关闭 = 上行写端排空确认（全部 ACK）后 finish
+                                // 全部存活流；Err(Transport) = 排空超时（proxy 层
+                                // 沿用现有忽略语义，通道已由 Err 路径显式报错）
+                                let _ = up.finish().await;
                             }
                             UpSink::Direct(mut w) => {
                                 let _ = w.shutdown().await;

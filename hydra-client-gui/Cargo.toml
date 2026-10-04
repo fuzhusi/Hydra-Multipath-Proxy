@@ -16,6 +16,11 @@ tracing-subscriber = "0.3"
 chrono = "0.4"
 # Exec-C：订阅拉取（轻量阻塞 HTTP，含 rustls https；GUI 后台线程调用，不进解析层依赖）
 ureq = "2"
+# Team-Q：二维码生成（fast_qr）与识别（rqrr + image，仅 png/jpeg 减体积）
+fast_qr = "0.12"
+rqrr = "0.7"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
 hydra-client = { path = "../hydra-client" }
 hydra-protocol = { path = "../hydra-protocol" }
 

@@ -44,6 +44,17 @@ const CHANNEL_MAX_FRAME: usize = u16::MAX as usize; // 与客户端 MAX_FRAME �
 const CHANNEL_WINDOW: usize = 32 * 1024 * 1024;
 /// 上行空洞等待兜底：next_seq 未到达超过该时长 → 通道失败（reset 0x13）
 const CHANNEL_HOLE_TIMEOUT: Duration = Duration::from_secs(5);
+/// V3.4 v2：上行 ACK 控制帧保留 seq（借道下行帧通道发给客户端）。
+/// 下行数据帧 seq 从 0 递增，4B 空间需 ~42 亿帧才回绕至此，无碰撞（文档注明）。
+const ACK_SEQ: u32 = u32::MAX;
+/// ACK 节流间隔：距上次 ACK 不足该时长且无空洞时不发（空洞时立即发）
+const ACK_INTERVAL: Duration = Duration::from_millis(10);
+
+/// V3.4 v2 ACK 节流判定（纯函数，单测覆盖）：next 有推进，且（存在空洞 → 立即，
+/// 否则距上次 ACK ≥ ACK_INTERVAL）。
+fn ack_due(next: u32, last_acked: u32, last_ack_at: std::time::Instant, has_hole: bool) -> bool {
+    next != last_acked && (has_hole || last_ack_at.elapsed() >= ACK_INTERVAL)
+}
 
 /// 已认证流故障的显式中止：RESET_STREAM（对端读到 ReadError::Reset(code)）
 /// + STOP_SENDING（对端 write 得到 WriteError::Stopped(code)），
@@ -1012,6 +1023,9 @@ impl ConnectionHandler {
         tokio::spawn(async move {
             let mut gate = UpOrderGate::new();
             let mut up_closed = false;
+            // V3.4 v2：ACK 状态——上次已确认水位与发送时刻（节流）
+            let mut last_acked: u32 = 0;
+            let mut last_ack_at = std::time::Instant::now();
             loop {
                 tokio::select! {
                     maybe = up_rx.recv(), if !up_closed => match maybe {
@@ -1026,6 +1040,21 @@ impl ConnectionHandler {
                         None => up_closed = true,
                     },
                     _ = all_up_rx.changed() => {
+                        // 读循环全部结束，但 up_rx 队列中可能仍有已收帧
+                        //（shared.up_tx 持有 sender，recv 永不返回 None）：
+                        // 先排空缓冲再关上行，否则丢帧直接造洞。
+                        loop {
+                            match up_rx.try_recv() {
+                                Ok((seq, payload)) => {
+                                    if gate.on_chunk(seq, payload).is_err() {
+                                        shared.log("upstream window exceeded, failing channel");
+                                        shared.fail();
+                                        return;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
                         up_closed = true;
                     }
                     _ = end_rx.changed() => {
@@ -1045,10 +1074,19 @@ impl ConnectionHandler {
                         return;
                     }
                 }
-                // 上行终止时若仍有空洞：字节流不可能完整，判失败而非半关闭（防目标侧静默缺块）
+                // 上行终止且仍有空洞：不再立即判死——V3.4 v2 给客户端重传
+                // 留窗口，等 hole timeout（5s）到期仍未补齐才判通道失败
+                //（客户端重传帧须经仍在打开的流到达，此分支意味着客户端真死）。
                 if up_closed && gate.orderer.has_hole() {
+                    let deadline = gate
+                        .hole_deadline
+                        .unwrap_or_else(|| tokio::time::Instant::now() + CHANNEL_HOLE_TIMEOUT);
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline) => {}
+                        _ = end_rx.changed() => return,
+                    }
                     shared.log(&format!(
-                        "upstream closed with hole: next_seq={}, pending={}",
+                        "upstream closed with hole after timeout: next_seq={}, pending={}",
                         gate.orderer.next_seq(),
                         gate.orderer.pending_bytes()
                     ));
@@ -1061,6 +1099,18 @@ impl ConnectionHandler {
                         shared.fail();
                         return;
                     }
+                }
+                // V3.4 v2：上行有推进则经下行帧通道发累计 ACK（payload=8B 大端 ack_next）。
+                // 节流：存在空洞立即发（帮客户端释放窗口），否则 ≥10ms 一发。
+                let next = gate.orderer.next_seq();
+                if ack_due(next, last_acked, last_ack_at, gate.orderer.has_hole()) {
+                    // payload=8B 大端（协议规格）：ack_next u32 置于低 4 字节，
+                    // 客户端解析 payload[4..8]
+                    let frame = encode_frame(shared.cid, ACK_SEQ, &u64::from(next).to_be_bytes());
+                    // ACK 写失败仅意味着流全灭：随后数据路径会如实判败，此处忽略
+                    let _ = Self::write_frame_round_robin(&shared, &frame).await;
+                    last_acked = next;
+                    last_ack_at = std::time::Instant::now();
                 }
                 if up_closed {
                     // 上行完整：优雅半关闭目标写侧（保留下行继续转发剩余响应）
@@ -1365,6 +1415,39 @@ mod channel_tests {
                 0x00, 0x02, // len 2B
                 0xde, 0xad, // payload
             ]
+        );
+    }
+
+    /// V3.4 v2 门③：ACK 节流判定——无推进不发；有推进时空洞立即发、
+    /// 无空洞须距上次 ≥10ms；ACK 帧保留 seq 与格式
+    #[test]
+    fn ack_throttle_decision() {
+        let now = std::time::Instant::now();
+        // 无推进：不发
+        assert!(!ack_due(5, 5, now, false));
+        assert!(!ack_due(5, 5, now, true));
+        // 有推进 + 空洞：立即发
+        assert!(ack_due(6, 5, now, true));
+        // 有推进、无空洞、距上次不足 10ms：节流不发
+        assert!(!ack_due(6, 5, now, false));
+        // 距上次 ≥10ms：发
+        let old = now - ACK_INTERVAL - Duration::from_millis(1);
+        assert!(ack_due(6, 5, old, false));
+        // ACK 帧格式：seq=0xFFFFFFFF，payload=8B 大端（ack_next u32 在低 4 字节）
+        let frame = encode_frame(0u64, ACK_SEQ, &u64::from(42u32).to_be_bytes());
+        assert_eq!(
+            u32::from_be_bytes(frame[8..12].try_into().unwrap()),
+            u32::MAX
+        );
+        assert_eq!(
+            u16::from_be_bytes(frame[12..14].try_into().unwrap()),
+            8,
+            "ACK payload 必须为 8 字节"
+        );
+        assert_eq!(
+            u32::from_be_bytes(frame[18..22].try_into().unwrap()),
+            42,
+            "ack_next 位于 payload[4..8]"
         );
     }
 }

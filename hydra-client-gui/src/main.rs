@@ -1,7 +1,8 @@
 use eframe::egui;
 use hydra_client::{
-    format_bytes, format_duration, format_speed, generate_share_links, parse_share_links,
-    ProxyServer, Scheduler, ShareLink, TrafficMonitor, Transport,
+    format_bytes, format_duration, format_speed, generate_share_links, hex_encode_lower,
+    parse_share_links, sha256_hex, ProxyServer, Scheduler, ShareLink, TrafficMonitor, Transport,
+    TransportMode,
 };
 use hydra_protocol::{NodeInfo, NodeStatus};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -11,6 +12,7 @@ use std::sync::Arc;
 
 mod config;
 use config::{GuiConfig, SubscriptionConfig};
+mod qr;
 mod subscription;
 
 #[derive(Clone, Debug)]
@@ -47,6 +49,17 @@ struct HydraApp {
     // 分享链接相关
     share_link_text: String,
     show_share_link_dialog: bool,
+
+    // Team-Q 分享体系 v2：单节点分享对话框（二维码 + 完整链接 + 安全提示）
+    share_dialog_open: bool,
+    share_node_addr: String,
+    share_compact: bool,
+    share_link: Option<ShareLink>,
+    share_url_cache: String,
+    share_qr_texture: Option<egui::TextureHandle>,
+    // Team-Q 导入区状态：粘贴文本 + 最近一次导入结果提示（成功绿/失败红）
+    import_text: String,
+    import_status: Option<(bool, String)>,
 
     // 密钥明文显示开关（默认掩码显示）
     show_auth_key: bool,
@@ -89,6 +102,14 @@ impl Default for HydraApp {
             pending_sub_updates: VecDeque::new(),
             share_link_text: String::new(),
             show_share_link_dialog: false,
+            share_dialog_open: false,
+            share_node_addr: String::new(),
+            share_compact: false,
+            share_link: None,
+            share_url_cache: String::new(),
+            share_qr_texture: None,
+            import_text: String::new(),
+            import_status: None,
             show_auth_key: false,
             show_obfs_key: false,
             scheduler: None,
@@ -177,6 +198,14 @@ impl HydraApp {
             pending_sub_updates: VecDeque::new(),
             share_link_text: String::new(),
             show_share_link_dialog: false,
+            share_dialog_open: false,
+            share_node_addr: String::new(),
+            share_compact: false,
+            share_link: None,
+            share_url_cache: String::new(),
+            share_qr_texture: None,
+            import_text: String::new(),
+            import_status: None,
             show_auth_key: false,
             show_obfs_key: false,
             scheduler: None,
@@ -869,6 +898,264 @@ impl HydraApp {
         }
     }
 
+    // ═══════════════ Team-Q：分享体系 v2（二维码 + 密钥链接）═══════════════
+
+    /// 为指定节点构造 v2 分享链接：带认证密钥 + 证书（完整）或证书指纹（紧凑）。
+    /// obfs 模式时附 obfs 第二密码。密钥/证书按当前配置解析，取不到的字段自动省略。
+    fn build_share_link(&self, addr_str: &str, compact: bool) -> Option<ShareLink> {
+        let addr: SocketAddr = addr_str.trim().parse().ok()?;
+        let node_info = NodeInfo {
+            address: addr,
+            bandwidth: 100.0,
+            latency: 10.0,
+            loss_rate: 0.01,
+            load: 0.5,
+            status: NodeStatus::Online,
+        };
+        let mode = if self.config.is_obfs() {
+            TransportMode::Obfs
+        } else {
+            TransportMode::Masquerade
+        };
+        let mut link = ShareLink::new_with_mode(&node_info, mode);
+
+        // 认证密钥（完整分享核心字段；解析失败则省略，链接退化为仅地址信息）
+        if let Ok(key) = config::resolve_auth_key(&self.config) {
+            link = link.with_auth_key_bytes(&key);
+        }
+
+        // 证书：完整模式带 DER 本体，紧凑模式只带 SHA-256 指纹
+        let cert_der = std::fs::read(self.config.cert_path.trim()).ok();
+        match cert_der {
+            Some(der) if compact => link = link.with_cert_fp(sha256_hex(&der)),
+            Some(der) => link = link.with_cert_der(&der),
+            None => {}
+        }
+
+        // obfs 第二密码（仅 obfs 模式且已设置时携带）
+        if self.config.is_obfs() && !self.config.obfs_key.trim().is_empty() {
+            link = link.with_obfs_key(self.config.obfs_key.trim());
+        }
+        Some(link)
+    }
+
+    /// 打开单节点分享对话框（完整/紧凑默认完整）
+    fn open_share_dialog(&mut self, addr: String) {
+        self.share_node_addr = addr;
+        self.share_compact = false;
+        self.share_link = self.build_share_link(&self.share_node_addr, false);
+        self.share_url_cache = String::new(); // 强制重建二维码纹理
+        self.share_dialog_open = true;
+        if let Some(link) = &self.share_link {
+            if link.is_full_share() {
+                self.add_log(format!(
+                    "已生成节点 {} 的完整分享（含密钥，注意仅限可信渠道）",
+                    self.share_node_addr
+                ));
+            } else {
+                self.add_log(format!(
+                    "已生成节点 {} 的分享（缺少密钥或证书，对方可能需要手动补全）",
+                    self.share_node_addr
+                ));
+            }
+        }
+    }
+
+    /// 应用一条导入的 v2 分享链接：节点地址 + 密钥/证书/模式自动入配置。
+    /// 返回 Err 时不改动任何配置（先全部校验再落库）。
+    fn apply_imported_link(&mut self, link: &ShareLink) -> Result<(), String> {
+        use base64::Engine as _;
+
+        // 先校验后写：密钥/证书解码失败直接报错，不产生半套配置
+        let auth_key_hex = match link.auth_key_bytes().map_err(|e| e.to_string())? {
+            Some(bytes) => {
+                let hex = hex_encode_lower(&bytes);
+                // 校验 hex + 长度（与启动代理同一套规则）
+                hydra_client::auth_key_from_hex(&hex)?;
+                Some(hex)
+            }
+            None => None,
+        };
+        let cert_b64 = match link.cert_der_bytes().map_err(|e| e.to_string())? {
+            Some(der) => Some(base64::engine::general_purpose::STANDARD.encode(&der)),
+            None => None,
+        };
+        let obfs_key = link.obfs_key_string().map_err(|e| e.to_string())?;
+
+        // ── 以下为落库（不会再失败）──
+        if let Some(hex) = auth_key_hex {
+            self.config.auth_key = hex;
+        }
+        if let Some(b64) = cert_b64 {
+            self.config.cert_der_b64 = b64;
+            // 已有证书文件时提示覆盖语义（cert_path 优先，导入值仅在路径为空时生效）
+            if !self.config.cert_path.trim().is_empty() {
+                self.add_log(
+                    "提示：已存在证书文件路径，链接携带的证书仅在清空证书路径后生效".to_string(),
+                );
+            }
+        }
+        // 紧凑模式指纹：本地有证书文件时核对，不一致显式告警
+        if let Some(fp) = &link.cert_fp {
+            if let Ok(der) = std::fs::read(self.config.cert_path.trim()) {
+                let local_fp = sha256_hex(&der);
+                if &local_fp != fp {
+                    self.add_log(format!(
+                        "⚠ 证书指纹不一致！链接 cf={}，本地证书 sha256={}，请确认证书来源",
+                        fp, local_fp
+                    ));
+                }
+            }
+        }
+        if let Some(ok) = obfs_key {
+            self.config.obfs_key = ok;
+        }
+        if link.mode == TransportMode::Obfs {
+            self.config.hydra_mode = "obfs".to_string();
+        }
+
+        let addr_str = format!("{}:{}", link.address, link.port);
+        if !self.config.node_addrs.contains(&addr_str) {
+            self.config.node_addrs.push(addr_str.clone());
+            self.node_status.insert(
+                addr_str.clone(),
+                NodeStatusInfo {
+                    addr: addr_str.clone(),
+                    connected: false,
+                    last_check: None,
+                    latency_ms: None,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// 记录一次导入结果（UI 绿/红提示 + 日志）
+    fn set_import_status(&mut self, ok: bool, msg: String) {
+        if ok {
+            self.add_log(msg.clone());
+        } else {
+            self.add_log(format!("导入失败: {}", msg));
+        }
+        self.import_status = Some((ok, msg));
+    }
+
+    /// 导入粘贴文本中的分享链接（支持多行，每行一条）
+    fn import_pasted_links(&mut self) {
+        let text = self.import_text.clone();
+        if text.trim().is_empty() {
+            self.set_import_status(false, "请先粘贴 hydra:// 分享链接".to_string());
+            return;
+        }
+        match parse_share_links(&text) {
+            Ok(links) if links.is_empty() => {
+                self.set_import_status(false, "未在文本中找到 hydra:// 分享链接".to_string());
+            }
+            Ok(links) => {
+                let (ok_count, fail_msgs) = self.apply_many_links(&links);
+                if ok_count > 0 {
+                    self.set_import_status(
+                        true,
+                        format!(
+                            "成功导入 {} 个节点（失败 {} 条）",
+                            ok_count,
+                            fail_msgs.len()
+                        ),
+                    );
+                } else {
+                    self.set_import_status(false, fail_msgs.into_iter().next().unwrap_or_default());
+                }
+            }
+            Err(e) => self.set_import_status(false, format!("链接解析失败: {}", e)),
+        }
+    }
+
+    /// 逐条应用链接，返回（成功数, 失败原因列表）
+    fn apply_many_links(&mut self, links: &[ShareLink]) -> (usize, Vec<String>) {
+        let mut ok = 0;
+        let mut fails = Vec::new();
+        for link in links {
+            match self.apply_imported_link(link) {
+                Ok(()) => ok += 1,
+                Err(e) => fails.push(format!("{}:{}: {}", link.address, link.port, e)),
+            }
+        }
+        (ok, fails)
+    }
+
+    /// 从二维码图片文件导入（rfd 选 png/jpg → rqrr 解码 → 解析链接）
+    fn import_from_qr_image(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("图片文件", &["png", "jpg", "jpeg"])
+            .add_filter("全部文件", &["*"])
+            .pick_file()
+        else {
+            return; // 用户取消
+        };
+        let result = std::fs::read(&path)
+            .map_err(|e| format!("读取图片 {} 失败: {}", path.display(), e))
+            .and_then(|bytes| qr::decode_qr_from_bytes(&bytes))
+            .and_then(|text| {
+                ShareLink::from_share_url(text.trim())
+                    .map_err(|e| format!("二维码内容不是有效的 hydra 分享链接: {}", e))
+            });
+        match result {
+            Ok(link) => match self.apply_imported_link(&link) {
+                Ok(()) => self.set_import_status(
+                    true,
+                    format!(
+                        "二维码导入成功：{}:{}（含密钥 {}）",
+                        link.address,
+                        link.port,
+                        if link.auth_key.is_some() {
+                            "是"
+                        } else {
+                            "否"
+                        }
+                    ),
+                ),
+                Err(e) => self.set_import_status(false, e),
+            },
+            Err(e) => self.set_import_status(false, e),
+        }
+    }
+
+    /// 从 .txt 链接文件导入（每行一条，支持 v1/v2 混排）
+    fn import_from_link_file(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("链接文件", &["txt"])
+            .add_filter("全部文件", &["*"])
+            .pick_file()
+        else {
+            return;
+        };
+        let result = std::fs::read_to_string(&path)
+            .map_err(|e| format!("读取文件 {} 失败: {}", path.display(), e))
+            .and_then(|text| parse_share_links(&text).map_err(|e| format!("链接解析失败: {}", e)));
+        match result {
+            Ok(links) if links.is_empty() => {
+                self.set_import_status(false, "文件中未找到 hydra:// 分享链接".to_string());
+            }
+            Ok(links) => {
+                let (ok_count, fails) = self.apply_many_links(&links);
+                if ok_count > 0 {
+                    self.set_import_status(
+                        true,
+                        format!(
+                            "从 {} 导入 {} 个节点（失败 {} 条）",
+                            path.display(),
+                            ok_count,
+                            fails.len()
+                        ),
+                    );
+                } else {
+                    self.set_import_status(false, fails.into_iter().next().unwrap_or_default());
+                }
+            }
+            Err(e) => self.set_import_status(false, e),
+        }
+    }
+
     // ═══════════════ Exec-C：订阅（hydra-sub v1）═══════════════
     //
     // 数据流：UI 线程 queue_subscription_update → 后台线程 fetch_and_parse_subscription
@@ -1186,6 +1473,146 @@ impl eframe::App for HydraApp {
         // 非阻塞地处理订阅更新结果（Exec-C，串行驱动排队更新）
         self.poll_subscription_updates();
 
+        // ── Team-Q v2：单节点分享对话框（二维码 + 完整链接 + 安全提示）──
+        if self.share_dialog_open {
+            let mut compact = self.share_compact;
+            egui::Window::new(format!("分享节点 {}", self.share_node_addr))
+                .collapsible(false)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("模式:");
+                        if ui
+                            .radio(!compact, "完整（含密钥/证书，对方即用）")
+                            .clicked()
+                            && compact
+                        {
+                            compact = false;
+                        }
+                        if ui
+                            .radio(compact, "紧凑（仅证书指纹，需另发证书）")
+                            .clicked()
+                            && !compact
+                        {
+                            compact = true;
+                        }
+                    });
+
+                    // 二维码显示（纹理缓存：URL 变化才重建）
+                    let url = self
+                        .share_link
+                        .as_ref()
+                        .map(|l| l.to_share_url())
+                        .unwrap_or_default();
+                    if url != self.share_url_cache || self.share_qr_texture.is_none() {
+                        self.share_url_cache = url.clone();
+                        self.share_qr_texture = qr::qr_color_image(&url).and_then(|img| {
+                            ctx.load_texture("share_qr", img, egui::TextureOptions::NEAREST)
+                                .into()
+                        });
+                    }
+                    ui.separator();
+                    match &self.share_qr_texture {
+                        Some(tex) => {
+                            ui.vertical_centered(|ui| {
+                                ui.add(egui::Image::new((tex.id(), egui::vec2(240.0, 240.0))));
+                            });
+                        }
+                        None => {
+                            ui.colored_label(egui::Color32::RED, "✗ 二维码生成失败（链接过长？）");
+                        }
+                    }
+
+                    ui.separator();
+                    ui.label("分享链接（可复制）:");
+                    egui::ScrollArea::vertical()
+                        .max_height(90.0)
+                        .show(ui, |ui| {
+                            // 只读展示：clone 后丢弃编辑，避免用户改动影响二维码/复制内容
+                            let mut url_display = self.share_url_cache.clone();
+                            ui.add(
+                                egui::TextEdit::multiline(&mut url_display)
+                                    .desired_width(460.0)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                        });
+                    ui.horizontal(|ui| {
+                        if ui.button("复制链接").clicked() {
+                            ui.ctx().copy_text(self.share_url_cache.clone());
+                            self.add_log("分享链接已复制到剪贴板".to_string());
+                        }
+                    });
+
+                    // 密钥掩码显示（明文永不出现在分享 UI）
+                    let has_key = self
+                        .share_link
+                        .as_ref()
+                        .map(|l| l.auth_key.is_some())
+                        .unwrap_or(false);
+                    let key_masked = if has_key {
+                        config::mask_secret(self.config.auth_key.trim())
+                    } else {
+                        "（未携带）".to_string()
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label("认证密钥:");
+                        ui.monospace(key_masked);
+                    });
+                    ui.small(format!(
+                        "证书: {}",
+                        if self
+                            .share_link
+                            .as_ref()
+                            .map(|l| l.cert_der.is_some())
+                            .unwrap_or(false)
+                        {
+                            "已包含 DER 本体"
+                        } else if self
+                            .share_link
+                            .as_ref()
+                            .map(|l| l.cert_fp.is_some())
+                            .unwrap_or(false)
+                        {
+                            "仅含指纹（紧凑模式）"
+                        } else {
+                            "未包含（对方需自行导入）"
+                        }
+                    ));
+                    ui.label(format!(
+                        "传输模式: {}",
+                        if self.config.is_obfs() {
+                            "obfs"
+                        } else {
+                            "masquerade"
+                        }
+                    ));
+
+                    // 红字安全提示
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::RED,
+                        "⚠ 完整链接 = 持有节点（含密钥与证书），仅限可信渠道分享！",
+                    );
+                    ui.colored_label(
+                        egui::Color32::RED,
+                        "  请勿粘贴到群聊/公开网页/明文 http；普通渠道请用「紧凑」模式。",
+                    );
+
+                    ui.horizontal(|ui| {
+                        if ui.button("关闭").clicked() {
+                            self.share_dialog_open = false;
+                        }
+                    });
+                });
+            // 单选切换后重建链接（紧凑 = 去掉证书本体只留指纹）
+            if compact != self.share_compact {
+                self.share_compact = compact;
+                self.share_link = self.build_share_link(&self.share_node_addr, compact);
+                self.share_url_cache = String::new(); // 触发二维码重建
+            }
+        }
+
         // 分享链接对话框
         if self.show_share_link_dialog {
             egui::Window::new("分享链接")
@@ -1262,16 +1689,43 @@ impl eframe::App for HydraApp {
 
             ui.separator();
 
-            // 分享链接功能
-            ui.heading("分享链接");
+            // ── Team-Q v2：导入节点（粘贴链接 / 二维码图片 / 链接文件）──
+            ui.heading("导入节点");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.import_text)
+                    .desired_rows(3)
+                    .hint_text("粘贴 hydra:// 分享链接（支持多行）"),
+            );
             ui.horizontal(|ui| {
-                if ui.button("导入分享链接").clicked() {
-                    self.show_share_link_dialog = true;
+                if ui.button("导入粘贴").clicked() {
+                    self.import_pasted_links();
                 }
-                if ui.button("导出分享链接").clicked() {
-                    self.export_share_links();
+                if ui.button("从二维码图片导入").clicked() {
+                    self.import_from_qr_image();
+                }
+                if ui.button("从链接文件导入").clicked() {
+                    self.import_from_link_file();
                 }
             });
+            if let Some((ok, msg)) = &self.import_status {
+                ui.colored_label(
+                    if *ok {
+                        egui::Color32::LIGHT_GREEN
+                    } else {
+                        egui::Color32::RED
+                    },
+                    format!("{} {}", if *ok { "✓" } else { "✗" }, msg),
+                );
+            }
+            ui.small("完整分享含密钥/证书，导入后自动配置，无需再填密钥与证书文件");
+
+            ui.separator();
+
+            // 批量导出分享链接（v1 地址信息，不含密钥）
+            ui.heading("分享链接");
+            if ui.button("导出分享链接").clicked() {
+                self.export_share_links();
+            }
 
             ui.separator();
 
@@ -1391,6 +1845,11 @@ impl eframe::App for HydraApp {
                         self.start_node_test(node_addr.clone());
                     }
 
+                    // Team-Q v2：单节点分享（二维码 + 密钥链接）
+                    if ui.button("分享").clicked() {
+                        self.open_share_dialog(node_addr.clone());
+                    }
+
                     if ui.button("删除").clicked() {
                         indices_to_remove.push(i);
                     }
@@ -1491,6 +1950,9 @@ impl eframe::App for HydraApp {
                 } else {
                     ui.colored_label(egui::Color32::RED, "✗ 证书文件不存在，请检查路径");
                 }
+            } else if !self.config.cert_der_b64.trim().is_empty() {
+                // Team-Q v2：完整分享导入的内嵌证书（无需文件）
+                ui.label("✓ 使用分享链接导入的证书（未设置证书文件）");
             }
 
             // 传输模式（对应 HYDRA_MODE；两端须一致）

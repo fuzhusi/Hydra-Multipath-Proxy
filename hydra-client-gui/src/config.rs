@@ -73,6 +73,11 @@ pub struct GuiConfig {
     /// 节点证书文件路径（对应 HYDRA_NODE_CERT，节点生成的 hydra-node-cert.der）
     #[serde(default)]
     pub cert_path: String,
+    /// Team-Q v2：通过分享链接导入的节点证书 DER（base64 标准编码）。
+    /// 与 cert_path 二选一：cert_path 优先，二者均空才回落环境变量。
+    /// 导入完整分享（cc 字段）时直接入库，无需证书文件落盘。
+    #[serde(default)]
+    pub cert_der_b64: String,
     /// 传输模式：""（默认，等价 masquerade）| "masquerade" | "obfs"（对应 HYDRA_MODE）
     #[serde(default)]
     pub hydra_mode: String,
@@ -214,14 +219,23 @@ pub fn resolve_auth_key(cfg: &GuiConfig) -> Result<Vec<u8>, String> {
     hydra_client::auth_key_from_env()
 }
 
-/// 节点证书解析（配置文件 > 环境变量）：
-/// 配置 `cert_path` 非空 → 直接读该文件；否则回落 `HYDRA_NODE_CERT` 环境变量。
+/// 节点证书解析（证书文件路径 > 链接导入的内嵌 DER > 环境变量）：
+/// `cert_path` 非空 → 读该文件；否则 `cert_der_b64` 非空 → base64 解码；
+/// 二者均空才回落 `HYDRA_NODE_CERT` 环境变量。
 pub fn resolve_node_certs(cfg: &GuiConfig) -> Result<Vec<Vec<u8>>, String> {
     let path = cfg.cert_path.trim();
     if !path.is_empty() {
         return std::fs::read(path)
             .map(|der| vec![der])
             .map_err(|e| format!("读取节点证书 {} 失败: {}", path, e));
+    }
+    let b64 = cfg.cert_der_b64.trim();
+    if !b64.is_empty() {
+        use base64::Engine as _;
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("解码分享链接导入的节点证书失败: {}", e))?;
+        return Ok(vec![der]);
     }
     hydra_client::node_certs_from_env()
 }
@@ -254,6 +268,7 @@ mod tests {
             node_addrs: vec!["127.0.0.1:4433".into(), "10.0.0.1:4433".into()],
             auth_key: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6".into(),
             cert_path: r"C:\certs\hydra-node-cert.der".into(),
+            cert_der_b64: String::new(),
             hydra_mode: "obfs".into(),
             obfs_key: "second-password".into(),
             probe_interval_secs: Some(15),
@@ -304,6 +319,7 @@ mod tests {
             node_addrs: vec!["127.0.0.1:4433".into()],
             auth_key: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6".into(),
             cert_path: "/tmp/node.der".into(),
+            cert_der_b64: String::new(),
             hydra_mode: "masquerade".into(),
             obfs_key: String::new(),
             probe_interval_secs: Some(30),
@@ -400,6 +416,41 @@ mod tests {
         };
         let err = resolve_node_certs(&missing).unwrap_err();
         assert!(err.contains("读取节点证书"), "错误信息应含根因: {}", err);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_node_certs_embedded_der_fallback() {
+        // Team-Q v2：cert_path 为空但 cert_der_b64 非空 → 解码内嵌 DER（链接导入场景，无需文件落盘）
+        use base64::Engine as _;
+        let cfg = GuiConfig {
+            cert_der_b64: base64::engine::general_purpose::STANDARD
+                .encode([0xDE, 0xAD, 0xBE, 0xEF]),
+            ..Default::default()
+        };
+        let certs = resolve_node_certs(&cfg).expect("内嵌 DER 应解码成功");
+        assert_eq!(certs, vec![vec![0xDE, 0xAD, 0xBE, 0xEF]]);
+
+        // cert_path 优先于内嵌 DER
+        let dir = std::env::temp_dir().join(format!("hydra-gui-der-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("node.der");
+        std::fs::write(&cert_path, [0x01]).unwrap();
+        let cfg = GuiConfig {
+            cert_path: cert_path.to_string_lossy().into_owned(),
+            cert_der_b64: "!!!bad!!!".into(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_node_certs(&cfg).unwrap(), vec![vec![0x01]]);
+
+        // 坏 base64 且无路径 → Err 带根因
+        let bad = GuiConfig {
+            cert_der_b64: "!!!bad!!!".into(),
+            ..Default::default()
+        };
+        let err = resolve_node_certs(&bad).unwrap_err();
+        assert!(err.contains("解码"), "错误信息应含根因: {}", err);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

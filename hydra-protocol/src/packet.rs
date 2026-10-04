@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Packet {
@@ -14,7 +14,13 @@ pub struct Packet {
 }
 
 impl Packet {
-    pub fn new(session_id: u64, stream_id: u32, chunk_id: u32, offset: u64, payload: Bytes) -> Self {
+    pub fn new(
+        session_id: u64,
+        stream_id: u32,
+        chunk_id: u32,
+        offset: u64,
+        payload: Bytes,
+    ) -> Self {
         let length = payload.len() as u32;
         let checksum = Self::calculate_checksum(&payload);
         Self {
