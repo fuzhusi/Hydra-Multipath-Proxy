@@ -63,6 +63,8 @@ struct NodeStatusInfo {
 struct HydraApp {
     // 应用状态
     proxy_running: bool,
+    proxy_start_receiver: Option<std::sync::mpsc::Receiver<std::result::Result<std::net::SocketAddr, std::io::Error>>>,
+    proxy_starting: bool,
     nodes: Vec<NodeInfo>,
     logs: Vec<String>,
     /// 持久化配置（配置文件 > 环境变量，见 config.rs）
@@ -161,6 +163,8 @@ impl Default for HydraApp {
     fn default() -> Self {
         Self {
             proxy_running: false,
+            proxy_start_receiver: None,
+            proxy_starting: false,
             nodes: Vec::new(),
             logs: Vec::new(),
             config: GuiConfig::default(),
@@ -286,6 +290,8 @@ impl HydraApp {
 
         let mut app = Self {
             proxy_running: false,
+            proxy_start_receiver: None,
+            proxy_starting: false,
             nodes: Vec::new(),
             logs: Vec::new(),
             saved_snapshot: cfg.clone(),
@@ -624,6 +630,10 @@ impl HydraApp {
             self.add_log("代理已经在运行".to_string());
             return;
         }
+        if self.proxy_starting {
+            self.add_log("代理正在启动中（节点预热可能需要数十秒），请稍候".to_string());
+            return;
+        }
 
         // Exec-1：模式/obfs 密码/探测间隔——配置非空 → 覆盖 env（hydra-client 内部从 env 读取）。
         // 此前已有线程在跑时本函数会被 proxy_running 拦截，故此处写 env 不会与之并发。
@@ -697,7 +707,7 @@ impl HydraApp {
         self.traffic_monitor = Some(traffic_monitor.clone());
 
         // 使用独立线程运行代理
-        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), std::io::Error>>();
+        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<std::net::SocketAddr, std::io::Error>>();
         let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
         let proxy_addr_clone = proxy_addr;
         let nodes_clone = nodes.clone();
@@ -723,8 +733,8 @@ impl HydraApp {
                 let ready_tx = tx.clone();
                 let watcher = tokio::spawn(async move {
                     for _ in 0..600 {
-                        if p2.bound_addr().is_some() {
-                            let _ = ready_tx.send(Ok(()));
+                        if let Some(bound) = p2.bound_addr() {
+                            let _ = ready_tx.send(Ok(bound));
                             return;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -765,29 +775,39 @@ impl HydraApp {
         self.stop_flag = Some(stop_flag);
         self.proxy_thread_handle = Some(handle);
         self.proxy_exit_receiver = Some(exit_rx);
+        // 非阻塞启动：就绪信号经 proxy_start_receiver 在 update 轮询中处理。
+        // 阻塞式 recv 会冻结 UI（节点预热/弱网下可达数十秒）
+        self.proxy_start_receiver = Some(rx);
+        self.proxy_starting = true;
+        self.add_log("代理启动中…（节点预热可能需要数十秒，视网络质量而定）".to_string());
+    }
 
-        // 等待代理启动
-        match rx.recv() {
-            Ok(Ok(())) => {
-                // 等待端口绑定完成
-                std::thread::sleep(std::time::Duration::from_millis(200));
+    /// update 轮询：消费代理就绪信号（非阻塞，替代原先冻结 UI 的阻塞 recv）
+    fn poll_start_receiver(&mut self) -> Option<()> {
+        let signal = match &self.proxy_start_receiver {
+            Some(rx) => rx.try_recv().ok(),
+            None => None,
+        };
+        let signal = signal?;
+        self.proxy_start_receiver = None;
+        self.proxy_starting = false;
+        match signal {
+            Ok(addr) => {
                 self.proxy_running = true;
-                self.add_log(format!("代理已启动，监听地址: {}", proxy_addr));
-                // 关键动作立即落盘（监听地址/节点等可能的变更）
+                self.add_log(format!("代理已就绪，监听地址: {addr}"));
                 self.maybe_save_config(true);
-
-                // 设置系统全局代理
-                let proxy_url = format!("socks5://{}", proxy_addr);
+                let proxy_url = format!("socks5://{addr}");
                 self.set_system_proxy(&proxy_url);
                 self.add_log("已设置系统全局代理".to_string());
             }
-            Ok(Err(e)) => {
-                self.add_log(format!("代理启动失败: {}", e));
-            }
             Err(e) => {
-                self.add_log(format!("代理启动错误: {}", e));
+                self.add_log(format!("代理启动失败: {e}"));
+                if let Some(flag) = &self.stop_flag {
+                    flag.store(true, Ordering::Relaxed);
+                }
             }
         }
+        Some(())
     }
 
     fn set_system_proxy(&mut self, proxy_url: &str) {
@@ -969,6 +989,8 @@ impl HydraApp {
         }
 
         self.proxy_running = false;
+        self.proxy_starting = false;
+        self.proxy_start_receiver = None;
         self.stop_flag = None;
         self.proxy_thread_handle = None;
         self.proxy_exit_receiver = None;
@@ -1549,6 +1571,7 @@ impl eframe::App for HydraApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_start_receiver();
         // ── T2：托盘命令轮询 + 关窗行为（隐藏到托盘 vs 真退出）──
         self.poll_tray_commands(ctx);
         self.handle_close_request(ctx);
