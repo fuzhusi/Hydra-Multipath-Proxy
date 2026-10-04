@@ -17,6 +17,9 @@ pub struct NodeOptions {
     pub cert_domains: Vec<String>,
     /// C2 传输模式：masquerade（默认，V2 行为零改动）| obfs（逃生舱，需 HYDRA_OBFS_KEY）
     pub mode: TransportMode,
+    /// Team-T：可选 TCP/TLS 传输监听（如 0.0.0.0:443；None=不监听 TCP，行为零改动）。
+    /// 与 QUIC 的 UDP 监听并存；已知限制见 hydra_node::tcp 模块文档。
+    pub tcp_listen: Option<SocketAddr>,
 }
 
 impl Default for NodeOptions {
@@ -27,6 +30,7 @@ impl Default for NodeOptions {
             key_file: PathBuf::from("hydra-node-key.der"),
             cert_domains: vec!["hydra.node".to_string(), "localhost".to_string()],
             mode: TransportMode::Masquerade,
+            tcp_listen: None,
         }
     }
 }
@@ -76,6 +80,8 @@ pub struct HydraServer {
     handler: Arc<ConnectionHandler>,
     max_connections: u32,
     cert_der: Vec<u8>,
+    /// Team-T：TCP/TLS 监听实际绑定地址（None=未启用 TCP 传输；测试/工具读取）
+    pub tcp_listen_addr: Option<SocketAddr>,
 }
 
 impl HydraServer {
@@ -89,7 +95,7 @@ impl HydraServer {
         let (cert_der, key_der) =
             cert::load_or_generate(&opts.cert_file, &opts.key_file, &opts.cert_domains)?;
 
-        let server_config = Self::configure_server(cert_der.clone(), key_der)?;
+        let server_config = Self::configure_server(cert_der.clone(), key_der.clone())?;
         let endpoint = match opts.mode {
             TransportMode::Masquerade => Endpoint::server(server_config, addr)?,
             TransportMode::Obfs => {
@@ -112,11 +118,28 @@ impl HydraServer {
             hydra_protocol::handshake::AuthMode::from_env(), // 启动时读一次，不在每流热路径读 env
         ));
 
+        // Team-T：可选 TCP/TLS 监听（HYDRA_TCP_LISTEN；未设=零改动）。
+        // 同一证书/密钥、同一 ConnectionHandler（认证/SSRF 复用）；绑定失败显式报错。
+        let tcp_listen_addr = if let Some(tcp_addr) = opts.tcp_listen {
+            Some(
+                crate::tcp::spawn_tcp_listener(
+                    tcp_addr,
+                    cert_der.clone(),
+                    key_der,
+                    handler.clone(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
             endpoint,
             handler,
             max_connections: opts.max_connections.max(1),
             cert_der: cert_der.0,
+            tcp_listen_addr,
         })
     }
 

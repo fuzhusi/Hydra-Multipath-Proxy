@@ -53,6 +53,10 @@ pub struct ShareLink {
     /// v2 obfs 独立第二密码（base64url(UTF-8 字节)）；仅 obfs 模式
     #[serde(default)]
     pub obfs_key: Option<String>,
+    /// Team-T 传输选择（链接参数 `tp=tcp|quic`）；None/缺省 = quic（既有链接零改动）。
+    /// 序列化仅在 tcp 时写 `tp=tcp`（quic 为缺省不写，与 mode 字段同一惯例）
+    #[serde(default)]
+    pub transport: Option<String>,
 }
 
 impl ShareLink {
@@ -70,6 +74,7 @@ impl ShareLink {
             cert_der: None,
             cert_fp: None,
             obfs_key: None,
+            transport: None,
         }
     }
 
@@ -98,6 +103,27 @@ impl ShareLink {
     pub fn with_obfs_key(mut self, key: &str) -> Self {
         self.obfs_key = Some(BASE64URL.encode(key.as_bytes()));
         self
+    }
+
+    /// 覆盖传输选择（Team-T：`tp=tcp`；builder 风格）
+    pub fn with_transport(mut self, tp: crate::tcp_transport::TransportChoice) -> Self {
+        self.transport = Some(tp.as_str().to_string());
+        self
+    }
+
+    /// 节点是否使用 TCP/TLS 传输（Team-T；缺省 = quic）
+    pub fn transport_is_tcp(&self) -> bool {
+        matches!(self.transport.as_deref(), Some("tcp"))
+    }
+
+    /// 解析传输选择字段（None/非法缺省按 quic 由调用方决定；此处非法值显式报错）
+    pub fn transport_choice(
+        &self,
+    ) -> std::result::Result<crate::tcp_transport::TransportChoice, HydraError> {
+        match self.transport.as_deref() {
+            None => Ok(crate::tcp_transport::TransportChoice::Quic),
+            Some(s) => crate::tcp_transport::TransportChoice::parse(s),
+        }
     }
 
     /// 是否完整分享（同时携带认证密钥与节点证书 = 对方导入即用 = 等同持有节点）
@@ -219,6 +245,12 @@ impl ShareLink {
         if let Some(cf) = &self.cert_fp {
             url.push_str(&format!("&cf={}", cf));
         }
+        // Team-T：传输选择（仅 tcp 写 tp=tcp；quic 为缺省不写，既有链接零改动）
+        if let Some(tp) = &self.transport {
+            if tp == "tcp" {
+                url.push_str("&tp=tcp");
+            }
+        }
         url
     }
 
@@ -251,6 +283,7 @@ impl ShareLink {
         let mut cert_der: Option<String> = None;
         let mut cert_fp: Option<String> = None;
         let mut obfs_key: Option<String> = None;
+        let mut transport: Option<String> = None;
 
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
@@ -319,6 +352,13 @@ impl ShareLink {
                             HydraError::ProtocolError(format!("Invalid mode: {}", e))
                         })?);
                 }
+                // Team-T：传输选择（tp=tcp|quic；非法值显式报错，不静默回落）
+                "tp" => {
+                    crate::tcp_transport::TransportChoice::parse(&value).map_err(|e| {
+                        HydraError::ProtocolError(format!("Invalid tp (transport): {}", e))
+                    })?;
+                    transport = Some(value.to_string());
+                }
                 _ => {}
             }
         }
@@ -336,6 +376,7 @@ impl ShareLink {
             cert_der,
             cert_fp,
             obfs_key,
+            transport,
         })
     }
 
@@ -505,6 +546,34 @@ hydra://192.168.1.100:8080?bandwidth=80&latency=15&loss_rate=0.02&status=online
     }
 
     // ===================== C4 V3.1 mode 字段 =====================
+
+    /// Team-T：`tp` 传输字段解析/序列化往返；缺省 quic 不写参数（既有链接零改动）
+    #[test]
+    fn tt_tp_field_roundtrip() {
+        let url = "hydra://1.2.3.4:443?bandwidth=100&tp=tcp";
+        let link = ShareLink::from_share_url(url).unwrap();
+        assert!(link.transport_is_tcp());
+        assert_eq!(link.transport_choice().unwrap(), crate::tcp_transport::TransportChoice::Tcp);
+
+        // URL 往返
+        let rt = ShareLink::from_share_url(&link.to_share_url()).unwrap();
+        assert!(rt.transport_is_tcp());
+
+        // serde（GUI 持久化）往返
+        let json = serde_json::to_string(&link).unwrap();
+        let rt2: ShareLink = serde_json::from_str(&json).unwrap();
+        assert!(rt2.transport_is_tcp());
+
+        // 显式 quic 与缺省等价：不写 tp 参数
+        let quic = ShareLink::from_share_url("hydra://1.2.3.4:443?tp=quic").unwrap();
+        assert!(!quic.transport_is_tcp());
+        assert!(!quic.to_share_url().contains("tp="));
+        let default = ShareLink::from_share_url("hydra://1.2.3.4:443?bandwidth=100").unwrap();
+        assert!(!default.transport_is_tcp());
+
+        // 非法值显式报错（不静默回落 quic）
+        assert!(ShareLink::from_share_url("hydra://1.2.3.4:443?tp=obfs").is_err());
+    }
 
     fn sample_node() -> NodeInfo {
         NodeInfo {

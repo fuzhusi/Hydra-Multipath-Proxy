@@ -486,6 +486,59 @@ impl ConnectionHandler {
         }
     }
 
+    /// 预共享认证密钥（Team-T TCP/TLS 路径复用同一密钥）
+    pub(crate) fn auth_key(&self) -> &[u8] {
+        &self.auth_key
+    }
+
+    /// Team-T TCP/TLS 路径共用的认证与请求解析：64B v2 token → 1B 模式标签 →
+    /// [1B 地址长度 + 地址]。与 QUIC legacy 路径的线缆格式逐字节一致
+    /// （v1 TCP 仅支持 v2 token，无 v3 Noise/通道模式）。
+    /// 返回 None = 认证失败/协议失步/超时——调用方必须静默关闭（无任何回显，
+    /// 与 QUIC 未认证路径的防探测语义一致）。
+    pub(crate) async fn tcp_auth_and_target<R: tokio::io::AsyncRead + Unpin>(
+        recv: &mut R,
+        auth_key: &[u8],
+    ) -> Option<String> {
+        let mut token = vec![0u8; AuthToken::TOKEN_LEN];
+        match tokio::time::timeout(AUTH_TIMEOUT, recv.read_exact(&mut token)).await {
+            Ok(Ok(_)) => {}
+            _ => return None,
+        }
+        if AuthToken::verify(auth_key, &token, CLIENT_ID, 30).is_err() {
+            debug!("TCP stream failed token authentication, closing silently");
+            return None;
+        }
+        let mut tag = [0u8; 1];
+        match tokio::time::timeout(AUTH_TIMEOUT, recv.read_exact(&mut tag)).await {
+            Ok(Ok(_)) => {}
+            _ => return None,
+        }
+        if tag[0] != MODE_LEGACY {
+            debug!(
+                "TCP stream unknown mode tag 0x{:02x}, closing silently",
+                tag[0]
+            );
+            return None;
+        }
+        let mut len_buf = [0u8; 1];
+        match tokio::time::timeout(AUTH_TIMEOUT, recv.read_exact(&mut len_buf)).await {
+            Ok(Ok(_)) => {}
+            _ => return None,
+        }
+        let addr_len = len_buf[0] as usize;
+        if addr_len == 0 || addr_len > MAX_ADDR_LEN {
+            debug!("TCP stream invalid address length: {}", addr_len);
+            return None;
+        }
+        let mut addr_buf = vec![0u8; addr_len];
+        match tokio::time::timeout(AUTH_TIMEOUT, recv.read_exact(&mut addr_buf)).await {
+            Ok(Ok(_)) => {}
+            _ => return None,
+        }
+        Some(String::from_utf8_lossy(&addr_buf).to_string())
+    }
+
     pub async fn handle_connection(&self, connection: Connection) -> Result<()> {
         debug!("Waiting for bidirectional stream from client...");
         let authed = Arc::new(AtomicBool::new(false));
@@ -656,7 +709,8 @@ impl ConnectionHandler {
     /// 解析目标地址（字面 IP 或节点侧 DNS）并执行 SSRF 过滤 + 建立目标 TCP。
     /// 错误返回 (应用错误码, 已格式化错误)：0x12=DNS 失败、0x11=SSRF 拒绝/无法连接/超时。
     /// 现行单流路径与 channel 创建流共用（SSRF 过滤对 channel 目标地址同样生效）。
-    async fn resolve_and_connect(
+    /// Team-T：TCP/TLS 路径复用同一函数——SSRF 过滤对 TCP 路径同样生效（强制门④）。
+    pub(crate) async fn resolve_and_connect(
         target_addr_str: &str,
     ) -> std::result::Result<TcpStream, (u32, HydraError)> {
         // 日志脱敏（防追踪性）：info 级一律短哈希，完整明文仅 debug 级（RUST_LOG=debug）可见

@@ -32,6 +32,12 @@ fn parse_args() -> (Option<SocketAddr>, Vec<SocketAddr>) {
                 println!(
                     "  HYDRA_CHANNELS   单连接多流通道聚合流数 2-16（V3.4；默认未设=关闭，走现行单流路径；须节点 ≥ V3.4）"
                 );
+                println!(
+                    "  HYDRA_TRANSPORT  传输选择 quic|tcp（Team-T；默认 quic=现状；tcp=TCP+TLS，须节点开启 HYDRA_TCP_LISTEN；"
+                );
+                println!(
+                    "                   无多流聚合/无 ACK（TCP 自带）；obfs 不适用）"
+                );
                 std::process::exit(0);
             }
             other => {

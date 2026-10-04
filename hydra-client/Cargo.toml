@@ -13,6 +13,8 @@ quinn = "0.10"
 # 直接依赖 quinn-proto 以实现 congestion::Controller trait（与 quinn 0.10 同一 0.10.x 实例）
 quinn-proto = "0.10"
 rustls = "0.21"
+# Team-T：TCP/TLS 传输模式（与 rustls 0.21 匹配的 tokio 适配层）
+tokio-rustls = "0.24"
 ring = "0.16"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

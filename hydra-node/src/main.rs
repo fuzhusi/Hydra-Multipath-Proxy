@@ -42,6 +42,8 @@ fn parse_args() -> CliArgs {
                 println!("  HYDRA_MAX_CONNECTIONS 最大并发连接数 (默认 1000)");
                 println!("  HYDRA_MODE            传输模式 masquerade|obfs (默认 masquerade；V3.1 双模式，两端须一致)");
                 println!("  HYDRA_OBFS_KEY        obfs 模式独立混淆密码（两端一致；masquerade 模式无需设置）");
+                println!("  HYDRA_TCP_LISTEN      可选 TCP/TLS 传输监听 ip:port（如 0.0.0.0:443；与 QUIC UDP 并存；");
+                println!("                        未设置=不监听 TCP。线缆=标准 TLS+v2 token，不支持 obfs/多流聚合）");
                 println!("  HYDRA_HEALTH_ADDR     健康检查端点地址 (如 127.0.0.1:8081；未设置=关闭；GET /health)");
                 println!("  HYDRA_STUN_ADDR       STUN 服务器 ip:port（如 74.125.250.129:19302；未设置=关闭；");
                 println!("                        启动及每 10 分钟做 RFC5389 公网地址发现，报入 /health 的 public_addr）");
@@ -124,13 +126,26 @@ async fn main() -> Result<()> {
         ..
     } = cfg;
 
-    let opts = NodeOptions {
+    let mut opts = NodeOptions {
         max_connections,
         cert_file,
         key_file,
         cert_domains,
         mode,
+        tcp_listen: None,
     };
+
+    // Team-T：可选 TCP/TLS 监听（HYDRA_TCP_LISTEN=ip:port；未设=不监听 TCP，零改动）。
+    // config.rs 不在本任务文件所有权内，env 解析在 main 层完成；非法值显式退出。
+    if let Ok(v) = std::env::var("HYDRA_TCP_LISTEN") {
+        match v.parse() {
+            Ok(a) => opts.tcp_listen = Some(a),
+            Err(e) => {
+                eprintln!("错误：HYDRA_TCP_LISTEN=\"{}\" 不是合法的 ip:port（{}）", v, e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     info!(
         "Starting Hydra node: listen={}, max_connections={}, cert={}, mode={}, stun={}",

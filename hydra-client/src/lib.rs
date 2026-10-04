@@ -13,6 +13,7 @@ pub mod share_link;
 pub mod speedtest;
 pub mod splitter;
 pub mod subscription;
+pub mod tcp_transport;
 pub mod traffic;
 pub mod transport;
 
@@ -31,6 +32,7 @@ pub use share_link::*;
 pub use speedtest::*;
 pub use splitter::*;
 pub use subscription::*;
+pub use tcp_transport::*;
 pub use traffic::*;
 pub use transport::*;
 

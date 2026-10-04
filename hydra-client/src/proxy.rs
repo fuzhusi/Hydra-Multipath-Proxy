@@ -2,6 +2,7 @@ use crate::aggregate_stream::{ChannelDownReader, ChannelError, ChannelPair, Chan
 use crate::pool::{ConnectionPool, PoolConfig};
 use crate::routing;
 use crate::scheduler::Scheduler;
+use crate::tcp_transport::{self, TransportChoice};
 use crate::traffic::{ByteCounter, CountingStream, TrafficMonitor};
 use crate::transport::{Transport, DEFAULT_SNI};
 use hydra_protocol::{mask_target, HydraError, NodeInfo, NodeStatus, Result};
@@ -24,6 +25,12 @@ pub fn active_relay_count() -> usize {
     ACTIVE_RELAYS.load(Ordering::Relaxed)
 }
 
+/// Team-T：TCP/TLS 路径凭据快照（start 时注入：节点证书 / SNI / 认证密钥）。
+/// open_target 是无 self 的关联函数，全局传输选择配全局凭据快照（单代理实例场景）；
+/// 未 start 过 = tcp 模式下报错（测试直连路径不经此，显式传参）。
+static TCP_CREDS: std::sync::OnceLock<(Vec<Vec<u8>>, String, Vec<u8>)> =
+    std::sync::OnceLock::new();
+
 // ── 节点侧应用错误码（与 hydra-node/src/handler.rs 保持一致；客户端经 ReadError::Reset 读到）──
 /// 0x11：节点无法连接目标
 pub const NODE_ERR_TARGET_CONNECT: u64 = 0x11;
@@ -39,6 +46,11 @@ pub(crate) enum NodeLink {
         recv: CountingStream<quinn::RecvStream>,
     },
     Channel(ChannelPair),
+    /// Team-T：TCP/TLS 传输（HYDRA_TRANSPORT=tcp；无多流聚合/ACK，TCP 自带可靠有序）
+    Tcp {
+        send: CountingStream<tokio::io::WriteHalf<tcp_transport::TcpNodeStream>>,
+        recv: CountingStream<tokio::io::ReadHalf<tcp_transport::TcpNodeStream>>,
+    },
 }
 
 /// V3.4 通道模式参数：Off = 现行单流路径（逐位不变），On(n) = n 流通道
@@ -147,6 +159,12 @@ impl ProxyServer {
 
         // Add nodes to scheduler（按加入顺序递减初始评分，测速上线后由实测数据取代）
         info!("Initializing proxy with {} nodes...", self.nodes.len());
+        // Team-T：快照 TCP/TLS 路径凭据（open_target 无 self，全局传输选择配全局快照）
+        let _ = TCP_CREDS.set((
+            self.node_certs.clone(),
+            self.sni.clone(),
+            self.auth_key.clone(),
+        ));
         for (idx, addr) in self.nodes.iter().enumerate() {
             let node = NodeInfo {
                 address: *addr,
@@ -292,6 +310,11 @@ impl ProxyServer {
         target: &str,
         peer_addr: SocketAddr,
     ) -> Result<NodeLink> {
+        // Team-T：全局 TCP/TLS 传输模式（HYDRA_TRANSPORT=tcp；默认 quic 零改动）。
+        // tcp 模式不做多流聚合/ACK（TCP 自带可靠有序），通道参数被忽略（warn 一次）。
+        if tcp_transport::transport_from_env() == TransportChoice::Tcp {
+            return Self::open_target_tcp(scheduler, traffic, target, peer_addr).await;
+        }
         if let Some(n) = crate::aggregate_stream::channel_count() {
             match Self::open_target_once(
                 scheduler,
@@ -528,6 +551,67 @@ impl ProxyServer {
         }
 
         Err(last_err.unwrap_or_else(|| HydraError::ConnectionError("All nodes failed".to_string())))
+    }
+
+    /// Team-T：TCP/TLS 传输的单轮建流（结构与 open_target_once 平行：候选节点逐个试，
+    /// 成功返回已认证、已收到 0x00 应答的 TLS 流；失败标记节点离线换下一个）。
+    /// 无通道模式（TCP 自带可靠有序）；无应用错误码通道——节点静默关闭按目标侧故障
+    /// 报错（不降级语义简化为：连接失败一律换下一候选，v1 限制，如实记录）。
+    async fn open_target_tcp(
+        scheduler: &Scheduler,
+        traffic: &Arc<TrafficMonitor>,
+        target: &str,
+        peer_addr: SocketAddr,
+    ) -> Result<NodeLink> {
+        const MAX_NODE_ATTEMPTS: usize = 3;
+        let Some((node_certs, sni, auth_key)) = TCP_CREDS.get() else {
+            return Err(HydraError::ConnectionError(
+                "TCP 传输模式缺少凭据快照（代理未完成初始化）".to_string(),
+            ));
+        };
+
+        let candidates = scheduler.get_nodes_by_priority().await;
+        if candidates.is_empty() {
+            return Err(HydraError::ConnectionError("No available nodes".to_string()));
+        }
+        let mut last_err: Option<HydraError> = None;
+        for node in candidates.iter().take(MAX_NODE_ATTEMPTS) {
+            match tcp_transport::connect_target(node.address, sni, node_certs, auth_key, target)
+                .await
+            {
+                Ok(tls) => {
+                    info!(
+                        "[{}] ✓ Connected to {} via node {} (tcp/tls)",
+                        peer_addr,
+                        mask_target(target),
+                        node.address
+                    );
+                    let node_entry = traffic.node_entry(node.address);
+                    let (r, w) = tokio::io::split(tls);
+                    let send = CountingStream::new(
+                        w,
+                        ByteCounter::up(Some(traffic.clone()), Some(node_entry.clone())),
+                    );
+                    let recv = CountingStream::new(
+                        r,
+                        ByteCounter::down(Some(traffic.clone()), Some(node_entry)),
+                    );
+                    return Ok(NodeLink::Tcp { send, recv });
+                }
+                Err(e) => {
+                    warn!(
+                        "[{}] Node {} tcp/tls connect failed ({}), failing over to next node",
+                        peer_addr,
+                        node.address,
+                        e
+                    );
+                    scheduler.mark_node_offline(&node.address).await;
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| HydraError::ConnectionError("All nodes failed".to_string())))
     }
 
     /// 处理 HTTP 代理请求（CONNECT 与普通明文请求共用入口）
@@ -1061,6 +1145,7 @@ impl ProxyServer {
                 NodeLink::Single { send, recv } => {
                     (UpSink::Node(send), DownSource::Node(recv), None)
                 }
+                NodeLink::Tcp { send, recv } => (UpSink::Tcp(send), DownSource::Tcp(recv), None),
             },
             RemoteLink::Direct(tcp) => {
                 let (r, w) = tcp.into_split();
@@ -1104,6 +1189,10 @@ impl ProxyServer {
                             UpSink::Direct(mut w) => {
                                 let _ = w.shutdown().await;
                             }
+                            // Team-T：TCP/TLS 链路半关闭 = shutdown 写端（FIN 传给节点）
+                            UpSink::Tcp(mut w) => {
+                                let _ = w.shutdown().await;
+                            }
                         }
                         return Ok(total);
                     }
@@ -1132,6 +1221,12 @@ impl ProxyServer {
                                 .await
                                 .map(|_| ())
                                 .map_err(RelayError::LocalIo),
+                            // Team-T：TCP/TLS 链路无错误码通道，写失败 = 传输故障
+                            UpSink::Tcp(w) => w
+                                .write_all(&buf[..n])
+                                .await
+                                .map(|_| ())
+                                .map_err(|_| RelayError::Transport),
                         };
                         if let Err(e) = write_res {
                             return Err(e);
@@ -1172,6 +1267,12 @@ impl ProxyServer {
                         Ok(0) => return Ok(total),
                         Ok(n) => n,
                         Err(e) => return Err(RelayError::LocalIo(e)),
+                    },
+                    // Team-T：TCP/TLS 链路。FIN = 响应完整结束；无错误码通道（v1 限制）
+                    DownSource::Tcp(r) => match r.read(&mut buf).await {
+                        Ok(0) => return Ok(total),
+                        Ok(n) => n,
+                        Err(_) => return Err(RelayError::Transport),
                     },
                 };
                 total += n as u64;
@@ -1281,13 +1382,19 @@ enum RemoteLink {
 /// HTTP 明文代理把原始请求字节写向节点链路（单流 write_all / 通道多流写入器）。
 async fn write_node_link(link: &mut NodeLink, raw: &[u8]) -> std::result::Result<(), ChannelError> {
     match link {
-        NodeLink::Single { send, .. } => send
-            .write_all(raw)
-            .await
-            .map_err(|_| ChannelError::Transport),
-        // V3.4：通道创建流已由 0x00 应答确认，原始请求字节经多流写入器分发
-        NodeLink::Channel(pair) => pair.up.write_all(raw).await,
-    }
+    NodeLink::Single { send, .. } => send
+        .write_all(raw)
+        .await
+        .map_err(|_| ChannelError::Transport),
+    // V3.4：通道创建流已由 0x00 应答确认，原始请求字节经多流写入器分发
+    NodeLink::Channel(pair) => pair.up.write_all(raw).await,
+    // Team-T：TCP/TLS 链路（无错误码通道）
+    NodeLink::Tcp { send, .. } => send
+        .write_all(raw)
+        .await
+        .map(|_| ())
+        .map_err(|_| ChannelError::Transport),
+}
 }
 
 /// 上行终点（浏览器 → 远端）
@@ -1296,6 +1403,8 @@ enum UpSink {
     /// V3.4 多流通道上行写端
     Channel(ChannelUpWriter),
     Direct(CountingStream<tokio::net::tcp::OwnedWriteHalf>),
+    /// Team-T：TCP/TLS 链路上行写端
+    Tcp(CountingStream<tokio::io::WriteHalf<tcp_transport::TcpNodeStream>>),
 }
 
 /// 下行源（远端 → 浏览器）
@@ -1304,6 +1413,8 @@ enum DownSource {
     /// V3.4 多流通道下行读端（seq 重排后交付）
     Channel(ChannelDownReader),
     Direct(CountingStream<tokio::net::tcp::OwnedReadHalf>),
+    /// Team-T：TCP/TLS 链路下行读端
+    Tcp(CountingStream<tokio::io::ReadHalf<tcp_transport::TcpNodeStream>>),
 }
 
 /// 中继方向错误

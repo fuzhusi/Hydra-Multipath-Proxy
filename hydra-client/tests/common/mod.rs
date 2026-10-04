@@ -23,6 +23,8 @@ pub struct TestNode {
     pub endpoint: quinn::Endpoint,
     /// 节点配置（证书目录等），供同端口重启（A2 恢复探测测试）
     pub opts: NodeOptions,
+    /// Team-T：TCP/TLS 监听实际绑定地址（None=未启用 HYDRA_TCP_LISTEN）
+    pub tcp_addr: Option<SocketAddr>,
 }
 
 /// 启动一个监听随机端口的节点服务器（带认证；证书持久化到独立临时目录）
@@ -75,6 +77,7 @@ pub async fn spawn_node_with_opts(addr: SocketAddr, opts: NodeOptions) -> TestNo
     let bound = server.endpoint.local_addr().unwrap();
     let cert = server.cert_der().to_vec();
     let endpoint = server.endpoint.clone();
+    let tcp_addr = server.tcp_listen_addr;
     tokio::spawn(async move {
         let _ = server.start().await;
     });
@@ -84,6 +87,7 @@ pub async fn spawn_node_with_opts(addr: SocketAddr, opts: NodeOptions) -> TestNo
         addr: bound,
         cert,
         endpoint,
+        tcp_addr,
         opts,
     }
 }
