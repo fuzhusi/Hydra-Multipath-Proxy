@@ -147,6 +147,38 @@ pub async fn spawn_proxy_with_handle(
     panic!("proxy failed to bind");
 }
 
+/// 同 spawn_proxy_with_handle，但注入共享 TrafficMonitor 并一并返回其句柄
+/// （流量统计 E2E：断言中继字节数与全局/按节点计数一致）
+pub async fn spawn_proxy_with_monitor(
+    nodes: Vec<(SocketAddr, Vec<u8>)>,
+) -> (
+    SocketAddr,
+    std::sync::Arc<ProxyServer>,
+    std::sync::Arc<hydra_client::TrafficMonitor>,
+) {
+    let node_addrs: Vec<SocketAddr> = nodes.iter().map(|(a, _)| *a).collect();
+    let certs: Vec<Vec<u8>> = nodes.iter().map(|(_, c)| c.clone()).collect();
+    let monitor = std::sync::Arc::new(hydra_client::TrafficMonitor::new());
+
+    let proxy = ProxyServer::new("127.0.0.1:0".parse().unwrap())
+        .with_nodes(node_addrs)
+        .with_auth_key(test_auth_key())
+        .with_node_certs(certs)
+        .with_traffic_monitor(monitor.clone());
+    let proxy = std::sync::Arc::new(proxy);
+    let p = proxy.clone();
+    tokio::spawn(async move {
+        let _ = p.start().await;
+    });
+    for _ in 0..50 {
+        if let Some(addr) = proxy.bound_addr() {
+            return (addr, proxy, monitor);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("proxy failed to bind");
+}
+
 /// 等待 UDP 端口释放（节点 endpoint 关闭后 server 任务退出需短暂时间）
 pub async fn wait_udp_port_free(port: u16, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;

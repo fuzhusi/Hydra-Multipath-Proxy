@@ -1,4 +1,5 @@
 pub mod aggregate;
+pub mod aggregate_stream;
 pub mod assembler;
 pub mod buf_pool;
 pub mod crypto;
@@ -16,6 +17,7 @@ pub mod traffic;
 pub mod transport;
 
 pub use aggregate::*;
+pub use aggregate_stream::*;
 pub use assembler::*;
 pub use buf_pool::*;
 pub use crypto::*;

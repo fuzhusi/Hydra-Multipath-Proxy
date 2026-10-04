@@ -29,6 +29,9 @@ fn parse_args() -> (Option<SocketAddr>, Vec<SocketAddr>) {
                 println!(
                     "  HYDRA_OBFS_KEY   obfs 模式独立混淆密码（两端一致；masquerade 模式无需设置）"
                 );
+                println!(
+                    "  HYDRA_CHANNELS   单连接多流通道聚合流数 2-16（V3.4；默认未设=关闭，走现行单流路径；须节点 ≥ V3.4）"
+                );
                 std::process::exit(0);
             }
             other => {

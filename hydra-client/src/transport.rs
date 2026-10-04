@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
 
-/// Brutal 式固定速率拥塞控制（Hysteria2 思路，Exec-B）。
+/// 拥塞控制选择（Exec-B Brutal / Team-C HYDRA_CC 三选一）。
 /// 经 `#[path]` 挂为本文件子模块：文件所有权制下不改 lib.rs 的模块声明。
-/// `HYDRA_BRUTAL_MBPS` 未设置时完全不生效（quinn 默认 CUBIC，零改动）。
+/// env `HYDRA_CC=brutal|bbr|cubic` 显式选算法（非法值/brutal 缺带宽 → 启动报错）；
+/// 未设置时保留 Wave4 行为：有合法 `HYDRA_BRUTAL_MBPS` 则 Brutal，否则 quinn 默认 CUBIC（零改动）。
 #[path = "cc.rs"]
 pub mod cc;
 
@@ -99,14 +100,16 @@ impl Transport {
         // B1: 流控窗口调优（吞吐杠杆 + 连接级内存封顶）。
         // 独立函数，节点侧（WS-C C2 改 server.rs 时）复用同一份逻辑。
         apply_transport_tuning(&mut transport_config);
-        // Brutal 式拥塞控制（Exec-B）：仅当 env HYDRA_BRUTAL_MBPS 已设置时启用，
-        // 未设置 = 不动 factory = quinn 默认 CUBIC，行为零改动。
+        // 拥塞控制（Team-C 三选一）：HYDRA_CC=brutal|bbr|cubic 显式指定；
+        // 未设置保留 Wave4 行为（有合法 HYDRA_BRUTAL_MBPS → Brutal，否则 quinn 默认 CUBIC）。
+        // HYDRA_CC 非法值、或 HYDRA_CC=brutal 而无带宽 → 此处返回 Err（启动显式报错退出）。
         // 注意：拥塞控制只约束本端发送方向；双向提速需两端都设（节点侧接线归总控/WS-C），
         // 且对端接收窗口（HYDRA_STREAM_WINDOW，默认 8MB）须 ≥ 带宽×RTT 才不成为新瓶颈
         //（经验：HYDRA_STREAM_WINDOW(MB) ≥ 带宽(Mbps) × RTT(s) / 8）。详见 cc 模块文档。
-        if let Some(brutal) = cc::BrutalConfig::from_env() {
-            cc::apply_brutal_congestion_control(&mut transport_config, brutal);
-        }
+        cc::apply_congestion_control_from_env(&mut transport_config, |name| {
+            std::env::var(name).ok()
+        })
+        .map_err(HydraError::ProtocolError)?;
         transport_config.max_idle_timeout(Some(
             quinn::IdleTimeout::try_from(Duration::from_secs(60)).unwrap(),
         ));
@@ -326,11 +329,12 @@ mod tests {
         let _ = _cfg;
     }
 
-    // ===================== Brutal 式拥塞控制接线（Exec-B）=====================
+    // ============= 拥塞控制接线（Exec-B Brutal / Team-C HYDRA_CC）=============
 
     #[tokio::test]
-    async fn brutal_env_unset_builds_endpoint_unchanged() {
-        // 回归保障：HYDRA_BRUTAL_MBPS 未设置 → 不动 factory，全路径与现状一致
+    async fn cc_env_unset_builds_endpoint_unchanged() {
+        // 回归保障：HYDRA_CC 与 HYDRA_BRUTAL_MBPS 均未设置 → 不动 factory，全路径与现状一致
+        std::env::remove_var(cc::HYDRA_CC_ENV);
         std::env::remove_var(cc::HYDRA_BRUTAL_MBPS_ENV);
         let (ep, _cfg) = Transport::create_shared_endpoint_in_mode(
             vec![test_cert_der()],
@@ -343,8 +347,9 @@ mod tests {
 
     #[tokio::test]
     async fn brutal_env_set_builds_endpoint_with_controller() {
-        // 设置带宽 → endpoint 照常构造（Brutal factory 挂载成功）；结束后还原 env。
+        // 设置带宽（HYDRA_CC 未设 → 隐含 brutal）→ endpoint 照常构造；结束后还原 env。
         // 注意：并行测试中其他 endpoint 构造若读到该值，仅额外启用 Brutal，不影响其断言。
+        std::env::remove_var(cc::HYDRA_CC_ENV);
         std::env::set_var(cc::HYDRA_BRUTAL_MBPS_ENV, "16");
         let result = Transport::create_shared_endpoint_in_mode(
             vec![test_cert_der()],
@@ -356,10 +361,33 @@ mod tests {
         assert_ne!(ep.local_addr().unwrap().port(), 0);
     }
 
+    #[tokio::test]
+    async fn cc_bbr_builds_endpoint_with_controller() {
+        // HYDRA_CC=bbr → quinn 内置 BBR factory 挂载成功（bbr 值本身无害，
+        // 并行测试读到也不改变其断言路径）
+        std::env::remove_var(cc::HYDRA_BRUTAL_MBPS_ENV);
+        std::env::set_var(cc::HYDRA_CC_ENV, "bbr");
+        let result = Transport::create_shared_endpoint_in_mode(
+            vec![test_cert_der()],
+            DEFAULT_SNI,
+            TransportMode::Masquerade,
+        );
+        std::env::remove_var(cc::HYDRA_CC_ENV);
+        let (ep, _cfg) = result.unwrap();
+        assert_ne!(ep.local_addr().unwrap().port(), 0);
+    }
+
     #[test]
     fn brutal_apply_directly_on_transport_config_smoke() {
         // 绕过 env 直接验证 factory 应用路径（quinn 0.10 无 getter，行为由 cc.rs 单测覆盖）
         let mut cfg = quinn::TransportConfig::default();
         cc::apply_brutal_congestion_control(&mut cfg, cc::BrutalConfig::new(1_562_500));
+    }
+
+    #[test]
+    fn bbr_apply_directly_on_transport_config_smoke() {
+        // 绕过 env 验证 BBR factory 应用路径（上游标注 Experimental，应用本身不 panic 即可通过）
+        let mut cfg = quinn::TransportConfig::default();
+        cc::apply_bbr_congestion_control(&mut cfg);
     }
 }

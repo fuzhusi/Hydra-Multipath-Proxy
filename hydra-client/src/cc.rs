@@ -29,13 +29,29 @@
 //! 3. **滥用风险如实声明**：固定速率在共享瓶颈上对 CUBIC 流不友好（Brutal 的已知代价），
 //!    带宽应配置为不超过实际链路容量（Hysteria2 同样要求）。
 //!
-//! 未设置 `HYDRA_BRUTAL_MBPS` 时 [`BrutalConfig::from_env`] 返回 None，
-//! transport.rs 不动 factory → quinn 默认 CUBIC，行为零改动。
+//! ## 算法选择入口（`HYDRA_CC`）
+//!
+//! env `HYDRA_CC` 三选一：`brutal` | `bbr` | `cubic`（大小写不敏感，空白视为未设置）。
+//! 优先级：`HYDRA_CC` 显式指定 > `HYDRA_BRUTAL_MBPS` 隐含 brutal > 默认 CUBIC。
+//!
+//! - `brutal`：本文件实现的固定速率控制器，要求 `HYDRA_BRUTAL_MBPS` 已设合法值，否则启动报错
+//!   （Brutal 无带宽配置无意义）；
+//! - `bbr`：quinn 内置 `quinn_proto::congestion::Bbr`——上游源码原话
+//!   *"Experimental! Use at your own risk."*，行为随 quinn 版本演进，出问题需自行兜底；
+//! - `cubic`：显式选择 quinn 默认 CUBIC（等价于不设 factory，行为零改动）。
+//!
+//! 未设置 `HYDRA_CC` 时保留 Wave4 行为：有合法 `HYDRA_BRUTAL_MBPS` 则 Brutal
+//! （此时 `HYDRA_BRUTAL_MBPS` 非法/未设 → CUBIC，静默回退零改动）。
+//! 解析核心 [`resolve_congestion_control`] 为 env 注入式纯函数，单测不触碰进程全局 env。
 
-use quinn_proto::congestion::{Controller, ControllerFactory};
+use quinn_proto::congestion::{BbrConfig, Controller, ControllerFactory};
 use quinn_proto::RttEstimator;
 use std::any::Any;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// 拥塞控制算法选择 env（`brutal` | `bbr` | `cubic`）
+pub const HYDRA_CC_ENV: &str = "HYDRA_CC";
 
 /// Brutal 带宽配置 env（Mbps，支持小数，如 "30"、"12.5"）
 pub const HYDRA_BRUTAL_MBPS_ENV: &str = "HYDRA_BRUTAL_MBPS";
@@ -58,7 +74,7 @@ const MAX_BANDWIDTH_MBPS: f64 = 100_000.0;
 /// Brutal 拥塞控制配置（= 目标带宽），实现 [`ControllerFactory`] 供 quinn 按需构造控制器。
 ///
 /// quinn 0.10 在连接建立与路径迁移时经 factory 重建控制器，故配置需 Clone 且为共享入口。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrutalConfig {
     bandwidth_bytes_per_sec: u64,
 }
@@ -272,7 +288,7 @@ impl Controller for Brutal {
 
 /// 把 Brutal 拥塞控制应用到 TransportConfig。
 ///
-/// 仅当 `HYDRA_BRUTAL_MBPS` 已设置时由 transport.rs 调用；未设置走 quinn 默认 CUBIC。
+/// 仅当解析结果为 Brutal 时由 [`apply_congestion_control_from_env`] 调用。
 pub fn apply_brutal_congestion_control(
     transport_config: &mut quinn::TransportConfig,
     config: BrutalConfig,
@@ -284,6 +300,86 @@ pub fn apply_brutal_congestion_control(
         config.bandwidth_bytes_per_sec
     );
     transport_config.congestion_controller_factory(config);
+}
+
+/// 把 quinn 内置 BBR 应用到 TransportConfig。
+///
+/// quinn-proto 0.10.6 源码中 BBR 模块头原文：*"Experimental! Use at your own risk."*
+/// （基于 google quiche 的 BBR 实现，未达稳定承诺），此处如实转告，不做任何封装加固。
+pub fn apply_bbr_congestion_control(transport_config: &mut quinn::TransportConfig) {
+    tracing::info!(
+        "BBR congestion control enabled (quinn builtin; upstream marked Experimental: \
+         'Use at your own risk.')"
+    );
+    // quinn-proto 0.10.6：ControllerFactory 实现在 Arc<BbrConfig>，
+    // build 时以 Arc 共享配置构造 Bbr::new(self.clone(), current_mtu)。
+    transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
+}
+
+/// 拥塞控制算法选择（[`resolve_congestion_control`] 的解析结果）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CongestionControlChoice {
+    /// 本 crate 实现的 Brutal 固定速率控制器（含目标带宽）
+    Brutal(BrutalConfig),
+    /// quinn 内置 BBR（上游标注 Experimental）
+    Bbr,
+    /// quinn 默认 CUBIC（显式选择；等价于不设 factory）
+    Cubic,
+}
+
+/// 解析拥塞控制选择（env 注入式纯函数，单测不触碰进程全局 env）。
+///
+/// 优先级：[`HYDRA_CC_ENV`] 显式指定 > [`HYDRA_BRUTAL_MBPS_ENV`] 隐含 brutal > 默认 CUBIC。
+///
+/// - `HYDRA_CC=brutal`：必须同时有合法 [`HYDRA_BRUTAL_MBPS_ENV`]，否则 Err（不能 brutal 无带宽）；
+/// - `HYDRA_CC=bbr` / `HYDRA_CC=cubic`：即使 `HYDRA_BRUTAL_MBPS` 已设也以显式指定为准；
+/// - 其他非空值：Err（非法值启动即报错）；
+/// - `HYDRA_CC` 未设置/空白：保留 Wave4 行为——有合法 `HYDRA_BRUTAL_MBPS` → Brutal，否则 CUBIC。
+pub fn resolve_congestion_control(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<CongestionControlChoice, String> {
+    let explicit = lookup(HYDRA_CC_ENV)
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty());
+    match explicit.as_deref() {
+        Some("brutal") => match BrutalConfig::from_env_lookup(&lookup) {
+            Some(cfg) => Ok(CongestionControlChoice::Brutal(cfg)),
+            None => Err(format!(
+                "HYDRA_CC=brutal 需要同时设置合法的 {}（Mbps，范围 0.1..=100000），当前未设置或非法",
+                HYDRA_BRUTAL_MBPS_ENV
+            )),
+        },
+        Some("bbr") => Ok(CongestionControlChoice::Bbr),
+        Some("cubic") => Ok(CongestionControlChoice::Cubic),
+        Some(other) => Err(format!(
+            "非法的 {}={:?}（合法值：brutal | bbr | cubic）",
+            HYDRA_CC_ENV, other
+        )),
+        None => Ok(match BrutalConfig::from_env_lookup(&lookup) {
+            Some(cfg) => CongestionControlChoice::Brutal(cfg),
+            None => CongestionControlChoice::Cubic,
+        }),
+    }
+}
+
+/// 解析 env 并把选中的拥塞控制应用到 TransportConfig（transport.rs 唯一调用入口）。
+///
+/// Err 仅由非法 `HYDRA_CC` 或 `HYDRA_CC=brutal` 缺带宽引起——调用方应启动失败而非静默回退。
+pub fn apply_congestion_control_from_env(
+    transport_config: &mut quinn::TransportConfig,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    match resolve_congestion_control(lookup)? {
+        CongestionControlChoice::Brutal(config) => {
+            apply_brutal_congestion_control(transport_config, config)
+        }
+        CongestionControlChoice::Bbr => apply_bbr_congestion_control(transport_config),
+        CongestionControlChoice::Cubic => {
+            // 显式默认：quinn TransportConfig 默认 factory 即 CUBIC，不动 = 行为零改动
+            tracing::info!("Congestion control: quinn default CUBIC (HYDRA_CC=cubic)");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -330,6 +426,140 @@ mod tests {
             let r = BrutalConfig::from_env_lookup(env_of(&[(HYDRA_BRUTAL_MBPS_ENV, bad)]));
             assert!(r.is_none(), "env={bad:?} 应视为非法并回退 CUBIC");
         }
+    }
+
+    // ===================== HYDRA_CC 算法选择（Team-C）=====================
+
+    #[test]
+    fn cc_unset_and_brutal_unset_defaults_to_cubic() {
+        // 双 env 均未设置 → 默认 CUBIC（现状零改动）
+        assert_eq!(
+            resolve_congestion_control(|_| None).unwrap(),
+            CongestionControlChoice::Cubic
+        );
+    }
+
+    #[test]
+    fn cc_unset_with_brutal_bandwidth_implies_brutal() {
+        // Wave4 隐含行为保留：只设带宽 → Brutal
+        let r = resolve_congestion_control(env_of(&[(HYDRA_BRUTAL_MBPS_ENV, "12.5")])).unwrap();
+        match r {
+            CongestionControlChoice::Brutal(cfg) => {
+                assert_eq!(cfg, BrutalConfig::new(1_562_500))
+            }
+            other => panic!("应解析为 Brutal，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cc_explicit_cubic_overrides_brutal_bandwidth() {
+        // 显式指定 > 隐含 brutal
+        let r = resolve_congestion_control(env_of(&[
+            (HYDRA_CC_ENV, "cubic"),
+            (HYDRA_BRUTAL_MBPS_ENV, "50"),
+        ]))
+        .unwrap();
+        assert_eq!(r, CongestionControlChoice::Cubic);
+    }
+
+    #[test]
+    fn cc_explicit_brutal_with_bandwidth_selects_brutal() {
+        let r = resolve_congestion_control(env_of(&[
+            (HYDRA_CC_ENV, "brutal"),
+            (HYDRA_BRUTAL_MBPS_ENV, "30"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            r,
+            CongestionControlChoice::Brutal(BrutalConfig::new(3_750_000))
+        );
+    }
+
+    #[test]
+    fn cc_brutal_without_bandwidth_is_startup_error() {
+        // HYDRA_CC=brutal 但无带宽 → 显式报错（不能 brutal 无带宽）
+        let r = resolve_congestion_control(env_of(&[(HYDRA_CC_ENV, "brutal")]));
+        assert!(r.is_err(), "brutal 缺 HYDRA_BRUTAL_MBPS 必须报错");
+    }
+
+    #[test]
+    fn cc_brutal_with_invalid_bandwidth_is_startup_error() {
+        // 带宽存在但非法同样拒绝（不允许静默降级为 CUBIC）
+        let r = resolve_congestion_control(env_of(&[
+            (HYDRA_CC_ENV, "brutal"),
+            (HYDRA_BRUTAL_MBPS_ENV, "abc"),
+        ]));
+        assert!(r.is_err(), "brutal 的 HYDRA_BRUTAL_MBPS 非法必须报错");
+    }
+
+    #[test]
+    fn cc_bbr_selected() {
+        let r = resolve_congestion_control(env_of(&[(HYDRA_CC_ENV, "bbr")])).unwrap();
+        assert_eq!(r, CongestionControlChoice::Bbr);
+    }
+
+    #[test]
+    fn cc_bbr_overrides_brutal_bandwidth() {
+        let r = resolve_congestion_control(env_of(&[
+            (HYDRA_CC_ENV, "bbr"),
+            (HYDRA_BRUTAL_MBPS_ENV, "50"),
+        ]))
+        .unwrap();
+        assert_eq!(r, CongestionControlChoice::Bbr);
+    }
+
+    #[test]
+    fn cc_value_is_trimmed_and_case_insensitive() {
+        assert_eq!(
+            resolve_congestion_control(env_of(&[(HYDRA_CC_ENV, "  BBR  ")])).unwrap(),
+            CongestionControlChoice::Bbr
+        );
+        assert_eq!(
+            resolve_congestion_control(env_of(&[(HYDRA_CC_ENV, "Cubic")])).unwrap(),
+            CongestionControlChoice::Cubic
+        );
+        // 大小写不敏感的 brutal 同样要求带宽
+        assert!(resolve_congestion_control(env_of(&[(HYDRA_CC_ENV, "Brutal")])).is_err());
+    }
+
+    #[test]
+    fn cc_blank_value_treated_as_unset() {
+        // 空白 = 未设置 → 走隐含规则（有带宽则 Brutal）
+        let r = resolve_congestion_control(env_of(&[
+            (HYDRA_CC_ENV, "   "),
+            (HYDRA_BRUTAL_MBPS_ENV, "10"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            r,
+            CongestionControlChoice::Brutal(BrutalConfig::new(1_250_000))
+        );
+    }
+
+    #[test]
+    fn cc_invalid_values_are_startup_errors() {
+        for bad in ["turbo", "bbr2", "new_reno", "0", "true"] {
+            let r = resolve_congestion_control(env_of(&[(HYDRA_CC_ENV, bad)]));
+            assert!(r.is_err(), "HYDRA_CC={bad:?} 应启动报错");
+        }
+    }
+
+    #[test]
+    fn cc_apply_dispatcher_smoke_all_three() {
+        // quinn TransportConfig 无 getter：三种选择走真实应用路径不 panic 即可，
+        // 行为由上面对应 factory/控制器单测覆盖
+        let mut cfg = quinn::TransportConfig::default();
+        apply_congestion_control_from_env(&mut cfg, env_of(&[(HYDRA_CC_ENV, "bbr")])).unwrap();
+        apply_congestion_control_from_env(&mut cfg, env_of(&[(HYDRA_CC_ENV, "cubic")])).unwrap();
+        apply_congestion_control_from_env(
+            &mut cfg,
+            env_of(&[(HYDRA_CC_ENV, "brutal"), (HYDRA_BRUTAL_MBPS_ENV, "16")]),
+        )
+        .unwrap();
+        // 非法值穿透到应用层仍报错
+        assert!(
+            apply_congestion_control_from_env(&mut cfg, env_of(&[(HYDRA_CC_ENV, "warp")])).is_err()
+        );
     }
 
     // ===================== 固定速率窗口行为 =====================

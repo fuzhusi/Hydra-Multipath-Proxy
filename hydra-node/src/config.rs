@@ -1,0 +1,364 @@
+//! 节点 toml 配置文件支持（施工方案遗留四大项之④）。
+//!
+//! 读取顺序（每字段独立回落）：**CLI 参数 > 环境变量 > 配置文件 > 默认值**。
+//!
+//! - 配置文件定位：`--config <path>`（CLI）> `HYDRA_NODE_CONFIG`（env，路径
+//!   显式给出但文件缺失 = 显式报错退出）> 自动探测 `./node.toml` →
+//!   `/etc/hydra/node.toml`（都不存在 = 无文件层，纯默认值）。
+//! - 认证密钥优先级：`HYDRA_AUTH_KEY`（env）> `HYDRA_AUTH_KEY_FILE`（env）>
+//!   配置文件 `auth_key_file` 字段。密钥文件化是为了修掉 env 泄漏面
+//!   （shell history / `/proc/<pid>/environ`）；文件权限非 0600 时告警。
+//! - 所有字段 `serde(default)`；未知字段 / 非法值显式报错（静默回落会让
+//!   "以为开了 obfs/健康检查"的用户得到黑洞）。
+//!
+//! 解析逻辑全部纯函数化（`resolve` 接收 `BTreeMap` 而非读真实 env），
+//! 便于离线单测优先级与报错；`main.rs` 只做薄 I/O 壳。
+
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+
+/// 配置文件路径的环境变量名
+pub const HYDRA_NODE_CONFIG_ENV: &str = "HYDRA_NODE_CONFIG";
+/// STUN 服务器地址环境变量（ip:port 字面量；常量本体归 stun.rs，避免 glob 再导出歧义）
+use crate::stun::HYDRA_STUN_ADDR_ENV;
+/// 认证密钥文件环境变量
+pub const HYDRA_AUTH_KEY_FILE_ENV: &str = "HYDRA_AUTH_KEY_FILE";
+/// 日志级别环境变量（RUST_LOG 仍优先）
+pub const HYDRA_LOG_LEVEL_ENV: &str = "HYDRA_LOG_LEVEL";
+
+/// toml 配置文件结构（全部字段可选，未设置 = 回落 env/默认值）
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NodeFileConfig {
+    pub listen_addr: Option<String>,
+    pub mode: Option<String>,
+    pub auth_key_file: Option<String>,
+    pub max_connections: Option<u32>,
+    pub cert_file: Option<String>,
+    pub key_file: Option<String>,
+    pub cert_domains: Option<Vec<String>>,
+    pub health_addr: Option<String>,
+    pub stun_addr: Option<String>,
+    pub log_level: Option<String>,
+}
+
+/// 解析 toml 文本；未知字段 / 类型错误显式报错
+pub fn parse_toml(text: &str) -> Result<NodeFileConfig, String> {
+    toml::from_str(text).map_err(|e| format!("配置文件解析失败: {}", e))
+}
+
+/// CLI 能表达的覆盖项（其余字段 CLI 不暴露，避免密钥进 /proc/<pid>/cmdline）
+#[derive(Debug, Clone, Default)]
+pub struct CliOverrides {
+    pub listen: Option<SocketAddr>,
+    pub auth_key: Option<String>,
+}
+
+/// 认证密钥来源（解析成 hex 字符串或文件路径，I/O 延后到 `load_auth_key`）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthKeySource {
+    /// 直接给定的 hex 字符串（CLI / HYDRA_AUTH_KEY）
+    Inline(String),
+    /// 密钥文件路径（HYDRA_AUTH_KEY_FILE / 配置文件 auth_key_file）
+    File(PathBuf),
+}
+
+/// 解析完成的最终配置（main 直接据此构造 NodeOptions / 启动服务）
+#[derive(Debug, Clone)]
+pub struct EffectiveConfig {
+    pub listen_addr: SocketAddr,
+    pub mode: hydra_obfs::TransportMode,
+    pub max_connections: u32,
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
+    pub cert_domains: Vec<String>,
+    pub health_addr: Option<SocketAddr>,
+    pub stun_addr: Option<SocketAddr>,
+    pub log_level: String,
+    pub auth_key_source: AuthKeySource,
+}
+
+/// 自动探测顺序：./node.toml → /etc/hydra/node.toml
+pub fn probe_paths() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("./node.toml"),
+        PathBuf::from("/etc/hydra/node.toml"),
+    ]
+}
+
+/// 决定配置文件层来源：显式路径（CLI > env）或自动探测；None = 无文件层
+pub fn resolve_config_path(
+    cli_config: Option<&Path>,
+    env: &BTreeMap<String, String>,
+) -> Option<PathBuf> {
+    if let Some(p) = cli_config {
+        return Some(p.to_path_buf());
+    }
+    if let Some(v) = env.get(HYDRA_NODE_CONFIG_ENV) {
+        let v = v.trim();
+        if !v.is_empty() {
+            return Some(PathBuf::from(v));
+        }
+        return None;
+    }
+    probe_paths().into_iter().find(|p| p.exists())
+}
+
+/// 读取并解析配置文件层（显式指定但读不到 = 显式报错）
+pub fn load_file_layer(
+    cli_config: Option<&Path>,
+    env: &BTreeMap<String, String>,
+) -> Result<Option<(PathBuf, NodeFileConfig)>, String> {
+    match resolve_config_path(cli_config, env) {
+        None => Ok(None),
+        Some(path) => {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("读取配置文件 {} 失败: {}", path.display(), e))?;
+            let cfg = parse_toml(&text).map_err(|e| format!("{}: {}", path.display(), e))?;
+            Ok(Some((path, cfg)))
+        }
+    }
+}
+
+/// 可选地址字段解析：env > file > None（未配置）；空白值视为未设置该层；
+/// 非法值带来源标签显式报错
+fn parse_addr_opt(
+    env_v: Option<&String>,
+    file_v: Option<&String>,
+    env_name: &str,
+    field_name: &str,
+) -> Result<Option<SocketAddr>, String> {
+    let parse = |v: &str, what: &str| {
+        v.trim().parse::<SocketAddr>().map_err(|e| {
+            format!(
+                "{} 非法（期望 ip:port 字面量，如 0.0.0.0:443，不做域名解析）: {}",
+                what, e
+            )
+        })
+    };
+    if let Some(v) = env_v {
+        if v.trim().is_empty() {
+            return parse_addr_opt(None, file_v, env_name, field_name);
+        }
+        return parse(v, env_name).map(Some);
+    }
+    if let Some(v) = file_v {
+        if v.trim().is_empty() {
+            return Ok(None);
+        }
+        return parse(v, &format!("配置文件字段 {}", field_name)).map(Some);
+    }
+    Ok(None)
+}
+
+fn parse_u32_field(
+    env_v: Option<&String>,
+    file_v: Option<u32>,
+    env_name: &str,
+    default: u32,
+) -> Result<u32, String> {
+    if let Some(v) = env_v {
+        return v
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| format!("{} 非法（期望正整数，如 1000）: {}", env_name, e));
+    }
+    match file_v {
+        Some(n) => Ok(n),
+        None => Ok(default),
+    }
+}
+
+/// 分层解析全部字段。任一非法值 → Err（main 显式退出，绝不静默回落）。
+pub fn resolve(
+    cli: &CliOverrides,
+    env: &BTreeMap<String, String>,
+    file: Option<&NodeFileConfig>,
+) -> Result<EffectiveConfig, String> {
+    let d = crate::NodeOptions::default();
+    let empty_file = NodeFileConfig::default();
+    let f = file.unwrap_or(&empty_file);
+
+    // listen：CLI 位置参数 > env > 文件 > 默认 0.0.0.0:8080
+    let listen_addr = if let Some(a) = cli.listen {
+        a
+    } else {
+        parse_addr_opt(
+            env.get("HYDRA_LISTEN"),
+            f.listen_addr.as_ref(),
+            "HYDRA_LISTEN",
+            "listen_addr",
+        )?
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 8080)))
+    };
+
+    // mode：env（与 hydra-obfs 共用 HYDRA_MODE_ENV）> 文件 > 默认 masquerade
+    let mode_str = env
+        .get(hydra_obfs::HYDRA_MODE_ENV)
+        .or_else(|| env.get("HYDRA_MODE"))
+        .map(|s| s.trim().to_string())
+        .or_else(|| f.mode.clone());
+    let mode = match mode_str {
+        Some(s) => hydra_obfs::TransportMode::parse(&s).map_err(|e| {
+            format!(
+                "传输模式非法（env {} 或配置文件 mode）: {}",
+                hydra_obfs::HYDRA_MODE_ENV,
+                e
+            )
+        })?,
+        None => d.mode,
+    };
+
+    let max_connections = parse_u32_field(
+        env.get("HYDRA_MAX_CONNECTIONS"),
+        f.max_connections,
+        "HYDRA_MAX_CONNECTIONS",
+        d.max_connections,
+    )?
+    .max(1);
+
+    let cert_file = env
+        .get("HYDRA_CERT_FILE")
+        .map(|s| s.as_str())
+        .or(f.cert_file.as_deref())
+        .map_or_else(|| d.cert_file.clone(), PathBuf::from);
+    let key_file = env
+        .get("HYDRA_KEY_FILE")
+        .map(|s| s.as_str())
+        .or(f.key_file.as_deref())
+        .map_or_else(|| d.key_file.clone(), PathBuf::from);
+
+    // 域名：env 逗号分隔 > 文件数组；空值回落默认（与 from_env 行为一致）
+    let domains_from_env = env.get("HYDRA_CERT_DOMAINS").map(|v| {
+        v.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+    });
+    let domains_from_file = f.cert_domains.as_ref().map(|v| {
+        v.iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+    });
+    let cert_domains = match domains_from_env.or(domains_from_file) {
+        Some(v) if !v.is_empty() => v,
+        _ => d.cert_domains.clone(),
+    };
+
+    let health_addr = parse_addr_opt(
+        env.get("HYDRA_HEALTH_ADDR"),
+        f.health_addr.as_ref(),
+        "HYDRA_HEALTH_ADDR",
+        "health_addr",
+    )?;
+
+    let stun_addr = parse_addr_opt(
+        env.get(HYDRA_STUN_ADDR_ENV),
+        f.stun_addr.as_ref(),
+        HYDRA_STUN_ADDR_ENV,
+        "stun_addr",
+    )?;
+
+    let log_level = env
+        .get(HYDRA_LOG_LEVEL_ENV)
+        .map(|s| s.as_str())
+        .or(f.log_level.as_deref())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "info".to_string());
+
+    // 认证密钥：CLI > HYDRA_AUTH_KEY > HYDRA_AUTH_KEY_FILE > 文件 auth_key_file
+    // （空白值视为未设置该层，防 systemd EnvironmentFile 空值踩坑）
+    let non_blank = |s: &String| !s.trim().is_empty();
+    let auth_key_source = if let Some(h) = cli.auth_key.as_ref().filter(|s| !s.trim().is_empty()) {
+        AuthKeySource::Inline(h.trim().to_string())
+    } else if let Some(h) = env.get("HYDRA_AUTH_KEY").filter(|s| non_blank(s)) {
+        AuthKeySource::Inline(h.trim().to_string())
+    } else if let Some(p) = env.get(HYDRA_AUTH_KEY_FILE_ENV).filter(|s| non_blank(s)) {
+        AuthKeySource::File(PathBuf::from(p.trim()))
+    } else if let Some(p) = f.auth_key_file.as_ref().filter(|s| non_blank(s)) {
+        AuthKeySource::File(PathBuf::from(p.trim()))
+    } else {
+        return Err(
+            "未设置认证密钥。请设置 HYDRA_AUTH_KEY（hex），或 HYDRA_AUTH_KEY_FILE / \
+             配置文件 auth_key_file 指向权限 600 的密钥文件。"
+                .to_string(),
+        );
+    };
+
+    Ok(EffectiveConfig {
+        listen_addr,
+        mode,
+        max_connections,
+        cert_file,
+        key_file,
+        cert_domains,
+        health_addr,
+        stun_addr,
+        log_level,
+        auth_key_source,
+    })
+}
+
+/// 读取认证密钥文件内容（unix 下校验权限非 0600 时告警，不拒绝——运维可用性优先）
+fn read_auth_key_file(path: &Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("读取认证密钥文件 {} 失败: {}", path.display(), e))?;
+    check_key_file_permissions(path);
+    Ok(text.trim().to_string())
+}
+
+#[cfg(unix)]
+fn check_key_file_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(m) => {
+            let mode = m.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                eprintln!(
+                    "警告：认证密钥文件 {} 权限为 {:o}，同机其他用户可读；建议 chmod 600",
+                    path.display(),
+                    mode
+                );
+            }
+        }
+        Err(_) => {}
+    }
+}
+
+#[cfg(not(unix))]
+fn check_key_file_permissions(_path: &Path) {}
+
+/// hex 解码 + 长度下限校验（与旧 resolve_auth_key 行为一致，改返回 Err 不再直接 exit）
+pub fn decode_auth_key(hex_str: &str) -> Result<Vec<u8>, String> {
+    match hydra_protocol::hex_decode(hex_str) {
+        Ok(key) if key.len() >= 16 => Ok(key),
+        Ok(_) => Err("认证密钥太短（解码后至少 16 字节）。".to_string()),
+        Err(e) => Err(format!("认证密钥不是合法的 hex：{}", e)),
+    }
+}
+
+/// 按来源加载认证密钥（文件来源在此才做 I/O，保持 `resolve` 纯函数）
+pub fn load_auth_key(source: &AuthKeySource) -> Result<Vec<u8>, String> {
+    let hex_str = match source {
+        AuthKeySource::Inline(h) => h.clone(),
+        AuthKeySource::File(p) => read_auth_key_file(p)?,
+    };
+    decode_auth_key(&hex_str)
+}
+
+/// 初始化日志：RUST_LOG 优先，否则用配置的 log_level；非法级别显式报错
+pub fn init_tracing(level: &str) -> Result<(), String> {
+    use tracing_subscriber::EnvFilter;
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(f) => f,
+        Err(_) => {
+            EnvFilter::try_new(level).map_err(|e| format!("日志级别 {} 非法: {}", level, e))?
+        }
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+    Ok(())
+}

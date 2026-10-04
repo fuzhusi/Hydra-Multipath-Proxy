@@ -1,8 +1,13 @@
+use quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Instant;
-use tokio::sync::RwLock;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// 流量统计信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,8 +40,10 @@ pub struct TrafficMonitor {
     total_connections: AtomicU64,
     /// 启动时间
     start_time: Instant,
-    /// 速度计算历史
-    speed_history: Arc<RwLock<SpeedHistory>>,
+    /// 速度计算历史（std Mutex：poll_read/poll_write 上下文内无 await，可同步短临界区累加）
+    speed_history: Mutex<SpeedHistory>,
+    /// 按节点流量计数（socket 地址 → 条目；节点路径中继在包装流时创建，直连路径无条目）
+    node_traffic: Mutex<HashMap<SocketAddr, Arc<NodeTrafficEntry>>>,
 }
 
 /// 速度计算历史记录
@@ -119,6 +126,194 @@ impl SpeedHistory {
     }
 }
 
+/// 单节点流量计数条目：上行 = 客户端→节点，下行 = 节点→客户端。
+/// 全原子计数，供中继包装流在 poll 上下文内无锁累加、测速按窗口差分读取。
+#[derive(Debug, Default)]
+pub struct NodeTrafficEntry {
+    bytes_sent: AtomicU64,
+    bytes_received: AtomicU64,
+}
+
+impl NodeTrafficEntry {
+    /// 累加上行字节（客户端→节点）
+    pub fn add_sent(&self, bytes: u64) {
+        if bytes > 0 {
+            self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// 累加下行字节（节点→客户端）
+    pub fn add_received(&self, bytes: u64) {
+        if bytes > 0 {
+            self.bytes_received.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// 累计上行字节
+    pub fn sent(&self) -> u64 {
+        self.bytes_sent.load(Ordering::Relaxed)
+    }
+
+    /// 累计下行字节
+    pub fn received(&self) -> u64 {
+        self.bytes_received.load(Ordering::Relaxed)
+    }
+}
+
+/// 方向性字节计数器：决定一次累加计入全局 TrafficMonitor 与（可选的）节点条目的哪个方向。
+/// up=true 计入上行（客户端→节点/直连目标），up=false 计入下行。
+#[derive(Clone, Default)]
+pub struct ByteCounter {
+    monitor: Option<Arc<TrafficMonitor>>,
+    node: Option<Arc<NodeTrafficEntry>>,
+    up: bool,
+}
+
+impl ByteCounter {
+    /// 上行方向计数器（客户端→远端）
+    pub fn up(monitor: Option<Arc<TrafficMonitor>>, node: Option<Arc<NodeTrafficEntry>>) -> Self {
+        Self {
+            monitor,
+            node,
+            up: true,
+        }
+    }
+
+    /// 下行方向计数器（远端→客户端）
+    pub fn down(monitor: Option<Arc<TrafficMonitor>>, node: Option<Arc<NodeTrafficEntry>>) -> Self {
+        Self {
+            monitor,
+            node,
+            up: false,
+        }
+    }
+
+    /// 累加 n 字节到对应方向；monitor 为 None 时仅（若有）节点条目计数
+    pub fn record(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        if let Some(m) = &self.monitor {
+            if self.up {
+                m.record_sent_sync(n);
+            } else {
+                m.record_received_sync(n);
+            }
+        }
+        if let Some(node) = &self.node {
+            if self.up {
+                node.add_sent(n);
+            } else {
+                node.add_received(n);
+            }
+        }
+    }
+}
+
+/// 计数流包装：在转发字节的同时累加到全局 TrafficMonitor 与（可选）单节点条目。
+///
+/// 方向语义（由 [`ByteCounter`] 携带）：
+/// - 上行包装（up=true）：对 `poll_write` 的字节数计数（客户端→节点方向）；
+/// - 下行包装（up=false）：对 `poll_read` 的字节数计数（节点→客户端方向）。
+///
+/// 对 quinn 流提供**固有方法** `write_all`/`finish`/`read`，保真转发 quinn 的
+/// `WriteError`/`ReadError`（A3 应用错误码 0x11-0x13 依赖其类型区分，泛型
+/// AsyncRead/AsyncWrite 会把错误折叠成 io::Error，故中继路径必须走固有方法）。
+pub struct CountingStream<T> {
+    inner: T,
+    counter: ByteCounter,
+}
+
+impl<T> CountingStream<T> {
+    /// 包装 inner，按 counter 的方向语义计数
+    pub fn new(inner: T, counter: ByteCounter) -> Self {
+        Self { inner, counter }
+    }
+
+    pub fn get_ref(&self) -> &T {
+        &self.inner
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for CountingStream<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let filled_before = buf.filled().len();
+        let r = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &r {
+            let n = (buf.filled().len() - filled_before) as u64;
+            if n > 0 && !self.counter.up {
+                self.counter.record(n);
+            }
+        }
+        r
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for CountingStream<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let r = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &r {
+            if *n > 0 && self.counter.up {
+                self.counter.record(*n as u64);
+            }
+        }
+        r
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl CountingStream<SendStream> {
+    /// quinn 固有 write_all 语义保真转发（错误类型 = `quinn::WriteError`，含 STOP_SENDING 错误码）
+    pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), quinn::WriteError> {
+        let r = self.inner.write_all(buf).await;
+        if r.is_ok() {
+            self.counter.record(buf.len() as u64);
+        }
+        r
+    }
+
+    /// quinn 固有 finish 语义保真转发
+    pub async fn finish(&mut self) -> Result<(), quinn::WriteError> {
+        self.inner.finish().await
+    }
+}
+
+impl CountingStream<RecvStream> {
+    /// quinn 固有 read 语义保真转发（错误类型 = `quinn::ReadError`，含 RESET_STREAM 错误码）
+    pub async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, quinn::ReadError> {
+        let r = self.inner.read(buf).await;
+        if let Ok(Some(n)) = &r {
+            if *n > 0 {
+                self.counter.record(*n as u64);
+            }
+        }
+        r
+    }
+}
+
 impl TrafficMonitor {
     /// 创建新的流量统计器
     pub fn new() -> Self {
@@ -128,22 +323,62 @@ impl TrafficMonitor {
             active_connections: AtomicU64::new(0),
             total_connections: AtomicU64::new(0),
             start_time: Instant::now(),
-            speed_history: Arc::new(RwLock::new(SpeedHistory::new())),
+            speed_history: Mutex::new(SpeedHistory::new()),
+            node_traffic: Mutex::new(HashMap::new()),
         }
     }
 
     /// 记录上传数据
     pub async fn record_sent(&self, bytes: u64) {
-        self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
-        let mut history = self.speed_history.write().await;
-        history.add_sent_sample(bytes);
+        self.record_sent_sync(bytes);
     }
 
     /// 记录下载数据
     pub async fn record_received(&self, bytes: u64) {
+        self.record_received_sync(bytes);
+    }
+
+    /// 同步记录上传数据（计数流包装在 poll 上下文内调用，无 await）
+    pub fn record_sent_sync(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+        if let Ok(mut history) = self.speed_history.lock() {
+            history.add_sent_sample(bytes);
+        }
+    }
+
+    /// 同步记录下载数据（计数流包装在 poll 上下文内调用，无 await）
+    pub fn record_received_sync(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
         self.bytes_received.fetch_add(bytes, Ordering::Relaxed);
-        let mut history = self.speed_history.write().await;
-        history.add_recv_sample(bytes);
+        if let Ok(mut history) = self.speed_history.lock() {
+            history.add_recv_sample(bytes);
+        }
+    }
+
+    /// 取（或创建）指定节点的流量计数条目。条目按地址复用，
+    /// 测速窗口差分依赖同一 Arc 内的原子计数单调累加。
+    pub fn node_entry(&self, addr: SocketAddr) -> Arc<NodeTrafficEntry> {
+        let mut map = self
+            .node_traffic
+            .lock()
+            .expect("node_traffic mutex poisoned");
+        map.entry(addr).or_default().clone()
+    }
+
+    /// 全部节点流量快照：(地址, 上行字节, 下行字节)，供 GUI/测速读取
+    pub fn node_traffic_snapshot(&self) -> Vec<(SocketAddr, u64, u64)> {
+        let map = self
+            .node_traffic
+            .lock()
+            .expect("node_traffic mutex poisoned");
+        map.iter()
+            .map(|(addr, e)| (*addr, e.sent(), e.received()))
+            .collect()
     }
 
     /// 增加活跃连接数
@@ -159,7 +394,10 @@ impl TrafficMonitor {
 
     /// 获取当前统计信息
     pub async fn get_stats(&self) -> TrafficStats {
-        let mut history = self.speed_history.write().await;
+        let mut history = self
+            .speed_history
+            .lock()
+            .expect("speed_history mutex poisoned");
         let upload_speed = history.calculate_upload_speed();
         let download_speed = history.calculate_download_speed();
 
@@ -244,6 +482,7 @@ pub fn format_duration(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_format_bytes() {
@@ -252,6 +491,87 @@ mod tests {
         assert_eq!(format_bytes(1024), "1.00 KB");
         assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+    }
+
+    /// CountingStream：上行包装对 poll_write 计数（全局 sent + 节点 sent），
+    /// 下行包装对 poll_read 计数（全局 received + 节点 received），字节数逐字节一致。
+    #[tokio::test]
+    async fn test_counting_stream_up_down() {
+        let monitor = Arc::new(TrafficMonitor::new());
+        let entry = monitor.node_entry("127.0.0.1:10000".parse().unwrap());
+
+        let (client, node) = tokio::io::duplex(64);
+        let mut up = CountingStream::new(
+            client,
+            ByteCounter::up(Some(monitor.clone()), Some(entry.clone())),
+        );
+        let mut down = CountingStream::new(
+            node,
+            ByteCounter::down(Some(monitor.clone()), Some(entry.clone())),
+        );
+
+        const PAYLOAD: usize = 300; // 超过 duplex 缓冲 64B，强制多轮 poll 读写
+        let payload: Vec<u8> = (0..PAYLOAD).map(|i| i as u8).collect();
+        let expect = payload.clone();
+
+        let writer = tokio::spawn(async move {
+            up.write_all(&payload).await.expect("write_all");
+            up.shutdown().await.expect("shutdown");
+        });
+        let mut got = Vec::new();
+        down.read_to_end(&mut got).await.expect("read_to_end");
+        writer.await.unwrap();
+
+        assert_eq!(got, expect, "payload must pass through byte-identical");
+        assert_eq!(entry.sent(), PAYLOAD as u64, "node up counter");
+        assert_eq!(entry.received(), PAYLOAD as u64, "node down counter");
+        let stats = monitor.get_stats().await;
+        assert_eq!(stats.bytes_sent, PAYLOAD as u64, "monitor sent");
+        assert_eq!(stats.bytes_received, PAYLOAD as u64, "monitor received");
+    }
+
+    /// 节点条目与全局 monitor 是独立计数面：仅节点计数器（monitor=None）不影响全局，
+    /// 仅全局计数器（node=None）不影响任何节点条目——直连路径（无节点归属）即此形态。
+    #[tokio::test]
+    async fn test_byte_counter_attribution_direct_vs_node() {
+        let monitor = Arc::new(TrafficMonitor::new());
+        let node_entry = monitor.node_entry("127.0.0.1:10001".parse().unwrap());
+        let other_entry = monitor.node_entry("127.0.0.1:10002".parse().unwrap());
+
+        // 直连形态：全局计数，不归属任何节点
+        ByteCounter::up(Some(monitor.clone()), None).record(100);
+        ByteCounter::down(Some(monitor.clone()), None).record(50);
+        // 节点形态：全局 + 指定节点条目同时累加
+        ByteCounter::up(Some(monitor.clone()), Some(node_entry.clone())).record(30);
+        ByteCounter::down(Some(monitor.clone()), Some(node_entry.clone())).record(20);
+
+        let stats = monitor.get_stats().await;
+        assert_eq!(stats.bytes_sent, 130);
+        assert_eq!(stats.bytes_received, 70);
+        assert_eq!(node_entry.sent(), 30);
+        assert_eq!(node_entry.received(), 20);
+        assert_eq!(other_entry.sent(), 0, "untouched node must stay zero");
+        assert_eq!(other_entry.received(), 0);
+        assert_eq!(
+            monitor.node_traffic_snapshot().len(),
+            2,
+            "snapshot must cover both created entries"
+        );
+    }
+
+    /// 零字节记录必须被忽略（不产生虚假样本）
+    #[tokio::test]
+    async fn test_zero_byte_record_ignored() {
+        let monitor = Arc::new(TrafficMonitor::new());
+        let entry = monitor.node_entry("127.0.0.1:10003".parse().unwrap());
+        monitor.record_sent_sync(0);
+        monitor.record_received_sync(0);
+        entry.add_sent(0);
+        entry.add_received(0);
+        let stats = monitor.get_stats().await;
+        assert_eq!(stats.bytes_sent, 0);
+        assert_eq!(stats.bytes_received, 0);
+        assert_eq!(entry.sent(), 0);
     }
 
     #[test]
