@@ -1948,7 +1948,8 @@ impl HydraApp {
         if !close_requested {
             return;
         }
-        if self.really_quit || !self.config.close_to_tray {
+        // 托盘不存在时隐藏=应用不可达（无任何唤回入口），必须放行真关闭
+        if self.really_quit || !self.config.close_to_tray || self.tray.is_none() {
             return; // 放行关闭；on_exit 会停代理 + 清系统代理 + 强制落盘
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);

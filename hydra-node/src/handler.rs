@@ -473,11 +473,17 @@ pub struct ConnectionHandler {
     auth_key: Vec<u8>,
     /// 本节点证书 SHA-256 指纹：v3 握手 confirm 通道绑定材料（server.rs 注入）
     cert_fp: [u8; 32],
+    /// 认证模式（启动时读一次 env；评审 P1-3：勿在每流热路径读 env）
+    auth_mode: AuthMode,
 }
 
 impl ConnectionHandler {
-    pub fn new(auth_key: Vec<u8>, cert_fp: [u8; 32]) -> Self {
-        Self { auth_key, cert_fp }
+    pub fn new(auth_key: Vec<u8>, cert_fp: [u8; 32], auth_mode: AuthMode) -> Self {
+        Self {
+            auth_key,
+            cert_fp,
+            auth_mode,
+        }
     }
 
     pub async fn handle_connection(&self, connection: Connection) -> Result<()> {
@@ -506,6 +512,7 @@ impl ConnectionHandler {
             })
         };
 
+        let auth_mode = self.auth_mode;
         loop {
             match connection.accept_bi().await {
                 Ok((send, recv)) => {
@@ -517,7 +524,7 @@ impl ConnectionHandler {
                     let exporter = exporter;
                     tokio::spawn(async move {
                         if let Err(e) =
-                            Self::handle_stream(send, recv, auth_key, cert_fp, exporter, authed, channels).await
+                            Self::handle_stream(send, recv, auth_key, cert_fp, exporter, authed, channels, auth_mode).await
                         {
                             error!("Stream error: {}", e);
                         }
@@ -546,11 +553,11 @@ impl ConnectionHandler {
         exporter: [u8; 32],
         authed: Arc<AtomicBool>,
         channels: ChannelRegistry,
+        auth_mode: AuthMode,
     ) -> Result<()> {
         // ── 第 1 步：认证。V3.2 双栈版本判别：流首字节 0x00=legacy v2（64B HMAC
         // token，现网 token 首字节即时间戳大端最高字节，2106 年前恒为 0x00）、
         // 0x03=v3 Noise 握手；其他值一律静默关流（防探测语义不变）。
-        let auth_mode = AuthMode::from_env();
         let mut version = [0u8; 1];
         let read_ok = match tokio::time::timeout(AUTH_TIMEOUT, recv.read_exact(&mut version)).await
         {

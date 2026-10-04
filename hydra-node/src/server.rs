@@ -109,6 +109,7 @@ impl HydraServer {
         let handler = Arc::new(ConnectionHandler::new(
             auth_key,
             hydra_protocol::handshake::cert_fingerprint(&cert_der.0),
+            hydra_protocol::handshake::AuthMode::from_env(), // 启动时读一次，不在每流热路径读 env
         ));
 
         Ok(Self {

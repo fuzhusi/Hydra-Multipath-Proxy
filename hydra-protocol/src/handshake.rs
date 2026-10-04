@@ -254,6 +254,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tokio::io::duplex;
 
     const PSK: [u8; 32] = [7u8; 32];
@@ -331,16 +332,50 @@ mod tests {
         assert!(s.unwrap().is_err());
     }
 
-    /// 门③（单测层）：把一轮合法握手的客户端出站字节（0x03+msg1+confirm_c）
+    /// 门③（单测层，真重放）：录下第一轮客户端全部出站字节（0x03+msg1+confirm_c），
     /// 原样重放到新服务端——节点 e 新鲜 → handshake hash 不同 → confirm 不匹配 →
     /// 服务端必须拒绝。QUIC 线级重放另见集成测试 test_handshake_v3。
     #[tokio::test]
     async fn replayed_client_transcript_is_rejected() {
-        // 第一轮：客户端出站字节写入 Capturing writer（服务端由真实 server_side 扮演）
+        // 录制用 writer：转发到 sink 同时留档
+        struct Rec<W> {
+            sink: W,
+            recorded: Arc<std::sync::Mutex<Vec<u8>>>,
+        }
+        impl<W: AsyncWrite + Unpin> AsyncWrite for Rec<W> {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                self.recorded.lock().unwrap().extend_from_slice(buf);
+                std::pin::Pin::new(&mut self.sink).poll_write(cx, buf)
+            }
+            fn poll_flush(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.sink).poll_flush(cx)
+            }
+            fn poll_shutdown(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.sink).poll_shutdown(cx)
+            }
+        }
+
+        // 第一轮：真实握手，录制客户端全部出站字节
         let (mut c_send, mut s_recv) = duplex(4096);
         let (mut s_send, mut c_recv) = duplex(4096);
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded2 = recorded.clone();
         let client = tokio::spawn(async move {
-            client_side(&mut c_send, &mut c_recv, &PSK, &CERT_FP, &EXPORTER).await
+            let mut rec = Rec {
+                sink: c_send,
+                recorded: recorded2,
+            };
+            client_side(&mut rec, &mut c_recv, &PSK, &CERT_FP, &EXPORTER).await
         });
         let server = tokio::spawn(async move {
             let mut vb = [0u8; 1];
@@ -351,25 +386,25 @@ mod tests {
         c.unwrap();
         s.unwrap();
 
-        // 重放：旧会话的 msg1 是纯临时公钥、攻击者可完整重放，但 confirm_c 绑定
-        // 旧服务端 e；新服务端 e 新鲜 → hash 不同 → 重放的 confirm_c 必不匹配。
-        // 此处用"合法格式 msg1 + 全零 confirm_c"模拟重放者（拿不到 PSK 推不出
-        // 正确 confirm，重放旧值与此等价地失败于同一比对点）。
-        let (mut s2_recv_from, mut s2_send_to) = duplex(4096);
-        let (mut v_send, mut _v_recv) = duplex(4096);
+        // 第二轮：把录下的完整 transcript（0x03+msg1+confirm_c）原样重放到新服务端
+        // ——新服务端 e 新鲜 → hash 不同 → 重放的 confirm_c 必不匹配 → 拒绝。
+        // 消费端结构与生产 handler 一致：先读版本字节，再进 server_side。
+        let transcript = recorded.lock().unwrap().clone();
+        assert_eq!(transcript.len(), 1 + MSG1_LEN + CONFIRM_LEN);
+        let (mut a_send, mut a_recv) = duplex(4096);
+        let (mut b_send, mut b_recv) = duplex(4096);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel::<bool>();
         let _server2 = tokio::spawn(async move {
-            server_side(&mut v_send, &mut s2_recv_from, &PSK, &CERT_FP, &EXPORTER).await
+            let mut ver = [0u8; 1];
+            a_recv.read_exact(&mut ver).await.unwrap();
+            assert_eq!(ver[0], HANDSHAKE_VERSION_BYTE);
+            let r = server_side(&mut b_send, &mut a_recv, &PSK, &CERT_FP, &EXPORTER).await;
+            let _ = res_tx.send(r.is_err());
         });
-        let mut hs = build(&PSK, true).unwrap(); // 只为生成合法格式的 msg1
-        let mut msg1 = [0u8; MSG1_LEN];
-        let n = hs.write_message(&[], &mut msg1).unwrap();
-        let (mut fake_c_send, mut fake_c_recv) = duplex(4096);
-        fake_c_send.write_all(&[HANDSHAKE_VERSION_BYTE]).await.unwrap();
-        fake_c_send.write_all(&msg1[..n]).await.unwrap();
-        // 伪造 confirm_c（全零）——重放者拿不到 PSK 推不出正确值
-        fake_c_send.write_all(&[0u8; CONFIRM_LEN]).await.unwrap();
-        let r = server_side(&mut s2_send_to, &mut fake_c_recv, &PSK, &CERT_FP, &EXPORTER).await;
-        assert!(r.is_err(), "伪造/重放的 confirm_c 必须被拒");
+        a_send.write_all(&transcript).await.unwrap();
+        drop(a_send); // 攻击者写完即收手；未确认的 confirm 已在线上
+        let rejected = res_rx.await.unwrap();
+        assert!(rejected, "重放的完整 transcript 必须被新服务端拒绝");
     }
 
     #[test]

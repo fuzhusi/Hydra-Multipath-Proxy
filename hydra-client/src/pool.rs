@@ -114,6 +114,12 @@ impl PooledConnection {
                     Ok(r)
                 }
                 Err(e) if auth_mode == AuthMode::V3 => Err(e),
+                // confirm 不匹配 = 握手被拒/被篡改（中间人或密钥不一致）——
+                // 这是 v3 安全属性生效的表现，绝不可静默回落 v2（可利用的降级攻击面）
+                Err(e) if e.to_string().contains("确认值不匹配") => {
+                    error!("v3 handshake confirm mismatch (possible MITM/tampering) — refusing v2 downgrade: {e}");
+                    Err(e)
+                }
                 Err(_) => {
                     // v3 被拒（v2-only 节点首字节 0x03 不合 legacy token → 静默关流）
                     warn!("v3 handshake rejected/failed; falling back to v2 token auth");
