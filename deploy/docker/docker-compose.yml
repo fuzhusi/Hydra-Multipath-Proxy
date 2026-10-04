@@ -1,0 +1,39 @@
+# Hydra 节点 docker compose
+#
+# 使用:
+#   1. cp ../env.example ./node.env 并用 vi 填好 HYDRA_AUTH_KEY（勿 export）
+#   2. docker compose up -d --build
+#   3. 取证书给客户端 pinning:
+#      docker compose cp hydra-node:/etc/hydra/hydra-node-cert.der ./hydra-node-cert.der
+#
+# 排障: docs/guides/部署指南.md
+
+services:
+  hydra-node:
+    build: .
+    image: hydra-node:latest
+    container_name: hydra-node
+    restart: unless-stopped
+    # 密钥/配置经 env_file 注入（等价 systemd 的 EnvironmentFile）
+    env_file: ./node.env
+    ports:
+      # QUIC 数据面。宿主端口:容器端口，容器内固定 443/udp
+      - "443:443/udp"
+      # 可选: 若需要从宿主 curl 健康检查，先在 node.env 把
+      # HYDRA_HEALTH_ADDR 改为 0.0.0.0:8081（容器内回环无法从宿主访问），
+      # 再取消下行注释。注意 0.0.0.0 + 端口映射会把健康端点暴露到宿主
+      # 所有网卡，公网机器上务必确认防火墙拦 8081/tcp 或保留注释。
+      # - "127.0.0.1:8081:8081/tcp"
+    volumes:
+      # 证书/私钥持久化；容器重建不重新生成证书，客户端 pinning 不失效
+      - hydra-data:/etc/hydra
+    # 非 root 用户绑 443 需要显式能力；其余能力全部丢弃
+    cap_add:
+      - NET_BIND_SERVICE
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  hydra-data:

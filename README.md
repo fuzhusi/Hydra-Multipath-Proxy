@@ -121,6 +121,13 @@ curl -x http://127.0.0.1:1080 https://www.google.com
 | `HYDRA_OBFS_KEY` | 双端 | obfs 模式独立第二密码（两端一致；未设置则拒绝启用 obfs 模式） |
 | `HYDRA_STREAM_WINDOW` / `HYDRA_CONN_WINDOW` | 双端 | QUIC 流控窗口（MB，默认 8/32；视频高码率慢链路可调大） |
 | `HYDRA_PROBE_INTERVAL_SECS` | 客户端 | Offline 节点恢复探测周期（默认 30s） |
+| `HYDRA_HEALTH_ADDR` | 节点 | TCP 健康检查端点（如 127.0.0.1:8081，GET /health；未设=关闭） |
+| `HYDRA_SPLIT` | 客户端 | 设为 `cn` 启用国内域名直连分流（默认关闭=全走节点，隐私优先） |
+| `HYDRA_DIRECT_DOMAIN_FILE` | 客户端 | 自定义直连域名列表（一行一域名，与内置 CN 表合并） |
+
+> **GUI 配置**：桌面端所有设置（节点/密钥/证书路径/模式）已持久化到本机配置文件（Windows `%APPDATA%\hydra\config.json`），填一次双击即用，环境变量仅作回落。
+> **服务器部署**：见 [docs/guides/部署指南.md](docs/guides/部署指南.md)（systemd/Docker/安装脚本，3 条命令部署 + 排障表）。
+> **日志隐私**：客户端与节点日志中的访问目标一律脱敏为短哈希（明文仅 `RUST_LOG=debug` 可查）。
 
 ## 项目结构
 

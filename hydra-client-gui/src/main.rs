@@ -9,6 +9,9 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+mod config;
+use config::GuiConfig;
+
 #[derive(Clone, Debug)]
 struct NodeStatusInfo {
     addr: String,
@@ -20,10 +23,13 @@ struct NodeStatusInfo {
 struct HydraApp {
     // 应用状态
     proxy_running: bool,
-    proxy_addr: String,
     nodes: Vec<NodeInfo>,
     logs: Vec<String>,
-    config: AppConfig,
+    /// 持久化配置（配置文件 > 环境变量，见 config.rs）
+    config: GuiConfig,
+    /// 最近一次成功落盘的配置快照（用于差分 + 防抖保存）
+    saved_snapshot: GuiConfig,
+    last_config_save: Option<std::time::Instant>,
 
     // 输入状态
     new_node_input: String,
@@ -31,6 +37,10 @@ struct HydraApp {
     // 分享链接相关
     share_link_text: String,
     show_share_link_dialog: bool,
+
+    // 密钥明文显示开关（默认掩码显示）
+    show_auth_key: bool,
+    show_obfs_key: bool,
 
     // 运行时状态
     scheduler: Option<Arc<Scheduler>>,
@@ -57,13 +67,16 @@ impl Default for HydraApp {
     fn default() -> Self {
         Self {
             proxy_running: false,
-            proxy_addr: String::new(),
             nodes: Vec::new(),
             logs: Vec::new(),
-            config: AppConfig::default(),
+            config: GuiConfig::default(),
+            saved_snapshot: GuiConfig::default(),
+            last_config_save: None,
             new_node_input: String::new(),
             share_link_text: String::new(),
             show_share_link_dialog: false,
+            show_auth_key: false,
+            show_obfs_key: false,
             scheduler: None,
             transport: None,
             stop_flag: None,
@@ -88,20 +101,43 @@ impl Drop for HydraApp {
     }
 }
 
-#[derive(Default, Clone)]
-struct AppConfig {
-    proxy_addr: String,
-    node_addrs: Vec<String>,
-}
-
 impl HydraApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // 设置自定义字体
         setup_custom_fonts(&cc.egui_ctx);
 
-        let node_addrs = vec!["127.0.0.1:8080".to_string()];
+        // ── 启动时加载持久化配置（配置文件 > 环境变量，见 config.rs）──
+        let mut startup_warning: Option<String> = None;
+        let (mut cfg, from_file) = match config::config_path() {
+            Some(path) => match config::load_from_file(&path) {
+                Ok(Some(cfg)) => (cfg, true),
+                Ok(None) => (GuiConfig::default(), false),
+                Err(e) => {
+                    // 文件损坏不静默：显式告警并降级为默认值/环境变量（不覆盖写坏文件）
+                    startup_warning = Some(format!("⚠️ {}", e));
+                    (GuiConfig::default(), false)
+                }
+            },
+            None => {
+                startup_warning = Some(
+                    "⚠️ 无法定位配置目录（缺少 APPDATA/HOME），本次配置仅保存在内存".to_string(),
+                );
+                (GuiConfig::default(), false)
+            }
+        };
+
+        // 缺省监听地址兜底（配置与 env 均未给出时的 UI 初始值）
+        if cfg.proxy_listen_addr.trim().is_empty() {
+            cfg.proxy_listen_addr = "127.0.0.1:1080".to_string();
+        }
+
+        // C2 双模式/obfs 密码/探测间隔：配置非空 → 覆盖 env（hydra-client 内部从 env 读取）。
+        // 必须在任何工作线程 spawn 之前执行，避免 env 并发读写。
+        config::apply_env_overrides(&cfg);
+
+        // 节点状态表初始化
         let mut node_status = HashMap::new();
-        for addr in &node_addrs {
+        for addr in &cfg.node_addrs {
             node_status.insert(
                 addr.clone(),
                 NodeStatusInfo {
@@ -113,18 +149,18 @@ impl HydraApp {
             );
         }
 
-        Self {
+        let mut app = Self {
             proxy_running: false,
-            proxy_addr: "127.0.0.1:1080".to_string(),
             nodes: Vec::new(),
             logs: Vec::new(),
-            config: AppConfig {
-                proxy_addr: "127.0.0.1:1080".to_string(),
-                node_addrs,
-            },
+            saved_snapshot: cfg.clone(),
+            last_config_save: None,
+            config: cfg,
             new_node_input: String::new(),
             share_link_text: String::new(),
             show_share_link_dialog: false,
+            show_auth_key: false,
+            show_obfs_key: false,
             scheduler: None,
             transport: None,
             stop_flag: None,
@@ -136,20 +172,87 @@ impl HydraApp {
             node_test_receiver: None,
             traffic_monitor: None,
             last_traffic_update: None,
+        };
+
+        // ── 首启向导（轻量版）：无配置文件且关键字段为空 → 日志区中文引导 ──
+        let key_missing = app.config.auth_key.trim().is_empty();
+        let cert_missing = app.config.cert_path.trim().is_empty();
+        if !from_file {
+            if key_missing || cert_missing || app.config.node_addrs.is_empty() {
+                for line in Self::wizard_lines() {
+                    app.add_log(line);
+                }
+            }
+        } else if key_missing || cert_missing {
+            app.add_log(
+                "配置已加载，但认证密钥或节点证书路径尚未填写，请在左侧「安全与传输设置」中补全"
+                    .to_string(),
+            );
+        } else {
+            app.add_log("配置已从文件加载（配置文件优先于环境变量）".to_string());
+        }
+        if let Some(warning) = startup_warning {
+            app.add_log(warning);
+        }
+        app
+    }
+
+    /// 首启向导引导文案
+    fn wizard_lines() -> Vec<String> {
+        let cfg_path = config::config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(配置目录不可用)".to_string());
+        vec![
+            "═══ 首次使用向导 ═══".to_string(),
+            "① 填写认证密钥：左侧「安全与传输设置」→ 认证密钥 → 点「编辑/显示」输入 hex 密钥"
+                .to_string(),
+            "② 选择节点证书文件：同区「节点证书」→ 点「浏览...」选择节点生成的 hydra-node-cert.der"
+                .to_string(),
+            "③ 添加节点：左上「节点地址」输入 host:port 后点「添加」".to_string(),
+            "④ 点「启动代理」即可使用".to_string(),
+            format!(
+                "完成一次后配置自动保存到 {}，以后双击本程序即可直接使用",
+                cfg_path
+            ),
+        ]
+    }
+
+    /// 差分 + 防抖保存：配置与上次落盘快照不同才写；force=true（启停/退出）跳过防抖立即写。
+    fn maybe_save_config(&mut self, force: bool) {
+        if self.config == self.saved_snapshot {
+            return;
+        }
+        if !force
+            && self
+                .last_config_save
+                .map(|t| t.elapsed() < std::time::Duration::from_millis(1000))
+                .unwrap_or(false)
+        {
+            return; // 防抖：1 秒内不重复写盘
+        }
+        let Some(path) = config::config_path() else {
+            return; // 无法定位配置目录（new 时已提示过），保持内存态
+        };
+        match config::save_to_file(&path, &self.config) {
+            Ok(()) => {
+                self.saved_snapshot = self.config.clone();
+                self.last_config_save = Some(std::time::Instant::now());
+            }
+            Err(e) => self.add_log(format!("⚠️ 配置保存失败: {}", e)),
         }
     }
 
     /// Test connectivity to a single node（A5：失败根因以 Err 透出，不再吞掉）
-    async fn test_node_connection(addr_str: &str) -> std::result::Result<u64, String> {
+    /// Exec-1：证书由调用方先按「配置文件 > 环境变量」解析后传入（config.rs resolve_node_certs）
+    async fn test_node_connection(
+        addr_str: &str,
+        node_certs: Vec<Vec<u8>>,
+    ) -> std::result::Result<u64, String> {
         let addr: SocketAddr = addr_str
             .parse()
             .map_err(|e| format!("地址解析失败: {}", e))?;
 
-        // 需要节点证书才能建立经过校验的连接；证书缺失/不可读的根因直接透出
-        let certs =
-            hydra_client::node_certs_from_env().map_err(|e| format!("证书加载失败: {}", e))?;
-
-        let transport = Transport::new_client(certs, hydra_client::DEFAULT_SNI)
+        let transport = Transport::new_client(node_certs, hydra_client::DEFAULT_SNI)
             .await
             .map_err(|e| format!("创建 QUIC 传输失败: {}", e))?;
 
@@ -167,6 +270,14 @@ impl HydraApp {
             self.add_log("已有节点测试正在进行，请稍候".to_string());
             return;
         }
+        // 证书按「配置文件 > 环境变量」解析；失败根因直接进日志（A5 行为保持）
+        let certs = match config::resolve_node_certs(&self.config) {
+            Ok(c) => c,
+            Err(e) => {
+                self.add_log(format!("节点 {} 测试失败: {}", addr, e));
+                return;
+            }
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         self.add_log(format!("开始测试节点 {}...", addr));
         std::thread::spawn(move || {
@@ -177,7 +288,7 @@ impl HydraApp {
                     return;
                 }
             };
-            let result = rt.block_on(HydraApp::test_node_connection(&addr));
+            let result = rt.block_on(HydraApp::test_node_connection(&addr, certs));
             let _ = tx.send((addr, result));
         });
         self.node_test_receiver = Some(rx);
@@ -232,6 +343,14 @@ impl HydraApp {
     /// Test all nodes and update status (non-blocking)
     fn test_all_nodes(&mut self) {
         let node_addrs = self.config.node_addrs.clone();
+        // 证书按「配置文件 > 环境变量」解析一次；失败根因直接进日志
+        let certs = match config::resolve_node_certs(&self.config) {
+            Ok(c) => c,
+            Err(e) => {
+                self.add_log(format!("全部节点测试失败: {}", e));
+                return;
+            }
+        };
         let (tx, rx) = std::sync::mpsc::channel();
 
         // 在后台线程中测试所有节点
@@ -242,9 +361,10 @@ impl HydraApp {
                 let mut handles = Vec::new();
                 for addr in &node_addrs {
                     let addr = addr.clone();
+                    let certs = certs.clone();
                     let tx = tx.clone();
                     handles.push(tokio::spawn(async move {
-                        let result = Self::test_node_connection(&addr).await;
+                        let result = Self::test_node_connection(&addr, certs).await;
                         let _ = tx.send((addr, result));
                     }));
                 }
@@ -339,10 +459,31 @@ impl HydraApp {
             return;
         }
 
-        let proxy_addr: SocketAddr = match self.proxy_addr.parse() {
+        // Exec-1：模式/obfs 密码/探测间隔——配置非空 → 覆盖 env（hydra-client 内部从 env 读取）。
+        // 此前已有线程在跑时本函数会被 proxy_running 拦截，故此处写 env 不会与之并发。
+        config::apply_env_overrides(&self.config);
+
+        let proxy_addr: SocketAddr = match self.config.proxy_listen_addr.trim().parse() {
             Ok(addr) => addr,
             Err(e) => {
                 self.add_log(format!("地址解析错误: {}", e));
+                return;
+            }
+        };
+
+        // ── 认证密钥与节点证书：先读配置文件，缺项再回落环境变量（config.rs）──
+        // 在 GUI 线程解析完成后再移交代理线程；失败根因直接进日志。
+        let auth_key = match config::resolve_auth_key(&self.config) {
+            Ok(k) => k,
+            Err(e) => {
+                self.add_log(format!("代理启动失败: {}", e));
+                return;
+            }
+        };
+        let node_certs = match config::resolve_node_certs(&self.config) {
+            Ok(c) => c,
+            Err(e) => {
+                self.add_log(format!("代理启动失败: {}", e));
                 return;
             }
         };
@@ -401,25 +542,12 @@ impl HydraApp {
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let proxy = match (move || -> std::result::Result<ProxyServer, String> {
-                    let auth_key = hydra_client::auth_key_from_env()?;
-                    let node_certs = hydra_client::node_certs_from_env()?;
-                    Ok(ProxyServer::new(proxy_addr_clone)
-                        .with_nodes(nodes_clone)
-                        .with_traffic_monitor(traffic_monitor_clone)
-                        .with_auth_key(auth_key)
-                        .with_node_certs(node_certs))
-                })() {
-                    Ok(p) => p,
-                    Err(msg) => {
-                        eprintln!("[Proxy Thread] 代理启动失败: {}", msg);
-                        let _ = tx.send(Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            msg,
-                        )));
-                        return;
-                    }
-                };
+                // 认证密钥/证书已由 GUI 线程按「配置文件 > 环境变量」解析完毕（见上）
+                let proxy = ProxyServer::new(proxy_addr_clone)
+                    .with_nodes(nodes_clone)
+                    .with_traffic_monitor(traffic_monitor_clone)
+                    .with_auth_key(auth_key)
+                    .with_node_certs(node_certs);
                 // 先绑定端口
                 match tokio::net::TcpListener::bind(proxy_addr_clone).await {
                     Ok(listener) => {
@@ -471,6 +599,8 @@ impl HydraApp {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 self.proxy_running = true;
                 self.add_log(format!("代理已启动，监听地址: {}", proxy_addr));
+                // 关键动作立即落盘（监听地址/节点等可能的变更）
+                self.maybe_save_config(true);
 
                 // 设置系统全局代理
                 let proxy_url = format!("socks5://{}", proxy_addr);
@@ -672,6 +802,8 @@ impl HydraApp {
         // 移除系统全局代理
         self.remove_system_proxy();
         self.add_log("代理已停止，已移除系统代理".to_string());
+        // 关键动作立即落盘
+        self.maybe_save_config(true);
     }
 
     fn export_share_links(&mut self) {
@@ -726,6 +858,8 @@ impl eframe::App for HydraApp {
         if self.proxy_running {
             self.stop_proxy();
         }
+        // Exec-1：退出前强制落盘（兜底防抖窗口内尚未写盘的变更）
+        self.maybe_save_config(true);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -924,7 +1058,7 @@ impl eframe::App for HydraApp {
             ui.heading("代理控制");
             ui.horizontal(|ui| {
                 ui.label("监听地址:");
-                ui.text_edit_singleline(&mut self.proxy_addr);
+                ui.text_edit_singleline(&mut self.config.proxy_listen_addr);
             });
 
             ui.horizontal(|ui| {
@@ -938,6 +1072,140 @@ impl eframe::App for HydraApp {
                     }
                 }
             });
+
+            ui.separator();
+
+            // ── Exec-1：安全与传输设置（配置文件 > 环境变量，自动持久化）──
+            ui.heading("安全与传输设置");
+            if ui.button("新手引导").clicked() {
+                for line in HydraApp::wizard_lines() {
+                    self.add_log(line);
+                }
+            }
+
+            // 认证密钥：默认掩码显示（如 a1b2****8f90），点击「编辑/显示」查看并编辑明文
+            ui.horizontal(|ui| {
+                ui.label("认证密钥:");
+                if self.show_auth_key {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.config.auth_key).desired_width(170.0),
+                    );
+                    if ui.button("隐藏").clicked() {
+                        self.show_auth_key = false;
+                    }
+                } else {
+                    let shown = if self.config.auth_key.is_empty() {
+                        "（未设置）".to_string()
+                    } else {
+                        config::mask_secret(self.config.auth_key.trim())
+                    };
+                    ui.monospace(shown);
+                    if ui.button("编辑/显示").clicked() {
+                        self.show_auth_key = true;
+                    }
+                }
+            });
+            // 密钥有效性实时校验（hex + 最短 16 字节）
+            if self.show_auth_key && !self.config.auth_key.trim().is_empty() {
+                match hydra_client::auth_key_from_hex(self.config.auth_key.trim()) {
+                    Ok(_) => ui.label("✓ 密钥格式有效"),
+                    Err(e) => ui.label(format!("✗ {}", e)),
+                };
+            }
+
+            // 节点证书文件：浏览选择（rfd 文件对话框）+ 手动粘贴路径，实时校验存在性
+            ui.label("节点证书:");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.config.cert_path)
+                        .desired_width(ui.available_width() - 80.0)
+                        .hint_text("节点生成的 hydra-node-cert.der"),
+                );
+                if ui.button("浏览...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("证书文件", &["der", "pem", "crt", "cer"])
+                        .add_filter("全部文件", &["*"])
+                        .pick_file()
+                    {
+                        self.config.cert_path = path.display().to_string();
+                        self.add_log(format!("已选择节点证书: {}", path.display()));
+                    }
+                }
+            });
+            let cert = self.config.cert_path.trim().to_string();
+            if !cert.is_empty() {
+                if std::path::Path::new(&cert).exists() {
+                    ui.label("✓ 证书文件存在");
+                } else {
+                    ui.colored_label(egui::Color32::RED, "✗ 证书文件不存在，请检查路径");
+                }
+            }
+
+            // 传输模式（对应 HYDRA_MODE；两端须一致）
+            ui.horizontal(|ui| {
+                ui.label("传输模式:");
+                let obfs = self.config.is_obfs();
+                if ui.radio(!obfs, "伪装 masquerade").clicked() && obfs {
+                    self.config.hydra_mode = "masquerade".to_string();
+                    self.add_log("已切换为 masquerade 模式，下次启动代理生效".to_string());
+                }
+                if ui.radio(obfs, "混淆 obfs").clicked() && !obfs {
+                    self.config.hydra_mode = "obfs".to_string();
+                    self.add_log("已切换为 obfs 模式（需两端一致），下次启动代理生效".to_string());
+                }
+            });
+
+            // obfs 独立第二密码（对应 HYDRA_OBFS_KEY；masquerade 模式忽略）
+            ui.horizontal(|ui| {
+                ui.label("obfs 密码:");
+                if self.show_obfs_key {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.config.obfs_key).desired_width(170.0),
+                    );
+                    if ui.button("隐藏").clicked() {
+                        self.show_obfs_key = false;
+                    }
+                } else {
+                    let shown = if self.config.obfs_key.is_empty() {
+                        "（未设置）".to_string()
+                    } else {
+                        config::mask_secret(self.config.obfs_key.trim())
+                    };
+                    ui.monospace(shown);
+                    if ui.button("编辑/显示").clicked() {
+                        self.show_obfs_key = true;
+                    }
+                }
+            });
+            if self.config.is_obfs() && self.config.obfs_key.trim().is_empty() {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "⚠ obfs 模式要求独立第二密码，否则代理无法启动",
+                );
+            }
+
+            // Offline 恢复探测间隔（对应 HYDRA_PROBE_INTERVAL_SECS）
+            ui.horizontal(|ui| {
+                ui.label("探测间隔(秒):");
+                let mut secs = self.config.probe_interval_secs.unwrap_or(30);
+                if ui
+                    .add(egui::DragValue::new(&mut secs).clamp_range(1..=3600))
+                    .changed()
+                {
+                    self.config.probe_interval_secs = Some(secs);
+                }
+                if self.config.probe_interval_secs.is_some() && ui.small_button("默认").clicked()
+                {
+                    self.config.probe_interval_secs = None;
+                }
+            });
+            ui.label("（Offline 节点自动恢复探测，默认 30 秒）");
+            ui.small(format!(
+                "配置自动保存: {}",
+                config::config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(配置目录不可用)".to_string())
+            ));
 
             ui.separator();
 
@@ -1026,6 +1294,9 @@ impl eframe::App for HydraApp {
                 }
             });
         });
+
+        // Exec-1：配置差分 + 防抖落盘（有变更时每秒至多写一次；启停/退出时强制写）
+        self.maybe_save_config(false);
     }
 }
 

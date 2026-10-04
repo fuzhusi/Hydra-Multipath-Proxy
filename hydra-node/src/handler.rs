@@ -1,4 +1,4 @@
-use hydra_protocol::{AuthToken, HydraError, Result, CLIENT_ID};
+use hydra_protocol::{mask_target, AuthToken, HydraError, Result, CLIENT_ID};
 use quinn::{Connection, VarInt};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -124,13 +124,15 @@ impl ConnectionHandler {
             return Ok(());
         }
         let target_addr_str = String::from_utf8_lossy(&addr_buf).to_string();
-        info!("Received target address: {}", target_addr_str);
+        // 日志脱敏（防追踪性）：info 级一律短哈希，完整明文仅 debug 级（RUST_LOG=debug）可见
+        info!("Received target address: {}", mask_target(&target_addr_str));
+        debug!("Received target address (plaintext): {}", target_addr_str);
 
         // ── 第 3 步：解析为 SocketAddr，否则节点侧 DNS 解析
         let target_addr: std::net::SocketAddr = if let Ok(addr) = target_addr_str.parse() {
             addr
         } else {
-            info!("Resolving DNS for: {}", target_addr_str);
+            info!("Resolving DNS for: {}", mask_target(&target_addr_str));
             match tokio::net::lookup_host(target_addr_str.to_string()).await {
                 Ok(addrs) => {
                     let addrs_vec: Vec<_> = addrs.collect();
@@ -167,7 +169,10 @@ impl ConnectionHandler {
             }
         };
 
-        info!("Connecting to target: {} (with 15s timeout)", target_addr);
+        info!(
+            "Connecting to target: {} (with 15s timeout)",
+            mask_target(&target_addr.to_string())
+        );
         let connect_start = std::time::Instant::now();
 
         // Connect to target with timeout（须小于客户端 20s 应答超时，否则慢目标被误判为节点故障）
@@ -181,7 +186,7 @@ impl ConnectionHandler {
                 let elapsed = connect_start.elapsed();
                 info!(
                     "Connected to target: {} (took {}ms)",
-                    target_addr,
+                    mask_target(&target_addr.to_string()),
                     elapsed.as_millis()
                 );
                 // Send success response
@@ -307,7 +312,8 @@ impl ConnectionHandler {
         if forward_failed {
             info!(
                 "Forwarding to {} aborted with app error 0x{:02x}",
-                target_addr, ERR_FORWARD_IO
+                mask_target(&target_addr.to_string()),
+                ERR_FORWARD_IO
             );
             return Err(HydraError::ConnectionError(format!(
                 "forwarding IO error for {}",
@@ -321,7 +327,8 @@ impl ConnectionHandler {
         );
         info!(
             "Connection to {} closed (QUIC->Target: {} bytes, Target->QUIC: {} bytes)",
-            target_addr, quic_bytes, target_bytes
+            mask_target(&target_addr.to_string()),
+            quic_bytes, target_bytes
         );
         Ok(())
     }

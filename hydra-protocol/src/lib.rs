@@ -3,9 +3,11 @@ pub mod session;
 pub mod node;
 pub mod error;
 pub mod auth;
+pub mod log;
 
 pub use packet::*;
 pub use session::*;
 pub use node::*;
 pub use error::*;
 pub use auth::*;
+pub use log::*;
