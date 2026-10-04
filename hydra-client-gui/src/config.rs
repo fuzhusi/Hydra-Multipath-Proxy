@@ -99,6 +99,9 @@ pub struct GuiConfig {
     /// Team-UI：节点备注名（地址 "host:port" → 展示名）。缺项 = 无备注，显示地址本身。
     #[serde(default)]
     pub node_names: HashMap<String, String>,
+    /// UI 重设计 v2：TUN 模式预留字段（固定 false，不驱动任何行为——见方案 §5）。
+    #[serde(default)]
+    pub tun_enabled: bool,
 }
 
 /// serde 默认值：true（关窗默认隐藏到托盘）
@@ -121,6 +124,7 @@ impl Default for GuiConfig {
             subscriptions: Vec::new(),
             close_to_tray: true,
             node_names: HashMap::new(),
+            tun_enabled: false,
         }
     }
 }
@@ -190,6 +194,20 @@ impl GuiConfig {
 }
 
 impl GuiConfig {
+    /// Team-UI：订阅节点「另存为手动」——从唯一认领它的订阅 nodes 列表移除该地址。
+    /// 移除后 `node_source_label` 即回落为「手动」；后续订阅更新按 manual_set 语义
+    /// 保留该地址且不再认领（见 main.rs apply_subscription_update）。
+    /// 返回是否发生了移除（地址不属于任何订阅时为 false）。
+    pub fn save_subscription_node_as_manual(&mut self, addr: &str) -> bool {
+        for sub in &mut self.subscriptions {
+            if let Some(pos) = sub.nodes.iter().position(|n| n == addr) {
+                sub.nodes.remove(pos);
+                return true;
+            }
+        }
+        false
+    }
+
     /// 模式是否为 obfs（"" 与 "masquerade" 均视为伪装模式）
     pub fn is_obfs(&self) -> bool {
         self.hydra_mode.trim().eq_ignore_ascii_case("obfs")
@@ -350,6 +368,7 @@ mod tests {
             subscriptions: Vec::new(),
             close_to_tray: true,
             node_names: Default::default(),
+            tun_enabled: false,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: GuiConfig = serde_json::from_str(&json).unwrap();
@@ -403,6 +422,7 @@ mod tests {
             subscriptions: Vec::new(),
             close_to_tray: true,
             node_names: Default::default(),
+            tun_enabled: false,
         };
         save_to_file(&path, &cfg).expect("保存应成功");
         let loaded = load_from_file(&path)
@@ -630,6 +650,65 @@ mod tests {
 
         let owned = cfg.subscription_owned_addrs();
         assert_eq!(owned, vec!["10.0.0.1:4433".to_string()]);
+    }
+
+    // ===================== UI 重设计 v2：TUN 预留字段 + 订阅节点另存为手动 =====================
+
+    #[test]
+    fn test_tun_enabled_reserved_default_false() {
+        // 缺省 / 旧版本配置文件 → tun_enabled=false（预留字段，不驱动任何行为）
+        let cfg: GuiConfig = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.tun_enabled);
+        let old: GuiConfig = serde_json::from_str(r#"{"auth_key":"ff"}"#).unwrap();
+        assert!(!old.tun_enabled);
+
+        // 显式 true 也能往返（序列化兼容），但 UI 恒回写 false
+        let cfg = GuiConfig {
+            tun_enabled: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: GuiConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.tun_enabled);
+    }
+
+    #[test]
+    fn test_save_subscription_node_as_manual() {
+        let mut cfg = GuiConfig {
+            node_addrs: vec!["10.0.0.1:4433".into(), "10.0.0.2:4433".into()],
+            subscriptions: vec![SubscriptionConfig {
+                name: "主订阅".into(),
+                source: "https://e/s".into(),
+                last_updated_secs: None,
+                nodes: vec!["10.0.0.1:4433".into()],
+            }],
+            ..Default::default()
+        };
+
+        // 订阅节点 → 移除认领，来源回落「手动」，地址保留在列表
+        assert!(cfg.save_subscription_node_as_manual("10.0.0.1:4433"));
+        assert!(cfg.subscriptions[0].nodes.is_empty());
+        assert!(cfg.node_addrs.contains(&"10.0.0.1:4433".to_string()));
+        assert_eq!(cfg.node_source_label("10.0.0.1:4433"), NODE_SOURCE_MANUAL);
+
+        // 手动节点 / 不存在的地址 → false，无副作用
+        assert!(!cfg.save_subscription_node_as_manual("10.0.0.2:4433"));
+        assert!(!cfg.save_subscription_node_as_manual("9.9.9.9:1"));
+
+        // 多订阅认领同一地址：只解除先匹配者
+        cfg.subscriptions[0].nodes = vec!["10.0.0.3:4433".into()];
+        cfg.subscriptions.push(SubscriptionConfig {
+            name: "备份订阅".into(),
+            source: "file:///x".into(),
+            last_updated_secs: None,
+            nodes: vec!["10.0.0.3:4433".into()],
+        });
+        assert!(cfg.save_subscription_node_as_manual("10.0.0.3:4433"));
+        assert!(cfg.subscriptions[0].nodes.is_empty());
+        assert_eq!(
+            cfg.subscriptions[1].nodes,
+            vec!["10.0.0.3:4433".to_string()]
+        );
     }
 
     // ===================== Team-UI：节点备注名与地址编辑 =====================

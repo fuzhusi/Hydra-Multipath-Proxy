@@ -20,33 +20,34 @@ mod subscription;
 mod tray;
 use tray::TrayCommand;
 
-/// T2：左侧导航五区（状态总览 / 节点管理 / 分享 / 设置 / 日志）
-/// Team-UI：订阅管理并入「节点管理」（统一节点列表 + 来源标记，消除功能重叠页面）
+/// UI 重设计 v2：左侧导航五页（状态总览 / 节点 / 订阅 / 日志 / 设置）。
+/// 分享入口并入节点页（单节点分享在节点行内，批量导出在节点页工具区）；
+/// 订阅独立成页：只管订阅源生命周期，节点归属在节点页以来源标记区分。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     Overview,
     Nodes,
-    Share,
-    Settings,
+    Subscriptions,
     Logs,
+    Settings,
 }
 
 impl Tab {
     const ALL: [Tab; 5] = [
         Tab::Overview,
         Tab::Nodes,
-        Tab::Share,
-        Tab::Settings,
+        Tab::Subscriptions,
         Tab::Logs,
+        Tab::Settings,
     ];
 
     fn label(self) -> &'static str {
         match self {
             Tab::Overview => "📊 状态总览",
-            Tab::Nodes => "🌐 节点管理",
-            Tab::Share => "🔗 分享",
+            Tab::Nodes => "🌐 节点",
+            Tab::Subscriptions => "📡 订阅",
+            Tab::Logs => "📜 日志",
             Tab::Settings => "⚙️ 设置",
-            Tab::Logs => "📜 运行日志",
         }
     }
 }
@@ -100,6 +101,17 @@ struct HydraApp {
     // 密钥明文显示开关（默认掩码显示）
     show_auth_key: bool,
     show_obfs_key: bool,
+
+    // ── UI 重设计 v2：节点页顶部「全局凭据」折叠区（过渡期全局生效，诚实标注）──
+    global_creds_open: bool,
+
+    // ── UI 重设计 v2：订阅页展开查看归属节点 + 订阅编辑对话框 ──
+    /// 当前展开归属节点列表的订阅名（None = 全部收起）
+    expanded_sub: Option<String>,
+    /// 订阅编辑对话框：被编辑订阅在列表中的下标
+    sub_edit_idx: Option<usize>,
+    sub_edit_name: String,
+    sub_edit_source: String,
 
     // ── Team-UI：节点编辑对话框（备注名/地址 + 全局安全参数，实时校验）──
     node_edit_open: bool,
@@ -181,6 +193,11 @@ impl Default for HydraApp {
             edit_obfs_key: String::new(),
             edit_obfs: false,
             edit_show_obfs: false,
+            global_creds_open: false,
+            expanded_sub: None,
+            sub_edit_idx: None,
+            sub_edit_name: String::new(),
+            sub_edit_source: String::new(),
             scheduler: None,
             transport: None,
             stop_flag: None,
@@ -301,6 +318,11 @@ impl HydraApp {
             edit_obfs_key: String::new(),
             edit_obfs: false,
             edit_show_obfs: false,
+            global_creds_open: false,
+            expanded_sub: None,
+            sub_edit_idx: None,
+            sub_edit_name: String::new(),
+            sub_edit_source: String::new(),
             scheduler: None,
             transport: None,
             stop_flag: None,
@@ -329,7 +351,7 @@ impl HydraApp {
             }
         } else if key_missing || cert_missing {
             app.add_log(
-                "配置已加载，但认证密钥或节点证书路径尚未填写，请在左侧「安全与传输设置」中补全"
+                "配置已加载，但认证密钥或节点证书路径尚未填写，请在「🌐 节点」页顶部「全局凭据」区补全"
                     .to_string(),
             );
         } else {
@@ -348,13 +370,12 @@ impl HydraApp {
             .unwrap_or_else(|| "(配置目录不可用)".to_string());
         vec![
             "═══ 首次使用向导 ═══".to_string(),
-            "① 填写认证密钥：左侧「⚙ 设置」→「安全与传输」→ 认证密钥 → 点「编辑/显示」输入 hex 密钥"
+            "① 填写认证密钥：「🌐 节点」页顶部「全局凭据」折叠区 → 认证密钥 → 点「编辑/显示」输入 hex 密钥"
                 .to_string(),
             "② 选择节点证书文件：同区「节点证书」→ 点「浏览...」选择节点生成的 hydra-node-cert.der"
                 .to_string(),
-            "③ 添加节点：「🌐 节点管理」页顶部输入框填 host:port 后点「添加」"
-                .to_string(),
-            "④ 点「▶ 启动代理」即可使用（也可直接点状态总览页的大按钮）".to_string(),
+            "③ 添加节点：「🌐 节点」页顶部输入框填 host:port 后点「添加」".to_string(),
+            "④ 点「📊 状态总览」页的大按钮「▶ 启动代理」即可使用".to_string(),
             format!(
                 "完成一次后配置自动保存到 {}，以后双击本程序即可直接使用",
                 cfg_path
@@ -1773,7 +1794,7 @@ impl eframe::App for HydraApp {
         egui::CentralPanel::default().show(ctx, |ui| match self.current_tab {
             Tab::Overview => self.ui_overview(ui),
             Tab::Nodes => self.ui_nodes(ui),
-            Tab::Share => self.ui_share(ui),
+            Tab::Subscriptions => self.ui_subscriptions(ui),
             Tab::Settings => self.ui_settings(ui),
             Tab::Logs => self.ui_logs(ui),
         });
@@ -2013,12 +2034,14 @@ impl HydraApp {
         }
     }
 
-    /// 状态总览：状态卡（大字状态 + 速率 + 活跃连接）+ 快捷启停 + 节点健康概要
+    /// 状态总览（v2 方案 §2.1）：仪表盘 + 全局启停大开关。
+    /// 含：运行状态、在线节点 x/y、实时上/下行速率、当前模式（传输+认证概要）、
+    /// 最近日志摘要（点击跳日志页）。本页无任何配置项。
     fn ui_overview(&mut self, ui: &mut egui::Ui) {
         ui.heading("状态总览");
         ui.separator();
 
-        // 状态卡
+        // 状态卡：启停大开关 + 监听地址 + 在线节点 + 速率
         egui::Frame::group(ui.style())
             .inner_margin(egui::Margin::same(12.0))
             .show(ui, |ui| {
@@ -2051,7 +2074,12 @@ impl HydraApp {
                         }
                     });
                 });
-                ui.label(format!("监听地址: {}", self.config.proxy_listen_addr));
+                let online = self.node_status.values().filter(|s| s.connected).count();
+                let total = self.config.node_addrs.len();
+                ui.label(format!(
+                    "本地监听 {}   活动: {}/{} 节点在线",
+                    self.config.proxy_listen_addr, online, total
+                ));
 
                 // 实时流量（TrafficMonitor 既有接口，每秒刷新由 500ms 周期重绘驱动）
                 if self.proxy_running {
@@ -2076,24 +2104,212 @@ impl HydraApp {
                 }
             });
 
+        // 概要卡：当前模式（传输 + 认证概要）与节点健康
         ui.add_space(8.0);
-        ui.heading("节点健康");
-        ui.separator();
-        let online = self.node_status.values().filter(|s| s.connected).count();
-        let total = self.config.node_addrs.len();
-        ui.label(format!("在线 {} / 总数 {}", online, total));
-        if let Some(last_check) = self.last_health_check {
-            ui.label(format!("上次检测: {}秒前", last_check.elapsed().as_secs()));
-        }
-        if ui.button("测试所有节点").clicked() {
-            self.test_all_nodes();
-        }
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.heading("当前模式");
+                ui.separator();
+                let mode = if self.config.is_obfs() {
+                    "obfs 混淆"
+                } else {
+                    "masquerade 伪装"
+                };
+                let psk_ok = !self.config.auth_key.trim().is_empty();
+                let cert_ok = !self.config.cert_path.trim().is_empty()
+                    || !self.config.cert_der_b64.trim().is_empty();
+                ui.label(format!(
+                    "传输: {} ｜ 认证: PSK {} ｜ 证书: {}",
+                    mode,
+                    if psk_ok { "已设置" } else { "未设置" },
+                    if cert_ok { "已设置" } else { "未设置" }
+                ));
+                ui.small("凭据为全局配置，在「🌐 节点」页顶部「全局凭据」区修改");
+                if let Some(last_check) = self.last_health_check {
+                    ui.small(format!(
+                        "上次节点检测: {}秒前",
+                        last_check.elapsed().as_secs()
+                    ));
+                }
+                if ui.button("测试所有节点").clicked() {
+                    self.test_all_nodes();
+                }
+            });
+
+        // 最近日志摘要（最近 3 条，点击跳日志页）
+        ui.add_space(8.0);
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("最近日志");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("查看全部 →").clicked() {
+                            self.current_tab = Tab::Logs;
+                        }
+                    });
+                });
+                ui.separator();
+                let start = self.logs.len().saturating_sub(3);
+                if start == self.logs.len() {
+                    ui.weak("暂无日志");
+                }
+                for line in &self.logs[start..] {
+                    ui.small(line);
+                }
+            });
     }
 
-    /// 节点管理（Team-UI 合并版）：统一节点列表（手动+订阅同列，来源标记）
-    /// + 导入节点 + 订阅管理（订阅页已并入本页）+ 每行「编辑」
+    /// 节点页（v2 方案 §2.2）：所有节点的唯一权威列表（手动+订阅合并展示）。
+    /// 顶部「全局凭据」折叠区（过渡期全局生效，诚实标注）→ 统一节点列表
+    /// （备注/地址、来源、状态、延迟、操作）→ 导入节点 → 页尾订阅管理区。
+    /// 注：后端调度器按节点健康自动调度，无「设为活动节点」概念，故未实现该操作。
     fn ui_nodes(&mut self, ui: &mut egui::Ui) {
-        ui.heading("节点管理");
+        ui.heading("节点");
+        ui.separator();
+
+        // ── UI 重设计 v2：全局凭据折叠区（PSK/证书/模式/obfs）──
+        // 过渡期这些字段仍为全局单值（GuiConfig），后端节点级凭据（方案 §6 P3）落地前
+        // 对所有节点生效——此处诚实标注，不假装是节点级凭据。
+        egui::CollapsingHeader::new("🔑 全局凭据（当前对所有节点生效）")
+            .default_open(self.global_creds_open)
+            .show(ui, |ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xFF, 0xD6, 0x66),
+                    "⚠ 当前 hydra-client 按全局凭据连接：以下配置对所有节点生效；节点级凭据将在后端改造后逐节点生效",
+                );
+                // 认证密钥：默认掩码显示（如 a1b2****8f90），点击「编辑/显示」查看并编辑明文
+                ui.horizontal(|ui| {
+                    ui.label("认证密钥:");
+                    if self.show_auth_key {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.auth_key)
+                                .desired_width(200.0),
+                        );
+                        if ui.small_button("隐藏").clicked() {
+                            self.show_auth_key = false;
+                        }
+                    } else {
+                        let shown = if self.config.auth_key.is_empty() {
+                            "（未设置）".to_string()
+                        } else {
+                            config::mask_secret(self.config.auth_key.trim())
+                        };
+                        ui.monospace(shown);
+                        if ui.small_button("编辑/显示").clicked() {
+                            self.show_auth_key = true;
+                        }
+                    }
+                });
+                // 密钥有效性实时校验（hex + 最短 16 字节）
+                if self.show_auth_key && !self.config.auth_key.trim().is_empty() {
+                    match hydra_client::auth_key_from_hex(self.config.auth_key.trim()) {
+                        Ok(_) => ui.colored_label(
+                            egui::Color32::from_rgb(0x7D, 0xE2, 0x97),
+                            "✓ 密钥格式有效",
+                        ),
+                        Err(e) => ui.colored_label(
+                            egui::Color32::from_rgb(0xFF, 0x8A, 0x80),
+                            format!("✗ {}", e),
+                        ),
+                    };
+                }
+
+                // 节点证书：当前状态（路径/内嵌指纹）+ 浏览替换，实时校验存在性
+                ui.horizontal(|ui| {
+                    ui.label("节点证书:");
+                    ui.small(Self::cert_status_text(&self.config));
+                });
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.config.cert_path)
+                            .desired_width(ui.available_width() - 80.0)
+                            .hint_text("证书文件路径（清空则使用内嵌/分享导入的证书）"),
+                    );
+                    if ui.button("浏览替换...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("证书文件", &["der", "pem", "crt", "cer"])
+                            .add_filter("全部文件", &["*"])
+                            .pick_file()
+                        {
+                            self.config.cert_path = path.display().to_string();
+                            self.add_log(format!("已选择节点证书: {}", path.display()));
+                        }
+                    }
+                });
+                if !self.config.cert_path.trim().is_empty()
+                    && !std::path::Path::new(self.config.cert_path.trim()).exists()
+                {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xFF, 0x8A, 0x80),
+                        "✗ 证书文件不存在，请检查路径",
+                    );
+                }
+
+                // 传输模式（下拉；对应 HYDRA_MODE；两端须一致）
+                ui.horizontal(|ui| {
+                    ui.label("传输模式:");
+                    let obfs = self.config.is_obfs();
+                    let current = if obfs { "obfs 混淆" } else { "masquerade 伪装" };
+                    egui::ComboBox::from_id_source("global_mode_combo")
+                        .selected_text(current)
+                        .width(160.0)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(!obfs, "masquerade 伪装")
+                                .clicked()
+                                && obfs
+                            {
+                                self.config.hydra_mode = "masquerade".to_string();
+                                self.add_log("已切换为 masquerade 模式，下次启动代理生效".to_string());
+                            }
+                            if ui
+                                .selectable_label(obfs, "obfs 混淆")
+                                .clicked()
+                                && !obfs
+                            {
+                                self.config.hydra_mode = "obfs".to_string();
+                                self.add_log(
+                                    "已切换为 obfs 模式（需两端一致），下次启动代理生效".to_string(),
+                                );
+                            }
+                        });
+                });
+
+                // obfs 独立第二密码（仅 obfs 模式显示；对应 HYDRA_OBFS_KEY）
+                if self.config.is_obfs() {
+                    ui.horizontal(|ui| {
+                        ui.label("obfs 密码:");
+                        if self.show_obfs_key {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.config.obfs_key)
+                                    .desired_width(200.0),
+                            );
+                            if ui.small_button("隐藏").clicked() {
+                                self.show_obfs_key = false;
+                            }
+                        } else {
+                            let shown = if self.config.obfs_key.is_empty() {
+                                "（未设置）".to_string()
+                            } else {
+                                config::mask_secret(self.config.obfs_key.trim())
+                            };
+                            ui.monospace(shown);
+                            if ui.small_button("编辑/显示").clicked() {
+                                self.show_obfs_key = true;
+                            }
+                        }
+                    });
+                    if self.config.obfs_key.trim().is_empty() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xFF, 0xD6, 0x66),
+                            "⚠ obfs 模式要求独立第二密码，否则代理无法启动",
+                        );
+                    }
+                }
+            });
+
         ui.separator();
 
         // 添加节点（实时校验 host:port，非法地址直接提示不再静默入库）
@@ -2165,6 +2381,7 @@ impl HydraApp {
         }
         let mut indices_to_remove = Vec::new();
         let mut edit_target: Option<String> = None;
+        let mut manual_target: Option<String> = None;
         let node_addrs_clone = self.config.node_addrs.clone();
         for (i, node_addr) in node_addrs_clone.iter().enumerate() {
             ui.horizontal(|ui| {
@@ -2217,8 +2434,20 @@ impl HydraApp {
                 if ui.small_button("分享").clicked() {
                     self.open_share_dialog(node_addr.clone());
                 }
-                if ui.small_button("✏ 编辑").clicked() {
-                    edit_target = Some(node_addr.clone());
+                // 订阅节点默认只读（地址/凭据随订阅更新覆盖），不提供编辑；
+                // 可「另存为手动」解除认领后再改
+                if source == config::NODE_SOURCE_MANUAL {
+                    if ui.small_button("✏ 编辑").clicked() {
+                        edit_target = Some(node_addr.clone());
+                    }
+                } else if ui
+                    .small_button("另存为手动")
+                    .on_hover_text(
+                        "解除订阅认领，变为可编辑的手动节点（后续订阅更新不再覆盖/认领它）",
+                    )
+                    .clicked()
+                {
+                    manual_target = Some(node_addr.clone());
                 }
                 if ui.small_button("删除").clicked() {
                     indices_to_remove.push(i);
@@ -2235,6 +2464,11 @@ impl HydraApp {
         }
         if let Some(addr) = edit_target {
             self.open_node_edit(&addr);
+        }
+        if let Some(addr) = manual_target {
+            if self.config.save_subscription_node_as_manual(&addr) {
+                self.add_log(format!("节点 {} 已另存为手动节点（不再随订阅更新）", addr));
+            }
         }
 
         ui.separator();
@@ -2269,15 +2503,33 @@ impl HydraApp {
         }
         ui.small("完整分享含密钥/证书，导入后自动配置，无需再填密钥与证书文件");
 
-        // ── Team-UI：订阅管理并入本页（原先与节点管理功能重叠的独立「订阅」页）──
+        // ── UI 重设计 v2：原「分享」页并入本页工具区（批量导出 + 使用说明）──
+        ui.separator();
+        ui.heading("分享工具");
+        ui.horizontal(|ui| {
+            if ui.button("批量导出分享链接（v1，仅地址）").clicked() {
+                self.export_share_links();
+            }
+        });
+        ui.small("• 单节点分享：节点列表行内「分享」，可生成二维码与完整/紧凑链接");
+        ui.small("• 完整链接含认证密钥与证书，对方导入即用；仅限可信渠道发送");
+        ui.small("• 紧凑链接仅含证书指纹，需另行发送证书文件");
+        ui.small("• 订阅节点：「📡 订阅」页管理订阅源；节点更新自动进入上方列表");
+
+        // ── 页尾订阅管理区（订阅源的快捷管理；完整生命周期见「📡 订阅」页）──
         ui.separator();
         self.ui_subscription_section(ui);
     }
 
-    /// 订阅管理（Exec-C，Team-UI 并入节点管理页）：添加 / 更新 / 删除，后台串行拉取
+    /// 订阅管理（节点页页尾快捷区；订阅源的完整生命周期/展开节点/编辑见「📡 订阅」页）
     fn ui_subscription_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("订阅管理");
         ui.small("订阅来源拉取的节点会自动加入上方节点列表，并以订阅名作为来源标记");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("前往订阅页管理 →").clicked() {
+                self.current_tab = Tab::Subscriptions;
+            }
+        });
         ui.horizontal(|ui| {
             ui.label("名称:");
             ui.add(
@@ -2349,23 +2601,210 @@ impl HydraApp {
         }
     }
 
-    /// 分享：批量导出（v1 地址信息）+ 使用说明；单节点分享从节点管理触发
-    fn ui_share(&mut self, ui: &mut egui::Ui) {
-        ui.heading("分享");
+    /// 订阅页（v2 方案 §2.3）：只管订阅源的生命周期（增/改/更新/删除）。
+    /// 每条订阅可展开查看归属节点（只读标记 + 「另存为手动」）；
+    /// 节点的统一列表与来源标记见「🌐 节点」页。
+    fn ui_subscriptions(&mut self, ui: &mut egui::Ui) {
+        ui.heading("订阅");
+        ui.small("订阅来源拉取的节点会自动加入「🌐 节点」页列表，并以订阅名作为来源标记；订阅节点默认只读");
         ui.separator();
-        ui.label("批量导出分享链接（v1 格式，仅含节点地址，不含密钥）:");
-        if ui.button("批量导出分享链接").clicked() {
-            self.export_share_links();
+
+        // 添加订阅
+        ui.horizontal(|ui| {
+            ui.label("名称:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_sub_name)
+                    .desired_width(110.0)
+                    .hint_text("可留空自动编号"),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("来源:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_sub_source)
+                    .desired_width(ui.available_width() - 80.0)
+                    .hint_text("https://… / 文件路径 / hydra-sub://…"),
+            );
+            if ui.button("浏览...").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("订阅文件", &["txt", "sub"])
+                    .add_filter("全部文件", &["*"])
+                    .pick_file()
+                {
+                    self.new_sub_source = path.display().to_string();
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("➕ 添加订阅").clicked() {
+                self.add_subscription();
+            }
+            if ui.button("🔄 更新全部订阅").clicked() {
+                self.update_all_subscriptions();
+            }
+            if self.sub_update_receiver.is_some() {
+                ui.label("⏳ 更新中...");
+            }
+        });
+
+        ui.separator();
+
+        // 订阅列表：名称 / 来源 / 更新时间 / 节点数 + 立即更新 / 展开节点 / 编辑 / 删除
+        let subs_clone = self.config.subscriptions.clone();
+        let mut subs_to_remove: Vec<usize> = Vec::new();
+        for (i, sub) in subs_clone.iter().enumerate() {
+            let updated = sub
+                .last_updated_secs
+                .and_then(|s| chrono::DateTime::from_timestamp(s as i64, 0))
+                .map(|dt| {
+                    dt.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "从未".to_string());
+            let expanded = self.expanded_sub.as_deref() == Some(sub.name.as_str());
+            ui.horizontal(|ui| {
+                ui.strong(&sub.name);
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xA8, 0xB0, 0xBC),
+                    format!("{} 节点", sub.nodes.len()),
+                );
+                ui.weak(format!("更新于 {}", updated));
+                if ui.small_button("立即更新").clicked() {
+                    self.queue_subscription_update(sub.name.clone(), sub.source.clone());
+                }
+                if ui
+                    .small_button(if expanded {
+                        "收起节点"
+                    } else {
+                        "展开节点"
+                    })
+                    .clicked()
+                {
+                    self.expanded_sub = if expanded {
+                        None
+                    } else {
+                        Some(sub.name.clone())
+                    };
+                }
+                if ui.small_button("编辑").clicked() {
+                    self.sub_edit_idx = Some(i);
+                    self.sub_edit_name = sub.name.clone();
+                    self.sub_edit_source = sub.source.clone();
+                }
+                if ui.small_button("删除").clicked() {
+                    subs_to_remove.push(i);
+                }
+            });
+            ui.small(&sub.source);
+
+            // 展开归属节点：只读清单 + 单条「另存为手动」
+            if expanded {
+                if sub.nodes.is_empty() {
+                    ui.small("  （该订阅暂无归属节点，请先「立即更新」）");
+                }
+                for addr in &sub.nodes {
+                    ui.indent(addr.as_str(), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(egui::Color32::from_rgb(0x7A, 0xB3, 0xFF), "[只读]");
+                            ui.label(addr);
+                            if ui.small_button("另存为手动").clicked() {
+                                if self.config.save_subscription_node_as_manual(addr) {
+                                    self.add_log(format!(
+                                        "节点 {} 已另存为手动节点（不再随订阅更新）",
+                                        addr
+                                    ));
+                                }
+                            }
+                        });
+                    });
+                }
+            }
         }
-        ui.separator();
-        ui.heading("使用说明");
-        ui.small("• 单节点分享：「🌐 节点管理」→ 节点列表 →「分享」，可生成二维码与完整/紧凑链接");
-        ui.small("• 完整链接含认证密钥与证书，对方导入即用；仅限可信渠道发送");
-        ui.small("• 紧凑链接仅含证书指纹，需另行发送证书文件");
-        ui.small("• 导入：「🌐 节点管理」→「导入节点」，支持粘贴链接 / 二维码图片 / 链接文件");
-        ui.small(
-            "• 订阅节点：「🌐 节点管理」→「订阅管理」添加 http(s)/文件来源后点「更新」自动拉取",
-        );
+        for &i in subs_to_remove.iter().rev() {
+            self.delete_subscription(i);
+        }
+
+        // 订阅编辑对话框（名称重复校验与添加同一套规则）
+        if let Some(idx) = self.sub_edit_idx {
+            let mut save_clicked = false;
+            egui::Window::new(format!("编辑订阅「{}」", subs_clone[idx].name))
+                .collapsible(false)
+                .resizable(false)
+                .default_width(480.0)
+                .show(ui.ctx(), |ui| {
+                    egui::Grid::new("sub_edit_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("名称:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.sub_edit_name)
+                                    .desired_width(300.0),
+                            );
+                            ui.end_row();
+                            ui.label("来源:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.sub_edit_source)
+                                    .desired_width(300.0)
+                                    .hint_text("https://… / 文件路径 / hydra-sub://…"),
+                            );
+                            ui.end_row();
+                        });
+                    if self.sub_edit_source.trim().is_empty() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xFF, 0x8A, 0x80),
+                            "✗ 来源不能为空",
+                        );
+                    }
+                    let name = self.sub_edit_name.trim();
+                    let name_conflict = !name.is_empty()
+                        && self
+                            .config
+                            .subscriptions
+                            .iter()
+                            .enumerate()
+                            .any(|(j, s)| j != idx && s.name == name);
+                    if name_conflict {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xFF, 0x8A, 0x80),
+                            "✗ 订阅名称已存在（名称是来源标记与更新对号的键）",
+                        );
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("💾 保存").strong()))
+                            .clicked()
+                        {
+                            save_clicked = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            self.sub_edit_idx = None;
+                        }
+                    });
+                });
+            if save_clicked {
+                let name = self.sub_edit_name.trim().to_string();
+                let source = self.sub_edit_source.trim().to_string();
+                if source.is_empty()
+                    || name.is_empty()
+                    || self
+                        .config
+                        .subscriptions
+                        .iter()
+                        .enumerate()
+                        .any(|(j, s)| j != idx && s.name == name)
+                {
+                    self.add_log("订阅编辑保存失败：来源为空或名称重复/为空".to_string());
+                } else {
+                    self.config.subscriptions[idx].name = name.clone();
+                    self.config.subscriptions[idx].source = source;
+                    self.sub_edit_idx = None;
+                    self.add_log(format!("订阅「{}」已保存", name));
+                }
+            }
+        }
     }
 
     // ═══════════════ Team-UI：节点编辑对话框 ═══════════════
@@ -2503,6 +2942,13 @@ impl HydraApp {
                                 .hint_text("1.2.3.4:4433"),
                         );
                         ui.end_row();
+                        // 来源只读（手动 / 订阅名；订阅节点不在本对话框编辑，见节点页）
+                        ui.label("来源:");
+                        ui.label(format!(
+                            "[{}]（只读）",
+                            self.config.node_source_label(&self.edit_orig_addr)
+                        ));
+                        ui.end_row();
                     });
                 if !self.edit_addr.trim().is_empty()
                     && self.edit_addr.trim().parse::<SocketAddr>().is_err()
@@ -2572,15 +3018,17 @@ impl HydraApp {
                     }
                 });
 
-                // 传输模式 + obfs 密码
+                // 传输模式（下拉，方案 §4）+ obfs 密码（仅 obfs 时显示）
                 ui.horizontal(|ui| {
                     ui.label("传输模式:");
-                    if ui.radio(!self.edit_obfs, "伪装 masquerade").clicked() && self.edit_obfs {
-                        self.edit_obfs = false;
-                    }
-                    if ui.radio(self.edit_obfs, "混淆 obfs").clicked() && !self.edit_obfs {
-                        self.edit_obfs = true;
-                    }
+                    let obfs = self.edit_obfs;
+                    egui::ComboBox::from_id_source("node_edit_mode_combo")
+                        .selected_text(if obfs { "obfs" } else { "masquerade" })
+                        .width(160.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.edit_obfs, false, "masquerade");
+                            ui.selectable_value(&mut self.edit_obfs, true, "obfs");
+                        });
                 });
                 ui.horizontal(|ui| {
                     ui.label("obfs 密码:");
@@ -2619,6 +3067,10 @@ impl HydraApp {
                     );
                 }
 
+                // 方案 §4：诚实提示——当前凭据为全局单值，节点级凭据待后端改造
+                ui.separator();
+                ui.small("当前 hydra-client 按全局凭据连接（上述密钥/证书/模式对所有节点生效），节点级凭据将在后端改造后逐节点生效");
+
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui
@@ -2637,127 +3089,23 @@ impl HydraApp {
         }
     }
 
-    /// 设置：代理监听 / 安全与传输 / 托盘行为 / 密钥证书 / 退出
+    /// 设置页（v2 方案 §2.5 / 裁决 C）：应用级配置，无任何凭据。
+    /// 分区：代理核心 / TUN 模式（预留）/ 系统 / 外观与数据 / 关于。
+    /// 认证密钥、证书、传输模式、obfs 密码已全部迁出到「🌐 节点」页「全局凭据」区。
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("设置");
         ui.separator();
 
-        // 代理监听
-        ui.heading("代理监听");
+        // ◈ 代理核心
+        ui.heading("代理核心");
         ui.horizontal(|ui| {
-            ui.label("监听地址:");
-            ui.text_edit_singleline(&mut self.config.proxy_listen_addr);
-        });
-        ui.separator();
-
-        // ── Exec-1：安全与传输设置（配置文件 > 环境变量，自动持久化）──
-        ui.heading("安全与传输");
-        if ui.button("新手引导").clicked() {
-            for line in HydraApp::wizard_lines() {
-                self.add_log(line);
-            }
-        }
-
-        // 认证密钥：默认掩码显示（如 a1b2****8f90），点击「编辑/显示」查看并编辑明文
-        ui.horizontal(|ui| {
-            ui.label("认证密钥:");
-            if self.show_auth_key {
-                ui.add(egui::TextEdit::singleline(&mut self.config.auth_key).desired_width(170.0));
-                if ui.button("隐藏").clicked() {
-                    self.show_auth_key = false;
-                }
-            } else {
-                let shown = if self.config.auth_key.is_empty() {
-                    "（未设置）".to_string()
-                } else {
-                    config::mask_secret(self.config.auth_key.trim())
-                };
-                ui.monospace(shown);
-                if ui.button("编辑/显示").clicked() {
-                    self.show_auth_key = true;
-                }
-            }
-        });
-        // 密钥有效性实时校验（hex + 最短 16 字节）
-        if self.show_auth_key && !self.config.auth_key.trim().is_empty() {
-            match hydra_client::auth_key_from_hex(self.config.auth_key.trim()) {
-                Ok(_) => ui.label("✓ 密钥格式有效"),
-                Err(e) => ui.label(format!("✗ {}", e)),
-            };
-        }
-
-        // 节点证书文件：浏览选择（rfd 文件对话框）+ 手动粘贴路径，实时校验存在性
-        ui.label("节点证书:");
-        ui.horizontal(|ui| {
+            ui.label("本地监听地址:");
             ui.add(
-                egui::TextEdit::singleline(&mut self.config.cert_path)
-                    .desired_width(ui.available_width() - 80.0)
-                    .hint_text("节点生成的 hydra-node-cert.der"),
+                egui::TextEdit::singleline(&mut self.config.proxy_listen_addr)
+                    .desired_width(180.0)
+                    .hint_text("127.0.0.1:1080"),
             );
-            if ui.button("浏览...").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("证书文件", &["der", "pem", "crt", "cer"])
-                    .add_filter("全部文件", &["*"])
-                    .pick_file()
-                {
-                    self.config.cert_path = path.display().to_string();
-                    self.add_log(format!("已选择节点证书: {}", path.display()));
-                }
-            }
         });
-        let cert = self.config.cert_path.trim().to_string();
-        if !cert.is_empty() {
-            if std::path::Path::new(&cert).exists() {
-                ui.label("✓ 证书文件存在");
-            } else {
-                ui.colored_label(egui::Color32::RED, "✗ 证书文件不存在，请检查路径");
-            }
-        } else if !self.config.cert_der_b64.trim().is_empty() {
-            // Team-Q v2：完整分享导入的内嵌证书（无需文件）
-            ui.label("✓ 使用分享链接导入的证书（未设置证书文件）");
-        }
-
-        // 传输模式（对应 HYDRA_MODE；两端须一致）
-        ui.horizontal(|ui| {
-            ui.label("传输模式:");
-            let obfs = self.config.is_obfs();
-            if ui.radio(!obfs, "伪装 masquerade").clicked() && obfs {
-                self.config.hydra_mode = "masquerade".to_string();
-                self.add_log("已切换为 masquerade 模式，下次启动代理生效".to_string());
-            }
-            if ui.radio(obfs, "混淆 obfs").clicked() && !obfs {
-                self.config.hydra_mode = "obfs".to_string();
-                self.add_log("已切换为 obfs 模式（需两端一致），下次启动代理生效".to_string());
-            }
-        });
-
-        // obfs 独立第二密码（对应 HYDRA_OBFS_KEY；masquerade 模式忽略）
-        ui.horizontal(|ui| {
-            ui.label("obfs 密码:");
-            if self.show_obfs_key {
-                ui.add(egui::TextEdit::singleline(&mut self.config.obfs_key).desired_width(170.0));
-                if ui.button("隐藏").clicked() {
-                    self.show_obfs_key = false;
-                }
-            } else {
-                let shown = if self.config.obfs_key.is_empty() {
-                    "（未设置）".to_string()
-                } else {
-                    config::mask_secret(self.config.obfs_key.trim())
-                };
-                ui.monospace(shown);
-                if ui.button("编辑/显示").clicked() {
-                    self.show_obfs_key = true;
-                }
-            }
-        });
-        if self.config.is_obfs() && self.config.obfs_key.trim().is_empty() {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                "⚠ obfs 模式要求独立第二密码，否则代理无法启动",
-            );
-        }
-
         // Offline 恢复探测间隔（对应 HYDRA_PROBE_INTERVAL_SECS）
         ui.horizontal(|ui| {
             ui.label("探测间隔(秒):");
@@ -2771,19 +3119,41 @@ impl HydraApp {
             if self.config.probe_interval_secs.is_some() && ui.small_button("默认").clicked() {
                 self.config.probe_interval_secs = None;
             }
+            ui.weak("（Offline 节点自动恢复探测，默认 30 秒）");
         });
-        ui.label("（Offline 节点自动恢复探测，默认 30 秒）");
-        ui.small(format!(
-            "配置自动保存: {}",
-            config::config_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(配置目录不可用)".to_string())
-        ));
+        ui.small("新手引导、认证密钥、节点证书、传输模式见「🌐 节点」页「全局凭据」区");
+        if ui.button("显示新手引导").clicked() {
+            for line in HydraApp::wizard_lines() {
+                self.add_log(line);
+            }
+        }
 
         ui.separator();
 
-        // ── T2：托盘行为 ──
-        ui.heading("托盘行为");
+        // ◈ TUN 模式（预留，方案 §5：占位不实现，不驱动任何行为）
+        ui.heading("TUN 模式（预留）");
+        let tun = ui
+            .add_enabled(false, egui::Checkbox::new(&mut false, "启用 TUN 模式"))
+            .on_hover_text("TUN 模式规划中，当前请使用本地代理 127.0.0.1:1080");
+        tun.on_disabled_hover_text("TUN 模式规划中，当前请使用本地代理 127.0.0.1:1080");
+        ui.add_enabled(
+            false,
+            egui::Checkbox::new(&mut false, "服务模式安装（规划中）"),
+        )
+        .on_disabled_hover_text("规划中");
+        ui.add_enabled(
+            false,
+            egui::Checkbox::new(&mut false, "TUN 栈：gVisor / System（规划中）"),
+        )
+        .on_disabled_hover_text("规划中");
+        self.config.tun_enabled = false; // 预留字段恒 false，不驱动任何行为
+
+        ui.separator();
+
+        // ◈ 系统
+        ui.heading("系统");
+        ui.add_enabled(false, egui::Checkbox::new(&mut false, "开机自启（规划中）"))
+            .on_disabled_hover_text("规划中：需随 TUN 服务模式一并实现");
         if ui
             .checkbox(
                 &mut self.config.close_to_tray,
@@ -2801,7 +3171,56 @@ impl HydraApp {
 
         ui.separator();
 
-        // 退出入口（原「文件→退出」菜单迁移至此；托盘菜单同样可退出）
+        // ◈ 外观与数据
+        ui.heading("外观与数据");
+        ui.horizontal(|ui| {
+            ui.label("主题:");
+            ui.add_enabled(
+                false,
+                egui::Checkbox::new(&mut false, "深色（当前唯一主题）"),
+            )
+            .on_disabled_hover_text("主题选择预留，后续版本提供多主题");
+        });
+        ui.horizontal(|ui| {
+            ui.label("配置目录:");
+            ui.monospace(
+                config::config_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(配置目录不可用)".to_string()),
+            );
+            if ui.button("打开目录").clicked() {
+                if let Some(dir) = config::config_dir() {
+                    #[cfg(windows)]
+                    let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                    #[cfg(not(windows))]
+                    let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+                }
+            }
+        });
+        ui.small(format!(
+            "配置文件: {}（自动保存）",
+            config::config_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(配置目录不可用)".to_string())
+        ));
+
+        ui.separator();
+
+        // ◈ 关于
+        ui.heading("关于");
+        ui.label(format!(
+            "Hydra Multipath Proxy v{}",
+            env!("CARGO_PKG_VERSION")
+        ));
+        ui.hyperlink_to(
+            "项目文档（GitHub）",
+            "https://github.com/hydra-multipath-proxy/hydra-multipath-proxy",
+        );
+        ui.small("检查更新：预留");
+
+        ui.separator();
+
+        // 退出入口（托盘菜单同样可退出）
         if ui.button("退出程序（停止代理并清理系统代理）").clicked() {
             if self.proxy_running {
                 self.stop_proxy();
