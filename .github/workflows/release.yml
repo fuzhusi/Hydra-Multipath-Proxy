@@ -1,0 +1,103 @@
+# Hydra 发布：push tag v* 触发，构建 release 二进制并上传 GitHub Release。
+# 产物：
+# - Windows: hydra-client.exe + hydra-client-gui.exe 打 zip（附 wintun.dll 说明 + README）
+# - Linux:   hydra-node 打 tar.gz
+# 注意：wintun.dll 本体不进仓库（授权与体积），zip 内附说明文件，用户按架构自行下载。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # 创建 Release 与上传产物所需
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    name: Windows 产物（客户端 + GUI）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: cargo build --release
+        run: cargo build --release --workspace
+
+      # 打包：两个客户端 exe + README + wintun.dll 部署说明（节点二进制不打进 Windows 包）
+      - name: 打包 zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/release/hydra-client.exe dist/
+          Copy-Item target/release/hydra-client-gui.exe dist/
+          Copy-Item README.md dist/
+          @'
+          wintun.dll 部署说明（TUN 模式需要）:
+          1. 从 https://www.wintun.net/ 下载 wintun-*.zip
+          2. 解压后取与 exe 同架构的 bin/<arch>/wintun.dll
+             （64 位系统用 bin/amd64/wintun.dll）
+          3. 放到 hydra-client.exe 同目录（或 PATH 可见处）
+          4. TUN 模式需以管理员身份运行
+          '@ | Set-Content -Path dist/WINTUN-README.txt -Encoding utf8
+          Compress-Archive -Path dist/* -DestinationPath hydra-windows-x64.zip
+
+      - name: 上传到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: hydra-windows-x64.zip
+          generate_release_notes: true
+
+  build-linux:
+    name: Linux 产物（hydra-node）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      # 仅构建节点（Linux 产物定位是 VPS 服务端；客户端 GUI 走 Windows 包）
+      - name: cargo build --release -p hydra-node
+        run: cargo build --release -p hydra-node
+
+      - name: 打包 tar.gz
+        run: |
+          mkdir -p dist
+          cp target/release/hydra-node dist/
+          cp README.md dist/
+          cp deploy/hydra-node.service dist/
+          cp deploy/install.sh dist/
+          cp deploy/env.example dist/
+          tar -czf hydra-linux-x64.tar.gz -C dist .
+
+      - name: 上传到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: hydra-linux-x64.tar.gz
+          generate_release_notes: true

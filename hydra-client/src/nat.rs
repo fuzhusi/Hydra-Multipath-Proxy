@@ -1,5 +1,10 @@
 //! NAT 穿透客户端侧（NAT 穿透方案 §3.1 / §3.3）。
 //!
+//! **安全边界声明**（安全分审查 P3-2，Wave 3）：本模块为实验性 P2P 直连路径，
+//! STUN 探测与打洞阶段的信令/nonce 交互为**明文**（设计决策：不隐藏流量形态），
+//! **无任何抗检测/抗审查设计**——对抗性网络环境（DPI/审查）请勿启用 NAT 打洞
+//! （不设 `HYDRA_STUN_ADDRS` 即整体关闭，代理流量走常规 TCP/TLS 路径）。
+//!
 //! 职责三块：
 //! 1. **公网地址发现 + NAT 分类**：经 TCP STUN（`hydra_protocol::stun`，RFC 5389）
 //!    对前两个 STUN 服务器各发一次 Binding Request，比较两次映射地址 →
@@ -61,6 +66,62 @@ pub fn stun_addrs_from_env() -> Result<Vec<SocketAddr>> {
     parse_stun_addrs(&raw)
 }
 
+/// 解析 `HYDRA_STUN_ADDRS`（审查 06-P2-4）：支持文档示例的域名写法
+/// （如 `stun.nextcloud.com:443`）——IP 字面量直接解析；域名经 tokio DNS
+/// 解析取首个地址（5s 超时，仍 fail-fast 报错，不静默跳过）。
+pub async fn stun_addrs_from_env_resolved() -> Result<Vec<SocketAddr>> {
+    let raw = std::env::var(HYDRA_STUN_ADDRS_ENV).map_err(|_| {
+        HydraError::ConnectionError(format!(
+            "未设置 {HYDRA_STUN_ADDRS_ENV}，STUN 公网地址发现功能关闭；\
+             设为逗分隔 ip:port 或域名:port（需支持 TCP 的公共 STUN，如 stun.nextcloud.com:443）"
+        ))
+    })?;
+    resolve_stun_addrs(&raw).await
+}
+
+/// 逐条解析 ip:port / 域名:port（域名走 lookup_host，取首个地址）
+pub async fn resolve_stun_addrs(raw: &str) -> Result<Vec<SocketAddr>> {
+    let mut out = Vec::new();
+    for s in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Ok(a) = s.parse::<SocketAddr>() {
+            out.push(a);
+            continue;
+        }
+        // 非字面量：按域名解析（审查 06-P2-4：文档主路径此前必然解析失败）
+        match tokio::time::timeout(STUN_CONNECT_TIMEOUT, tokio::net::lookup_host(s.to_string()))
+            .await
+        {
+            Ok(Ok(mut addrs)) => match addrs.next() {
+                Some(a) => {
+                    info!("STUN 地址 '{s}' 经 DNS 解析为 {a}");
+                    out.push(a);
+                }
+                None => {
+                    return Err(HydraError::ProtocolError(format!(
+                        "HYDRA_STUN_ADDRS 中的地址 '{s}' DNS 解析无结果"
+                    )))
+                }
+            },
+            Ok(Err(e)) => {
+                return Err(HydraError::ProtocolError(format!(
+                    "HYDRA_STUN_ADDRS 中的地址 '{s}' DNS 解析失败: {e}"
+                )))
+            }
+            Err(_) => {
+                return Err(HydraError::ProtocolError(format!(
+                    "HYDRA_STUN_ADDRS 中的地址 '{s}' DNS 解析超时（{STUN_CONNECT_TIMEOUT:?}）"
+                )))
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(HydraError::ProtocolError(
+            "HYDRA_STUN_ADDRS 为空，STUN 公网地址发现功能关闭".into(),
+        ));
+    }
+    Ok(out)
+}
+
 /// 解析逗号分隔的 ip:port 列表（容忍空白；空列表报错）
 pub fn parse_stun_addrs(raw: &str) -> Result<Vec<SocketAddr>> {
     let addrs: Vec<SocketAddr> = raw
@@ -116,9 +177,9 @@ pub async fn probe_one(stun_server: SocketAddr) -> Result<Discovery> {
     };
     let _ = tcp.set_nodelay(true);
     // 记录本地 socket：打洞时把 listener 绑到同一端口（NAT 映射按本地端口建立）
-    let local = tcp.local_addr().map_err(|e| {
-        HydraError::ConnectionError(format!("STUN 探测本地地址不可得: {e}"))
-    })?;
+    let local = tcp
+        .local_addr()
+        .map_err(|e| HydraError::ConnectionError(format!("STUN 探测本地地址不可得: {e}")))?;
     let (mut rd, mut wr) = tcp.into_split();
     let (req, tx_id) = stun::build_binding_request();
     wr.write_all(&req)
@@ -152,9 +213,7 @@ pub async fn probe_one(stun_server: SocketAddr) -> Result<Discovery> {
 /// - 取前两个 STUN 服务器并发探测，两次映射地址相同 → EIM，不同 → Symmetric；
 /// - 只有一个服务器：无法比较，**按 Symmetric 保守处理**（见模块文档）；
 /// - 任一步失败 → Err（调用方回落中继）。探测连接用完即关（Binding 一次性事务）。
-pub async fn discover_public_address(
-    stun_addrs: &[SocketAddr],
-) -> Result<(SocketAddr, NatType)> {
+pub async fn discover_public_address(stun_addrs: &[SocketAddr]) -> Result<(SocketAddr, NatType)> {
     let d = discover_full(stun_addrs).await?;
     Ok((d.mapped, d.nat))
 }
@@ -188,7 +247,13 @@ pub async fn discover_full(stun_addrs: &[SocketAddr]) -> Result<Discovery> {
 #[serde(tag = "op")]
 enum SignalUp {
     #[serde(rename = "register")]
-    Register { peer_id: String, mapped: String },
+    Register {
+        peer_id: String,
+        mapped: String,
+        /// peer_id 属主证明（hydra_protocol::p2p_owner_proof，PSK 派生）：
+        /// 防同 peer_id 重注册顶替——节点侧校验，伪造 proof 的注册被拒
+        proof: String,
+    },
     #[serde(rename = "invite")]
     Invite { peer_id: String, cand: Vec<String> },
     #[serde(rename = "accept")]
@@ -307,7 +372,10 @@ async fn verify_stream(
         handshake::server_side(&mut wr, &mut rd, auth_key, &ZERO, &ZERO).await
     };
     hs.map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("P2P Noise 握手失败: {e}"))
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("P2P Noise 握手失败: {e}"),
+        )
     })?;
 
     // nonce 回显校验（握手后明文小交互；mine 由调用方每端生成一次）
@@ -329,9 +397,8 @@ async fn verify_stream(
             "对端未正确回显本端 nonce（疑似扫描者/协议不符）",
         ));
     }
-    rd.reunite(wr).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("流 reunite 失败: {e}"))
-    })
+    rd.reunite(wr)
+        .map_err(|e| std::io::Error::other(format!("流 reunite 失败: {e}")))
 }
 
 /// TCP 同时打开 + 握手校验（打洞编排的可复用核心，便于 loopback 自动化测试）。
@@ -367,19 +434,15 @@ pub async fn punch_open_and_verify(
                     let laddr = listener.local_addr().ok();
                     debug!("打洞 listener 绑定 {local_bind}");
                     tokio::spawn(async move {
-                        loop {
-                            match listener.accept().await {
-                                Ok((s, peer)) => {
-                                    // 自连过滤第一层：对端地址 == 本端 listener 地址
-                                    if Some(peer) == laddr {
-                                        debug!("打洞 accept 命中自连（{}），丢弃", peer);
-                                        continue;
-                                    }
-                                    if accept_tx.send((s, peer)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(_) => break,
+                        // while let 形式（clippy）：accept Err = listener 关闭，退出任务
+                        while let Ok((s, peer)) = listener.accept().await {
+                            // 自连过滤第一层：对端地址 == 本端 listener 地址
+                            if Some(peer) == laddr {
+                                debug!("打洞 accept 命中自连（{}），丢弃", peer);
+                                continue;
+                            }
+                            if accept_tx.send((s, peer)).await.is_err() {
+                                break;
                             }
                         }
                     });
@@ -444,13 +507,12 @@ pub async fn punch_open_and_verify(
                         my_nonce: [u8; 32],
                         remain: Duration| {
         tokio::spawn(async move {
-            match tokio::time::timeout(remain, verify_stream(initiator, s, &key, my_nonce)).await
+            // if let 形式（clippy）：其余分支均为"丢弃该尝试"（流随之关闭）
+            if let Ok(Ok(v)) =
+                tokio::time::timeout(remain, verify_stream(initiator, s, &key, my_nonce)).await
             {
-                Ok(Ok(v)) => {
-                    let _ = tx.send(v).await;
-                }
-                _ => {} // 握手失败/超时/自连拒绝：丢弃该尝试（流随之关闭）
-            }
+                let _ = tx.send(v).await;
+            } // 握手失败/超时/自连拒绝：丢弃该尝试
         });
     };
     // 通道存活标志：recv() 返回 None（已关闭且为空）后把该臂从 select 移除，
@@ -540,26 +602,21 @@ pub async fn punch_direct_with_discovery(
         );
         return None;
     }
-    let mut sess = match SignalSession::connect(
-        p.node_addr,
-        p.sni,
-        p.trust,
-        p.auth_key,
-        p.my_peer_id,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("信令连接失败，回落中继: {e}");
-            return None;
-        }
-    };
+    let mut sess =
+        match SignalSession::connect(p.node_addr, p.sni, p.trust, p.auth_key, p.my_peer_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("信令连接失败，回落中继: {e}");
+                return None;
+            }
+        };
     let my_cand = disc.mapped.to_string();
     if let Err(e) = sess
         .send(&SignalUp::Register {
             peer_id: p.my_peer_id.to_string(),
             mapped: my_cand.clone(),
+            // 属主证明：PSK HMAC 派生，节点复算校验（防 peer_id 冒用顶替）
+            proof: hydra_protocol::p2p_owner_proof(p.auth_key, p.my_peer_id),
         })
         .await
     {
@@ -584,7 +641,11 @@ pub async fn punch_direct_with_discovery(
 /// - 等不到（或先收到 error）→ 本端为发起方：invite（peer_offline 退避重试）→
 ///   等 accepted；期间收到的 incoming（双向同时发起）也回 accept 并暂存候选，
 ///   accepted 迟迟不到时用暂存候选——保证两端同时启动也能收敛。
-async fn signal_exchange(sess: &mut SignalSession, p: &PunchParams<'_>, my_cand: &str) -> Option<Vec<SocketAddr>> {
+async fn signal_exchange(
+    sess: &mut SignalSession,
+    p: &PunchParams<'_>,
+    my_cand: &str,
+) -> Option<Vec<SocketAddr>> {
     // 阶段一：角色判定
     match tokio::time::timeout(ROLE_WAIT, sess.recv()).await {
         Err(_) => {} // 短等超时 → 发起方
@@ -592,7 +653,7 @@ async fn signal_exchange(sess: &mut SignalSession, p: &PunchParams<'_>, my_cand:
             warn!("信令下行读失败: {e}");
             return None;
         }
-        Ok(Ok(SignalDown::Incoming { from, cand })) => {
+        Ok(Ok(SignalDown::Incoming { from, cand })) if from == p.peer_id => {
             debug!("收到 incoming（from={from}），本端为应答方");
             if sess
                 .send(&SignalUp::Accept {
@@ -606,6 +667,15 @@ async fn signal_exchange(sess: &mut SignalSession, p: &PunchParams<'_>, my_cand:
                 return None;
             }
             return Some(parse_cands(cand));
+        }
+        // 审查 06-P2-6：incoming 来源必须与目标 peer_id 一致——同 PSK 恶意对端
+        // 可伪造 incoming 诱导本端向任意地址 connect（内网探测/轻量 DoS），
+        // 来源不符一律忽略
+        Ok(Ok(SignalDown::Incoming { from, .. })) => {
+            debug!(
+                "忽略来源不符的 incoming（from={from} ≠ 目标 peer_id={}）",
+                p.peer_id
+            );
         }
         Ok(Ok(SignalDown::Error { code, .. })) => {
             debug!("角色判定期收到 error({code})，转入发起方");
@@ -645,7 +715,7 @@ async fn signal_exchange(sess: &mut SignalSession, p: &PunchParams<'_>, my_cand:
                 }
                 return Some(parse_cands(all));
             }
-            Ok(Ok(SignalDown::Incoming { from, cand })) => {
+            Ok(Ok(SignalDown::Incoming { from, cand })) if from == p.peer_id => {
                 // 对端同时也发起了 invite：回 accept，暂存其候选继续等 accepted
                 debug!("等 accepted 期间收到 incoming（from={from}）：双向同时发起，回 accept");
                 let _ = sess
@@ -657,6 +727,13 @@ async fn signal_exchange(sess: &mut SignalSession, p: &PunchParams<'_>, my_cand:
                 if stashed.is_none() {
                     stashed = Some(cand);
                 }
+            }
+            // 审查 06-P2-6：来源不符的 incoming 一律忽略（不 accept、不暂存候选）
+            Ok(Ok(SignalDown::Incoming { from, .. })) => {
+                debug!(
+                    "忽略来源不符的 incoming（from={from} ≠ 目标 peer_id={}）",
+                    p.peer_id
+                );
             }
             Ok(Ok(SignalDown::Error { code, .. })) if code == "peer_offline" => {
                 tokio::time::sleep(INVITE_RETRY).await; // 对端尚未注册：退避重试
@@ -694,6 +771,24 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0], "127.0.0.1:3478".parse::<SocketAddr>().unwrap());
         assert_eq!(v[1], "[::1]:3479".parse::<SocketAddr>().unwrap());
+    }
+
+    /// 审查 06-P2-4：resolve_stun_addrs 对 IP 字面量零开销直通
+    #[tokio::test]
+    async fn resolve_stun_addrs_ip字面量直通() {
+        let v = resolve_stun_addrs("127.0.0.1:3478, [::1]:3479")
+            .await
+            .unwrap();
+        assert_eq!(v.len(), 2);
+        assert!(resolve_stun_addrs("  , ").await.is_err());
+        assert!(resolve_stun_addrs("not-an-addr").await.is_err()); // 无端口/非域名非 IP
+    }
+
+    /// 审查 06-P2-4：域名写法经 DNS 解析（loopback 域名走系统解析器，无外网依赖）
+    #[tokio::test]
+    async fn resolve_stun_addrs_域名可解析() {
+        let v = resolve_stun_addrs("localhost:3478").await.unwrap();
+        assert_eq!(v.len(), 1, "localhost 应解析出一个地址，得到 {v:?}");
     }
 
     /// 自连拒绝分支（审查 P1-4）：nonce 每端一次后，同一进程内自连的两端

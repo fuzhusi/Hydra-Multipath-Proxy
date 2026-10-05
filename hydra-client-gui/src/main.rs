@@ -4,7 +4,7 @@
 use eframe::egui;
 use hydra_client::{
     format_bytes, format_duration, format_speed, generate_share_links, hex_encode_lower,
-    parse_share_links, sha256_hex, ProxyServer, Scheduler, ShareLink, TrafficMonitor,
+    parse_share_links, sha256_hex, ProxyServer, ShareLink, TrafficMonitor, TrafficStats,
 };
 use hydra_protocol::{NodeInfo, NodeStatus};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -53,7 +53,6 @@ impl Tab {
 
 #[derive(Clone, Debug)]
 struct NodeStatusInfo {
-    addr: String,
     connected: bool,
     last_check: Option<std::time::Instant>,
     latency_ms: Option<u64>,
@@ -62,9 +61,10 @@ struct NodeStatusInfo {
 struct HydraApp {
     // 应用状态
     proxy_running: bool,
-    proxy_start_receiver: Option<std::sync::mpsc::Receiver<std::result::Result<std::net::SocketAddr, std::io::Error>>>,
+    proxy_start_receiver: Option<
+        std::sync::mpsc::Receiver<std::result::Result<std::net::SocketAddr, std::io::Error>>,
+    >,
     proxy_starting: bool,
-    nodes: Vec<NodeInfo>,
     logs: Vec<String>,
     /// 持久化配置（配置文件 > 环境变量，见 config.rs）
     config: GuiConfig,
@@ -123,8 +123,7 @@ struct HydraApp {
     edit_show_auth: bool,
     edit_cert_path: String,
 
-    // 运行时状态
-    scheduler: Option<Arc<Scheduler>>,
+    // 运行时状态（scheduler 字段已随死代码清理移除：只写不读，代理线程自带实例）
     stop_flag: Option<Arc<AtomicBool>>,
     proxy_thread_handle: Option<std::thread::JoinHandle<()>>,
     proxy_exit_receiver: Option<std::sync::mpsc::Receiver<()>>,
@@ -137,10 +136,15 @@ struct HydraApp {
     /// 单节点手动测试（A5：后台线程+通道，UI 线程零阻塞）
     node_test_receiver:
         Option<std::sync::mpsc::Receiver<(String, std::result::Result<u64, String>)>>,
+    /// 二维码图片导入（R-15：解码在后台线程执行，结果经通道回投，UI 轮询非阻塞收集）
+    qr_import_receiver: Option<std::sync::mpsc::Receiver<std::result::Result<ShareLink, String>>>,
 
     // 流量统计
     traffic_monitor: Option<Arc<TrafficMonitor>>,
-    last_traffic_update: Option<std::time::Instant>,
+    /// 流量统计缓存（R-16：后台采样线程每 500ms 写入最新 TrafficStats，UI 帧只读零阻塞）
+    traffic_stats_cache: Arc<std::sync::Mutex<Option<TrafficStats>>>,
+    /// 流量采样线程停止标记（stop_proxy / 重新启动代理时置位，旧线程自行退出）
+    traffic_sampler_stop: Option<Arc<AtomicBool>>,
 
     // ── T2：托盘 + UI 重排 ──
     /// 当前导航页签
@@ -159,7 +163,6 @@ impl Default for HydraApp {
             proxy_running: false,
             proxy_start_receiver: None,
             proxy_starting: false,
-            nodes: Vec::new(),
             logs: Vec::new(),
             config: GuiConfig::default(),
             saved_snapshot: GuiConfig::default(),
@@ -192,7 +195,6 @@ impl Default for HydraApp {
             sub_edit_idx: None,
             sub_edit_name: String::new(),
             sub_edit_source: String::new(),
-            scheduler: None,
             stop_flag: None,
             proxy_thread_handle: None,
             proxy_exit_receiver: None,
@@ -200,8 +202,10 @@ impl Default for HydraApp {
             last_health_check: None,
             health_check_receiver: None,
             node_test_receiver: None,
+            qr_import_receiver: None,
             traffic_monitor: None,
-            last_traffic_update: None,
+            traffic_stats_cache: Arc::new(std::sync::Mutex::new(None)),
+            traffic_sampler_stop: None,
             current_tab: Tab::Overview,
             tray: None,
             really_quit: false,
@@ -217,6 +221,19 @@ impl Drop for HydraApp {
             Self::remove_system_proxy_static();
         }
     }
+}
+
+/// 进程级探测 runtime（审查 R-34）：健康检查（每 30s）与单节点手动测试共用，
+/// 不再每次在后台线程里冷启动/销毁一个多线程 tokio runtime（num_cpus 个
+/// worker 线程 + epoll 实例 + 线程创建毛刺）。多线程可从任意线程 block_on。
+fn probe_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("创建探测 tokio 运行时失败")
+    })
 }
 
 impl HydraApp {
@@ -269,7 +286,6 @@ impl HydraApp {
             node_status.insert(
                 addr.clone(),
                 NodeStatusInfo {
-                    addr: addr.clone(),
                     connected: false,
                     last_check: None,
                     latency_ms: None,
@@ -281,7 +297,6 @@ impl HydraApp {
             proxy_running: false,
             proxy_start_receiver: None,
             proxy_starting: false,
-            nodes: Vec::new(),
             logs: Vec::new(),
             saved_snapshot: cfg.clone(),
             last_config_save: None,
@@ -314,7 +329,6 @@ impl HydraApp {
             sub_edit_idx: None,
             sub_edit_name: String::new(),
             sub_edit_source: String::new(),
-            scheduler: None,
             stop_flag: None,
             proxy_thread_handle: None,
             proxy_exit_receiver: None,
@@ -322,8 +336,10 @@ impl HydraApp {
             last_health_check: None,
             health_check_receiver: None,
             node_test_receiver: None,
+            qr_import_receiver: None,
             traffic_monitor: None,
-            last_traffic_update: None,
+            traffic_stats_cache: Arc::new(std::sync::Mutex::new(None)),
+            traffic_sampler_stop: None,
             current_tab: Tab::Overview,
             tray,
             really_quit: false,
@@ -400,25 +416,60 @@ impl HydraApp {
 
     /// Test connectivity to a single node（A5：失败根因以 Err 透出，不再吞掉）
     /// Exec-1：证书由调用方先按「配置文件 > 环境变量」解析后传入（config.rs resolve_node_certs）
+    /// 0-7 修复"测速假绿"：不再只做 TCP connect（测不出密钥错误），而是完整走
+    /// `connect_target`（TCP+TLS+Noise-PSK 认证 + 节点应答）。探测目标用
+    /// `192.0.0.1:9`（TEST-NET-3 测试网段 discard 端口，节点侧快速失败、完整走认证），
+    /// 错误分类：
+    /// - 节点回"目标不可达"（TargetUnreachable / 应答 0x01）→ **认证已通过，节点健康 ✓**，
+    ///   返回耗时 ms（测速语义不变）；
+    /// - Noise 握手失败 → 认证/密钥错误 ✗；
+    /// - TCP 连接失败/超时 → 节点不可达 ✗。
     async fn test_node_connection(
         addr_str: &str,
         node_certs: Vec<Vec<u8>>,
+        auth_key: Vec<u8>,
     ) -> std::result::Result<u64, String> {
+        use hydra_client::tcp_transport::{connect_target, TlsTrust};
+        use hydra_protocol::HydraError;
+
         let addr: SocketAddr = addr_str
             .parse()
             .map_err(|e| format!("地址解析失败: {}", e))?;
 
-        // TCP 连通性探测（TCP 转型后：用 TCP connect 时延作为节点健康近似，3s 超时语义保持）
+        // GUI 现状仅支持自签 pin 模式（README 如实声明）：证书入本地信任根
+        let trust = TlsTrust::pinned(node_certs);
         let start = std::time::Instant::now();
+        // 总时限 10s：目标探测在节点侧快速失败，正常远小于该值；覆盖 TCP/TLS 5s+握手
         let probe = tokio::time::timeout(
-            std::time::Duration::from_millis(3000),
-            tokio::net::TcpStream::connect(addr),
+            std::time::Duration::from_millis(10_000),
+            connect_target(
+                addr,
+                hydra_client::DEFAULT_SNI,
+                &trust,
+                &auth_key,
+                "192.0.0.1:9",
+            ),
         )
         .await;
         match probe {
+            // 目标探测成功（理论不可能，TEST-NET 不路由）——握手已通过，同样算节点健康
             Ok(Ok(_)) => Ok(start.elapsed().as_millis() as u64),
-            Ok(Err(e)) => Err(format!("TCP 连接失败: {} ({})", addr, e)),
-            Err(_) => Err(format!("TCP 连接超时（3s）: {}", addr)),
+            Ok(Err(e)) => match &e {
+                // 节点存活且完成了 Noise 认证，只是目标连不上（含 SSRF 拒绝/DNS 失败）
+                // → 节点健康，测速语义 = 返回耗时 ms
+                HydraError::TargetUnreachable(_) => Ok(start.elapsed().as_millis() as u64),
+                _ => {
+                    let msg = e.to_string();
+                    if msg.contains("Noise 握手失败") || msg.contains("认证失败") {
+                        Err(format!("认证/密钥错误（Noise 握手失败）: {}", msg))
+                    } else if msg.contains("TCP connect") {
+                        Err(format!("节点不可达: {}", msg))
+                    } else {
+                        Err(msg)
+                    }
+                }
+            },
+            Err(_) => Err(format!("节点测速超时（10s）: {}", addr)),
         }
     }
 
@@ -436,17 +487,20 @@ impl HydraApp {
                 return;
             }
         };
+        // 0-7：完整握手测速需要认证密钥（PSK）——解析失败直接报错（假密钥测不出健康）
+        let auth_key = match config::resolve_auth_key(&self.config) {
+            Ok(k) => k,
+            Err(e) => {
+                self.add_log(format!("节点 {} 测试失败（认证密钥未就绪）: {}", addr, e));
+                return;
+            }
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         self.add_log(format!("开始测试节点 {}...", addr));
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    let _ = tx.send((addr, Err(format!("创建 tokio 运行时失败: {}", e))));
-                    return;
-                }
-            };
-            let result = rt.block_on(HydraApp::test_node_connection(&addr, certs));
+            // 审查 R-34：复用进程级探测 runtime（不再每次冷启动一个多线程 runtime）
+            let result =
+                probe_runtime().block_on(HydraApp::test_node_connection(&addr, certs, auth_key));
             let _ = tx.send((addr, result));
         });
         self.node_test_receiver = Some(rx);
@@ -474,7 +528,6 @@ impl HydraApp {
                     self.node_status.insert(
                         addr.clone(),
                         NodeStatusInfo {
-                            addr: addr.clone(),
                             connected: true,
                             last_check: Some(now),
                             latency_ms: Some(latency),
@@ -486,7 +539,6 @@ impl HydraApp {
                     self.node_status.insert(
                         addr.clone(),
                         NodeStatusInfo {
-                            addr: addr.clone(),
                             connected: false,
                             last_check: Some(now),
                             latency_ms: None,
@@ -509,20 +561,30 @@ impl HydraApp {
                 return;
             }
         };
+        // 0-7：完整握手测速需要认证密钥（PSK）
+        let auth_key = match config::resolve_auth_key(&self.config) {
+            Ok(k) => k,
+            Err(e) => {
+                self.add_log(format!("全部节点测试失败（认证密钥未就绪）: {}", e));
+                return;
+            }
+        };
         let (tx, rx) = std::sync::mpsc::channel();
 
-        // 在后台线程中测试所有节点
+        // 在后台线程中测试所有节点（审查 R-34：复用进程级探测 runtime，
+        // 不再每 30s 冷启动/销毁一个多线程 runtime——num_cpus 个 worker 线程、
+        // epoll 实例与线程创建毛刺全部消除）
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
+            probe_runtime().block_on(async {
                 // 并发测试所有节点
                 let mut handles = Vec::new();
                 for addr in &node_addrs {
                     let addr = addr.clone();
                     let certs = certs.clone();
+                    let auth_key = auth_key.clone();
                     let tx = tx.clone();
                     handles.push(tokio::spawn(async move {
-                        let result = Self::test_node_connection(&addr, certs).await;
+                        let result = Self::test_node_connection(&addr, certs, auth_key).await;
                         let _ = tx.send((addr, result));
                     }));
                 }
@@ -569,7 +631,6 @@ impl HydraApp {
                     self.node_status.insert(
                         addr.clone(),
                         NodeStatusInfo {
-                            addr: addr.clone(),
                             connected: true,
                             last_check: Some(now),
                             latency_ms: Some(latency),
@@ -581,7 +642,6 @@ impl HydraApp {
                     self.node_status.insert(
                         addr.clone(),
                         NodeStatusInfo {
-                            addr: addr.clone(),
                             connected: false,
                             last_check: Some(now),
                             latency_ms: None,
@@ -621,9 +681,9 @@ impl HydraApp {
             return;
         }
 
-        // Exec-1：探测间隔——配置非空 → 覆盖 env（hydra-client 内部从 env 读取）。
-        // 此前已有线程在跑时本函数会被 proxy_running 拦截，故此处写 env 不会与之并发。
-        config::apply_env_overrides(&self.config);
+        // Exec-1：探测间隔 env 覆盖已移至 HydraApp::new（审查 R-24：多线程进程
+        // 运行期调用 std::env::set_var 与后台线程的 env 读取构成数据竞争 UB；
+        // new 阶段确认尚无工作线程，仅此一次安全）。
 
         let proxy_addr: SocketAddr = match self.config.proxy_listen_addr.trim().parse() {
             Ok(addr) => addr,
@@ -650,17 +710,13 @@ impl HydraApp {
             }
         };
 
-        // 先测试所有节点连接
+        // 先测试所有节点连接（审查 R-37，Wave 3 修复）：test_all_nodes 的结果是异步
+        // 回来的（经健康检查通道在后续帧落地），此刻统计 node_status 必然是上一轮的
+        // 过期值（首启恒为 0，"没有可用节点"与"代理已就绪"并存的自相矛盾日志）。
+        // 改为中性提示；真实结果由 poll_health_check_results 落地后自然刷新 UI。
         self.add_log("正在测试节点连接...".to_string());
         self.test_all_nodes();
-
-        // 检查是否有可用节点
-        let online_count = self.node_status.values().filter(|s| s.connected).count();
-        if online_count == 0 {
-            self.add_log("警告: 没有可用的节点连接，代理可能无法正常工作".to_string());
-        } else {
-            self.add_log(format!("有 {} 个节点可用", online_count));
-        }
+        self.add_log("节点连通性检测已在后台启动，结果稍后自动更新".to_string());
 
         // 解析节点地址。
         // P1-14 修复：首启时健康检查尚未返回、node_status 全是初始"未连接"值，
@@ -692,8 +748,37 @@ impl HydraApp {
         let traffic_monitor = Arc::new(TrafficMonitor::new());
         self.traffic_monitor = Some(traffic_monitor.clone());
 
+        // R-16：启动后台流量采样线程（每 500ms 采一次 TrafficStats 写入缓存槽，
+        // UI 帧只读缓存，不再 block_in_place/block_on 阻塞渲染）。复用进程级探测
+        // runtime（R-34 范式），采样线程可在任意线程 block_on。
+        // 旧采样线程若在（重复启动场景），先置位其停止标记。
+        if let Some(old) = self.traffic_sampler_stop.take() {
+            old.store(true, Ordering::Relaxed);
+        }
+        {
+            let cache = self.traffic_stats_cache.clone();
+            let monitor = traffic_monitor.clone();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_clone = stop.clone();
+            std::thread::spawn(move || {
+                while !stop_clone.load(Ordering::Relaxed) {
+                    let stats = probe_runtime().block_on(monitor.get_stats());
+                    if let Ok(mut slot) = cache.lock() {
+                        *slot = Some(stats);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            });
+            self.traffic_sampler_stop = Some(stop);
+        }
+        // 新会话清空上一轮的过期统计快照，避免启动瞬间显示旧速率
+        if let Ok(mut slot) = self.traffic_stats_cache.lock() {
+            *slot = None;
+        }
+
         // 使用独立线程运行代理
-        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<std::net::SocketAddr, std::io::Error>>();
+        let (tx, rx) =
+            std::sync::mpsc::channel::<std::result::Result<std::net::SocketAddr, std::io::Error>>();
         let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
         let proxy_addr_clone = proxy_addr;
         let nodes_clone = nodes.clone();
@@ -770,10 +855,25 @@ impl HydraApp {
 
     /// update 轮询：消费代理就绪信号（非阻塞，替代原先冻结 UI 的阻塞 recv）
     fn poll_start_receiver(&mut self) -> Option<()> {
-        let signal = match &self.proxy_start_receiver {
-            Some(rx) => rx.try_recv().ok(),
-            None => None,
+        // 07-P2-5：必须区分 Empty 与 Disconnected——Empty = 结果尚未产生，保留
+        // receiver 下帧再收；Disconnected = 代理线程在就绪信号发出前已退出
+        //（如 Runtime::new().unwrap() panic），若吞掉则 proxy_starting 恒为 true，
+        // 「启动代理」按钮从此永久命中早退分支，无法再次启动。
+        let (signal, disconnected) = match &self.proxy_start_receiver {
+            Some(rx) => match rx.try_recv() {
+                Ok(sig) => (Some(sig), false),
+                Err(std::sync::mpsc::TryRecvError::Empty) => (None, false),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => (None, true),
+            },
+            None => (None, false),
         };
+        if disconnected {
+            // 代理线程异常退出：清 receiver、复位启动态，恢复可再次启动
+            self.proxy_start_receiver = None;
+            self.proxy_starting = false;
+            self.add_log("代理启动线程异常退出（未发出就绪信号即终止）".to_string());
+            return Some(());
+        }
         let signal = signal?;
         self.proxy_start_receiver = None;
         self.proxy_starting = false;
@@ -791,26 +891,41 @@ impl HydraApp {
                 if let Some(flag) = &self.stop_flag {
                     flag.store(true, Ordering::Relaxed);
                 }
+                // 07-P3-10 零成本顺修：置位 stop_flag 后立即清空，让 update 的
+                // 收敛分支（!proxy_running && stop_flag.is_none()）正常接管
+                // JoinHandle / exit_receiver 清理
+                self.stop_flag = None;
             }
         }
         Some(())
     }
 
     fn set_system_proxy(&mut self, proxy_url: &str) {
-        // 设置环境变量
-        std::env::set_var("http_proxy", proxy_url);
-        std::env::set_var("https_proxy", proxy_url);
-        std::env::set_var("all_proxy", proxy_url);
-        std::env::set_var("HTTP_PROXY", proxy_url);
-        std::env::set_var("HTTPS_PROXY", proxy_url);
-        std::env::set_var("ALL_PROXY", proxy_url);
+        // 审查 R-24：不再向本进程写 http_proxy 等 6 个 env var——GUI 自身进程不
+        // 通过 env 读代理（env 只对子进程有意义，GUI 不 spawn 走代理的子进程）；
+        // 运行期 set_var 与代理/健康检查/订阅线程的 env 读取构成数据竞争（UB）。
+        // 系统代理设置由下方各平台原生路径（注册表/gsettings/kwriteconfig）完成。
 
-        // 解析代理地址和端口
-        let parts: Vec<&str> = proxy_url.split("://").collect();
-        let addr_port = if parts.len() > 1 { parts[1] } else { parts[0] };
-        let addr_parts: Vec<&str> = addr_port.split(':').collect();
-        let proxy_host = addr_parts.get(0).unwrap_or(&"127.0.0.1");
-        let proxy_port = addr_parts.get(1).unwrap_or(&"1080");
+        // 解析代理地址和端口（审查 R-38，Wave 3 修复）：不再按 ':' 盲切——
+        // IPv6 监听（GUI 支持 `[::1]:4433`）时 `socks5://[::1]:1080` 会被切碎成
+        // 错误端口段，gsettings/kwriteconfig 写入损坏的桌面代理配置。
+        // 按 RFC 3986 authority 解析：先剥 scheme，再区分方括号 IPv6 与 host:port。
+        let after_scheme = proxy_url.split("://").nth(1).unwrap_or(proxy_url);
+        // Windows 注册表分支直接用 host:port 原串（含 IPv6 方括号形态，WinINet 惯例）
+        let addr_port = after_scheme;
+        let (proxy_host, proxy_port) = if let Some(rest) = after_scheme.strip_prefix('[') {
+            // IPv6 字面量：`[::1]:1080`
+            match rest.split_once("]:") {
+                Some((host, port)) => (host, port),
+                None => (rest.trim_end_matches(']'), "1080"),
+            }
+        } else {
+            // host:port（rsplit 从右侧取最后一个 ':'，兼容无端口 host）
+            match after_scheme.rsplit_once(':') {
+                Some((host, port)) => (host, port),
+                None => (after_scheme, "1080"),
+            }
+        };
 
         // A1：Windows 注册表真实实现（HKCU Internet Settings + WinINet 刷新）
         #[cfg(windows)]
@@ -907,13 +1022,8 @@ impl HydraApp {
     }
 
     fn remove_system_proxy_static() {
-        // 清除环境变量
-        std::env::remove_var("http_proxy");
-        std::env::remove_var("https_proxy");
-        std::env::remove_var("all_proxy");
-        std::env::remove_var("HTTP_PROXY");
-        std::env::remove_var("HTTPS_PROXY");
-        std::env::remove_var("ALL_PROXY");
+        // 审查 R-24：对应 set_system_proxy，移除本进程 6 个 proxy env var 的运行期
+        // 写入（remove_var 同样是多线程进程的 UB 面；GUI 不依赖这些变量）
 
         // A1：Windows 恢复旧值（stop/panic/Drop 三条清理路径都经此静态函数）
         #[cfg(windows)]
@@ -969,21 +1079,28 @@ impl HydraApp {
             stop_flag.store(true, Ordering::Relaxed);
         }
 
-        // 等待代理线程退出
-        if let Some(handle) = self.proxy_thread_handle.take() {
-            let _ = handle.join();
-        }
-
+        // 审查 R-35：不在 UI 线程 join 代理线程——停止信号靠线程内 100ms 轮询，
+        // join 至少阻塞 UI 100ms；若 start() 正处于长 await 链（节点预热数十秒）
+        // UI 将冻结同样久，托盘/按钮/窗口全部无响应。退出确认交给 update 里已有的
+        // proxy_exit_receiver 轮询分支（收到退出通知后再清理 handle）。
+        // 此处只置 stop_flag、立即返回，UI 状态先置"停止中"。
         self.proxy_running = false;
         self.proxy_starting = false;
         self.proxy_start_receiver = None;
         self.stop_flag = None;
-        self.proxy_thread_handle = None;
-        self.proxy_exit_receiver = None;
+        // R-16：停止流量采样线程（线程内 ≤500ms 自行退出，不 join）
+        if let Some(stop) = self.traffic_sampler_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Ok(mut slot) = self.traffic_stats_cache.lock() {
+            *slot = None;
+        }
+        // handle/exit receiver 保留给 update 的退出通知分支收敛，避免泄漏：
+        // 线程退出后 exit_rx 断开 → 该分支清理两者。
 
         // 移除系统全局代理
         self.remove_system_proxy();
-        self.add_log("代理已停止，已移除系统代理".to_string());
+        self.add_log("代理停止中，已移除系统代理".to_string());
         // 关键动作立即落盘
         self.maybe_save_config(true);
     }
@@ -1103,10 +1220,10 @@ impl HydraApp {
             }
             None => None,
         };
-        let cert_b64 = match link.cert_der_bytes().map_err(|e| e.to_string())? {
-            Some(der) => Some(base64::engine::general_purpose::STANDARD.encode(&der)),
-            None => None,
-        };
+        let cert_b64 = link
+            .cert_der_bytes()
+            .map_err(|e| e.to_string())?
+            .map(|der| base64::engine::general_purpose::STANDARD.encode(&der));
 
         // ── 以下为落库（不会再失败）──
         if let Some(hex) = auth_key_hex {
@@ -1142,7 +1259,6 @@ impl HydraApp {
             self.node_status.insert(
                 addr_str.clone(),
                 NodeStatusInfo {
-                    addr: addr_str.clone(),
                     connected: false,
                     last_check: None,
                     latency_ms: None,
@@ -1205,7 +1321,9 @@ impl HydraApp {
         (ok, fails)
     }
 
-    /// 从二维码图片文件导入（rfd 选 png/jpg → rqrr 解码 → 解析链接）
+    /// 从二维码图片文件导入（R-15：rfd 选文件在 UI 线程，读文件+缩图+rqrr 解码
+    /// 全部移入后台 std::thread，结果经 mpsc 回投，由 update 轮询非阻塞收集——
+    /// 大图解码不再冻结界面；同一时刻仅允许一个导入任务进行）
     fn import_from_qr_image(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("图片文件", &["png", "jpg", "jpeg"])
@@ -1214,31 +1332,65 @@ impl HydraApp {
         else {
             return; // 用户取消
         };
-        let result = std::fs::read(&path)
-            .map_err(|e| format!("读取图片 {} 失败: {}", path.display(), e))
-            .and_then(|bytes| qr::decode_qr_from_bytes(&bytes))
-            .and_then(|text| {
-                ShareLink::from_share_url(text.trim())
-                    .map_err(|e| format!("二维码内容不是有效的 hydra 分享链接: {}", e))
-            });
-        match result {
-            Ok(link) => match self.apply_imported_link(&link) {
-                Ok(()) => self.set_import_status(
-                    true,
-                    format!(
-                        "二维码导入成功：{}:{}（含密钥 {}）",
-                        link.address,
-                        link.port,
-                        if link.auth_key.is_some() {
-                            "是"
-                        } else {
-                            "否"
-                        }
-                    ),
-                ),
-                Err(e) => self.set_import_status(false, e),
+        if self.qr_import_receiver.is_some() {
+            self.set_import_status(false, "已有二维码导入进行中，请稍候".to_string());
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.qr_import_receiver = Some(rx);
+        std::thread::spawn(move || {
+            // 后台线程：读文件 → 缩图 → rqrr 解码 → 解析分享链接（CPU 密集部分全部离 UI 线程）
+            let result = std::fs::read(&path)
+                .map_err(|e| format!("读取图片 {} 失败: {}", path.display(), e))
+                .and_then(|bytes| qr::decode_qr_from_bytes(&bytes))
+                .and_then(|text| {
+                    ShareLink::from_share_url(text.trim())
+                        .map_err(|e| format!("二维码内容不是有效的 hydra 分享链接: {}", e))
+                });
+            let _ = tx.send(result);
+        });
+        self.set_import_status(
+            true,
+            "二维码解码中…（后台执行，完成后自动导入）".to_string(),
+        );
+    }
+
+    /// 在 update 循环中非阻塞收集二维码导入结果并应用（R-15）
+    fn poll_qr_import_result(&mut self) {
+        let result = match &self.qr_import_receiver {
+            Some(rx) => match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // 后台线程异常退出：重置以允许再次发起导入
+                    self.qr_import_receiver = None;
+                    self.set_import_status(false, "二维码解码线程异常退出".to_string());
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
             },
-            Err(e) => self.set_import_status(false, e),
+            None => None,
+        };
+        if let Some(result) = result {
+            self.qr_import_receiver = None;
+            match result {
+                Ok(link) => match self.apply_imported_link(&link) {
+                    Ok(()) => self.set_import_status(
+                        true,
+                        format!(
+                            "二维码导入成功：{}:{}（含密钥 {}）",
+                            link.address,
+                            link.port,
+                            if link.auth_key.is_some() {
+                                "是"
+                            } else {
+                                "否"
+                            }
+                        ),
+                    ),
+                    Err(e) => self.set_import_status(false, e),
+                },
+                Err(e) => self.set_import_status(false, e),
+            }
         }
     }
 
@@ -1489,7 +1641,6 @@ impl HydraApp {
                 continue;
             }
             self.node_status.entry(a.clone()).or_insert(NodeStatusInfo {
-                addr: a.clone(),
                 connected: false,
                 last_check: None,
                 latency_ms: None,
@@ -1545,6 +1696,21 @@ impl eframe::App for HydraApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_start_receiver();
+        // ── R-35：stop_proxy 后的非阻塞收敛 ──
+        // 代理线程退出使 exit receiver 可读/断开时，在此清理 handle 与 receiver
+        //（不在 UI 线程 join；JoinHandle drop = detach，线程自然结束）
+        if !self.proxy_running && self.stop_flag.is_none() {
+            if let Some(receiver) = &self.proxy_exit_receiver {
+                match receiver.try_recv() {
+                    Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.proxy_thread_handle = None;
+                        self.proxy_exit_receiver = None;
+                        self.add_log("代理线程已退出".to_string());
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
+        }
         // ── T2：托盘命令轮询 + 关窗行为（隐藏到托盘 vs 真退出）──
         self.poll_tray_commands(ctx);
         self.handle_close_request(ctx);
@@ -1599,6 +1765,8 @@ impl eframe::App for HydraApp {
         self.poll_node_test_results();
         // 非阻塞地处理订阅更新结果（Exec-C，串行驱动排队更新）
         self.poll_subscription_updates();
+        // 非阻塞地处理二维码图片导入结果（R-15：解码在后台线程）
+        self.poll_qr_import_result();
 
         // ── Team-Q v2：单节点分享对话框（二维码 + 完整链接 + 安全提示）──
         if self.share_dialog_open {
@@ -1706,7 +1874,7 @@ impl eframe::App for HydraApp {
                             "未包含（对方需自行导入）"
                         }
                     ));
-                    ui.label(format!("传输模式: TCP/TLS（TLS 1.3 + Noise-PSK）"));
+                    ui.label("传输模式: TCP/TLS（TLS 1.3 + Noise-PSK）".to_string());
 
                     // 红字安全提示
                     ui.separator();
@@ -2078,12 +2246,11 @@ impl HydraApp {
                     self.config.proxy_listen_addr, online, total
                 ));
 
-                // 实时流量（TrafficMonitor 既有接口，每秒刷新由 500ms 周期重绘驱动）
+                // 实时流量（R-16：后台采样线程每 500ms 写缓存，UI 帧只读零阻塞）
                 if self.proxy_running {
-                    if let Some(monitor) = &self.traffic_monitor {
-                        let stats = tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(monitor.get_stats())
-                        });
+                    if let Some(stats) =
+                        self.traffic_stats_cache.lock().ok().and_then(|g| g.clone())
+                    {
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.label(format!("⬆ {} /s", format_speed(stats.upload_speed)));
@@ -2268,7 +2435,6 @@ impl HydraApp {
                     self.node_status.insert(
                         input.clone(),
                         NodeStatusInfo {
-                            addr: input.clone(),
                             connected: false,
                             last_check: None,
                             latency_ms: None,
@@ -2642,13 +2808,13 @@ impl HydraApp {
                         ui.horizontal(|ui| {
                             ui.colored_label(egui::Color32::from_rgb(0x7A, 0xB3, 0xFF), "[只读]");
                             ui.label(addr);
-                            if ui.small_button("另存为手动").clicked() {
-                                if self.config.save_subscription_node_as_manual(addr) {
-                                    self.add_log(format!(
-                                        "节点 {} 已另存为手动节点（不再随订阅更新）",
-                                        addr
-                                    ));
-                                }
+                            if ui.small_button("另存为手动").clicked()
+                                && self.config.save_subscription_node_as_manual(addr)
+                            {
+                                self.add_log(format!(
+                                    "节点 {} 已另存为手动节点（不再随订阅更新）",
+                                    addr
+                                ));
                             }
                         });
                     });
@@ -2832,7 +2998,7 @@ impl HydraApp {
                 self.node_status.insert(new_addr.clone(), st);
             }
         }
-        self.config.set_node_name(&new_addr, &self.edit_name.trim());
+        self.config.set_node_name(&new_addr, self.edit_name.trim());
         self.config.auth_key = key;
         self.config.cert_path = cert_path;
         self.node_edit_open = false;

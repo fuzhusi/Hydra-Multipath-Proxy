@@ -87,27 +87,23 @@ pub fn create_tray(ctx: egui::Context) -> Result<HydraTray, String> {
     let ctx_menu = ctx.clone();
     std::thread::spawn(move || {
         let rx_menu = MenuEvent::receiver();
-        loop {
-            match rx_menu.recv() {
-                Ok(ev) => {
-                    let cmd = if ev.id == id_show {
-                        Some(TrayCommand::ShowWindow)
-                    } else if ev.id == id_start {
-                        Some(TrayCommand::StartProxy)
-                    } else if ev.id == id_stop {
-                        Some(TrayCommand::StopProxy)
-                    } else if ev.id == id_quit {
-                        Some(TrayCommand::Quit)
-                    } else {
-                        None
-                    };
-                    if let Some(cmd) = cmd {
-                        let _ = tx_menu.send(cmd);
-                        // 窗口隐藏/空闲时唤醒 egui 立即处理
-                        ctx_menu.request_repaint();
-                    }
-                }
-                Err(_) => break, // 全局发送端已弃（进程退出）
+        // while let 形式（clippy）：recv Err = 发送端弃用（进程退出），线程结束
+        while let Ok(ev) = rx_menu.recv() {
+            let cmd = if ev.id == id_show {
+                Some(TrayCommand::ShowWindow)
+            } else if ev.id == id_start {
+                Some(TrayCommand::StartProxy)
+            } else if ev.id == id_stop {
+                Some(TrayCommand::StopProxy)
+            } else if ev.id == id_quit {
+                Some(TrayCommand::Quit)
+            } else {
+                None
+            };
+            if let Some(cmd) = cmd {
+                let _ = tx_menu.send(cmd);
+                // 窗口隐藏/空闲时唤醒 egui 立即处理
+                ctx_menu.request_repaint();
             }
         }
     });

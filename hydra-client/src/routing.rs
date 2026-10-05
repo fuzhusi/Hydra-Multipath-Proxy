@@ -279,8 +279,8 @@ fn suffix_match(table: &HashSet<String>, domain: &str) -> bool {
 fn all_suffixes() -> &'static HashSet<String> {
     ALL_SUFFIXES.get_or_init(|| {
         let mut set: HashSet<String> = BUILTIN_CN_SUFFIXES.iter().map(|s| s.to_string()).collect();
-        match std::env::var("HYDRA_DIRECT_DOMAIN_FILE") {
-            Ok(path) => match load_domain_file(&path) {
+        if let Ok(path) = std::env::var("HYDRA_DIRECT_DOMAIN_FILE") {
+            match load_domain_file(&path) {
                 Ok(extra) => {
                     info_loaded(path, extra.len());
                     set.extend(extra);
@@ -291,8 +291,7 @@ fn all_suffixes() -> &'static HashSet<String> {
                         path, e
                     );
                 }
-            },
-            Err(_) => {}
+            }
         }
         set
     })

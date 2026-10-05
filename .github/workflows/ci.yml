@@ -1,0 +1,64 @@
+# Hydra CI：push / PR 全量构建 + 测试 + clippy（Windows / Linux 双矩阵）
+# 说明：
+# - cargo build/test 覆盖全部 workspace 成员（默认 features，含 GUI）。
+# - Linux 上无 GUI 显示依赖问题：eframe/egui 纯软渲染编译不需要 X11 运行库，
+#   但如遇系统依赖缺失，见 ubuntu 步骤中的 apt 安装。
+# - clippy 以 -D warnings 阻断；如历史债务较多可临时降级（见仓库报告）。
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # 增量编译在 CI 无收益，关闭以减小缓存体积
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build-test-clippy:
+    name: ${{ matrix.os }} · build/test/clippy
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rust 工具链（版本以 rust-toolchain / Cargo.lock MSRV 为准，缺省 stable）
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # 依赖缓存：按 Cargo.lock 哈希，避免重复拉取 crates
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Linux 构建依赖（egui/eframe 在 headless 编译仅需基础工具链；防护性安装）
+      - name: 安装 Linux 系统依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      # clippy 阻断（Wave 3，2026-10-05：存量 59 条 warning 已清偿归零，收紧为
+      # -D warnings 防止新债务回流；纯机械项已修，行为类项见审查报告处置表）
+      - name: cargo clippy --workspace（-D warnings 阻断）
+        run: cargo clippy --workspace --all-targets -- -D warnings

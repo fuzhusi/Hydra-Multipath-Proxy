@@ -1,0 +1,13 @@
+# R-25（05 报告 P2）：docker build 的 COPY . . 会把整个构建上下文发进 daemon
+# （.gitignore 只对 git 生效）。以下目录/文件不得进入构建上下文：
+# 体积（GB 级 target/）与敏感物（探测密钥、E2E 证书/私钥、节点私钥）。
+target/
+.git/
+.e2e/
+.probe/
+*.der
+*.pem
+*.key
+*.log
+node.toml
+config.json

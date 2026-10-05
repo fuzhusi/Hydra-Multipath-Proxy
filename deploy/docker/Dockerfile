@@ -10,10 +10,25 @@
 # ── 阶段 1: 构建 ──────────────────────────────────────────────────
 FROM rust:1-slim AS builder
 WORKDIR /build
-# workspace 全量拷贝（根 Cargo.toml 声明了全部成员，无法只拷 manifests
-# 做依赖缓存；代价是源码变更时全量重编，本项目体量可接受）
+# 依赖缓存层（审查 R-25 收尾）：先只拷各 Cargo.toml + 虚 src 做 cargo fetch，
+# 源码不变时依赖层直接命中，源码变更不必全量重编
+COPY Cargo.toml Cargo.lock ./
+COPY hydra-protocol/Cargo.toml hydra-protocol/Cargo.toml
+COPY hydra-node/Cargo.toml hydra-node/Cargo.toml
+COPY hydra-client/Cargo.toml hydra-client/Cargo.toml
+COPY hydra-client-gui/Cargo.toml hydra-client-gui/Cargo.toml
+RUN mkdir -p hydra-protocol/src hydra-node/src hydra-client/src hydra-client-gui/src \
+    && echo "pub fn placeholder() {}" > hydra-protocol/src/lib.rs \
+    && echo "fn main() {}" > hydra-node/src/main.rs \
+    && echo "fn main() {}" > hydra-client/src/main.rs \
+    && echo "pub fn placeholder() {}" > hydra-client/src/lib.rs \
+    && echo "fn main() {}" > hydra-client-gui/src/main.rs \
+    && cargo fetch
+# 全量源码（.dockerignore 已排除 target/.probe/.e2e/*.der 等体积与敏感物）
 COPY . .
-RUN cargo build --release -p hydra-node
+# 触碰虚文件的时间戳使依赖层产物仍可用（cargo 以 mtime+内容判断重编）
+RUN find hydra-* -name "*.rs" -not -path "*/tests/*" -exec touch {} + \
+    && cargo build --release -p hydra-node
 
 # ── 阶段 2: 运行（debian-slim，仅二进制 + CA 证书）───────────────
 FROM debian:bookworm-slim

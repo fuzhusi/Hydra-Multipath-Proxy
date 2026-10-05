@@ -35,10 +35,68 @@ struct TcpCreds {
     auth_key: Arc<Vec<u8>>,
 }
 
+/// 中继缓冲 16KB（05-R-14 收尾）：与 TLS 1.3 单条记录实际读出量（≤16KB）对齐，
+/// 与节点侧 pump 一致；1000 并发常驻缓冲从 128MB 降到 32MB，64KB 无收益
+const RELAY_BUF: usize = 16 * 1024;
+
 /// HTTP 头部区最大长度（防恶意超大头部无限累积）
 const MAX_HTTP_HEAD: usize = 64 * 1024;
 /// 半关闭排水阶段等待另一方向的超时（浏览器已关写侧后，剩余响应应在此窗口内到齐）
 const RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// 初始读超时（审查 R-39，Wave 3 修复）：协议探测 / HTTP 头循环 / SOCKS5 请求
+/// 三处首读包 30s 超时——慢连接（连上不发数据）不再无限期占用任务与缓冲。
+/// 与节点侧认证超时（10s）同级的防慢速资源泄漏面，`--listen 0.0.0.0` 时尤其必要。
+const INITIAL_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// 远端先 FIN 后给上行的有限排水窗口（审查 R-27：不再直接 abort 上行丢尾部数据）
+const RELAY_DOWN_FIN_DRAIN: Duration = Duration::from_secs(5);
+/// 连续 TargetUnreachable 阈值（审查 06-P2-1）：同一目标连续 N 次在首选节点
+/// "目标不可达"后，允许一次跨节点重试——消除"节点 A resolver/出口整体故障被
+/// R-01 语义放大为该目标全客户端黑洞且对评分隐形"；命中即重置计数。
+const TARGET_UNREACH_FAILOVER_THRESHOLD: u32 = 3;
+
+/// 同一目标"连续不可达"计数表（审查 06-P2-1）。进程级共享：key 为目标字符串。
+fn target_unreach_counts() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
+    static COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> =
+        std::sync::OnceLock::new();
+    COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 记录一次目标不可达，返回该目标当前连续不可达次数。
+fn record_target_unreachable(target: &str) -> u32 {
+    let mut map = target_unreach_counts()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let c = map.entry(target.to_string()).or_insert(0);
+    *c = c.saturating_add(1);
+    *c
+}
+
+/// 目标在某节点连接成功：清除其连续不可达计数。
+fn clear_target_unreachable(target: &str) {
+    target_unreach_counts()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(target);
+}
+
+/// TargetUnreachable 分支统一入口（07-P1-3）：记录一次失败并判定是否允许
+/// 一次性跨节点重试。达阈值时**立即重置计数**（"命中即重置"语义，06-P2-1
+/// 承诺此前未实现——计数只增不减导致偶发目标失败被永久放大为每请求 3 节点
+/// 全握手）。返回 true = 本次允许继续尝试下一节点；false = 直接报错给客户端。
+/// 时间窗说明：并发突发下多个请求可能各自命中一次阈值（最多放大 MAX_NODE_
+/// ATTEMPTS × 在途请求数），实现 60s 时间窗需将计数表改为 `(u32, Instant)`
+/// 并在所有读写路径加时钟比较——收益有限、侵入面大，故以注释说明取舍，
+/// 保持一次性重置语义即可。
+fn record_and_should_failover(target: &str) -> bool {
+    let consecutive = record_target_unreachable(target);
+    if consecutive >= TARGET_UNREACH_FAILOVER_THRESHOLD {
+        // 命中阈值：重置，保证跨节点重试真正一次性
+        clear_target_unreachable(target);
+        true
+    } else {
+        false
+    }
+}
 /// 国内直连分流的直连建连超时（超时后回退节点路径，不让浏览器干等）
 const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -200,7 +258,13 @@ impl ProxyServer {
     /// （通道开启器依赖 get_nodes_by_priority）。
     pub async fn register_nodes(&self) {
         for (idx, addr) in self.nodes.iter().enumerate() {
-            if self.scheduler.get_nodes_by_priority().await.iter().any(|n| n.address == *addr) {
+            if self
+                .scheduler
+                .get_nodes_by_priority()
+                .await
+                .iter()
+                .any(|n| n.address == *addr)
+            {
                 continue;
             }
             let node = NodeInfo {
@@ -274,13 +338,19 @@ impl ProxyServer {
             .peer_addr()
             .unwrap_or_else(|_| SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0));
 
-        // 读取第一个字节来判断协议类型
+        // 读取第一个字节来判断协议类型（R-39：30s 超时防慢连接挂起）
         info!("[{}] Reading first byte to detect protocol...", peer_addr);
-        let n = match stream.read(&mut buf).await {
-            Ok(n) => n,
-            Err(e) => {
+        let n = match tokio::time::timeout(INITIAL_READ_TIMEOUT, stream.read(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
                 error!("[{}] Failed to read: {}", peer_addr, e);
                 return Err(e.into());
+            }
+            Err(_) => {
+                return Err(HydraError::ConnectionError(format!(
+                    "[{}] Initial read timeout ({:?})",
+                    peer_addr, INITIAL_READ_TIMEOUT
+                )));
             }
         };
 
@@ -344,6 +414,8 @@ impl ProxyServer {
                 .await
             {
                 Ok(tls) => {
+                    // 连接成功：清除该目标的连续不可达计数（审查 06-P2-1）
+                    clear_target_unreachable(target);
                     info!(
                         "[{}] ✓ Connected to {} via node {} (tcp/tls)",
                         peer_addr,
@@ -364,30 +436,39 @@ impl ProxyServer {
                     return Ok(NodeLink { send, recv });
                 }
                 Err(e) => {
-                    // 目标不可达（节点存活但目标连不上/SSRF/DNS 失败）：换节点无意义
+                    // 目标不可达（节点存活但目标连不上/SSRF 失败）：默认换节点无意义
                     //（目标在任意节点都同样不可达），且绝不污染节点评分——直接报错给
                     // 客户端（审查 R-01：原实现把健康节点连锁标记 Offline）。
+                    // 但 06-P2-1：DNS 失败按节点出口位置解析（geo-DNS/局部污染/节点
+                    // resolver 故障），节点 A 失败不代表节点 B 也失败——同一目标连续
+                    // 达阈值后允许一次跨节点重试（仍不标记节点故障），命中即重置。
                     if matches!(e, HydraError::TargetUnreachable(_)) {
+                        // 07-P1-3：达阈值判定与"命中即重置"统一在
+                        // record_and_should_failover 内完成（一次性跨节点重试）
+                        if record_and_should_failover(target) {
+                            warn!(
+                                "[{}] Target unreachable {}+ times in a row, retrying next node once (node {} still healthy)",
+                                peer_addr, TARGET_UNREACH_FAILOVER_THRESHOLD, node.address
+                            );
+                            last_err = Some(e);
+                            continue;
+                        }
                         warn!(
                             "[{}] Target unreachable via node {} (node healthy, not failing over)",
-                            peer_addr,
-                            node.address
+                            peer_addr, node.address
                         );
                         return Err(e);
                     }
                     warn!(
                         "[{}] Node {} tcp/tls connect failed ({}), failing over to next node",
-                        peer_addr,
-                        node.address,
-                        e
+                        peer_addr, node.address, e
                     );
                     scheduler.mark_node_offline(&node.address).await;
                     last_err = Some(e);
                 }
             }
         }
-        Err(last_err
-            .unwrap_or_else(|| HydraError::ConnectionError("All nodes failed".to_string())))
+        Err(last_err.unwrap_or_else(|| HydraError::ConnectionError("All nodes failed".to_string())))
     }
 
     /// 处理 HTTP 代理请求（CONNECT 与普通明文请求共用入口）
@@ -414,11 +495,18 @@ impl ProxyServer {
                 return Err(HydraError::ProtocolError("HTTP head too large".to_string()));
             }
             let mut buf = [0u8; 4096];
-            let n = match stream.read(&mut buf).await {
-                Ok(n) => n,
-                Err(e) => {
+            // R-39：头循环每段读同样包超时（头部可分多段到达，逐段计时）
+            let n = match tokio::time::timeout(INITIAL_READ_TIMEOUT, stream.read(&mut buf)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => {
                     error!("[{}] Failed to read HTTP request: {}", peer_addr, e);
                     return Err(e.into());
+                }
+                Err(_) => {
+                    return Err(HydraError::ConnectionError(format!(
+                        "[{}] HTTP header read timeout ({:?})",
+                        peer_addr, INITIAL_READ_TIMEOUT
+                    )));
                 }
             };
             if n == 0 {
@@ -449,7 +537,12 @@ impl ProxyServer {
         let parts: Vec<&str> = first_line.split_whitespace().collect();
 
         if parts.len() < 3 {
-            error!("[{}] Invalid HTTP request: {}", peer_addr, first_line);
+            // 审查 R-23：请求行含目标 URL 明文，error 级只记脱敏视图
+            error!(
+                "[{}] Invalid HTTP request: {}",
+                peer_addr,
+                mask_target(first_line)
+            );
             let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
             return Err(HydraError::ProtocolError(
                 "Invalid HTTP request".to_string(),
@@ -495,9 +588,12 @@ impl ProxyServer {
                 None => without_protocol.to_string(),
             }
         } else {
-            // 从 Host header 中获取
+            // 从 Host header 中获取（审查 R-44：跳过 obs-fold 续行——RFC 7230 折行
+            // 以空白开头，不跳过的话折行片段可能被误判为 Host 头；多 Host 头取首个
+            // 保持原语义，多 Host 本身非法）
             head_view
                 .lines()
+                .filter(|line| !line.starts_with(' ') && !line.starts_with('\t'))
                 .find(|line| line.to_lowercase().starts_with("host:"))
                 .map(|line| line[5..].trim().to_string())
                 .unwrap_or_else(|| "unknown".to_string())
@@ -608,13 +704,13 @@ impl ProxyServer {
                     match Self::open_target(&scheduler, &traffic, &creds, &target_str, peer_addr)
                         .await
                     {
-                    Ok(link) => link,
-                    Err(e) => {
-                        error!("[{}] Failed to connect via any node: {}", peer_addr, e);
-                        let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                        return Err(e);
-                    }
-                };
+                        Ok(link) => link,
+                        Err(e) => {
+                            error!("[{}] Failed to connect via any node: {}", peer_addr, e);
+                            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                            return Err(e);
+                        }
+                    };
                 RemoteLink::Node { link: node_link }
             }
         };
@@ -644,10 +740,18 @@ impl ProxyServer {
 
         // 初始数据应该是 SOCKS5 greeting
         if initial_len < 2 || initial_buf[0] != 0x05 {
+            // 审查 R-23：error 级不再 dump 原始字节（含潜在目标明文/可被恶意方
+            // 注入任意内容落日志）；只记长度与结构信息，字节 dump 降为 debug 级
             error!(
-                "[{}] Invalid SOCKS5 greeting: {:?}",
+                "[{}] Invalid SOCKS5 greeting ({} bytes, ver=0x{:02x})",
                 peer_addr,
-                &initial_buf[..initial_len]
+                initial_len,
+                initial_buf.first().copied().unwrap_or(0)
+            );
+            debug!(
+                "[{}] Invalid SOCKS5 greeting (plaintext bytes): {:?}",
+                peer_addr,
+                &initial_buf[..initial_len.min(initial_buf.len())]
             );
             let _ = stream.write_all(&[0x05, 0xFF]).await;
             return Err(HydraError::ProtocolError(
@@ -664,17 +768,33 @@ impl ProxyServer {
         stream.write_all(&[0x05, 0x00]).await?;
         info!("[{}] Sent no-auth response", peer_addr);
 
-        // 读取 SOCKS5 请求
+        // 读取 SOCKS5 请求（R-39：30s 超时防慢连接挂起）
         info!("[{}] Reading SOCKS5 request...", peer_addr);
-        let n = match stream.read(&mut buf).await {
-            Ok(n) => n,
-            Err(e) => {
+        let n = match tokio::time::timeout(INITIAL_READ_TIMEOUT, stream.read(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
                 error!("[{}] Failed to read request: {}", peer_addr, e);
                 return Err(e.into());
             }
+            Err(_) => {
+                return Err(HydraError::ConnectionError(format!(
+                    "[{}] SOCKS5 request read timeout ({:?})",
+                    peer_addr, INITIAL_READ_TIMEOUT
+                )));
+            }
         };
         if n < 7 || buf[0] != 0x05 {
-            error!("[{}] Invalid SOCKS5 request: {:?}", peer_addr, &buf[..n]);
+            // 审查 R-23：error 级不 dump 原始请求字节（SOCKS 请求含目标域名/IP 明文，
+            // 恶意方可借畸形请求把任意"明文目标"写进日志）；只记 ver/cmd/长度结构信息
+            error!(
+                "[{}] Invalid SOCKS5 request ({} bytes, ver=0x{:02x}, cmd=0x{:02x})",
+                peer_addr, n, buf[0], buf[1]
+            );
+            debug!(
+                "[{}] Invalid SOCKS5 request (plaintext bytes): {:?}",
+                peer_addr,
+                &buf[..n]
+            );
             let _ = stream
                 .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                 .await;
@@ -929,7 +1049,7 @@ impl ProxyServer {
 
         // 浏览器 → 远端（节点 TCP/TLS 流 / 直连 TCP）
         let mut up = tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
+            let mut buf = vec![0u8; RELAY_BUF];
             let mut total = 0u64;
             loop {
                 match client_read.read(&mut buf).await {
@@ -961,9 +1081,7 @@ impl ProxyServer {
                                 .map(|_| ())
                                 .map_err(RelayError::LocalIo),
                         };
-                        if let Err(e) = write_res {
-                            return Err(e);
-                        }
+                        write_res?;
                     }
                     Err(_) => return Err(RelayError::Transport),
                 }
@@ -972,7 +1090,7 @@ impl ProxyServer {
 
         // 远端 → 浏览器
         let mut down = tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
+            let mut buf = vec![0u8; RELAY_BUF];
             let mut total = 0u64;
             loop {
                 let n = match &mut down_src {
@@ -1037,10 +1155,24 @@ impl ProxyServer {
                 let _ = down.await;
                 Err(Self::relay_error(e, peer_addr, target))
             }
-            // 远端响应已完整（FIN）：显式中止上行并收敛（写端 drop → FIN 传给远端）
+            // 远端响应已完整（FIN）：审查 R-27——此前直接 abort 上行，客户端仍在
+            // write_all 途中的尾部数据被静默丢弃（与半关闭方向的排水语义不对称）。
+            // 现给上行一个有限排水窗口：上行自然结束（客户端 EOF → shutdown 远端
+            // 写端）或超时后再中止，超时告警保留。
             (false, None) => {
-                up.abort();
-                let _ = up.await;
+                match tokio::time::timeout(RELAY_DOWN_FIN_DRAIN, &mut up).await {
+                    Ok(r) => {
+                        let _ = join_relay_result(r);
+                    }
+                    Err(_) => {
+                        up.abort();
+                        let _ = up.await;
+                        warn!(
+                            "[{}] Upstream drain timeout after remote FIN for {}, aborted",
+                            peer_addr, masked
+                        );
+                    }
+                }
                 info!("[{}] Connection to {} closed", peer_addr, masked);
                 Ok(())
             }
@@ -1085,9 +1217,7 @@ pub(crate) struct NodeLink {
 impl NodeLink {
     /// 拆分为（读端, 写端），供 TUN 模式把节点链路透传给用户态 TCP 栈
     /// （pub(crate)：仅 crate 内 tun 模块经 tun_channel_opener 使用）。
-    pub(crate) fn into_parts(
-        self,
-    ) -> (CountingStream<TcpReadHalf>, CountingStream<TcpWriteHalf>) {
+    pub(crate) fn into_parts(self) -> (CountingStream<TcpReadHalf>, CountingStream<TcpWriteHalf>) {
         (self.recv, self.send)
     }
 }
@@ -1144,4 +1274,66 @@ impl Drop for RelayGuard {
 /// 在原始字节中定位 HTTP 头部结束标记 "\r\n\r\n"
 fn find_header_end(raw: &[u8]) -> Option<usize> {
     raw.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// 06-P2-1：连续 TargetUnreachable 计数与阈值重置逻辑（open_target 跨节点重试判定）
+#[cfg(test)]
+mod unreach_counter_tests {
+    use super::*;
+
+    #[test]
+    fn 连续计数达阈值后由调用方重试_计数递增() {
+        let t = "unit-test.example:443";
+        clear_target_unreachable(t);
+        assert_eq!(record_target_unreachable(t), 1);
+        assert_eq!(record_target_unreachable(t), 2);
+        assert_eq!(record_target_unreachable(t), 3);
+        assert!(record_target_unreachable(t) >= TARGET_UNREACH_FAILOVER_THRESHOLD);
+    }
+
+    #[test]
+    fn 连接成功后计数清零() {
+        let t = "unit-test-clear.example:443";
+        record_target_unreachable(t);
+        record_target_unreachable(t);
+        clear_target_unreachable(t);
+        assert_eq!(record_target_unreachable(t), 1, "清零后应从 1 重新计数");
+    }
+
+    /// 07-P1-3：命中阈值重置后，同一目标的第 4 个请求（以及任何其他目标）
+    /// 计数从 1 起步，不再触发跨节点重试——消除"永久 3 倍重试放大"。
+    #[test]
+    fn 命中阈值即重置_后续请求不再跨节点重试() {
+        // 唯一目标名：避免与并行测试进程内其他用例的计数互相干扰
+        let t = format!(
+            "failover-once-{}.example:443",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        clear_target_unreachable(&t);
+        // 前 3 次失败：第 1、2 次不重试（直接报错给客户端），第 3 次命中阈值 →
+        // 允许一次跨节点重试，同时计数被重置
+        assert!(!record_and_should_failover(&t), "第 1 次失败不应重试");
+        assert!(!record_and_should_failover(&t), "第 2 次失败不应重试");
+        assert!(
+            record_and_should_failover(&t),
+            "第 3 次失败应允许一次跨节点重试"
+        );
+        // 重置后的第 4 个请求（无论同目标还是不同目标——不同目标计数本就从 0
+        // 起步）均不再跨节点重试：放大态已被解除
+        assert!(
+            !record_and_should_failover(&t),
+            "命中重置后第 4 次请求不得再重试"
+        );
+        // 换一个全新目标：计数从 0 起步，同样不重试
+        let t2 = format!("{}-alt", t);
+        assert!(
+            !record_and_should_failover(&t2),
+            "全新目标不应触发跨节点重试"
+        );
+        clear_target_unreachable(&t);
+        clear_target_unreachable(&t2);
+    }
 }

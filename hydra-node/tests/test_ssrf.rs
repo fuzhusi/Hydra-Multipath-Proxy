@@ -72,3 +72,26 @@ async fn default_denies_ipv4_mapped_link_local_target() {
     .await;
     expect_target_fail(tls, "[::ffff:169.254.169.254]:80").await;
 }
+
+/// 审查 N-06 补段回归：组播/CGNAT/保留段目标必须在建连前即被拒——
+/// 这些地址不可路由，若过滤缺失会走到 15s 建连超时（本测试 10s 读超时即红），
+/// 立即收到 [0x00,0x01] 说明分类命中发生在 connect 之前
+#[tokio::test]
+async fn default_denies_new_reserved_segments_before_connect() {
+    for (target, desc) in [
+        ("224.0.0.1:80", "组播 224.0.0.1"),
+        ("100.64.1.1:80", "CGNAT 100.64.1.1"),
+        ("198.18.0.1:80", "基准测试 198.18.0.1"),
+        ("255.255.255.255:80", "受限广播 255.255.255.255"),
+    ] {
+        let node = common::spawn_node().await;
+        let tls = common::connect_and_request(
+            node.addr,
+            &node.cert,
+            &common::test_auth_key(),
+            target,
+        )
+        .await;
+        expect_target_fail(tls, desc).await;
+    }
+}

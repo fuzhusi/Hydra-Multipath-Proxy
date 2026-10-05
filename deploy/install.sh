@@ -8,9 +8,9 @@
 #   sudo ./deploy/install.sh --no-enable     # 安装但不 enable/start，人工检查后再启
 #
 # 前置: 目标机已装 Rust 工具链（cargo，1.81+，见 Cargo.lock MSRV）、
-#       openssl、systemd。本项目目前【没有远程发布产物】（无 GitHub
-#       release、无预编译包），因此本脚本只做本地构建+本地安装，
-#       不做任何远程下载——如实说明，避免误导。
+#       openssl、systemd。发布产物见 GitHub Releases（tag v* 自动构建，
+#       Linux tar.gz 含 hydra-node）；本脚本走本地构建+本地安装路线，
+#       不做远程下载——两条路线二选一，避免版本混淆。
 #
 # 脚本做什么:
 #   1. cargo build --release -p hydra-node
@@ -76,7 +76,9 @@ if ! id -u "$NODE_USER" &>/dev/null; then
 fi
 install -d -o "$NODE_USER" -g "$NODE_USER" -m 0750 "$NODE_DIR"
 
-# ── 4. 生成环境配置（密钥管理最佳实践: root:600，不进 history）──
+# ── 4. 生成环境配置（审查 R-46，注释如实化：属主 hydra:hydra 0600——
+#      服务以 hydra 用户运行需可读；ProtectSystem=strict 下 hydra 用户
+#      亦无法篡改 unit/二进制。不进 shell history：本文件非交互写入）──
 GENERATED_KEY=0
 if [[ -f "$ENV_FILE" ]]; then
   echo "==> [4/5] $ENV_FILE 已存在，保留（升级不覆盖密钥与证书）"
@@ -110,12 +112,32 @@ fi
 echo "==> [5/5] 安装 systemd unit 并启用"
 install -m 0644 "$SERVICE_SRC" "$SERVICE_DST"
 systemctl daemon-reload
+
+# 升级场景识别：unit 此前已存在且服务当前 active → 安装后自动重启，
+# 让新版二进制生效（否则旧进程继续跑旧代码，升级等于没生效）。
+# 全新安装路径（unit 原不存在）行为不变：走 enable --now / enable。
+IS_UPGRADE=0
+if systemctl is-active --quiet hydra-node.service 2>/dev/null; then
+  IS_UPGRADE=1
+fi
+
 if [[ $ENABLE -eq 1 ]]; then
-  systemctl enable --now hydra-node.service
-  systemctl --no-pager --lines=5 status hydra-node.service || true
+  if [[ $IS_UPGRADE -eq 1 ]]; then
+    echo "==> 检测到已有 hydra-node 服务在运行（升级场景），重启以加载新二进制"
+    systemctl restart hydra-node.service
+    systemctl --no-pager --lines=5 status hydra-node.service || true
+    echo "    ✓ hydra-node 已重启"
+  else
+    systemctl enable --now hydra-node.service
+    systemctl --no-pager --lines=5 status hydra-node.service || true
+  fi
 else
   systemctl enable hydra-node.service
-  echo "（--no-enable: 已 enable 但未启动。人工检查 $ENV_FILE 后执行: systemctl start hydra-node）"
+  if [[ $IS_UPGRADE -eq 1 ]]; then
+    echo "（--no-enable: 升级场景。服务此前已在运行，人工确认后执行: systemctl restart hydra-node）"
+  else
+    echo "（--no-enable: 已 enable 但未启动。人工检查 $ENV_FILE 后执行: systemctl start hydra-node）"
+  fi
 fi
 
 # ── 6. 内核网络加固: BBR + fq（协议优化评估 P0 项，跨境高丢包链路收益显著）──
@@ -135,10 +157,11 @@ fi
 echo
 echo "════════════════════════════════════════════════════════════"
 if [[ $GENERATED_KEY -eq 1 ]]; then
+  # 审查 R-46（Wave 3 修复）：不再把明文密钥 echo 到终端（会留在回滚缓冲/
+  # 会话日志里）；统一指向 env 文件查看。
   echo "节点自动生成了认证密钥（客户端 HYDRA_AUTH_KEY 必须与此一致）:"
-  echo "  $AUTH_KEY"
-  echo "  （注意: 上面这行已留在终端回滚缓冲，介意可 systemctl restart 后用"
-  echo "    sudo grep ^HYDRA_AUTH_KEY $ENV_FILE 查看）"
+  echo "  查看: sudo grep ^HYDRA_AUTH_KEY $ENV_FILE"
+  echo "  （密钥不回显终端，避免留在终端回滚缓冲与会话日志中）"
 else
   echo "认证密钥: 见 $ENV_FILE（sudo grep ^HYDRA_AUTH_KEY $ENV_FILE）"
 fi

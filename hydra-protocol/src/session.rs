@@ -1,14 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Session {
-    pub id: u64,
-    pub client: SocketAddr,
-    pub nodes: Vec<NodeInfo>,
-    pub streams: Vec<Stream>,
-    pub status: SessionStatus,
-}
+// 审查 R-30（2026-10-05 Wave 2）：QUIC 时代的 Session / Stream / SessionStatus /
+// StreamStatus 死代码已删除（零生产引用）；本文件仅保留调度器与 GUI 共用的
+// NodeInfo / NodeStatus。
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
@@ -21,34 +16,10 @@ pub struct NodeInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Stream {
-    pub id: u32,
-    pub offset: u64,
-    pub length: u64,
-    pub status: StreamStatus,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SessionStatus {
-    Connecting,
-    Active,
-    Closed,
-    Error(String),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NodeStatus {
     Online,
     Offline,
     Degraded,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum StreamStatus {
-    Pending,
-    Active,
-    Completed,
-    Failed,
 }
 
 impl NodeInfo {

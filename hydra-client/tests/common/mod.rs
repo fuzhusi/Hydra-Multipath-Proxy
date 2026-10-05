@@ -31,16 +31,22 @@ pub async fn spawn_node() -> TestNode {
 
 /// 在指定地址启动节点服务器（指定 127.0.0.1:0 则随机端口）
 pub async fn spawn_node_on(addr: SocketAddr) -> TestNode {
-    spawn_node_with_opts_on(addr, false).await
+    spawn_node_with_opts_on(addr, false, None).await
 }
 
 /// 启动开启 P2P 信令模式（HYDRA_P2P_SIGNAL=1 语义，`@hydra-p2p/<peer_id>`）的节点
 pub async fn spawn_node_with_p2p() -> TestNode {
-    spawn_node_with_opts_on("127.0.0.1:0".parse().unwrap(), true).await
+    spawn_node_with_opts_on("127.0.0.1:0".parse().unwrap(), true, None).await
 }
 
-/// spawn_node_on 的内部实现：`p2p` = 是否开启信令模式
-async fn spawn_node_with_opts_on(addr: SocketAddr, p2p: bool) -> TestNode {
+/// 07-P2-4：显式注入节点 idle 超时（替代 HYDRA_IDLE_TIMEOUT_SECS env 写入，
+/// 避免与并行测试线程的 env 读取构成数据竞争/跨用例干扰）
+pub async fn spawn_node_with_idle_timeout(idle: Duration) -> TestNode {
+    spawn_node_with_opts_on("127.0.0.1:0".parse().unwrap(), false, Some(idle)).await
+}
+
+/// spawn_node_on 的内部实现：`p2p` = 是否开启信令模式；`idle` = 显式注入的 idle 超时
+async fn spawn_node_with_opts_on(addr: SocketAddr, p2p: bool, idle: Option<Duration>) -> TestNode {
     // 测试全部使用 127.0.0.1 回显与回环目标：放宽节点侧 SSRF 过滤
     // （生产默认拒绝私有目标；见 hydra-node/src/handler.rs 与 docs/guides/部署指南.md）
     std::env::set_var("HYDRA_ALLOW_PRIVATE_TARGETS", "1");
@@ -53,6 +59,7 @@ async fn spawn_node_with_opts_on(addr: SocketAddr, p2p: bool) -> TestNode {
         cert_file: dir.join("cert.der"),
         key_file: dir.join("key.der"),
         p2p_signal: p2p,
+        idle_timeout: idle,
         ..NodeOptions::default()
     };
     spawn_node_with_opts(addr, opts).await
@@ -64,7 +71,9 @@ pub async fn spawn_node_with_opts(addr: SocketAddr, opts: NodeOptions) -> TestNo
     let server = HydraServer::new(addr, test_auth_key(), opts.clone())
         .await
         .unwrap();
-    let tcp_addr = server.tcp_listen_addr.expect("TCP 监听应已绑定（唯一传输）");
+    let tcp_addr = server
+        .tcp_listen_addr
+        .expect("TCP 监听应已绑定（唯一传输）");
     let cert = server.cert_der().to_vec();
     // TCP 接受循环已在 new 时后台运行；无需 spawn start()（start 仅永久挂起保活）
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -174,10 +183,12 @@ pub async fn socks5_connect(
     proxy_addr: SocketAddr,
     target: &str,
 ) -> std::io::Result<tokio::net::TcpStream> {
-    socks5_connect_lenient(proxy_addr, target).await.map(|(s, code)| {
-        assert_eq!(code, 0x00, "SOCKS5 connect failed: status={}", code);
-        s
-    })
+    socks5_connect_lenient(proxy_addr, target)
+        .await
+        .map(|(s, code)| {
+            assert_eq!(code, 0x00, "SOCKS5 connect failed: status={}", code);
+            s
+        })
 }
 
 /// SOCKS5 CONNECT 的宽松版本：不断言成功，返回应答码（供故障路径测试）

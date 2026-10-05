@@ -25,6 +25,9 @@ pub struct NodeOptions {
     pub cert_domains: Vec<String>,
     /// P2P 信令模式（NAT 穿透方案 §3.2）：默认关闭 = 行为零变化
     pub p2p_signal: bool,
+    /// 转发空闲看门狗超时（07-P2-4：显式注入优先于 env `HYDRA_IDLE_TIMEOUT_SECS`，
+    /// 避免测试进程内 set_var 与并行线程 env 读取的数据竞争；None = env/默认值）
+    pub idle_timeout: Option<std::time::Duration>,
 }
 
 impl Default for NodeOptions {
@@ -35,6 +38,7 @@ impl Default for NodeOptions {
             key_file: PathBuf::from("hydra-node-key.der"),
             cert_domains: vec!["hydra.node".to_string(), "localhost".to_string()],
             p2p_signal: false,
+            idle_timeout: None,
         }
     }
 }
@@ -82,12 +86,16 @@ impl HydraServer {
     /// 创建节点服务器。auth_key 为必填的预共享密钥（Noise-PSK 握手使用；
     /// 认证失败的流将被静默关闭）。
     pub async fn new(addr: SocketAddr, auth_key: Vec<u8>, opts: NodeOptions) -> Result<Self> {
-        let (cert_der, key_der) =
+        // 07-P1-1：load_or_generate 返回整条证书链（叶在前）
+        let (cert_chain, key_der) =
             cert::load_or_generate(&opts.cert_file, &opts.key_file, &opts.cert_domains)?;
+        // 叶证书 DER（链首）：指纹/通道绑定与对外暴露的 cert_der 均只取叶，语义不变
+        let leaf_der = cert_chain[0].clone();
 
         let handler = Arc::new(ConnectionHandler::new(
             auth_key,
-            hydra_protocol::handshake::cert_fingerprint(&cert_der.0),
+            // rustls 0.23（Wave 3）：CertificateDer 用 as_ref() 取 DER 字节
+            hydra_protocol::handshake::cert_fingerprint(leaf_der.as_ref()),
             hydra_protocol::handshake::AuthMode::from_env(), // 启动时读一次，不在每流热路径读 env
         ));
 
@@ -95,17 +103,19 @@ impl HydraServer {
         // 绑定失败显式报错（静默回落会让用户得到黑洞）。
         let tcp_listen_addr = spawn_tcp_listener(
             addr,
-            cert_der.clone(),
+            cert_chain,
             key_der,
             handler.clone(),
             opts.max_connections.max(1) as usize,
             opts.p2p_signal,
+            // 07-P2-4：显式注入优先，未注入回落 env/默认（spawn_tcp_listener 内解析）
+            opts.idle_timeout,
         )
         .await?;
 
         Ok(Self {
             tcp_listen_addr: Some(tcp_listen_addr),
-            cert_der: cert_der.0,
+            cert_der: leaf_der.as_ref().to_vec(),
         })
     }
 

@@ -22,7 +22,8 @@ use hydra_protocol::tcp_frame::{
     read_target, write_reply, REPLY_DNS_FAIL, REPLY_OK, REPLY_TARGET_FAIL, TCP_VERSION_BYTE,
 };
 use hydra_protocol::{mask_target, Result};
-use rustls::{Certificate, PrivateKey};
+// rustls 0.23（Wave 3）：pki-types 的 DER 新类型取代旧的 Certificate/PrivateKey 元组结构体
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -50,39 +51,59 @@ fn idle_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// 解析生效的 idle 超时（07-P2-4）：显式注入（NodeOptions.idle_timeout）优先，
+/// 未注入时回落 env `HYDRA_IDLE_TIMEOUT_SECS`——测试通过注入避免进程级
+/// set_var/remove_var 与并行测试线程的数据竞争。
+fn effective_idle_timeout(injected: Option<std::time::Duration>) -> std::time::Duration {
+    injected.unwrap_or_else(idle_timeout)
+}
 /// 信令模式的保留目标前缀（NAT 穿透方案 §3.2）：`@hydra-p2p/<peer_id>`
 const P2P_SIGNAL_PREFIX: &str = "@hydra-p2p/";
 
 /// peer_id 校验：非空、≤64 字节、仅 hex 字符（客户端自选 16 字节 hex）
 fn validate_peer_id(peer_id: &str) -> bool {
-    !peer_id.is_empty()
-        && peer_id.len() <= 64
-        && peer_id.bytes().all(|b| b.is_ascii_hexdigit())
+    !peer_id.is_empty() && peer_id.len() <= 64 && peer_id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// 启动 TCP/TLS 监听（后台任务运行接受循环），返回实际绑定的本地地址。
+/// `cert_chain` 为整条证书链（叶在前；07-P1-1：真证书部署必须下发中间链）。
 /// 证书/密钥与主路径同一份（cert.rs 产物）；`max_connections` 用 Semaphore 强制。
 /// `p2p_signal` = 是否开启信令模式（NAT 穿透 §3.2；默认关闭 = 零行为变化）。
+/// `idle_timeout` = 转发空闲看门狗显式注入（07-P2-4；None = env/默认值）。
 pub async fn spawn_tcp_listener(
     addr: SocketAddr,
-    cert: Certificate,
-    key: PrivateKey,
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
     handler: Arc<ConnectionHandler>,
     max_connections: usize,
     p2p_signal: bool,
+    idle_timeout: Option<std::time::Duration>,
 ) -> Result<SocketAddr> {
-    let mut config = rustls::ServerConfig::builder()
-        .with_safe_defaults()
+    // rustls 0.23（Wave 3）：显式 ring provider（与客户端同一选择，全工作区 ring 0.17）；
+    // 协议版本 = 安全默认（TLS 1.2 + 1.3）。
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| {
+            hydra_protocol::HydraError::ProtocolError(format!("TLS 协议版本配置失败: {e}"))
+        })?
         .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
+        // 07-P1-1：整链下发（自签路径链长 1，行为不变）
+        .with_single_cert(cert_chain, key)
         .map_err(|e| {
             hydra_protocol::HydraError::ProtocolError(format!("TCP/TLS 证书配置失败: {e}"))
         })?;
     // 不做 ALPN：非标 ALPN 是单规则 DPI 指纹；留空 = 普通 HTTPS 客户端形态
     config.alpn_protocols = Vec::new();
     config.max_early_data_size = 0;
+    // 07-P3-1 零成本顺修：禁服务端会话恢复/ticket 下发（与客户端
+    // Resumption::disabled() 对齐，兑现"禁会话恢复两端保持"承诺）
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let sem = Arc::new(Semaphore::new(max_connections.max(1)));
+    // 07-P2-4：idle 超时在监听启动时解析一次（显式注入优先，回落 env/默认值），
+    // 经 Arc 随连接任务传递——不再每连接读 env
+    let idle = Arc::new(effective_idle_timeout(idle_timeout));
     // 信令注册表：开启信令模式时创建（跨连接共享）；关闭时 None = 零开销
     let registry = if p2p_signal {
         Some(Arc::new(SignalRegistry::new()))
@@ -97,7 +118,7 @@ pub async fn spawn_tcp_listener(
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((mut stream, peer)) => {
+                Ok((stream, peer)) => {
                     // 禁 Nagle：握手与交互式流量的小包延迟敏感
                     let _ = stream.set_nodelay(true);
                     // 快速失败（sheding）：额度满时立即丢弃新连接而非让其在内核
@@ -109,13 +130,16 @@ pub async fn spawn_tcp_listener(
                     let acceptor = acceptor.clone();
                     let handler = handler.clone();
                     let registry = registry.clone(); // 每连接一份 Arc 克隆（避免 move 出循环）
+                    let idle = idle.clone();
                     tokio::spawn(async move {
                         let _permit = permit; // 连接结束自动归还
-                        // TLS 握手超时：认证前 slowloris 防护（超时静默 drop，语义不变）
+                                              // TLS 握手超时：认证前 slowloris 防护（超时静默 drop，语义不变）
                         match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
                             .await
                         {
-                            Ok(Ok(tls)) => handle_tls_stream(tls, handler, registry.clone()).await,
+                            Ok(Ok(tls)) => {
+                                handle_tls_stream(tls, handler, registry.clone(), idle).await
+                            }
                             Ok(Err(e)) => {
                                 // 握手失败（扫描/探测）不回显任何信息，仅 debug 记录
                                 debug!("TLS handshake from {} failed: {}", peer, e)
@@ -140,6 +164,7 @@ async fn handle_tls_stream(
     mut tls: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     handler: Arc<ConnectionHandler>,
     signal_registry: Option<Arc<SignalRegistry>>,
+    idle: Arc<std::time::Duration>,
 ) {
     // ── 第 1 步：版本字节判别（0x03 = Noise-PSK；其他值静默关流，防探测语义不变）
     let mut version = [0u8; 1];
@@ -173,7 +198,7 @@ async fn handle_tls_stream(
             &mut wr,
             &mut rd,
             handler.auth_key(),
-            &handler.cert_fingerprint(),
+            handler.cert_fingerprint(),
             &exporter,
         ),
     )
@@ -213,8 +238,16 @@ async fn handle_tls_stream(
             if write_reply(&mut wr, REPLY_OK).await.is_err() {
                 return;
             }
-            // 信令会话：读超时 90s 覆盖空闲（serve_signal_stream 内部看门狗）
-            signal::serve_signal_stream(registry, peer_id.to_string(), rd, wr).await;
+            // 信令会话：读超时 90s 覆盖空闲（serve_signal_stream 内部看门狗）；
+            // auth_key 供 register 属主 proof 的独立复算校验（防 peer_id 冒用顶替）
+            signal::serve_signal_stream(
+                registry,
+                peer_id.to_string(),
+                handler.auth_key().to_vec(),
+                rd,
+                wr,
+            )
+            .await;
             return;
         }
     }
@@ -243,7 +276,8 @@ async fn handle_tls_stream(
     if write_reply(&mut wr, REPLY_OK).await.is_err() {
         return;
     }
-    let idle = idle_timeout();
+    // 07-P2-4：idle 超时由监听器启动时注入（显式注入优先于 env）
+    let idle = *idle;
     // 双向共享的最后活跃时间戳（AtomicU64 毫秒）：任一方向读到数据即刷新，
     // 空闲判定看「连接整体」而非单方向——否则长下载/长上传（单方向连续数百秒
     // 纯接收）会在 idle 处被误杀。
@@ -255,9 +289,21 @@ async fn handle_tls_stream(
     ));
     let (c2t, t2c) = {
         let (t_rd, t_wr) = tokio::io::split(target_stream);
+        // 审查 06-P2-2：两泵共享退出通知——任一泵结束（EOF/错误/idle）即唤醒对侧，
+        // 对侧 shutdown 自己的写端并退出，避免 join! 下另一方向空挂至 idle 超时、
+        // 白白占用连接额度与 fd。
+        let exit_notify = Arc::new(tokio::sync::Notify::new());
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
         tokio::join!(
-            pump(rd, t_wr, idle, last_active.clone()),
-            pump(t_rd, wr, idle, last_active.clone())
+            pump(
+                rd,
+                t_wr,
+                idle,
+                last_active.clone(),
+                exit_notify.clone(),
+                exited.clone()
+            ),
+            pump(t_rd, wr, idle, last_active, exit_notify, exited)
         )
     };
     let (up, down) = (c2t.unwrap_or(0), t2c.unwrap_or(0));
@@ -277,11 +323,17 @@ async fn handle_tls_stream(
 /// 最后活跃时间戳，任一方向读到数据即刷新；只有连接整体（双向均）超过 `idle`
 /// 无数据才 shutdown 写端并结束（审查：无 idle 超时时已认证零流量连接可
 /// 无限期占用连接额度与 fd；单方向独立计时会误杀长下载/长上传）。
+///
+/// `peer_exit`/`peer_done`（审查 06-P2-2）：对侧泵结束（EOF/错误/idle）时置位
+/// 并通知本侧立即 shutdown 退出；写错误路径不再跳过 shutdown——所有出口
+/// （EOF/错误/idle/对侧退出）统一走到 shutdown 后返回。
 async fn pump<R, W>(
     mut r: R,
     mut w: W,
     idle: std::time::Duration,
     last_active: Arc<std::sync::atomic::AtomicU64>,
+    peer_exit: Arc<tokio::sync::Notify>,
+    peer_done: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -290,7 +342,11 @@ where
     use std::sync::atomic::Ordering;
     let mut total = 0u64;
     let mut buf = vec![0u8; 16 * 1024]; // 与 TLS 1.3 单记录上限对齐（审查 R-14 同源）
-    loop {
+    let result = loop {
+        // 对侧泵已结束：立即收尾（下行先结束/写错误等场景不再空挂）
+        if peer_done.load(Ordering::Relaxed) {
+            break Ok(total);
+        }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -298,22 +354,38 @@ where
         let last = last_active.load(Ordering::Relaxed);
         let idle_ms = idle.as_millis() as u64;
         if now_ms.saturating_sub(last) >= idle_ms {
-            debug!("relay idle timeout ({}s), closing connection", idle.as_secs());
-            break;
+            debug!(
+                "relay idle timeout ({}s), closing connection",
+                idle.as_secs()
+            );
+            break Ok(total);
         }
-        // read 包超时兜底唤醒（到期后由上方共享时间戳判定是否真正全局空闲）
+        // read 包超时兜底唤醒（到期后由上方共享时间戳判定是否真正全局空闲）；
+        // 对侧退出通知可随时打断阻塞中的 read
         let budget = idle_ms - now_ms.saturating_sub(last);
-        let n = match tokio::time::timeout(
-            std::time::Duration::from_millis(budget),
-            r.read(&mut buf),
-        )
-        .await
-        {
-            Ok(x) => x?,
-            Err(_) => continue, // 超时醒来：回到循环顶部按共享时间戳重新判定
+        let n = tokio::select! {
+            biased;
+            _ = peer_exit.notified() => {
+                if peer_done.load(Ordering::Relaxed) {
+                    break Ok(total);
+                }
+                continue;
+            }
+            x = tokio::time::timeout(
+                std::time::Duration::from_millis(budget),
+                r.read(&mut buf),
+            ) => {
+                match x {
+                    Ok(x) => match x {
+                        Ok(n) => n,
+                        Err(e) => break Err(e), // 读错误：记录后在统一出口 shutdown
+                    },
+                    Err(_) => continue, // 超时醒来：回到循环顶部按共享时间戳重新判定
+                }
+            }
         };
         if n == 0 {
-            break; // 源 EOF → 半关闭：shutdown 写端
+            break Ok(total); // 源 EOF → 半关闭：shutdown 写端
         }
         // 任一方向读到数据：刷新共享时间戳（另一方向的空闲计时随之重置）
         last_active.store(
@@ -323,11 +395,22 @@ where
                 .unwrap_or(0),
             Ordering::Relaxed,
         );
-        w.write_all(&buf[..n]).await?;
+        if let Err(e) = w.write_all(&buf[..n]).await {
+            break Err(e); // 写错误（审查 06-P2-2）：不再直接 ? 跳过 shutdown
+        }
         total += n as u64;
-    }
+    };
+    // 统一出口：EOF/错误/idle/对侧退出——一律 shutdown 写端。
+    // 注意（半关闭语义）：EOF 正常结束**不**通知对侧——对侧方向仍需继续排水
+    // 直至自身 EOF/idle（否则下行在途数据被截断，回环回显测试可复现）。
+    // 仅在**错误**路径通知对侧立即收尾（审查 06-P2-2：写错误后连接已死，
+    // 对侧不再空挂至 idle 超时）。
     let _ = w.shutdown().await;
-    Ok(total)
+    if result.is_err() {
+        peer_done.store(true, Ordering::Relaxed);
+        peer_exit.notify_one();
+    }
+    result.map(|_| total)
 }
 
 #[cfg(test)]
@@ -353,12 +436,28 @@ mod tests {
         let idle = std::time::Duration::from_millis(300);
 
         // 活跃方向：测试侧持续往 a_cli 写 → pump_a 读 a_srv 刷新时间戳
-        let (mut a_cli, mut a_srv) = duplex(64);
+        let (mut a_cli, a_srv) = duplex(64);
         // 静默方向：b_cli 由测试持有（不写不关）→ pump_b 读 b_srv 永远 pending
-        let (_b_cli, mut b_srv) = duplex(64);
+        let (_b_cli, b_srv) = duplex(64);
 
-        let pump_b = tokio::spawn(pump(b_srv, tokio::io::sink(), idle, last_active.clone()));
-        let pump_a = tokio::spawn(pump(a_srv, tokio::io::sink(), idle, last_active));
+        let exit_notify = Arc::new(tokio::sync::Notify::new());
+        let peer_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pump_b = tokio::spawn(pump(
+            b_srv,
+            tokio::io::sink(),
+            idle,
+            last_active.clone(),
+            exit_notify.clone(),
+            peer_done.clone(),
+        ));
+        let pump_a = tokio::spawn(pump(
+            a_srv,
+            tokio::io::sink(),
+            idle,
+            last_active,
+            exit_notify,
+            peer_done,
+        ));
 
         // 静默 pump 运行 1s（约为 idle 的 3 倍），期间活跃 pump 持续喂数据
         for _ in 0..10 {

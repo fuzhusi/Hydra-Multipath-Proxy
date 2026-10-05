@@ -45,9 +45,28 @@ pub fn qr_color_image(text: &str) -> Option<egui::ColorImage> {
     })
 }
 
+/// 解码前缩图上限（长边像素，审查 R-15）：手机相册常见 4000px 级照片直接喂
+/// rqrr 会做全图多次扫描（像素工作量 ~12 倍于 1000px），且在 UI 调用栈同步
+/// 执行时冻结界面。二维码在 ≤1000px 下信息密度绰绰有余。
+const DECODE_MAX_EDGE: u32 = 1000;
+
 /// 从图片文件字节（png/jpg）解码二维码文本；图片中无二维码或解码失败 → Err（中文根因）。
+/// 解码前先缩图至长边 ≤1000px（`image::imageops::resize` 三次插值），降低像素工作量。
 pub fn decode_qr_from_bytes(bytes: &[u8]) -> Result<String, String> {
     let img = image::load_from_memory(bytes).map_err(|e| format!("图片解码失败: {}", e))?;
+    // 缩图：长边超过上限时等比缩小（小图不动，避免放大失真）
+    let (w, h) = (img.width(), img.height());
+    let long_edge = w.max(h);
+    let img = if long_edge > DECODE_MAX_EDGE {
+        let scale = DECODE_MAX_EDGE as f64 / long_edge as f64;
+        let (nw, nh) = (
+            (w as f64 * scale).round() as u32,
+            (h as f64 * scale).round() as u32,
+        );
+        img.resize(nw.max(1), nh.max(1), image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
     let gray = img.to_luma8();
     let mut prepared = rqrr::PreparedImage::prepare(gray);
     let grids = prepared.detect_grids();
@@ -79,14 +98,14 @@ mod tests {
 
         // ColorImage 尺寸 = size + 两侧静区
         let img = qr_color_image(url).unwrap();
-        let total = size as usize + QUIET_ZONE as usize * 2;
+        let total = size + QUIET_ZONE as usize * 2;
         assert_eq!(img.size[0], total);
         assert_eq!(img.size[1], total);
         assert_eq!(img.pixels.len(), total * total);
         // 四角静区全白
         assert_eq!(img.pixels[0], egui::Color32::WHITE);
         // 中心区域应存在黑模块
-        assert!(img.pixels.iter().any(|p| *p == egui::Color32::BLACK));
+        assert!(img.pixels.contains(&egui::Color32::BLACK));
     }
 
     #[test]
@@ -123,6 +142,45 @@ mod tests {
             .write_to(&mut png_buf, image::ImageFormat::Png)
             .expect("PNG 编码应成功");
         let decoded = decode_qr_from_bytes(png_buf.get_ref()).expect("应从 PNG 解码出二维码");
+        assert_eq!(decoded, url);
+    }
+
+    #[test]
+    fn tq_decode_downscales_oversized_image() {
+        // R-15：长边 >1000px 的大图先缩图再解码，仍能正确识别（超清相册图路径）
+        let url = "hydra://192.168.1.100:4433?bandwidth=100&latency=10&loss_rate=0.01&load=0.5&status=online&v=3&k=MTIzNDU2Nzg5MGFiY2RlZg";
+        let (cells, size) = qr_matrix(url).unwrap();
+        let scale: u32 = 40; // total≈(size+8)*40 → 长边 >1000px，触发缩图分支
+        let total = size as u32 + QUIET_ZONE * 2;
+        let mut gray = image::GrayImage::new(total * scale, total * scale);
+        for y in 0..total {
+            for x in 0..total {
+                let v = if x >= QUIET_ZONE
+                    && y >= QUIET_ZONE
+                    && x < total - QUIET_ZONE
+                    && y < total - QUIET_ZONE
+                    && cells[((y - QUIET_ZONE) * size as u32 + (x - QUIET_ZONE)) as usize]
+                {
+                    0u8
+                } else {
+                    255u8
+                };
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        gray.put_pixel(x * scale + dx, y * scale + dy, image::Luma([v]));
+                    }
+                }
+            }
+        }
+        assert!(
+            gray.width() > 1000 && gray.height() > 1000,
+            "测试图必须超限"
+        );
+        let mut png_buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(gray)
+            .write_to(&mut png_buf, image::ImageFormat::Png)
+            .unwrap();
+        let decoded = decode_qr_from_bytes(png_buf.get_ref()).expect("缩图后仍应解码成功");
         assert_eq!(decoded, url);
     }
 

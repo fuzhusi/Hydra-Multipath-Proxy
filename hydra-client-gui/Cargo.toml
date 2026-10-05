@@ -1,18 +1,19 @@
 [package]
 name = "hydra-client-gui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
 eframe = "0.27"
 egui = "0.27"
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-anyhow = "1"
+# 版本统一由根 [workspace.dependencies] 声明（审查 R-31）
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
 rfd = "0.15"
-tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 chrono = "0.4"
 # Exec-C：订阅拉取（轻量阻塞 HTTP，含 rustls https；GUI 后台线程调用，不进解析层依赖）
 ureq = "2"
@@ -20,7 +21,7 @@ ureq = "2"
 fast_qr = "0.12"
 rqrr = "0.7"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-base64 = "0.22"
+base64 = { workspace = true }
 # T2：系统托盘（Tauri 官方库；Windows 下事件经全局通道投递，GUI 线程轮询即可）
 tray-icon = "0.19"
 hydra-client = { path = "../hydra-client" }

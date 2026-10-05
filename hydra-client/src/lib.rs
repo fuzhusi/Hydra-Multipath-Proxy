@@ -4,7 +4,6 @@ pub mod routing;
 pub mod scheduler;
 pub mod share_link;
 pub mod speedtest;
-pub mod splitter;
 pub mod subscription;
 pub mod tcp_transport;
 pub mod traffic;
@@ -19,7 +18,6 @@ pub use routing::*;
 pub use scheduler::*;
 pub use share_link::*;
 pub use speedtest::*;
-pub use splitter::*;
 pub use subscription::*;
 pub use tcp_transport::*;
 pub use traffic::*;
@@ -68,8 +66,6 @@ pub fn node_certs_from_paths(paths: &str) -> Result<Vec<Vec<u8>>, String> {
         .split(',')
         .map(|p| p.trim())
         .filter(|p| !p.is_empty())
-        .map(|p| {
-            std::fs::read(p).map_err(|e| format!("读取节点证书 {} 失败: {}", p, e))
-        })
+        .map(|p| std::fs::read(p).map_err(|e| format!("读取节点证书 {} 失败: {}", p, e)))
         .collect()
 }

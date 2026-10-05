@@ -3,7 +3,7 @@ use hydra_client::tcp_transport::TlsTrust;
 use hydra_client::ProxyServer;
 use hydra_protocol::Result;
 use std::net::SocketAddr;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// P2P 实验参数（--p2p 出现时走演示流程）
 struct P2pArgs {
@@ -25,17 +25,40 @@ fn tun_config_from_env(nodes: &[SocketAddr]) -> hydra_client::tun::TunConfig {
     if let Ok(s) = std::env::var("HYDRA_TUN_ADDR") {
         if let Some((ip, prefix)) = s.trim().split_once('/') {
             if let (Ok(ip), Ok(prefix)) = (ip.parse::<std::net::Ipv4Addr>(), prefix.parse::<u8>()) {
-                cfg.addr = ip;
-                cfg.prefix = prefix;
+                // 审查 06-P2-9：prefix>32 会使掩码计算下溢（debug panic / release
+                // 错误接管路由）——非法时保持默认 /30 并明确告警
+                if prefix <= 32 {
+                    cfg.addr = ip;
+                    cfg.prefix = prefix;
+                } else {
+                    error!(
+                        "HYDRA_TUN_ADDR 前缀长度 {prefix} 非法（须 ≤32），使用默认 {}/30",
+                        cfg.addr
+                    );
+                }
             }
         } else if let Ok(ip) = s.trim().parse::<std::net::Ipv4Addr>() {
             cfg.addr = ip;
         }
     }
-    // 防环路关键：节点 IP 豁免（IPv6 节点不适用本 v1 TUN 方案，如实忽略）
+    // IPv6 接管开关（07-P1-2 修复）：默认**关**（proto-ipv4 栈下开启接管即 v6 黑洞）；
+    // HYDRA_TUN_IPV6=1 显式开启（开启后有 SYN-RST/ICMPv6 不可达代答快速失败兜底）
+    if let Ok(v) = std::env::var("HYDRA_TUN_IPV6") {
+        if v.trim() == "1" {
+            cfg.ipv6_enabled = true;
+        }
+    }
+    // TUN v6 网关占位地址覆盖（形如 fd07::1；接管路由 via 指向它）
+    if let Ok(s) = std::env::var("HYDRA_TUN_ADDR6") {
+        if let Ok(ip) = s.trim().parse::<std::net::Ipv6Addr>() {
+            cfg.addr6 = ip;
+        }
+    }
+    // 防环路关键：节点 IP 豁免（IPv4 /32；IPv6 节点进 v6 豁免清单，/128 回物理网关 v6）
     for n in nodes {
-        if let std::net::IpAddr::V4(ip) = n.ip() {
-            cfg.exclude_routes.push(ip);
+        match n.ip() {
+            std::net::IpAddr::V4(ip) => cfg.exclude_routes.push(ip),
+            std::net::IpAddr::V6(ip) => cfg.exclude_routes_v6.push(ip),
         }
     }
     // 系统 DNS 豁免（best-effort；DNS 明文直出物理网卡——v1 无 DNS 劫持，如实边界）
@@ -43,15 +66,18 @@ fn tun_config_from_env(nodes: &[SocketAddr]) -> hydra_client::tun::TunConfig {
         cfg.exclude_routes.push(dns);
     }
     if let Ok(s) = std::env::var("HYDRA_TUN_EXCLUDE") {
-        for ip in s.split(',').filter_map(|p| p.trim().parse().ok()) {
-            cfg.exclude_routes.push(ip);
+        for ip in s
+            .split(',')
+            .filter_map(|p| p.trim().parse::<std::net::IpAddr>().ok())
+        {
+            match ip {
+                std::net::IpAddr::V4(v4) => cfg.exclude_routes.push(v4),
+                std::net::IpAddr::V6(v6) => cfg.exclude_routes_v6.push(v6),
+            }
         }
     }
     if let Ok(s) = std::env::var("HYDRA_TUN_PORTS") {
-        let ports: Vec<u16> = s
-            .split(',')
-            .filter_map(|p| p.trim().parse().ok())
-            .collect();
+        let ports: Vec<u16> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
         if !ports.is_empty() {
             cfg.listen_ports = ports;
         }
@@ -117,16 +143,27 @@ fn parse_args() -> (Option<SocketAddr>, Vec<SocketAddr>, Option<P2pArgs>) {
                 i += 2;
             }
             "--node" => {
-                let n = args
-                    .get(i + 1)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap());
-                let p = p2p.get_or_insert_with(|| P2pArgs {
-                    my_peer_id: String::new(),
-                    peer_id: String::new(),
-                    node: n,
-                });
-                p.node = n;
+                // 审查 06-P2-7：--node 仅是 P2P 演示的节点参数——不得无条件把常规
+                // 代理调用劫持进 demo 流程（仅当 --p2p/--peer 已出现时才写入）；
+                // 解析失败按参数错误明确退出（不再静默回退 127.0.0.1:0）
+                let Some(raw) = args.get(i + 1) else {
+                    error!("--node 需要参数 <节点地址:端口>");
+                    std::process::exit(1);
+                };
+                let Ok(n) = raw.parse::<SocketAddr>() else {
+                    error!(
+                        "--node 参数 \"{}\" 无法解析（应为 地址:端口，如 1.2.3.4:443）",
+                        raw
+                    );
+                    std::process::exit(1);
+                };
+                match p2p.as_mut() {
+                    Some(p) => p.node = n,
+                    None => {
+                        error!("--node 仅在 P2P 演示模式下有效：请先给出 --p2p <我的peer_id> 与 --peer <对方peer_id>；常规代理请直接用位置参数指定节点");
+                        std::process::exit(1);
+                    }
+                }
                 i += 2;
             }
             "--help" | "-h" => {
@@ -138,10 +175,12 @@ fn parse_args() -> (Option<SocketAddr>, Vec<SocketAddr>, Option<P2pArgs>) {
                     "  --tun                在 SOCKS 监听之外叠加启动 TUN 虚拟网卡接管系统流量\n                       （Windows 需管理员运行且 wintun.dll 可用；Linux 需 root）"
                 );
                 println!(
-                    "  HYDRA_TUN=1          同 --tun；HYDRA_TUN_ADDR 覆盖 TUN 地址（默认 10.7.0.1/30）\n                       HYDRA_TUN_EXCLUDE 额外豁免 IP（逗号分隔，/32 回物理网关）\n                       HYDRA_TUN_PORTS 覆盖拦截端口列表（默认 80,443,8080,8443；\n                       smoltcp 无通配监听，v1 已知限制）\n                       HYDRA_TUN_DNS/HYDRA_TUN_GW 手动指定 DNS/物理网关（默认自动探测）"
+                    "  HYDRA_TUN=1          同 --tun；HYDRA_TUN_ADDR 覆盖 TUN 地址（默认 10.7.0.1/30）\n                       HYDRA_TUN_EXCLUDE 额外豁免 IP（逗号分隔，/32 回物理网关）\n                       HYDRA_TUN_PORTS 覆盖拦截端口列表（默认 80,443,8080,8443；\n                       smoltcp 无通配监听，v1 已知限制）\n                       HYDRA_TUN_DNS/HYDRA_TUN_GW 手动指定 DNS/物理网关（默认自动探测）\n                       HYDRA_TUN_IPV6=1 开启 IPv6 接管（默认关；栈不支持 v6 转发，\n                       开启后 v6 连接将收到快速失败回落 IPv4；关闭时 v6 不经代理）\n                       HYDRA_TUN_GW6 手动指定物理网关 IPv6；HYDRA_TUN_IF Windows 下\n                       netsh v6 路由所需的 TUN 适配器名"
                 );
                 println!("P2P 打洞实验（NAT 穿透 §3.3，本轮仅验证输出，不接入代理热路径）:");
-                println!("  --p2p <我的peer_id>  出现即走 P2P 演示流程（探测→信令→打洞→打印结果后退出）");
+                println!(
+                    "  --p2p <我的peer_id>  出现即走 P2P 演示流程（探测→信令→打洞→打印结果后退出）"
+                );
                 println!("  --peer <对方peer_id>  对端信令路由键");
                 println!("  --node <节点地址:端口> 信令/中继节点地址");
                 println!("环境变量:");
@@ -184,10 +223,36 @@ fn trust_from_env() -> std::result::Result<TlsTrust, String> {
         Ok("ca") => {
             let pin = std::env::var("HYDRA_CERT_SHA256")
                 .ok()
-                .filter(|s| !s.trim().is_empty());
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            // 审查 06-P3-5（Wave 3 修复）：叶 pin 启动时做格式校验——此前畸形 pin
+            // （长度/字符错）要到每条连接握手后才报误导性错误，现在启动即失败。
+            if let Some(p) = &pin {
+                if p.len() != 64 || !p.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(
+                        "HYDRA_CERT_SHA256 格式非法：需要 64 位 hex 字符（SHA-256 摘要），\
+                         当前值将无法与任何证书匹配"
+                            .to_string(),
+                    );
+                }
+            }
+            if pin.is_none() {
+                // 审查 06-P2-5：CA 模式无叶 pin 时，Noise confirm 只能防跨会话转发，
+                // 防不了持合法证书的终结式 MITM——节点身份仅由公共 CA + 共享 PSK
+                // 保密性保证；任一客户端泄露 PSK 即全体节点可被主动中间人。明示告警。
+                warn!(
+                    "HYDRA_TRUST=ca 且未设置 HYDRA_CERT_SHA256：无叶证书硬 pin，\
+                     节点身份仅由公共 CA 与 PSK 保密性保证（PSK 泄露即可被 MITM），\
+                     建议设置 HYDRA_CERT_SHA256=<节点叶证书 SHA-256>"
+                );
+            }
             info!(
                 "TLS 信任模式：公共 CA（真证书部署）{}",
-                if pin.is_some() { "+ 叶证书硬 pin" } else { "" }
+                if pin.is_some() {
+                    "+ 叶证书硬 pin"
+                } else {
+                    ""
+                }
             );
             Ok(TlsTrust::public_ca(pin))
         }
@@ -206,13 +271,16 @@ fn trust_from_env() -> std::result::Result<TlsTrust, String> {
 /// 本轮仅验证输出，直连流不接入代理热路径。
 async fn run_p2p_demo(p2p: P2pArgs, trust: TlsTrust, auth_key: Vec<u8>) -> Result<()> {
     if p2p.my_peer_id.is_empty() || p2p.peer_id.is_empty() {
-        error!("--p2p 演示需同时提供 --p2p <我的peer_id> --peer <对方peer_id> --node <节点地址:端口>");
+        error!(
+            "--p2p 演示需同时提供 --p2p <我的peer_id> --peer <对方peer_id> --node <节点地址:端口>"
+        );
         std::process::exit(1);
     }
     let sni = std::env::var("HYDRA_SNI").unwrap_or_default();
 
     // 公网地址发现（未设 HYDRA_STUN_ADDRS = 功能关闭，直接回落中继）
-    let stun_addrs = match nat::stun_addrs_from_env() {
+    // 审查 06-P2-4：改用带 DNS 解析的版本，域名写法（文档主路径）不再必然失败
+    let stun_addrs = match nat::stun_addrs_from_env_resolved().await {
         Ok(v) => v,
         Err(e) => {
             println!("fell back to relay (stun disabled: {e})");
@@ -262,6 +330,10 @@ async fn run_p2p_demo(p2p: P2pArgs, trust: TlsTrust, auth_key: Vec<u8>) -> Resul
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    // 审查 R-30 收尾：启动时读取一次 HYDRA_TRANSPORT——设了 legacy `quic` 时
+    // 如实告警回退 tcp（兑现 README 行为；此前该函数零调用，告警不存在）
+    let _transport = hydra_client::tcp_transport::transport_from_env();
+
     let (listen_arg, nodes, p2p) = parse_args();
 
     let auth_key = match hydra_client::auth_key_from_env() {
@@ -294,7 +366,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "127.0.0.1:1080".parse().unwrap());
 
     if nodes.is_empty() {
-        error!("用法: hydra-client [--listen <监听地址:端口>] [--tun] <节点地址:端口> [更多节点...]");
+        error!(
+            "用法: hydra-client [--listen <监听地址:端口>] [--tun] <节点地址:端口> [更多节点...]"
+        );
         error!("请同时设置环境变量 HYDRA_AUTH_KEY（认证密钥 hex）和 HYDRA_NODE_CERT（节点证书文件路径）");
         std::process::exit(1);
     }
@@ -340,10 +414,11 @@ async fn main() -> Result<()> {
             );
             // 保存 JoinHandle：停机时等待栈任务退出（RouteGuard Drop 清理路由）
             let tun_task = tokio::spawn(async move {
-                if let Err(e) =
-                    hydra_client::tun::run_tun(tcfg, opener, shutdown2).await
-                {
-                    error!("TUN 模式启动失败: {}（设备创建需管理员/root；Windows 还需 wintun.dll）", e);
+                if let Err(e) = hydra_client::tun::run_tun(tcfg, opener, shutdown2).await {
+                    error!(
+                        "TUN 模式启动失败: {}（设备创建需管理员/root；Windows 还需 wintun.dll）",
+                        e
+                    );
                     // 路由半接管比不接管更糟：明确退出
                     std::process::exit(1);
                 }

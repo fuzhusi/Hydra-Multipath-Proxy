@@ -17,15 +17,15 @@ mod common;
 
 use common::{spawn_node_with_p2p, TEST_KEY_HEX};
 use hydra_client::nat::{
-    discover_full, discover_public_address, parse_stun_addrs, punch_open_and_verify, punch_direct,
-    stun_addrs_from_env, PunchParams, PUNCH_WINDOW,
+    discover_full, discover_public_address, parse_stun_addrs, punch_direct, punch_open_and_verify,
+    PunchParams, PUNCH_WINDOW,
 };
 use hydra_client::tcp_transport::{connect_target, TlsTrust};
 use hydra_node::signal::{SignalDownMessage, SignalMessage};
 use std::net::SocketAddr;
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use std::time::{Duration, Instant};
 use tokio::io::ReadHalf;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 // ── 假 STUN 服务器（RFC 5389 手工构造）─────────────────────────────────────
@@ -106,7 +106,11 @@ async fn spawn_fake_stun_eim_pair() -> (SocketAddr, SocketAddr) {
                 tokio::spawn(async move {
                     let tx = read_request(&mut sock).await;
                     let client = sock.peer_addr().unwrap();
-                    let port = *seen.lock().unwrap().entry(client.ip()).or_insert(client.port());
+                    let port = *seen
+                        .lock()
+                        .unwrap()
+                        .entry(client.ip())
+                        .or_insert(client.port());
                     let resp = binding_success(&tx, SocketAddr::new(client.ip(), port));
                     let _ = sock.write_all(&resp).await;
                 });
@@ -122,31 +126,27 @@ async fn spawn_fake_stun_eim_pair() -> (SocketAddr, SocketAddr) {
 // ── 地址发现 + 分类 ─────────────────────────────────────────────────────────
 
 #[test]
-fn env_未设置_特定错误_设置则解析() {
-    // 无 env → 特定错误（功能关闭语义）；测试进程内先确保移除，避免其他用例残留
-    std::env::remove_var("HYDRA_STUN_ADDRS");
-    let err = stun_addrs_from_env().unwrap_err();
-    assert!(
-        err.to_string().contains("HYDRA_STUN_ADDRS"),
-        "应为 HYDRA_STUN_ADDRS 特定错误: {err}"
-    );
-
-    // 设置 → 正常解析
-    std::env::set_var("HYDRA_STUN_ADDRS", "127.0.0.1:3478, 127.0.0.1:3479");
-    let v = stun_addrs_from_env().unwrap();
+fn stun地址解析_注入列表_空与非法报特定错误() {
+    // 07-P2-4：不再 set/remove HYDRA_STUN_ADDRS（进程级 env 写入与并行测试线程
+    // 的 env 读取构成数据竞争）——改测参数化入口 parse_stun_addrs；discover 的
+    // 服务器列表注入见 discover_* 系列用例（直接传 &[SocketAddr]）。
+    let v = parse_stun_addrs("127.0.0.1:3478, 127.0.0.1:3479").unwrap();
     assert_eq!(
         v,
-        parse_stun_addrs("127.0.0.1:3478,127.0.0.1:3479").unwrap()
+        vec![
+            "127.0.0.1:3478".parse::<SocketAddr>().unwrap(),
+            "127.0.0.1:3479".parse::<SocketAddr>().unwrap()
+        ]
     );
-    // 清理，避免污染并行测试进程内的其他 env 断言
-    std::env::remove_var("HYDRA_STUN_ADDRS");
-
     // 空值/非法值同样是特定错误
-    std::env::set_var("HYDRA_STUN_ADDRS", "  ");
-    assert!(stun_addrs_from_env().is_err());
-    std::env::set_var("HYDRA_STUN_ADDRS", "not-an-addr");
-    assert!(stun_addrs_from_env().is_err());
-    std::env::remove_var("HYDRA_STUN_ADDRS");
+    assert!(parse_stun_addrs("  ")
+        .unwrap_err()
+        .to_string()
+        .contains("HYDRA_STUN_ADDRS"));
+    assert!(parse_stun_addrs("not-an-addr")
+        .unwrap_err()
+        .to_string()
+        .contains("非法地址"));
 }
 
 #[tokio::test]
@@ -216,10 +216,7 @@ async fn connect_signal(
     (BufReader::new(rd), wr)
 }
 
-async fn send_msg(
-    wr: &mut hydra_client::tcp_transport::TcpWriteHalf,
-    msg: &SignalMessage,
-) {
+async fn send_msg(wr: &mut hydra_client::tcp_transport::TcpWriteHalf, msg: &SignalMessage) {
     let line = serde_json::to_string(msg).unwrap();
     wr.write_all(line.as_bytes()).await.unwrap();
     wr.write_all(b"\n").await.unwrap();
@@ -275,7 +272,8 @@ async fn invite_until_online(
 #[tokio::test]
 async fn 客户端视角信令全链路() {
     let node = spawn_node_with_p2p().await;
-    let (mut alice_rd, mut alice_wr) = connect_signal(node.addr, &node.cert, "a6a6a6a6a6a6a6a6").await;
+    let (mut alice_rd, mut alice_wr) =
+        connect_signal(node.addr, &node.cert, "a6a6a6a6a6a6a6a6").await;
     let (mut bob_rd, mut bob_wr) = connect_signal(node.addr, &node.cert, "b7b7b7b7b7b7b7b7").await;
 
     send_msg(
@@ -283,6 +281,7 @@ async fn 客户端视角信令全链路() {
         &SignalMessage::Register {
             peer_id: "a6a6a6a6a6a6a6a6".into(),
             mapped: "127.0.0.1:41001".into(),
+            proof: hydra_protocol::p2p_owner_proof(&test_auth_key(), "a6a6a6a6a6a6a6a6"),
         },
     )
     .await;
@@ -291,6 +290,7 @@ async fn 客户端视角信令全链路() {
         &SignalMessage::Register {
             peer_id: "b7b7b7b7b7b7b7b7".into(),
             mapped: "127.0.0.1:41002".into(),
+            proof: hydra_protocol::p2p_owner_proof(&test_auth_key(), "b7b7b7b7b7b7b7b7"),
         },
     )
     .await;
@@ -361,9 +361,10 @@ async fn 打洞核心_loopback_同时打开_握手_nonce回显() {
         .await
     });
     // B：listener 绑候选端口（A 来连），出站候选不可达
-    let peer_b = tokio::spawn(async move {
-        punch_open_and_verify(b_cand, &[dead], &key, PUNCH_WINDOW).await
-    });
+    let peer_b =
+        tokio::spawn(
+            async move { punch_open_and_verify(b_cand, &[dead], &key, PUNCH_WINDOW).await },
+        );
 
     let (ra, rb) = tokio::join!(peer_a, peer_b);
     let sa = ra.unwrap().expect("A 端（connect 路径）应建成经验证的直连");
@@ -384,6 +385,7 @@ async fn 打洞核心_nonce相同判自连拒绝() {
     // 该防线在 verify_stream 内部，经 duplex 流单测等价覆盖：两端 nonce 相同
     // 时的拒绝分支由「本端读到的对端 nonce == 自己 nonce」触发。此处直接验证
     // 打洞窗口超时路径：候选不可达 + 无 listener（另端不监听）→ None。
+    // （同时即 06 报告 P3-7④ 的确认：EIM 全候选不可达 → 窗口超时回落 None）
     let dead: SocketAddr = "127.0.0.1:44999".parse().unwrap();
     let r = punch_open_and_verify(
         "127.0.0.1:0".parse().unwrap(),
@@ -393,6 +395,200 @@ async fn 打洞核心_nonce相同判自连拒绝() {
     )
     .await;
     assert!(r.is_none(), "候选不可达应在窗口内返回 None");
+}
+
+/// hairpin 自连拒绝（06 报告 P1-4 / P3-7①）：候选指向「自身映射地址+同端口」。
+/// loopback 上「映射地址」即本端 listener 地址，等价于 hairpin 回环的最贴近替身：
+/// 出站 connect 命中本端 listener 时，第一层过滤（对端地址 == 本端 listener 地址）
+/// 直接丢弃；即便穿透该层，同进程两端共享同一 nonce 也会被 verify_stream 判自连
+/// 拒绝（nonce 同源防线单测覆盖）。两条防线叠加 → 窗口内必须回落 None，
+/// 不得建成静默回环隧道。
+#[tokio::test]
+async fn hairpin_自连候选_双防线拒绝回落None() {
+    // 取一个端口并释放，供 punch listener 绑定（REUSEADDR 下亦可共存，先释放更稳）
+    let self_addr = free_loopback_port().await;
+    let self_cand: SocketAddr = format!("127.0.0.1:{self_addr}").parse().unwrap();
+    let start = Instant::now();
+    let r = punch_open_and_verify(
+        self_cand,
+        &[self_cand],
+        &test_auth_key(),
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(r.is_none(), "hairpin 自连候选必须被拒绝，不得返回连接");
+    // 自连被丢弃后本端 listener 仍在窗口内等待对端（loopback 无对端），
+    // 回落发生在窗口耗尽：断言耗时有界（不忙等、不久挂）
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "自连拒绝后应在窗口内回落（实际 {:?}）",
+        start.elapsed()
+    );
+}
+
+/// 多候选（06 报告 P3-7③）：候选列表含死地址在前、可达候选在后时，
+/// 任一成功即可建成直连（死候选毫秒级失败不拖垮整体）。
+#[tokio::test]
+async fn 打洞核心_多候选_死活混合_任一成功即建成() {
+    let pb = free_loopback_port().await;
+    let b_cand: SocketAddr = format!("127.0.0.1:{pb}").parse().unwrap();
+    let dead: SocketAddr = "127.0.0.1:44998".parse().unwrap();
+    let key = test_auth_key();
+
+    // A：候选 = [死地址, B 可达候选]；B：listener 绑候选端口，出站候选死地址
+    let key_a = key.clone();
+    let peer_a = tokio::spawn(async move {
+        punch_open_and_verify(
+            "127.0.0.1:0".parse().unwrap(),
+            &[dead, b_cand],
+            &key_a,
+            PUNCH_WINDOW,
+        )
+        .await
+    });
+    let peer_b =
+        tokio::spawn(
+            async move { punch_open_and_verify(b_cand, &[dead], &key, PUNCH_WINDOW).await },
+        );
+
+    let (ra, rb) = tokio::join!(peer_a, peer_b);
+    assert!(ra.unwrap().is_some(), "多候选中任一可达即应建成（A 端）");
+    assert!(rb.unwrap().is_some(), "B 端（accept 路径）应建成");
+}
+
+/// 信令断线重连（06 报告 P3-7②）：注册后断开连接，同 peer_id + 正确 proof
+/// 重新注册应被接受，且后续 invite 能送达重连后的会话。
+#[tokio::test]
+async fn 信令断线重连_同peer_id_正确proof重注册后收invite() {
+    let node = spawn_node_with_p2p().await;
+    let pid = "e5e5e5e5e5e5e5e5";
+
+    // 第一次注册后立即断开（模拟客户端崩溃/网络闪断）
+    {
+        let (mut rd, mut wr) = connect_signal(node.addr, &node.cert, pid).await;
+        send_msg(
+            &mut wr,
+            &SignalMessage::Register {
+                peer_id: pid.into(),
+                mapped: "127.0.0.1:41005".into(),
+                proof: hydra_protocol::p2p_owner_proof(&test_auth_key(), pid),
+            },
+        )
+        .await;
+        // 等注册落地后再断开（写后即 drop 可能在节点读取前关闭）
+        let mut line = String::new();
+        let _ = tokio::time::timeout(Duration::from_millis(300), rd.read_line(&mut line)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 重连：同 peer_id + 正确 proof 重新注册
+    let (mut alice_rd, mut _alice_wr) = connect_signal(node.addr, &node.cert, pid).await;
+    send_msg(
+        &mut _alice_wr,
+        &SignalMessage::Register {
+            peer_id: pid.into(),
+            mapped: "127.0.0.1:41006".into(),
+            proof: hydra_protocol::p2p_owner_proof(&test_auth_key(), pid),
+        },
+    )
+    .await;
+
+    // bob 注册并 invite alice → 重连后的 alice 会话应收到 incoming
+    let (mut bob_rd, mut bob_wr) = connect_signal(node.addr, &node.cert, "f6f6f6f6f6f6f6f6").await;
+    send_msg(
+        &mut bob_wr,
+        &SignalMessage::Register {
+            peer_id: "f6f6f6f6f6f6f6f6".into(),
+            mapped: "127.0.0.1:41007".into(),
+            proof: hydra_protocol::p2p_owner_proof(&test_auth_key(), "f6f6f6f6f6f6f6f6"),
+        },
+    )
+    .await;
+    invite_until_online(
+        &mut bob_wr,
+        &mut bob_rd,
+        pid,
+        vec!["127.0.0.1:41007".into()],
+    )
+    .await;
+    match recv_msg(&mut alice_rd).await {
+        SignalDownMessage::Incoming { from, cand } => {
+            assert_eq!(from, "f6f6f6f6f6f6f6f6");
+            assert_eq!(cand, vec!["127.0.0.1:41007".to_string()]);
+        }
+        other => panic!("重连后应收到 incoming，实际 {other:?}"),
+    }
+}
+
+/// 多候选信令转发（06 报告 P3-7③ 信令层）：invite/accept 携带多条候选
+/// （含非法/死地址形态）时节点必须原样转发，交由打洞层「任一成功」裁决。
+#[tokio::test]
+async fn 信令_多候选完整转发() {
+    let node = spawn_node_with_p2p().await;
+    let (mut alice_rd, mut alice_wr) =
+        connect_signal(node.addr, &node.cert, "a7a7a7a7a7a7a7a7").await;
+    let (mut bob_rd, mut bob_wr) = connect_signal(node.addr, &node.cert, "b8b8b8b8b8b8b8b8").await;
+    for (pid, mapped) in [
+        ("a7a7a7a7a7a7a7a7", "127.0.0.1:41011"),
+        ("b8b8b8b8b8b8b8b8", "127.0.0.1:41012"),
+    ] {
+        let target_wr: &mut hydra_client::tcp_transport::TcpWriteHalf = if pid.starts_with('a') {
+            &mut alice_wr
+        } else {
+            &mut bob_wr
+        };
+        send_msg(
+            target_wr,
+            &SignalMessage::Register {
+                peer_id: pid.into(),
+                mapped: mapped.into(),
+                proof: hydra_protocol::p2p_owner_proof(&test_auth_key(), pid),
+            },
+        )
+        .await;
+    }
+
+    // alice invite bob：候选 = [死地址, 公网形态地址, 内网形态地址] 多条
+    let cands = vec![
+        "127.0.0.1:44997".to_string(),
+        "203.0.113.7:45001".to_string(),
+        "192.168.1.50:45002".to_string(),
+    ];
+    invite_until_online(
+        &mut alice_wr,
+        &mut alice_rd,
+        "b8b8b8b8b8b8b8b8",
+        cands.clone(),
+    )
+    .await;
+    match recv_msg(&mut bob_rd).await {
+        SignalDownMessage::Incoming { from, cand } => {
+            assert_eq!(from, "a7a7a7a7a7a7a7a7");
+            assert_eq!(cand, cands, "多候选必须完整有序转发");
+        }
+        other => panic!("应收到 incoming，实际 {other:?}"),
+    }
+
+    // bob accept 回多条候选 → alice 收 accepted 同样完整
+    let resp_cands = vec![
+        "203.0.113.9:45003".to_string(),
+        "10.0.0.5:45004".to_string(),
+    ];
+    send_msg(
+        &mut bob_wr,
+        &SignalMessage::Accept {
+            to: "a7a7a7a7a7a7a7a7".into(),
+            cand: resp_cands.clone(),
+        },
+    )
+    .await;
+    match recv_msg(&mut alice_rd).await {
+        SignalDownMessage::Accepted { from, cand } => {
+            assert_eq!(from, "b8b8b8b8b8b8b8b8");
+            assert_eq!(cand, resp_cands, "accept 多候选必须完整有序转发");
+        }
+        other => panic!("应收到 accepted，实际 {other:?}"),
+    }
 }
 
 /// 完整 punch_direct 端到端（loopback）：节点信令 + 假 STUN 回显真实本地地址

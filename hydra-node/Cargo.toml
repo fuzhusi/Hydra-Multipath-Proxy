@@ -1,6 +1,6 @@
 [package]
 name = "hydra-node"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [[bin]]
@@ -8,22 +8,26 @@ name = "hydra-node"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-rustls = "0.21"
-# TCP/TLS 传输（与 rustls 0.21 兼配的 tokio 适配层）
-tokio-rustls = "0.24"
-ring = "0.16"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-bytes = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 版本统一由根 [workspace.dependencies] 声明（审查 R-31）
+tokio = { workspace = true }
+rustls = { workspace = true }
+# TCP/TLS 传输（与 rustls 0.23 兼配的 tokio 适配层，Wave 3 升级）
+tokio-rustls = { workspace = true }
+ring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 toml = "0.8"
-anyhow = "1"
-thiserror = "1"
-rcgen = "0.10"
-# 真证书部署（审查协议评估 P0）：解析 ACME 产出的 PEM fullchain/key
-rustls-pemfile = "1"
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+# rcgen 0.13（Wave 3 随 rustls 0.23 升级）：内部 ring 0.17，与全工作区单 ring 对齐；
+# KeyPair::serialize_der 产 PKCS#8 DER，与 PrivateKeyDer::Pkcs8 直接兼容
+rcgen = "0.13"
+# 真证书部署（审查协议评估 P0）：解析 ACME 产出的 PEM fullchain/key。
+# 2.x 返回 rustls-pki-types 的 CertificateDer/PrivateKeyDer（Wave 3 随 rustls 0.23 升级）
+rustls-pemfile = "2"
 hydra-protocol = { path = "../hydra-protocol" }
 
 [dev-dependencies]

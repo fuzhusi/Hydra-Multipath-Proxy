@@ -153,6 +153,13 @@ fn parse_u32_field(
     default: u32,
 ) -> Result<u32, String> {
     if let Some(v) = env_v {
+        // 空白 env 值 = 未设置（模块约定）：回落文件值/默认，而非解析失败启动退出
+        if v.trim().is_empty() {
+            return match file_v {
+                Some(n) => Ok(n),
+                None => Ok(default),
+            };
+        }
         return v
             .trim()
             .parse::<u32>()
@@ -330,4 +337,41 @@ pub fn init_tracing(level: &str) -> Result<(), String> {
     };
     tracing_subscriber::fmt().with_env_filter(filter).init();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 审查 N-08：空白 env 值 = 未设置，回落文件值/默认而非启动失败
+    #[test]
+    fn parse_u32_field_空白env回落文件与默认() {
+        // 空白 env + 无文件值 → 默认
+        assert_eq!(
+            parse_u32_field(Some(&"  ".to_string()), None, "HYDRA_MAX_CONNECTIONS", 1000)
+                .unwrap(),
+            1000
+        );
+        // 空白 env + 有文件值 → 文件值优先级保持（env 未设置语义）
+        assert_eq!(
+            parse_u32_field(
+                Some(&"\t".to_string()),
+                Some(500),
+                "HYDRA_MAX_CONNECTIONS",
+                1000
+            )
+            .unwrap(),
+            500
+        );
+        // 非空白合法值照常解析
+        assert_eq!(
+            parse_u32_field(Some(&" 42 ".to_string()), Some(500), "X", 1000).unwrap(),
+            42
+        );
+        // 非空白非法值仍显式报错（绝不静默吞错）
+        assert!(parse_u32_field(Some(&"abc".to_string()), None, "X", 1000).is_err());
+        // env 未设置：文件值 > 默认
+        assert_eq!(parse_u32_field(None, Some(7), "X", 1000).unwrap(), 7);
+        assert_eq!(parse_u32_field(None, None, "X", 1000).unwrap(), 1000);
+    }
 }

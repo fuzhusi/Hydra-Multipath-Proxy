@@ -168,6 +168,8 @@ fn derive_confirm(
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    // ring 0.17 弃用告警豁免：常量时间比较正是所需语义（见 auth.rs 同处注释）
+    #[allow(deprecated)]
     ring::constant_time::verify_slices_are_equal(a, b).is_ok()
 }
 
@@ -372,7 +374,7 @@ mod tests {
         }
 
         // 第一轮：真实握手，录制客户端全部出站字节
-        let (mut c_send, mut s_recv) = duplex(4096);
+        let (c_send, mut s_recv) = duplex(4096);
         let (mut s_send, mut c_recv) = duplex(4096);
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded2 = recorded.clone();
@@ -389,8 +391,9 @@ mod tests {
             server_side(&mut s_send, &mut s_recv, &PSK, &CERT_FP, &EXPORTER).await
         });
         let (c, s) = tokio::join!(client, server);
-        c.unwrap();
-        s.unwrap();
+        // 显式绑定丢弃返回值（confirm 摘要），同时以 expect 断言成功
+        let _confirm_c = c.expect("客户端握手应成功");
+        let _confirm_s = s.expect("服务端握手应成功");
 
         // 第二轮：把录下的完整 transcript（0x03+msg1+confirm_c）原样重放到新服务端
         // ——新服务端 e 新鲜 → hash 不同 → 重放的 confirm_c 必不匹配 → 拒绝。
@@ -398,7 +401,7 @@ mod tests {
         let transcript = recorded.lock().unwrap().clone();
         assert_eq!(transcript.len(), 1 + MSG1_LEN + CONFIRM_LEN);
         let (mut a_send, mut a_recv) = duplex(4096);
-        let (mut b_send, mut b_recv) = duplex(4096);
+        let (mut b_send, _b_recv) = duplex(4096);
         let (res_tx, res_rx) = tokio::sync::oneshot::channel::<bool>();
         let _server2 = tokio::spawn(async move {
             let mut ver = [0u8; 1];

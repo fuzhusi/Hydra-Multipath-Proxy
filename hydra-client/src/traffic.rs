@@ -39,90 +39,50 @@ pub struct TrafficMonitor {
     total_connections: AtomicU64,
     /// 启动时间
     start_time: Instant,
-    /// 速度计算历史（std Mutex：poll_read/poll_write 上下文内无 await，可同步短临界区累加）
+    /// 速度计算历史（std Mutex：仅 get_stats 快照路径加锁，每 500ms 一次；
+    /// 热路径 record_sent/received_sync 只做原子累加，不再触碰此锁——R-28）。
+    ///
+    /// 样本语义（R-28 修复）：记录「时刻 + 累计字节计数快照」，速度 = 窗口两端
+    /// 计数差 / 时间差。原先每个 64KB 数据块都加锁 push 一次增量样本，高吞吐下
+    /// Mutex 在 relay 热路径上形成强竞争；采样移入 get_stats 后热路径零锁。
+    /// 此数据仅服务 GUI 速度显示；speedtest 吞吐差分读取的 node_traffic 条目
+    /// 本就是纯原子（NodeTrafficEntry），不受本次改动影响。
     speed_history: Mutex<SpeedHistory>,
     /// 按节点流量计数（socket 地址 → 条目；节点路径中继在包装流时创建，直连路径无条目）
     node_traffic: Mutex<HashMap<SocketAddr, Arc<NodeTrafficEntry>>>,
 }
 
-/// 速度计算历史记录
+/// 速度计算历史记录（R-28：样本 = (时刻, 累计字节计数快照)，仅在 get_stats 加锁写入）
 struct SpeedHistory {
-    /// 最近的上传字节数记录 (timestamp, bytes)
+    /// 最近的上传累计计数快照 (timestamp, bytes_sent_total)
     sent_samples: Vec<(Instant, u64)>,
-    /// 最近的下载字节数记录 (timestamp, bytes)
+    /// 最近的下载累计计数快照 (timestamp, bytes_received_total)
     recv_samples: Vec<(Instant, u64)>,
-    /// 最后一次的速度值
+    /// 最后一次的速度值（样本不足/时间差为零时保持上值，避免显示抖动归零）
     last_upload_speed: f64,
     last_download_speed: f64,
 }
 
-impl SpeedHistory {
-    fn new() -> Self {
-        Self {
-            sent_samples: Vec::new(),
-            recv_samples: Vec::new(),
-            last_upload_speed: 0.0,
-            last_download_speed: 0.0,
-        }
+/// 窗口速度计算：push 当前累计计数快照，取 5s 窗口两端 (计数差/时间差)。
+/// 计数被 reset() 清零（新快照小于旧快照）时丢弃历史样本重新起算。
+fn window_speed(samples: &mut Vec<(Instant, u64)>, total: u64, last: f64) -> f64 {
+    let now = Instant::now();
+    let cutoff = now - std::time::Duration::from_secs(5);
+    samples.retain(|(t, _)| *t > cutoff);
+    if samples.last().is_some_and(|(_, t)| *t > total) {
+        samples.clear(); // 计数回退 = reset 过，旧窗口作废
     }
-
-    /// 添加上传样本
-    fn add_sent_sample(&mut self, bytes: u64) {
-        let now = Instant::now();
-        self.sent_samples.push((now, bytes));
-        // 保留最近 5 秒的样本
-        let cutoff = now - std::time::Duration::from_secs(5);
-        self.sent_samples.retain(|(t, _)| *t > cutoff);
+    samples.push((now, total));
+    if samples.len() < 2 {
+        return last;
     }
-
-    /// 添加下载样本
-    fn add_recv_sample(&mut self, bytes: u64) {
-        let now = Instant::now();
-        self.recv_samples.push((now, bytes));
-        // 保留最近 5 秒的样本
-        let cutoff = now - std::time::Duration::from_secs(5);
-        self.recv_samples.retain(|(t, _)| *t > cutoff);
+    let first = samples.first().expect("len >= 2");
+    let newest = samples.last().expect("len >= 2");
+    let duration = newest.0.duration_since(first.0).as_secs_f64();
+    if duration <= 0.0 {
+        return last;
     }
-
-    /// 计算上传速度
-    fn calculate_upload_speed(&mut self) -> f64 {
-        if self.sent_samples.len() < 2 {
-            return self.last_upload_speed;
-        }
-
-        let first = self.sent_samples.first().unwrap();
-        let last = self.sent_samples.last().unwrap();
-        let duration = last.0.duration_since(first.0).as_secs_f64();
-
-        if duration <= 0.0 {
-            return self.last_upload_speed;
-        }
-
-        let total_bytes: u64 = self.sent_samples.iter().skip(1).map(|(_, b)| *b).sum();
-        let speed = total_bytes as f64 / duration;
-        self.last_upload_speed = speed;
-        speed
-    }
-
-    /// 计算下载速度
-    fn calculate_download_speed(&mut self) -> f64 {
-        if self.recv_samples.len() < 2 {
-            return self.last_download_speed;
-        }
-
-        let first = self.recv_samples.first().unwrap();
-        let last = self.recv_samples.last().unwrap();
-        let duration = last.0.duration_since(first.0).as_secs_f64();
-
-        if duration <= 0.0 {
-            return self.last_download_speed;
-        }
-
-        let total_bytes: u64 = self.recv_samples.iter().skip(1).map(|(_, b)| *b).sum();
-        let speed = total_bytes as f64 / duration;
-        self.last_download_speed = speed;
-        speed
-    }
+    newest.1.saturating_sub(first.1) as f64 / duration
 }
 
 /// 单节点流量计数条目：上行 = 客户端→节点，下行 = 节点→客户端。
@@ -293,7 +253,12 @@ impl TrafficMonitor {
             active_connections: AtomicU64::new(0),
             total_connections: AtomicU64::new(0),
             start_time: Instant::now(),
-            speed_history: Mutex::new(SpeedHistory::new()),
+            speed_history: Mutex::new(SpeedHistory {
+                sent_samples: Vec::new(),
+                recv_samples: Vec::new(),
+                last_upload_speed: 0.0,
+                last_download_speed: 0.0,
+            }),
             node_traffic: Mutex::new(HashMap::new()),
         }
     }
@@ -308,26 +273,21 @@ impl TrafficMonitor {
         self.record_received_sync(bytes);
     }
 
-    /// 同步记录上传数据（计数流包装在 poll 上下文内调用，无 await）
+    /// 同步记录上传数据（热路径 R-28：仅原子累加，不加任何锁；
+    /// 速度样本由 get_stats 快照路径按窗口差分推算）
     pub fn record_sent_sync(&self, bytes: u64) {
         if bytes == 0 {
             return;
         }
         self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
-        if let Ok(mut history) = self.speed_history.lock() {
-            history.add_sent_sample(bytes);
-        }
     }
 
-    /// 同步记录下载数据（计数流包装在 poll 上下文内调用，无 await）
+    /// 同步记录下载数据（热路径 R-28：仅原子累加，不加任何锁）
     pub fn record_received_sync(&self, bytes: u64) {
         if bytes == 0 {
             return;
         }
         self.bytes_received.fetch_add(bytes, Ordering::Relaxed);
-        if let Ok(mut history) = self.speed_history.lock() {
-            history.add_recv_sample(bytes);
-        }
     }
 
     /// 取（或创建）指定节点的流量计数条目。条目按地址复用，
@@ -362,18 +322,25 @@ impl TrafficMonitor {
         self.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// 获取当前统计信息
+    /// 获取当前统计信息（R-28：唯一的 speed_history 加锁点，由 GUI 采样线程每
+    /// 500ms 调用一次；速度由 5s 窗口两端累计计数差分推算）
     pub async fn get_stats(&self) -> TrafficStats {
+        let bytes_sent = self.bytes_sent.load(Ordering::Relaxed);
+        let bytes_received = self.bytes_received.load(Ordering::Relaxed);
         let mut history = self
             .speed_history
             .lock()
             .expect("speed_history mutex poisoned");
-        let upload_speed = history.calculate_upload_speed();
-        let download_speed = history.calculate_download_speed();
+        let last_up = history.last_upload_speed;
+        let last_down = history.last_download_speed;
+        let upload_speed = window_speed(&mut history.sent_samples, bytes_sent, last_up);
+        let download_speed = window_speed(&mut history.recv_samples, bytes_received, last_down);
+        history.last_upload_speed = upload_speed;
+        history.last_download_speed = download_speed;
 
         TrafficStats {
-            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
-            bytes_received: self.bytes_received.load(Ordering::Relaxed),
+            bytes_sent,
+            bytes_received,
             upload_speed,
             download_speed,
             active_connections: self.active_connections.load(Ordering::Relaxed),
@@ -542,6 +509,22 @@ mod tests {
         assert_eq!(stats.bytes_sent, 0);
         assert_eq!(stats.bytes_received, 0);
         assert_eq!(entry.sent(), 0);
+    }
+
+    /// reset() 后计数回退：window_speed 必须丢弃旧窗口重新起算，速度不出现负数
+    #[test]
+    fn test_window_speed_discards_after_reset() {
+        let mut samples: Vec<(Instant, u64)> = Vec::new();
+        let s1 = window_speed(&mut samples, 0, 0.0);
+        assert_eq!(s1, 0.0, "首个样本无窗口，保持 last");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let s2 = window_speed(&mut samples, 1000, 0.0);
+        assert!(s2 > 0.0, "第二个样本应有正速度（20ms 内 1000B）");
+        // 模拟 reset：计数回退到 0 → 旧窗口作废；样本不足 2 个时按设计保持
+        // 上次速度（GUI 下一帧 500ms 后即有新窗口，不显示负数/跳变）
+        let s3 = window_speed(&mut samples, 0, s2);
+        assert_eq!(s3, s2, "reset 后窗口作废，样本不足时保持上值");
+        assert_eq!(samples.len(), 1, "reset 后只保留新样本");
     }
 
     #[test]

@@ -26,7 +26,7 @@
 use hydra_protocol::{HydraError, Result};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -49,6 +49,16 @@ pub struct TunConfig {
     pub mtu: u16,
     /// 路由豁免 IP（/32 回物理网关）：节点 IP、系统 DNS 等，防代理环路
     pub exclude_routes: Vec<Ipv4Addr>,
+    /// IPv6 豁免 IP（/128 回物理网关 v6）：节点 IPv6 地址等（0-4 IPv6 防泄漏）
+    pub exclude_routes_v6: Vec<Ipv6Addr>,
+    /// TUN 虚拟网卡 IPv6 网关占位地址（v6 接管路由 `via` 指向它；
+    /// HYDRA_TUN_ADDR6 可覆盖。默认 ULA 段 fd07::1，与 v4 的 10.7.0.1 对称）
+    pub addr6: Ipv6Addr,
+    /// IPv6 接管开关（07-P1-2 修复：默认**关**；`HYDRA_TUN_IPV6=1` 显式开启）。
+    /// 默认关闭的原因：栈仅启用 proto-ipv4，开启接管会把全系统 v6 流量导入
+    /// 静默黑洞（开启后已有 SYN-RST/ICMPv6 不可达代答兜底，见主循环）；
+    /// 关闭时系统 IPv6 走原路径（不代理，启动有泄漏告警）。
+    pub ipv6_enabled: bool,
     /// 并发流上限（超限对新流回 RST，防资源耗尽）
     pub max_flows: usize,
     /// smoltcp LISTEN 端口列表（smoltcp 无通配监听，v1 已知限制，见模块注释）
@@ -62,6 +72,10 @@ impl Default for TunConfig {
             prefix: 30,
             mtu: 1500,
             exclude_routes: Vec::new(),
+            exclude_routes_v6: Vec::new(),
+            addr6: Ipv6Addr::new(0xfd07, 0, 0, 0, 0, 0, 0, 1),
+            // 07-P1-2：默认关闭（proto-ipv4 栈下开启接管即全系统 v6 黑洞）
+            ipv6_enabled: false,
             max_flows: 512,
             // 常用明文/加密 Web 端口；其余端口需 HYDRA_TUN_PORTS 扩展
             listen_ports: vec![80, 443, 8080, 8443],
@@ -87,7 +101,10 @@ impl TunConfig {
 
 /// 前缀长度 → 掩码
 fn prefix_to_mask(prefix: u8) -> [u8; 4] {
-    let v = if prefix == 0 { 0 } else { !0u32 << (32 - prefix as u32) };
+    // 审查 06-P2-9：prefix>32 时 `32 - prefix` 下溢——debug 构建 panic（启动 TUN
+    // 即崩，而此时设备已建）、release 回绕成错误掩码。做双保险：钳制到 ≤32。
+    let shift = 32u32.saturating_sub(prefix.min(32) as u32);
+    let v = if prefix == 0 { 0 } else { !0u32 << shift };
     v.to_be_bytes()
 }
 
@@ -159,16 +176,47 @@ pub struct RoutePlan {
 /// - 每个 exclude IP /32 → 物理网关（None 时跳过豁免项——没有物理网关就无法
 ///   生成豁免命令，调用方应先 [`detect_physical_gateway`] 或要求 `HYDRA_TUN_GW`）
 pub fn compute_routes(tun: &TunConfig, physical_gw: Option<Ipv4Addr>) -> RoutePlan {
+    // 审查 06-P2-10：TUN 网段直连路由仅 Windows 需要——Linux 内核在配置 TUN
+    // 地址后已自动生成 connected route，显式 `via <本机TUN地址>` 会被内核以
+    // EINVAL（Nexthop has invalid gateway）拒绝；而 apply_routes 部分失败即整体
+    // 回滚，这条必然失败的命令会让 Linux 上 TUN 启动 100% 失败。
+    compute_routes_for(tun, physical_gw, cfg!(windows))
+}
+
+/// `include_subnet_direct` 显式参数版（供测试确定性地构造含/不含网段直连的方案）
+pub fn compute_routes_for(
+    tun: &TunConfig,
+    physical_gw: Option<Ipv4Addr>,
+    include_subnet_direct: bool,
+) -> RoutePlan {
     let mut add = Vec::new();
     // 1. 接管路由：两条 /1 覆盖整个 IPv4 空间且比 /0 更精确
-    add.push(RouteCmd { dest: Ipv4Addr::new(0, 0, 0, 0), prefix: 1, gateway: tun.addr });
-    add.push(RouteCmd { dest: Ipv4Addr::new(128, 0, 0, 0), prefix: 1, gateway: tun.addr });
-    // 2. TUN 网段直连（保证 TUN 子网内部通信不绕行）
-    add.push(RouteCmd { dest: tun.network(), prefix: tun.prefix, gateway: tun.addr });
+    add.push(RouteCmd {
+        dest: Ipv4Addr::new(0, 0, 0, 0),
+        prefix: 1,
+        gateway: tun.addr,
+    });
+    add.push(RouteCmd {
+        dest: Ipv4Addr::new(128, 0, 0, 0),
+        prefix: 1,
+        gateway: tun.addr,
+    });
+    // 2. TUN 网段直连（保证 TUN 子网内部通信不绕行；仅 Windows，见 compute_routes）
+    if include_subnet_direct {
+        add.push(RouteCmd {
+            dest: tun.network(),
+            prefix: tun.prefix,
+            gateway: tun.addr,
+        });
+    }
     // 3. 豁免清单：/32 回物理网关（节点 IP / DNS —— 防环路关键）
     if let Some(gw) = physical_gw {
         for ip in &tun.exclude_routes {
-            add.push(RouteCmd { dest: *ip, prefix: 32, gateway: gw });
+            add.push(RouteCmd {
+                dest: *ip,
+                prefix: 32,
+                gateway: gw,
+            });
         }
     } else if !tun.exclude_routes.is_empty() {
         warn!(
@@ -177,8 +225,102 @@ pub fn compute_routes(tun: &TunConfig, physical_gw: Option<Ipv4Addr>) -> RoutePl
             tun.exclude_routes.len()
         );
     }
-    let remove = add.iter().cloned().collect();
+    let remove = add.to_vec();
     RoutePlan { add, remove }
+}
+
+// ── IPv6 路由方案（0-4 防泄漏：与 v4 对称的接管/豁免清单）────────────────────
+
+/// 一条结构化 IPv6 路由命令（与 v4 [`RouteCmd`] 对称）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteCmdV6 {
+    pub dest: Ipv6Addr,
+    pub prefix: u8,
+    /// 下一跳网关（接管路由 = TUN 自身 v6 地址；豁免路由 = 物理网关 v6）
+    pub gateway: Ipv6Addr,
+}
+
+impl RouteCmdV6 {
+    /// Linux `ip -6 route add/delete <dest/prefix> via <gw>` 参数
+    pub fn linux_args(&self, action: RouteAction) -> Vec<String> {
+        vec![
+            "-6".to_string(),
+            "route".to_string(),
+            match action {
+                RouteAction::Add => "add".to_string(),
+                RouteAction::Delete => "delete".to_string(),
+            },
+            format!("{}/{}", self.dest, self.prefix),
+            "via".to_string(),
+            self.gateway.to_string(),
+        ]
+    }
+
+    /// Windows `netsh interface ipv6 add/delete route <pfx>/<len> interface=<if>`
+    /// 参数（Windows `route` 命令不支持 IPv6，只能走 netsh，且必须给接口名——
+    /// 取 `HYDRA_TUN_IF`；未设置返回 None，由执行器按"失败告警"路径处理）
+    pub fn windows_args(&self, action: RouteAction, ifname: &str) -> Vec<String> {
+        vec![
+            "interface".to_string(),
+            "ipv6".to_string(),
+            match action {
+                RouteAction::Add => "add".to_string(),
+                RouteAction::Delete => "delete".to_string(),
+            },
+            "route".to_string(),
+            format!("{}/{}", self.dest, self.prefix),
+            "interface=".to_string() + ifname,
+        ]
+    }
+}
+
+/// IPv6 路由方案：添加清单 + 一一对应的幂等删除清单（可为空 = 未启用/无网关）
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RoutePlanV6 {
+    pub add: Vec<RouteCmdV6>,
+    /// 与 `add` 同序的删除命令（退出/崩溃后幂等清理用）
+    pub remove: Vec<RouteCmdV6>,
+}
+
+/// 计算 IPv6 路由方案（纯函数，与 [`compute_routes`] 对称）。
+///
+/// - `ipv6_enabled == false`（默认；`HYDRA_TUN_IPV6` 未设或非 "1"）→ 返回空方案（不生成任何命令）；
+/// - 接管：`::/1` + `8000::/1` → TUN（比 v6 默认路由 /0 更精确即接管全 v6 空间）；
+/// - 豁免：每个 exclude v6 IP /128 → 物理网关 v6（None 时跳过豁免项并告警——
+///   与 v4 同语义：没有网关就无法生成豁免命令）；
+/// - **try-and-warn 语义在执行侧**（[`apply_routes_v6_try`]）：本函数只产出方案。
+pub fn compute_routes_v6(tun: &TunConfig, physical_gw6: Option<Ipv6Addr>) -> RoutePlanV6 {
+    let mut add: Vec<RouteCmdV6> = Vec::new();
+    if tun.ipv6_enabled {
+        // 接管：两条 /1 覆盖整个 IPv6 空间（::/1 与 8000::/1 各半）
+        add.push(RouteCmdV6 {
+            dest: Ipv6Addr::UNSPECIFIED,
+            prefix: 1,
+            gateway: tun.addr6,
+        });
+        add.push(RouteCmdV6 {
+            dest: Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0),
+            prefix: 1,
+            gateway: tun.addr6,
+        });
+        // 豁免：节点 IPv6 地址 /128 回物理网关 v6
+        if let Some(gw) = physical_gw6 {
+            for ip in &tun.exclude_routes_v6 {
+                add.push(RouteCmdV6 {
+                    dest: *ip,
+                    prefix: 128,
+                    gateway: gw,
+                });
+            }
+        } else if !tun.exclude_routes_v6.is_empty() {
+            warn!(
+                "物理网关（IPv6）未知，{} 条 v6 豁免路由未能生成——代理到 v6 节点的流量可能环路",
+                tun.exclude_routes_v6.len()
+            );
+        }
+    }
+    let remove = add.to_vec();
+    RoutePlanV6 { add, remove }
 }
 
 // ── 路由命令执行（可注入 dry-run）────────────────────────────────────────────
@@ -186,6 +328,9 @@ pub fn compute_routes(tun: &TunConfig, physical_gw: Option<Ipv4Addr>) -> RoutePl
 /// 路由命令执行器抽象（测试注入 fake，不真跑系统命令）
 pub trait RouteExecutor: Send + Sync {
     fn run(&self, action: RouteAction, cmd: &RouteCmd) -> std::io::Result<()>;
+
+    /// IPv6 路由命令执行（与 v4 `run` 分离：v6 失败走 try-and-warn，不阻断启动）
+    fn run6(&self, action: RouteAction, cmd: &RouteCmdV6) -> std::io::Result<()>;
 }
 
 /// 真实执行器：Windows `route` / Linux `ip route`（需管理员/root）
@@ -199,14 +344,11 @@ impl RouteExecutor for SystemRouteExecutor {
             debug!("route {}", args.join(" "));
             let out = std::process::Command::new("route").args(&args).output()?;
             if !out.status.success() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "route {} 失败: {}",
-                        args.join(" "),
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "route {} 失败: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
             }
             Ok(())
         }
@@ -214,7 +356,10 @@ impl RouteExecutor for SystemRouteExecutor {
         {
             let args = cmd.linux_args(action);
             debug!("ip route {}", args.join(" "));
-            let out = std::process::Command::new("ip").args(["route"]).args(&args).output()?;
+            let out = std::process::Command::new("ip")
+                .args(["route"])
+                .args(&args)
+                .output()?;
             if !out.status.success() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -236,6 +381,58 @@ impl RouteExecutor for SystemRouteExecutor {
             ))
         }
     }
+
+    fn run6(&self, action: RouteAction, cmd: &RouteCmdV6) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            // Windows 的 `route` 命令不支持 IPv6，只能 netsh + 接口名；
+            // 接口名取 HYDRA_TUN_IF（Wintun 适配器名），未设置则按失败处理
+            // （调用方告警"IPv6 未接管"，不阻断启动）。
+            let ifname = std::env::var("HYDRA_TUN_IF").unwrap_or_default();
+            if ifname.trim().is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "Windows 下 IPv6 接管需设置 HYDRA_TUN_IF（TUN 适配器名，netsh 需要）",
+                ));
+            }
+            let args = cmd.windows_args(action, ifname.trim());
+            debug!("netsh {}", args.join(" "));
+            let out = std::process::Command::new("netsh").args(&args).output()?;
+            if !out.status.success() {
+                return Err(std::io::Error::other(format!(
+                    "netsh {} 失败: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(unix)]
+        {
+            let args = cmd.linux_args(action);
+            debug!("ip {}", args.join(" "));
+            let out = std::process::Command::new("ip").args(&args).output()?;
+            if !out.status.success() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "ip {} 失败: {}",
+                        args.join(" "),
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = (action, cmd);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "TUN IPv6 路由配置不支持当前平台",
+            ))
+        }
+    }
 }
 
 /// dry-run 执行器：记录命令清单（单测断言用），不真跑
@@ -248,6 +445,15 @@ impl RouteExecutor for DryRunExecutor {
     fn run(&self, action: RouteAction, cmd: &RouteCmd) -> std::io::Result<()> {
         let line = format!(
             "{:?} {}/{} via {}",
+            action, cmd.dest, cmd.prefix, cmd.gateway
+        );
+        self.commands.lock().unwrap().push(line);
+        Ok(())
+    }
+
+    fn run6(&self, action: RouteAction, cmd: &RouteCmdV6) -> std::io::Result<()> {
+        let line = format!(
+            "v6 {:?} {}/{} via {}",
             action, cmd.dest, cmd.prefix, cmd.gateway
         );
         self.commands.lock().unwrap().push(line);
@@ -283,15 +489,48 @@ pub fn cleanup_routes(exec: &dyn RouteExecutor, plan: &RoutePlan) {
     }
 }
 
+/// IPv6 路由 try-and-warn 应用（0-4 语义核心）：逐条添加，**任一条失败只告警、
+/// 绝不回滚、绝不阻断启动**。理由：v6 接管是"防泄漏增益"而非"可用性前提"——
+/// 若因 v6 命令失败放弃整个 TUN 启动，v4 防泄漏一并丢失；若像 v4 一样回滚，
+/// 泄漏面反而更大。失败时调用方（run_tun）会追加"IPv6 未接管，存在泄漏"告警。
+/// 返回失败条数（0 = 全部成功）。
+pub fn apply_routes_v6_try(exec: &dyn RouteExecutor, plan: &RoutePlanV6) -> usize {
+    let mut failed = 0;
+    for cmd in &plan.add {
+        if let Err(e) = exec.run6(RouteAction::Add, cmd) {
+            failed += 1;
+            warn!(
+                "IPv6 接管路由 {}/{} 添加失败（忽略，仅告警）: {}",
+                cmd.dest, cmd.prefix, e
+            );
+        }
+    }
+    failed
+}
+
+/// IPv6 路由幂等清理（best-effort，与 v4 cleanup_routes 对称）
+pub fn cleanup_routes_v6(exec: &dyn RouteExecutor, plan: &RoutePlanV6) {
+    for cmd in &plan.remove {
+        if let Err(e) = exec.run6(RouteAction::Delete, cmd) {
+            warn!("清理 IPv6 路由 {}/{} 失败: {}", cmd.dest, cmd.prefix, e);
+        }
+    }
+}
+
 /// drop guard：任务任何路径退出（含 panic 展开）都执行幂等删除
+/// （v4 计划必清；v6 计划可选——None 表示未启用 IPv6 接管）
 pub struct RouteGuard {
     exec: Arc<dyn RouteExecutor>,
     plan: RoutePlan,
+    plan6: Option<RoutePlanV6>,
 }
 
 impl Drop for RouteGuard {
     fn drop(&mut self) {
         cleanup_routes(self.exec.as_ref(), &self.plan);
+        if let Some(p6) = &self.plan6 {
+            cleanup_routes_v6(self.exec.as_ref(), p6);
+        }
     }
 }
 
@@ -308,7 +547,10 @@ pub fn detect_physical_gateway() -> Option<Ipv4Addr> {
     }
     #[cfg(windows)]
     {
-        if let Ok(out) = std::process::Command::new("route").args(["print", "-4", "0.0.0.0"]).output() {
+        if let Ok(out) = std::process::Command::new("route")
+            .args(["print", "-4", "0.0.0.0"])
+            .output()
+        {
             let text = String::from_utf8_lossy(&out.stdout);
             for line in text.lines() {
                 let toks: Vec<&str> = line.split_whitespace().collect();
@@ -336,6 +578,59 @@ pub fn detect_physical_gateway() -> Option<Ipv4Addr> {
                         if ip != Ipv4Addr::UNSPECIFIED {
                             return Some(ip);
                         }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// best-effort 探测物理网关的 IPv6 地址（v6 豁免路由用）。
+/// `HYDRA_TUN_GW6` 优先；Windows 解析 `route print -6` 的 `::/0` 行，
+/// Linux 解析 `ip -6 route show default`。失败返回 None（豁免项跳过，仅告警）。
+pub fn detect_physical_gateway_v6() -> Option<Ipv6Addr> {
+    if let Ok(s) = std::env::var("HYDRA_TUN_GW6") {
+        if let Ok(ip) = s.trim().parse::<Ipv6Addr>() {
+            if !ip.is_unspecified() {
+                return Some(ip);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(out) = std::process::Command::new("route")
+            .args(["print", "-6"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                let toks: Vec<&str> = line.split_whitespace().collect();
+                // ::/0 行形如 `::/0  <gateway>  ...`；网关列是能解析的 v6 且非 ::
+                if toks.first() == Some(&"::/0") {
+                    for tok in toks.iter().skip(1) {
+                        if let Ok(ip) = tok.parse::<Ipv6Addr>() {
+                            if !ip.is_unspecified() {
+                                return Some(ip);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        if let Ok(out) = std::process::Command::new("ip")
+            .args(["-6", "route", "show", "default"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for tok in text.split_whitespace() {
+                // 形如 `default via  fe80::1 dev eth0`（部分 iproute2 无空格差异）
+                if let Some(ip) = tok.trim_start_matches("via").parse::<Ipv6Addr>() {
+                    if !ip.is_unspecified() {
+                        return Some(ip);
                     }
                 }
             }
@@ -442,7 +737,7 @@ impl PacketTransport for Tun2Transport {
             self.dev
                 .recv(buf)
                 .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                .map_err(|e| std::io::Error::other(e.to_string()))
         })
     }
 
@@ -452,7 +747,7 @@ impl PacketTransport for Tun2Transport {
                 .send(buf)
                 .await
                 .map(|_| ())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                .map_err(|e| std::io::Error::other(e.to_string()))
         })
     }
 }
@@ -476,13 +771,16 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 /// 通道化 smoltcp Device：入站队列由主循环投喂，出站队列由主循环排空写回 TUN。
 /// （队列指针在 Device 与主循环间共享，Send/Sync 安全。）
 struct ChanDevice {
-    inbound: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    outbound: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    inbound: SharedQueue,
+    outbound: SharedQueue,
     mtu: usize,
 }
 
+/// 共享队列类型别名（clippy type_complexity：Arc<Mutex<VecDeque<Vec<u8>>>> 三处复用）
+type SharedQueue = Arc<Mutex<VecDeque<Vec<u8>>>>;
+
 impl ChanDevice {
-    fn new(mtu: usize) -> (Self, Arc<Mutex<VecDeque<Vec<u8>>>>, Arc<Mutex<VecDeque<Vec<u8>>>>) {
+    fn new(mtu: usize) -> (Self, SharedQueue, SharedQueue) {
         let inbound = Arc::new(Mutex::new(VecDeque::new()));
         let outbound = Arc::new(Mutex::new(VecDeque::new()));
         let dev = Self {
@@ -510,12 +808,16 @@ impl Device for ChanDevice {
         let frame = self.inbound.lock().unwrap().pop_front()?;
         Some((
             ChanRx(Some(frame)),
-            ChanTx { queue: self.outbound.clone() },
+            ChanTx {
+                queue: self.outbound.clone(),
+            },
         ))
     }
 
     fn transmit(&mut self, _ts: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(ChanTx { queue: self.outbound.clone() })
+        Some(ChanTx {
+            queue: self.outbound.clone(),
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -560,7 +862,10 @@ fn build_interface(cfg: &TunConfig, device: &mut ChanDevice) -> Result<Interface
     let mut iface = Interface::new(iface_cfg, device, now);
     iface.update_ip_addrs(|addrs| {
         addrs
-            .push(IpCidr::new(IpAddress::Ipv4(Ipv4Address(cfg.addr.octets())), cfg.prefix))
+            .push(IpCidr::new(
+                IpAddress::Ipv4(Ipv4Address(cfg.addr.octets())),
+                cfg.prefix,
+            ))
             .expect("IP 地址表已满");
     });
     // 默认路由（TUN 是 IP 层端点，网关占位为 TUN 自身地址；仅用于路由查找存在性）
@@ -577,8 +882,17 @@ fn build_interface(cfg: &TunConfig, device: &mut ChanDevice) -> Result<Interface
 const TCP_BUF: usize = 64 * 1024;
 /// 代理 → 栈 单条流的下行通道深度（背压用）
 const FLOW_CHAN: usize = 64;
+/// 栈 → 代理 单条流的上行通道深度（16KB 块 ×8 = 128KB 缓冲；满即停 recv，
+/// 让 smoltcp 接收窗口归零形成真实 TCP 背压）
+const FLOW_UP_CHAN: usize = 8;
+/// 上行单次写入超时（06-P1-8）：节点链路假死/窗口耗尽时写任务有限期退出并
+/// 回报错误中止该流，绝不拖累其他流
+const UP_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 建连超时（open_target 内部已有节点级超时，这里兜底总时限）
 const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
+/// 未完成 TCP 握手的流的建立超时（审查 06-P2-8）：握手从未完成（扫描 SYN 等）
+/// 的僵尸流用更短窗口回收，不再等 300s 空闲超时
+const FLOW_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 流消息：代理侧任务 → 栈主循环
 enum FlowMsg {
@@ -588,6 +902,8 @@ enum FlowMsg {
     LinkErr,
     /// 代理侧读到的下行数据
     Data(Vec<u8>),
+    /// 上行写任务故障（写错误/写超时）→ 回 RST 中止该流
+    UpErr,
 }
 
 /// 一条活动流
@@ -599,11 +915,184 @@ struct Flow {
     reader_task: Option<tokio::task::JoinHandle<()>>,
     /// 通道开启任务持有的发送端（派生下行读取任务时需要）
     flow_tx: mpsc::Sender<FlowMsg>,
-    /// 代理链路写端（上行：栈 → 代理；读端由下行读取任务持有）
-    link_writer: Option<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>,
+    /// 代理链路上行发送端（栈 → 代理；写任务独立派生，主循环只做非阻塞投递）
+    up_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// 上行写任务（own duplex.writer：write_all 阻塞不再发生在栈主循环）
+    writer_task: Option<tokio::task::JoinHandle<()>>,
     /// socket 发不下的积压（socket 缓冲满时暂存，防字节流损坏）
     pending: VecDeque<Vec<u8>>,
     last_active: Instant,
+    /// 06-P2-8：真实上游建链是否已派生（Established 后才派生，扫描 SYN 不触发建链）
+    opened: bool,
+    /// 接受时刻（建立超时回收用）
+    accepted_at: Instant,
+}
+
+/// 派生上游建链任务（open_target → FlowMsg::Link/LinkErr）。
+/// 06-P2-8：从 accept 分支拆出，改由"待建立流"循环在流进入 Established 后调用。
+fn spawn_up_task(
+    opener: ChannelOpener,
+    target: String,
+    tx: mpsc::Sender<FlowMsg>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let open_fut = opener(target.clone());
+        match tokio::time::timeout(OPEN_TIMEOUT, open_fut).await {
+            Ok(Ok(duplex)) => {
+                let _ = tx.send(FlowMsg::Link(duplex)).await;
+                // 通道已交付主循环；up 任务结束（下行读取由 reader 任务负责）
+            }
+            Ok(Err(e)) => {
+                warn!("TUN 流开通道失败（{target}）: {} → 回 RST", e);
+                let _ = tx.send(FlowMsg::LinkErr).await;
+            }
+            Err(_) => {
+                warn!("TUN 流开通道超时（{target}）→ 回 RST");
+                let _ = tx.send(FlowMsg::LinkErr).await;
+            }
+        }
+    })
+}
+
+// ── IPv6 黑洞快速失败（07-P1-2）──────────────────────────────────────────────
+// 栈仅启用 proto-ipv4：投喂的 IPv6 包会被 smoltcp 静默丢弃（v6 入口对非本机
+// 目的包直接 drop，无 any-ip 路径）→ 全系统 v6 超时黑洞。这里在投喂前拦截，
+// 手工构造响应包使应用快速失败回落 IPv4：TCP SYN 回 RST，其余回 ICMPv6
+// destination unreachable。无 proto-ipv6 特性，全部手工组包（IPv6 头 40B）。
+
+/// 判断包是否为 IPv6（首字节高 4 位版本号 == 6，且至少有完整 40B 头）
+fn is_ipv6_packet(pkt: &[u8]) -> bool {
+    pkt.len() >= 40 && pkt[0] >> 4 == 6
+}
+
+/// RFC 1071 校验和（16 位反码求和；输入网络字节序，输出网络字节序）
+fn checksum16(data: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < data.len() {
+        sum += (data[i] as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// IPv6 伪首部（上层校验和计算用）：src + dst + 4B 上层长度 + next header
+fn ipv6_pseudo_header(src: &[u8; 16], dst: &[u8; 16], upper_len: u32, next_header: u8) -> Vec<u8> {
+    let mut v = Vec::with_capacity(40);
+    v.extend_from_slice(src);
+    v.extend_from_slice(dst);
+    v.extend_from_slice(&upper_len.to_be_bytes());
+    v.push(0); // 3B 保留
+    v.push(0);
+    v.push(0);
+    v.push(next_header);
+    v
+}
+
+/// 40B IPv6 头：版本 6 + payload_len + next_header + hop limit 64 + 地址
+fn build_ipv6_header(src: &[u8; 16], dst: &[u8; 16], payload_len: u16, next_header: u8) -> Vec<u8> {
+    let mut v = Vec::with_capacity(40);
+    v.push(0x60); // 版本 6 + 流类别/流标签 0
+    v.extend_from_slice(&[0, 0, 0]);
+    v.extend_from_slice(&payload_len.to_be_bytes());
+    v.push(next_header);
+    v.push(64); // hop limit
+    v.extend_from_slice(src);
+    v.extend_from_slice(dst);
+    v
+}
+
+/// 对 IPv6 TCP SYN 构造 RST（40B IPv6 头 + 20B TCP 头）：
+/// 地址/端口对调，ack = 对端 seq + 1（SYN 占一个序号），flags = RST|ACK，
+/// 应用侧立即收到 ECONNRESET 快速回落 IPv4。非 SYN（已建立流的 ACK/DATA 等）
+/// 返回 None——对既有流代答只会制造噪声。
+fn build_tcp_rst_v6(pkt: &[u8]) -> Option<Vec<u8>> {
+    if pkt.len() < 60 || pkt[6] != 6 {
+        return None; // 需完整 40B IPv6 头 + 20B TCP 头，且 next header = TCP
+    }
+    let tcp_off = 40;
+    let data_off = ((pkt[tcp_off + 12] >> 4) as usize) * 4;
+    if data_off < 20 || pkt.len() < tcp_off + data_off {
+        return None;
+    }
+    let flags = pkt[tcp_off + 13];
+    // 只应答首包 SYN（无 ACK）；SYN-ACK/ACK/FIN 等不代答
+    if flags & 0x02 == 0 || flags & 0x10 != 0 {
+        return None;
+    }
+    let mut src = [0u8; 16];
+    let mut dst = [0u8; 16];
+    src.copy_from_slice(&pkt[8..24]);
+    dst.copy_from_slice(&pkt[24..40]);
+    let sport = u16::from_be_bytes([pkt[tcp_off], pkt[tcp_off + 1]]); // 对端源端口
+    let dport = u16::from_be_bytes([pkt[tcp_off + 2], pkt[tcp_off + 3]]); // 对端目的端口
+    let seq = u32::from_be_bytes([
+        pkt[tcp_off + 4],
+        pkt[tcp_off + 5],
+        pkt[tcp_off + 6],
+        pkt[tcp_off + 7],
+    ]);
+    let ack = u32::from_be_bytes([
+        pkt[tcp_off + 8],
+        pkt[tcp_off + 9],
+        pkt[tcp_off + 10],
+        pkt[tcp_off + 11],
+    ]);
+
+    // RST 包 TCP 头（校验和先置 0）
+    let mut tcp = Vec::with_capacity(20);
+    tcp.extend_from_slice(&dport.to_be_bytes()); // 我方源端口 = 原目的端口
+    tcp.extend_from_slice(&sport.to_be_bytes());
+    tcp.extend_from_slice(&ack.to_be_bytes()); // 我方 seq = 对端 ack
+    tcp.extend_from_slice(&(seq.wrapping_add(1)).to_be_bytes()); // ack = 对端 seq + 1
+    tcp.push(0x50); // 数据偏移 5（20B）
+    tcp.push(0x14); // RST | ACK
+    tcp.extend_from_slice(&0u16.to_be_bytes()); // window 0
+    tcp.extend_from_slice(&[0, 0]); // 校验和占位
+    tcp.extend_from_slice(&[0, 0]); // urgent pointer
+    let ck = checksum16(&[ipv6_pseudo_header(&dst, &src, 20, 6), tcp.clone()].concat());
+    tcp[16..18].copy_from_slice(&ck.to_be_bytes());
+
+    let mut out = build_ipv6_header(&dst, &src, 20, 6);
+    out.extend_from_slice(&tcp);
+    Some(out)
+}
+
+/// 构造 ICMPv6 destination unreachable（type 1 / code 0）应答：引用原包前缀
+/// （截到总长 ≤ 1280B，即 IPv6 最小 MTU），让 UDP/ICMP 等非 TCP 的 v6 请求
+/// 立即收到不可达错误而非等待超时。
+fn build_icmpv6_unreachable_v6(pkt: &[u8]) -> Vec<u8> {
+    let mut src = [0u8; 16];
+    let mut dst = [0u8; 16];
+    src.copy_from_slice(&pkt[8..24]);
+    dst.copy_from_slice(&pkt[24..40]);
+    // 引用载荷截断：40B 头 + 8B ICMP 头 + 引用 ≤ 1280
+    let quoted = &pkt[..pkt.len().min(1280 - 40 - 8)];
+    let icmp_len = 8 + quoted.len();
+    let mut icmp = Vec::with_capacity(icmp_len);
+    icmp.push(1); // type = destination unreachable
+    icmp.push(0); // code = 0（无路由到达目标）
+    icmp.extend_from_slice(&[0, 0]); // 校验和占位
+    icmp.extend_from_slice(&[0, 0, 0, 0]); // 4B 保留
+    icmp.extend_from_slice(quoted);
+    let ck = checksum16(
+        &[
+            ipv6_pseudo_header(&dst, &src, icmp_len as u32, 58),
+            icmp.clone(),
+        ]
+        .concat(),
+    );
+    icmp[2..4].copy_from_slice(&ck.to_be_bytes());
+
+    let mut out = build_ipv6_header(&dst, &src, icmp_len as u16, 58);
+    out.extend_from_slice(&icmp);
+    out
 }
 
 /// 栈主循环（与真实 TUN 设备解耦：任何 [`PacketTransport`] 都可驱动，
@@ -630,6 +1119,8 @@ pub async fn run_stack<T: PacketTransport>(
 
     let mut flows: HashMap<SocketHandle, Flow> = HashMap::new();
     let mut buf = vec![0u8; cfg.mtu as usize + 4];
+    // 07-P1-2：IPv6 包首见告警只发一次（避免每包刷日志）
+    let mut warned_v6 = false;
 
     loop {
         tokio::select! {
@@ -643,7 +1134,30 @@ pub async fn run_stack<T: PacketTransport>(
                     break;
                 }
                 Ok(n) => {
-                    device.push_inbound(&buf[..n]);
+                    let pkt = &buf[..n];
+                    if is_ipv6_packet(pkt) {
+                        // 07-P1-2：栈无 proto-ipv6，投喂即被静默丢弃（黑洞）——
+                        // 代答快速失败，使应用回落 IPv4；包不进栈
+                        if !warned_v6 {
+                            warn!(
+                                "TUN 收到 IPv6 包：本版本栈不支持 v6 转发，将代答\
+                                 快速失败（SYN→RST，其余→ICMPv6 不可达）供应用回落 IPv4"
+                            );
+                            warned_v6 = true;
+                        }
+                        if let Some(rst) = build_tcp_rst_v6(pkt) {
+                            if let Err(e) = transport.send(&rst).await {
+                                error!("TUN 写 IPv6 RST 失败: {}", e);
+                            }
+                        } else {
+                            let icmp = build_icmpv6_unreachable_v6(pkt);
+                            if let Err(e) = transport.send(&icmp).await {
+                                error!("TUN 写 ICMPv6 不可达失败: {}", e);
+                            }
+                        }
+                    } else {
+                        device.push_inbound(pkt);
+                    }
                 }
                 Err(e) => {
                     error!("TUN 读包失败: {}（100ms 后重试）", e);
@@ -654,9 +1168,18 @@ pub async fn run_stack<T: PacketTransport>(
             _ = tokio::time::sleep(Duration::from_millis(10)) => {}
         }
 
+        // 栈中转缓冲：一次分配、整个主循环复用（06-P3-8：此前 step() 每 tick
+        // 分配 16KB 再丢弃，持续产生无效内存带宽）
+        let mut stack_buf = vec![0u8; 16 * 1024];
         step(
-            &cfg, &mut iface, &mut device, &mut sockets, &mut listeners,
-            &mut flows, &opener,
+            &cfg,
+            &mut iface,
+            &mut device,
+            &mut sockets,
+            &mut listeners,
+            &mut flows,
+            &opener,
+            &mut stack_buf,
         )
         .await?;
 
@@ -671,6 +1194,9 @@ pub async fn run_stack<T: PacketTransport>(
     for (_, mut f) in flows.drain() {
         f.up_task.abort();
         if let Some(t) = f.reader_task.take() {
+            t.abort();
+        }
+        if let Some(t) = f.writer_task.take() {
             t.abort();
         }
     }
@@ -699,6 +1225,8 @@ async fn step(
     listeners: &mut Vec<SocketHandle>,
     flows: &mut HashMap<SocketHandle, Flow>,
     opener: &ChannelOpener,
+    // 06-P3-8：栈中转缓冲由调用方一次分配传入，step 每 tick 不再重新分配
+    stack_buf: &mut [u8],
 ) -> Result<()> {
     // 1. 接受：监听 socket 一旦收到 SYN 就不再是 Listen 状态——它本身就是这条连接
     // （手工索引：port 0/None 分支会从 listeners 移除条目，此时不递增）
@@ -709,6 +1237,12 @@ async fn step(
             i += 1;
             continue;
         }
+        // 审查 06-P2-8：仍然立即接受（占住流槽、补挂新监听，保证并发 SYN 不被
+        // 丢弃），但**推迟真实上游建链**——up 任务（open_target → 节点 TCP+TLS+
+        // Noise 握手）改到流进入 Established 后才派生（见下方"待建立流"循环）。
+        // 此前 SynReceived 即建链：端口扫描的每个 SYN 都会兑换一条经节点的真实
+        // 出站连接（出口流量放大器）；从未握成手的僵尸流由 30s 建立超时回收，
+        // 不再等 300s 空闲超时。
         // 提取目标（TUN 视角：本地端点 = 应用想连的真实目的地）
         // 注意：必须在 abort() 之前取端点——abort 后 local_endpoint 必为 None
         let endpoint = sockets.get::<TcpSocket>(h).local_endpoint();
@@ -740,40 +1274,26 @@ async fn step(
             i += 1;
             continue;
         }
-        // 生成流：up 任务负责开代理通道；Link 之后派生下行读取任务
+        // 生成流：up 任务负责开代理通道；Link 之后派生下行读取任务。
+        // 06-P2-8：up 任务推迟到 Established 才派生（见 accepted_at/opened 字段
+        // 与下方"待建立流"循环）——此处只登记通道与流槽。
         let (tx, rx) = mpsc::channel(FLOW_CHAN);
         let flow_tx = tx.clone();
-        let opener2 = opener.clone();
-        let target2 = target.clone();
-        let up_task = tokio::spawn(async move {
-            let open_fut = (opener2)(target2.clone());
-            match tokio::time::timeout(OPEN_TIMEOUT, open_fut).await {
-                Ok(Ok(duplex)) => {
-                    let _ = tx.send(FlowMsg::Link(duplex)).await;
-                    // 通道已交付主循环；up 任务结束（下行读取由 reader 任务负责）
-                }
-                Ok(Err(e)) => {
-                    warn!("TUN 流开通道失败（{target2}）: {} → 回 RST", e);
-                    let _ = tx.send(FlowMsg::LinkErr).await;
-                }
-                Err(_) => {
-                    warn!("TUN 流开通道超时（{target2}）→ 回 RST");
-                    let _ = tx.send(FlowMsg::LinkErr).await;
-                }
-            }
-        });
         debug!("TUN 新流: {target}");
         flows.insert(
             h,
             Flow {
                 target,
                 up_rx: rx,
-                up_task,
+                up_task: tokio::spawn(async {}), // 占位：Established 后替换为真实 up 任务
                 reader_task: None,
                 flow_tx,
-                link_writer: None,
+                up_tx: None,
+                writer_task: None,
                 pending: VecDeque::new(),
                 last_active: Instant::now(),
+                opened: false,
+                accepted_at: Instant::now(),
             },
         );
         // 补一个新监听 socket 接下一个连接
@@ -781,13 +1301,43 @@ async fn step(
         i += 1;
     }
 
-    // 2. 泵代理下行数据入栈（socket 缓冲满则积压在 pending）
+    // 1.5 待建立流（审查 06-P2-8）：流进入 Established 后才派生真实上游建链；
+    // 握手死掉 / 建立超时（30s）的流回 RST 回收——扫描 SYN 不再兑换成经节点的
+    // 真实出站连接，僵尸流也不再等 300s 空闲超时。
     let mut to_remove: Vec<SocketHandle> = Vec::new();
+    let mut to_open: Vec<SocketHandle> = Vec::new();
+    for (&h, flow) in flows.iter_mut() {
+        if flow.opened {
+            continue;
+        }
+        let st = sockets.get::<TcpSocket>(h).state();
+        if st == State::Established {
+            flow.opened = true;
+            to_open.push(h);
+        } else if matches!(st, State::Closed | State::TimeWait)
+            || flow.accepted_at.elapsed() > FLOW_ESTABLISH_TIMEOUT
+        {
+            debug!(
+                "TUN 流握手未完成即终结（state={st:?}），回收: {}",
+                flow.target
+            );
+            sockets.get_mut::<TcpSocket>(h).abort();
+            to_remove.push(h);
+        }
+    }
+    for h in to_open {
+        if let Some(flow) = flows.get_mut(&h) {
+            flow.up_task = spawn_up_task(opener.clone(), flow.target.clone(), flow.flow_tx.clone());
+        }
+    }
+
+    // 2. 泵代理下行数据入栈（socket 缓冲满则积压在 pending）
     for (&h, flow) in flows.iter_mut() {
         while let Ok(msg) = flow.up_rx.try_recv() {
             match msg {
                 FlowMsg::Link(d) => {
-                    // 拆出读写端：读端交给下行读取任务，写端留在 Flow（上行用）
+                    // 拆出读写端：读端交给下行读取任务，写端交给独立上行写任务
+                    // （06-P1-8：write_all 阻塞被移出栈主循环，慢流不再队头阻塞）
                     let ProxyDuplex { reader, writer } = d;
                     let tx = flow.flow_tx.clone();
                     let mut reader = reader;
@@ -795,20 +1345,62 @@ async fn step(
                         let mut buf = vec![0u8; 16 * 1024];
                         loop {
                             match reader.read(&mut buf).await {
-                                Ok(0) => break,            // 代理侧 EOF（响应完整结束）
+                                Ok(0) => break, // 代理侧 EOF（响应完整结束）
                                 Ok(n) => {
                                     if tx.send(FlowMsg::Data(buf[..n].to_vec())).await.is_err() {
                                         break;
                                     }
                                 }
-                                Err(_) => break,           // 代理链路故障 → EOF 语义（FIN）
+                                Err(_) => break, // 代理链路故障 → EOF 语义（FIN）
                             }
                         }
                         // 任务结束 → 主循环检测 is_finished 后关写侧（发 FIN 给应用）
                     }));
-                    flow.link_writer = Some(writer);
+                    // 上行写任务：own 写端 + 独立通道；写错误/写超时经 UpErr 回报
+                    // 主循环中止该流，自身永不拖慢其他流
+                    let (up_tx, mut up_rx) = mpsc::channel::<Vec<u8>>(FLOW_UP_CHAN);
+                    let err_tx = flow.flow_tx.clone();
+                    let mut writer = writer;
+                    let target2 = flow.target.clone();
+                    flow.writer_task = Some(tokio::spawn(async move {
+                        loop {
+                            match up_rx.recv().await {
+                                Some(chunk) => {
+                                    let wr = tokio::time::timeout(
+                                        UP_WRITE_TIMEOUT,
+                                        writer.write_all(&chunk),
+                                    )
+                                    .await;
+                                    match wr {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(e)) => {
+                                            warn!("TUN 流上行写失败（{target2}）: {e} → 回 RST");
+                                            let _ = err_tx.send(FlowMsg::UpErr).await;
+                                            return;
+                                        }
+                                        Err(_) => {
+                                            // 写超时：链路假死/窗口耗尽，弃流保栈
+                                            warn!("TUN 流上行写超时（{target2}，{UP_WRITE_TIMEOUT:?}）→ 回 RST");
+                                            let _ = err_tx.send(FlowMsg::UpErr).await;
+                                            return;
+                                        }
+                                    }
+                                }
+                                // 通道关闭 = 流已被主循环移除清理
+                                None => return,
+                            }
+                        }
+                    }));
+                    flow.up_tx = Some(up_tx);
                 }
                 FlowMsg::LinkErr => {
+                    sockets.get_mut::<TcpSocket>(h).abort();
+                    to_remove.push(h);
+                    break;
+                }
+                FlowMsg::UpErr => {
+                    // 上行写任务故障：中止该流（RST 应用），其余流不受影响
+                    warn!("TUN 流上行故障（{}）→ 回 RST", flow.target);
                     sockets.get_mut::<TcpSocket>(h).abort();
                     to_remove.push(h);
                     break;
@@ -825,9 +1417,12 @@ async fn step(
             if !sock.may_send() {
                 break;
             }
-            let chunk = flow.pending.front().unwrap().clone();
-            // 0.11 的 send_slice 返回 Result<usize, SendError>（socket 已关闭等）
-            let n = sock.send_slice(&chunk).unwrap_or(0);
+            // 06-P3-8：不再整块 clone——直接借 front 切片喂 socket（send_slice 只读）；
+            // 仅部分写入的罕见路径才为剩余字节做一次 to_vec
+            let n = {
+                let front = flow.pending.front().unwrap();
+                sock.send_slice(front).unwrap_or(0)
+            };
             if n == 0 {
                 break;
             }
@@ -846,34 +1441,54 @@ async fn step(
     iface.poll(now, device, sockets);
 
     // 4. 栈 → 代理上行 + 关闭/超时管理
-    let mut buf = vec![0u8; 16 * 1024];
+    // 06-P1-8 修复：上行投递改为非阻塞 try_send——单流链路卡死最多占满自己的
+    // 上行通道（此后停 recv，靠 smoltcp 接收窗口归零背压），绝不阻塞主循环，
+    // 其他流照常推进
+    // 06-P3-8：此处原每 tick `vec![0u8; 16*1024]`——已改为调用方一次分配复用
     for (&h, flow) in flows.iter_mut() {
         let sock = sockets.get_mut::<TcpSocket>(h);
         // 应用半关闭后我方也应关闭（CloseWait → 关写侧发 FIN）
         if sock.state() == State::CloseWait {
             sock.close();
         }
-        // 通道未就绪（link_writer == None）时不 recv：数据留在 smoltcp rx 缓冲，
+        // 通道未就绪（up_tx == None）时不 recv：数据留在 smoltcp rx 缓冲，
         // 接收窗口归零形成真实背压，对端会重传——此前先 recv 再丢弃是错的
         // （smoltcp 取走数据即推进 ACK，对端绝不会重传，窗口期字节被静默吞掉，
         // TLS ClientHello 丢失导致连接永久挂死）
-        if sock.may_recv() && flow.link_writer.is_some() {
-            // 0.11 的 recv_slice 返回 Result<usize, RecvError>
-            let n = sock.recv_slice(&mut buf).unwrap_or(0);
-            if n > 0 {
-                flow.last_active = Instant::now();
-                if let Some(w) = flow.link_writer.as_mut() {
-                    if let Err(e) = w.write_all(&buf[..n]).await {
-                        warn!("TUN 流写代理通道失败（{}）: {}", flow.target, e);
-                        sock.abort();
-                        to_remove.push(h);
-                        continue;
+        if sock.may_recv() {
+            if let Some(up_tx) = &flow.up_tx {
+                // 【取数顺序关键】先确认通道确有余量，再从 socket 取一块：
+                // 每块只占一个槽位，且本上行通道的唯一发送方就是主循环自身，
+                // capacity 检查到 try_send 之间无竞态——try_send 的 Full 分支
+                // 理论不可达（防御性保留）。通道满 = 写端被慢链路拖住 → 本流
+                // 停止 recv（数据留 socket，TCP 窗口背压），主循环继续服务其他流。
+                while up_tx.capacity() > 0 && sock.may_recv() {
+                    // 0.11 的 recv_slice 返回 Result<usize, RecvError>
+                    let n = sock.recv_slice(stack_buf).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    match up_tx.try_send(stack_buf[..n].to_vec()) {
+                        Ok(()) => {
+                            flow.last_active = Instant::now();
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => break, // 防御性兜底
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            // 写任务已死（UpErr 已回报）：中止该流
+                            sock.abort();
+                            to_remove.push(h);
+                            break;
+                        }
                     }
                 }
             }
         }
         // 代理下行读取任务结束 = 代理侧 EOF/故障 → 关写侧（发 FIN 给应用）
-        if flow.reader_task.as_ref().map(|t| t.is_finished()).unwrap_or(false)
+        if flow
+            .reader_task
+            .as_ref()
+            .map(|t| t.is_finished())
+            .unwrap_or(false)
             && flow.pending.is_empty()
         {
             sock.close();
@@ -896,6 +1511,9 @@ async fn step(
             if let Some(t) = f.reader_task.take() {
                 t.abort();
             }
+            if let Some(t) = f.writer_task.take() {
+                t.abort();
+            }
             sockets.remove(h);
         }
     }
@@ -916,18 +1534,19 @@ pub async fn run_tun(
     let gw = detect_physical_gateway();
     let plan = compute_routes(&cfg, gw);
     info!(
-        "TUN 路由方案：{} 条添加（含 {} 条豁免），物理网关={}",
+        // 07-P2-3：不再做平台相关的硬编码减法（`len() - 3` 在 Linux + 物理网关
+        // 探测失败时 usize 下溢 panic）——直接输出总数与豁免数，与平台解耦
+        "TUN 路由方案：{} 条添加（豁免 {} 条），物理网关={}",
         plan.add.len(),
-        plan.add.len() - 3,
+        cfg.exclude_routes.len(),
         gw.map(|i| i.to_string()).unwrap_or_else(|| "未知".into())
     );
 
     // 2. 创建 TUN 设备（先于路由：路由指向 TUN 地址，设备必须先存在）
     let mut tcfg = tun2::Configuration::default();
-    tcfg
-        .address(cfg.addr)
+    tcfg.address(cfg.addr)
         .netmask(prefix_to_mask(cfg.prefix).map(|o| o.to_string()).join("."))
-        .mtu(cfg.mtu as u16)
+        .mtu(cfg.mtu)
         .up();
     // Windows：wintun.dll（与 exe 同架构）需放在 exe 目录或 PATH；非管理员创建会失败
     let dev = tun2::create_as_async(&tcfg).map_err(|e| {
@@ -935,15 +1554,58 @@ pub async fn run_tun(
             "TUN 设备创建失败: {e}（Windows 需管理员运行且 wintun.dll 可用；Linux 需 root/CAP_NET_ADMIN）"
         ))
     })?;
-    info!("✓ TUN 设备已创建（addr={} prefix={} mtu={}）", cfg.addr, cfg.prefix, cfg.mtu);
+    info!(
+        "✓ TUN 设备已创建（addr={} prefix={} mtu={}）",
+        cfg.addr, cfg.prefix, cfg.mtu
+    );
 
     // 3. 应用路由 + drop guard（任务结束/崩溃展开时幂等清理）
     let exec: Arc<dyn RouteExecutor> = Arc::new(SystemRouteExecutor);
     if let Err(e) = apply_routes(exec.as_ref(), &plan) {
         error!("路由配置失败: {e}——已回滚本次已添加的路由，放弃启动 TUN（无残留）");
-        return Err(HydraError::ConnectionError(format!("TUN 路由配置失败: {e}")));
+        return Err(HydraError::ConnectionError(format!(
+            "TUN 路由配置失败: {e}"
+        )));
     }
-    let _guard = RouteGuard { exec, plan };
+    // 3b. IPv6 对称接管（try-and-warn，见 apply_routes_v6_try）：
+    // 失败/关闭均不阻断启动，但必须明确告警泄漏面（0-4 防泄漏要求）。
+    let gw6 = detect_physical_gateway_v6();
+    let plan6 = compute_routes_v6(&cfg, gw6);
+    if !cfg.ipv6_enabled {
+        // 07-P1-2：默认关闭 = 不黑洞，但 v6 流量不经代理直接出网——如实告警泄漏面
+        warn!(
+            "IPv6 接管未启用（默认关闭，防 v6 黑洞；HYDRA_TUN_IPV6=1 可开启）——\
+             系统 IPv6 流量不经代理直接出网，存在泄漏"
+        );
+    } else if plan6.add.is_empty() {
+        warn!("IPv6 接管未生成任何路由（无方案）——存在 IPv6 泄漏风险");
+    } else {
+        // 双栈环境开启接管：栈不支持 v6 转发，主循环已有 SYN-RST / ICMPv6
+        // 不可达代答，v6 应用会快速失败回落 IPv4（不再静默黑洞）
+        warn!(
+            "IPv6 接管已开启：本版本栈仅支持 IPv4 转发，进入 TUN 的 v6 连接将被\
+             快速拒绝（TCP SYN 回 RST、其余回 ICMPv6 不可达），应用应回落 IPv4"
+        );
+        let failed = apply_routes_v6_try(exec.as_ref(), &plan6);
+        if failed > 0 {
+            warn!(
+                "IPv6 接管 {} / {} 条路由失败——未接管部分存在 IPv6 泄漏；\
+                 v4 接管不受影响，继续启动",
+                failed,
+                plan6.add.len()
+            );
+        } else {
+            info!(
+                "✓ IPv6 接管路由已添加（::/1 + 8000::/1，豁免 {} 条）",
+                plan6.add.len() - 2
+            );
+        }
+    }
+    let _guard = RouteGuard {
+        exec,
+        plan,
+        plan6: cfg.ipv6_enabled.then_some(plan6),
+    };
 
     // 4. 栈主循环
     let transport = Arc::new(Tun2Transport::new(dev));
@@ -961,17 +1623,134 @@ mod tests {
     fn tun() -> TunConfig {
         TunConfig {
             exclude_routes: vec![
-                Ipv4Addr::new(203, 0, 113, 7),  // 节点 IP
-                Ipv4Addr::new(8, 8, 8, 8),      // DNS
+                Ipv4Addr::new(203, 0, 113, 7), // 节点 IP
+                Ipv4Addr::new(8, 8, 8, 8),     // DNS
             ],
             ..Default::default()
+        }
+    }
+
+    /// 07-P1-2：IPv6 黑洞快速失败——组包正确性单测
+    mod v6_blackhole {
+        use super::*;
+
+        /// 构造一个 IPv6 + TCP SYN 包（应用 → 远端 2001:db8::1:443）
+        fn sample_syn() -> Vec<u8> {
+            let mut p = Vec::new();
+            p.push(0x60);
+            p.extend_from_slice(&[0, 0, 0]);
+            p.extend_from_slice(&20u16.to_be_bytes());
+            p.push(6); // next header = TCP
+            p.push(64);
+            p.extend_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2]); // src
+            p.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]); // dst
+            p.extend_from_slice(&54321u16.to_be_bytes()); // sport
+            p.extend_from_slice(&443u16.to_be_bytes()); // dport
+            p.extend_from_slice(&1000u32.to_be_bytes()); // seq
+            p.extend_from_slice(&0u32.to_be_bytes()); // ack
+            p.push(0x50);
+            p.push(0x02); // SYN
+            p.extend_from_slice(&0u16.to_be_bytes());
+            p.extend_from_slice(&[0, 0]);
+            p.extend_from_slice(&[0, 0]);
+            p
+        }
+
+        #[test]
+        fn ipv6识别() {
+            assert!(is_ipv6_packet(&sample_syn()));
+            let mut v4 = vec![
+                0x45, 0, 0, 60, 0, 0, 0, 0, 64, 6, 0, 0, 127, 0, 0, 1, 127, 0, 0, 2, 0, 0, 0, 0,
+            ];
+            v4.resize(40, 0);
+            assert!(!is_ipv6_packet(&v4));
+            assert!(!is_ipv6_packet(&[0x60, 0x00])); // 长度不足
+        }
+
+        #[test]
+        fn syn回rst_地址端口对调_ack为seq加一() {
+            let syn = sample_syn();
+            let rst = build_tcp_rst_v6(&syn).expect("SYN 应构造出 RST");
+            assert_eq!(rst.len(), 60);
+            // IPv6 头：版本 6、方向对调
+            assert_eq!(rst[0] >> 4, 6);
+            assert_eq!(&rst[8..24], &syn[24..40], "RST 源 = 原 SYN 目的");
+            assert_eq!(&rst[24..40], &syn[8..24], "RST 目的 = 原 SYN 源");
+            // TCP 头：端口对调、ack = seq+1、RST|ACK
+            assert_eq!(&rst[40..42], &syn[42..44], "源端口 = 原 SYN 目的端口");
+            assert_eq!(&rst[42..44], &syn[40..42], "目的端口 = 原 SYN 源端口");
+            assert_eq!(
+                rst[51], 0xE9,
+                "ack 低字节 = seq+1（seq=1000=0x3E8 → ack=0x3E9）"
+            );
+            assert_eq!(rst[53], 0x14, "flags = RST|ACK");
+            // 校验和自洽：置 0 后按伪首部复算应等于包内值
+            let mut tcp = rst[40..].to_vec();
+            let ck_in_pkt = u16::from_be_bytes([tcp[16], tcp[17]]);
+            tcp[16] = 0;
+            tcp[17] = 0;
+            let ck_recalc = checksum16(
+                &[
+                    ipv6_pseudo_header(
+                        &rst[8..24].try_into().unwrap(),
+                        &rst[24..40].try_into().unwrap(),
+                        20,
+                        6,
+                    ),
+                    tcp,
+                ]
+                .concat(),
+            );
+            assert_eq!(ck_in_pkt, ck_recalc, "RST 校验和应自洽");
+        }
+
+        #[test]
+        fn 非syn不回rst() {
+            let mut syn = sample_syn();
+            syn[53] = 0x10; // ACK（无 SYN）
+            assert!(build_tcp_rst_v6(&syn).is_none(), "纯 ACK 不应代答 RST");
+            syn[53] = 0x12; // SYN|ACK
+            assert!(build_tcp_rst_v6(&syn).is_none(), "SYN-ACK 不应代答 RST");
+            syn[6] = 17; // next header = UDP
+            assert!(build_tcp_rst_v6(&syn).is_none(), "非 TCP 不应代答 RST");
+        }
+
+        #[test]
+        fn 其余回icmpv6不可达_引用原包() {
+            let syn = sample_syn();
+            let icmp = build_icmpv6_unreachable_v6(&syn);
+            // 40B 头 + 8B ICMP 头 + 引用整包（60B < 1232 截断限）
+            assert_eq!(icmp.len(), 40 + 8 + syn.len());
+            assert_eq!(icmp[40], 1, "type = destination unreachable");
+            assert_eq!(icmp[41], 0, "code = 0");
+            assert_eq!(&icmp[48..], &syn[..], "应引用原包全文（未达截断限时）");
+            assert_eq!(&icmp[8..24], &syn[24..40], "ICMPv6 源 = 原目的");
+            // 校验和自洽
+            let mut body = icmp[40..].to_vec();
+            let ck_in_pkt = u16::from_be_bytes([body[2], body[3]]);
+            body[2] = 0;
+            body[3] = 0;
+            let ck_recalc = checksum16(
+                &[
+                    ipv6_pseudo_header(
+                        &icmp[8..24].try_into().unwrap(),
+                        &icmp[24..40].try_into().unwrap(),
+                        (icmp.len() - 40) as u32,
+                        58,
+                    ),
+                    body,
+                ]
+                .concat(),
+            );
+            assert_eq!(ck_in_pkt, ck_recalc, "ICMPv6 校验和应自洽");
         }
     }
 
     #[test]
     fn compute_routes_含豁免清单完备() {
         let gw = Some(Ipv4Addr::new(192, 168, 1, 1));
-        let plan = compute_routes(&tun(), gw);
+        // 显式含网段直连版（平台无关；生产入口按 cfg!(windows) 决定，见 compute_routes）
+        let plan = compute_routes_for(&tun(), gw, true);
         // 添加清单：/1 x2 + TUN 网段 + 2 豁免
         assert_eq!(plan.add.len(), 5);
         assert!(plan.add.contains(&RouteCmd {
@@ -992,12 +1771,13 @@ mod tests {
         assert!(plan.add.contains(&RouteCmd {
             dest: Ipv4Addr::new(203, 0, 113, 7),
             prefix: 32,
-            gateway: gw.unwrap(),
+            // gw 静态为 Some：直接写字面量（clippy unnecessary_literal_unwrap）
+            gateway: Ipv4Addr::new(192, 168, 1, 1),
         }));
         assert!(plan.add.contains(&RouteCmd {
             dest: Ipv4Addr::new(8, 8, 8, 8),
             prefix: 32,
-            gateway: gw.unwrap(),
+            gateway: Ipv4Addr::new(192, 168, 1, 1),
         }));
     }
 
@@ -1015,10 +1795,164 @@ mod tests {
 
     #[test]
     fn compute_routes_无物理网关时跳过豁免并保留接管() {
-        let plan = compute_routes(&tun(), None);
+        let plan = compute_routes_for(&tun(), None, true);
         // 仅 /1 x2 + TUN 网段；豁免项不生成（避免生成错误路由）
         assert_eq!(plan.add.len(), 3);
         assert!(plan.remove.len() == 3);
+    }
+
+    /// 审查 06-P2-10：Linux 不生成 TUN 网段直连路由（内核 connected route 已覆盖，
+    /// 显式 via 本机地址会 EINVAL 且连累整体回滚）
+    #[test]
+    fn compute_routes_linux不含网段直连() {
+        let plan = compute_routes_for(&tun(), Some(Ipv4Addr::new(192, 168, 1, 1)), false);
+        // /1 x2 + 2 豁免 = 4；无 10.7.0.0/30
+        assert_eq!(plan.add.len(), 4);
+        assert!(!plan
+            .add
+            .iter()
+            .any(|c| c.prefix == 30 && c.dest == Ipv4Addr::new(10, 7, 0, 0)));
+        assert_eq!(plan.remove.len(), 4);
+    }
+
+    /// 审查 06-P2-9：prefix>32 不再下溢（钳制到 32 的掩码）
+    #[test]
+    fn prefix_to_mask_prefix超界被钳制() {
+        assert_eq!(prefix_to_mask(32), [255, 255, 255, 255]);
+        assert_eq!(
+            prefix_to_mask(33),
+            [255, 255, 255, 255],
+            "prefix>32 应钳制而非下溢"
+        );
+        assert_eq!(prefix_to_mask(255), [255, 255, 255, 255]);
+        assert_eq!(prefix_to_mask(0), [0, 0, 0, 0]);
+        assert_eq!(prefix_to_mask(30), [255, 255, 255, 252]);
+    }
+
+    // ── 0-4 IPv6 对称接管单测 ────────────────────────────────────────────────
+
+    fn tun_v6() -> TunConfig {
+        TunConfig {
+            exclude_routes_v6: vec![
+                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7), // 节点 IPv6 地址
+            ],
+            // 07-P1-2 后默认关闭；本组用例专门验证"接管开启"的方案生成，显式打开
+            ipv6_enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn compute_routes_v6_接管与豁免完备() {
+        let gw6 = Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        let plan = compute_routes_v6(&tun_v6(), gw6);
+        // ::/1 + 8000::/1 接管 + 1 条节点 v6 豁免 /128
+        assert_eq!(plan.add.len(), 3);
+        assert!(plan.add.contains(&RouteCmdV6 {
+            dest: Ipv6Addr::UNSPECIFIED,
+            prefix: 1,
+            gateway: Ipv6Addr::new(0xfd07, 0, 0, 0, 0, 0, 0, 1),
+        }));
+        assert!(plan.add.contains(&RouteCmdV6 {
+            dest: Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0),
+            prefix: 1,
+            gateway: Ipv6Addr::new(0xfd07, 0, 0, 0, 0, 0, 0, 1),
+        }));
+        assert!(plan.add.contains(&RouteCmdV6 {
+            dest: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7),
+            prefix: 128,
+            // gw6 静态为 Some：直接写字面量
+            gateway: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+        }));
+        // 删除与添加一一对应（幂等清理配对）
+        assert_eq!(plan.add.len(), plan.remove.len());
+    }
+
+    #[test]
+    fn compute_routes_v6_无v6网关时跳过豁免保留接管() {
+        let plan = compute_routes_v6(&tun_v6(), None);
+        assert_eq!(plan.add.len(), 2);
+        assert_eq!(plan.remove.len(), 2);
+    }
+
+    #[test]
+    fn compute_routes_v6_开关关闭时产出空方案() {
+        let mut cfg = tun_v6();
+        cfg.ipv6_enabled = false;
+        let plan = compute_routes_v6(&cfg, Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
+        assert!(plan.add.is_empty());
+        assert!(plan.remove.is_empty());
+    }
+
+    #[test]
+    fn v6_路由命令平台参数格式() {
+        let cmd = RouteCmdV6 {
+            dest: Ipv6Addr::UNSPECIFIED,
+            prefix: 1,
+            gateway: Ipv6Addr::new(0xfd07, 0, 0, 0, 0, 0, 0, 1),
+        };
+        assert_eq!(
+            cmd.linux_args(RouteAction::Add),
+            vec!["-6", "route", "add", "::/1", "via", "fd07::1"]
+        );
+        assert_eq!(
+            cmd.linux_args(RouteAction::Delete),
+            vec!["-6", "route", "delete", "::/1", "via", "fd07::1"]
+        );
+        assert_eq!(
+            cmd.windows_args(RouteAction::Add, "Hydra"),
+            vec![
+                "interface",
+                "ipv6",
+                "add",
+                "route",
+                "::/1",
+                "interface=Hydra"
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_routes_v6_try_失败不回滚不阻断只计数() {
+        let plan = compute_routes_v6(&tun_v6(), Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
+        // 第 1 条（::/1）成功，之后全部失败
+        let exec = FailAfterExecutor {
+            ok: 1,
+            calls: Mutex::new(Vec::new()),
+        };
+        let failed = apply_routes_v6_try(&exec, &plan);
+        assert_eq!(
+            failed,
+            2,
+            "::/1 之后的 2 条应失败: {calls:?}",
+            calls = exec.calls.lock().unwrap()
+        );
+        // try-and-warn：失败条目不产生任何 Delete（不回滚），已成功的保留
+        let calls = exec.calls.lock().unwrap();
+        let deletes: Vec<&String> = calls.iter().filter(|c| c.contains("Delete")).collect();
+        assert!(deletes.is_empty(), "v6 接管失败不应回滚: {deletes:?}");
+    }
+
+    #[test]
+    fn apply_routes_v6_try_全部成功返回零() {
+        let plan = compute_routes_v6(&tun_v6(), Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
+        let exec = FailAfterExecutor {
+            ok: usize::MAX,
+            calls: Mutex::new(Vec::new()),
+        };
+        assert_eq!(apply_routes_v6_try(&exec, &plan), 0);
+        assert_eq!(exec.calls.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn cleanup_routes_v6_幂等删除配对() {
+        let exec = DryRunExecutor::default();
+        let plan = compute_routes_v6(&tun_v6(), Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
+        assert_eq!(apply_routes_v6_try(&exec, &plan), 0);
+        cleanup_routes_v6(&exec, &plan);
+        let cmds = exec.commands.lock().unwrap();
+        assert_eq!(cmds.len(), 6);
+        assert!(cmds[3].starts_with("v6 Delete ::/1"));
     }
 
     #[test]
@@ -1030,7 +1964,15 @@ mod tests {
         };
         assert_eq!(
             cmd.windows_args(RouteAction::Add),
-            vec!["add", "0.0.0.0", "mask", "128.0.0.0", "10.7.0.1", "metric", "1"]
+            vec![
+                "add",
+                "0.0.0.0",
+                "mask",
+                "128.0.0.0",
+                "10.7.0.1",
+                "metric",
+                "1"
+            ]
         );
         assert_eq!(
             cmd.windows_args(RouteAction::Delete),
@@ -1045,7 +1987,7 @@ mod tests {
     #[test]
     fn dry_run执行器记录命令且不真跑() {
         let exec = DryRunExecutor::default();
-        let plan = compute_routes(&tun(), Some(Ipv4Addr::new(192, 168, 1, 1)));
+        let plan = compute_routes_for(&tun(), Some(Ipv4Addr::new(192, 168, 1, 1)), true);
         apply_routes(&exec, &plan).unwrap();
         assert_eq!(exec.commands.lock().unwrap().len(), 5);
         cleanup_routes(&exec, &plan);
@@ -1063,9 +2005,31 @@ mod tests {
     impl RouteExecutor for FailAfterExecutor {
         fn run(&self, action: RouteAction, cmd: &RouteCmd) -> std::io::Result<()> {
             let line = format!("{:?} {}/{}", action, cmd.dest, cmd.prefix);
-            let adds = self.calls.lock().unwrap().iter().filter(|c| c.starts_with("Add")).count();
+            let adds = self
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.starts_with("Add"))
+                .count();
             if action == RouteAction::Add && adds >= self.ok {
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, "注入失败"));
+                return Err(std::io::Error::other("注入失败"));
+            }
+            self.calls.lock().unwrap().push(line);
+            Ok(())
+        }
+
+        fn run6(&self, action: RouteAction, cmd: &RouteCmdV6) -> std::io::Result<()> {
+            let line = format!("v6 {:?} {}/{}", action, cmd.dest, cmd.prefix);
+            let adds = self
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.starts_with("v6 Add"))
+                .count();
+            if action == RouteAction::Add && adds >= self.ok {
+                return Err(std::io::Error::other("注入失败"));
             }
             self.calls.lock().unwrap().push(line);
             Ok(())
@@ -1074,9 +2038,12 @@ mod tests {
 
     #[test]
     fn apply_routes_部分失败回滚已成功部分() {
-        let plan = compute_routes(&tun(), Some(Ipv4Addr::new(192, 168, 1, 1)));
+        let plan = compute_routes_for(&tun(), Some(Ipv4Addr::new(192, 168, 1, 1)), true);
         // 前 3 条（两条 /1 接管 + TUN 网段）成功，第 4 条（豁免路由，最易失败）失败
-        let exec = FailAfterExecutor { ok: 3, calls: Mutex::new(Vec::new()) };
+        let exec = FailAfterExecutor {
+            ok: 3,
+            calls: Mutex::new(Vec::new()),
+        };
         assert!(apply_routes(&exec, &plan).is_err());
         let calls = exec.calls.lock().unwrap();
         // 已成功的 3 条必须全部回滚（Delete x3），否则半接管黑洞残留
@@ -1089,11 +2056,19 @@ mod tests {
 
     #[test]
     fn apply_routes_全部成功不产生删除() {
-        let plan = compute_routes(&tun(), Some(Ipv4Addr::new(192, 168, 1, 1)));
-        let exec = FailAfterExecutor { ok: usize::MAX, calls: Mutex::new(Vec::new()) };
+        let plan = compute_routes_for(&tun(), Some(Ipv4Addr::new(192, 168, 1, 1)), true);
+        let exec = FailAfterExecutor {
+            ok: usize::MAX,
+            calls: Mutex::new(Vec::new()),
+        };
         assert!(apply_routes(&exec, &plan).is_ok());
         assert_eq!(exec.calls.lock().unwrap().len(), 5);
-        assert!(exec.calls.lock().unwrap().iter().all(|c| c.starts_with("Add")));
+        assert!(exec
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.starts_with("Add")));
     }
 
     // ── smoltcp 回环集成：单进程两个 Interface 对接（无真实 TUN 设备）────────
@@ -1116,7 +2091,7 @@ mod tests {
                     .await
                     .recv()
                     .await
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "closed"))?;
+                    .ok_or_else(|| std::io::Error::other("closed"))?;
                 let n = pkt.len().min(buf.len());
                 buf[..n].copy_from_slice(&pkt[..n]);
                 Ok(n)
@@ -1141,10 +2116,17 @@ mod tests {
         type TxToken<'a> = ChanTx;
         fn receive(&mut self, _ts: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
             let frame = self.inbound.lock().unwrap().pop_front()?;
-            Some((ChanRx(Some(frame)), ChanTx { queue: self.outbound.clone() }))
+            Some((
+                ChanRx(Some(frame)),
+                ChanTx {
+                    queue: self.outbound.clone(),
+                },
+            ))
         }
         fn transmit(&mut self, _ts: SmolInstant) -> Option<Self::TxToken<'_>> {
-            Some(ChanTx { queue: self.outbound.clone() })
+            Some(ChanTx {
+                queue: self.outbound.clone(),
+            })
         }
         fn capabilities(&self) -> DeviceCapabilities {
             let mut caps = DeviceCapabilities::default();
@@ -1159,7 +2141,9 @@ mod tests {
 
     /// mock opener：建一条 duplex——一半交给测试侧（写"pong"/读"ping"），
     /// 另一半打包成 ProxyDuplex 交给栈。
-    fn mock_opener(recorded: RecordedTargets) -> (ChannelOpener, mpsc::Receiver<tokio::io::DuplexStream>) {
+    fn mock_opener(
+        recorded: RecordedTargets,
+    ) -> (ChannelOpener, mpsc::Receiver<tokio::io::DuplexStream>) {
         let (tx, rx) = mpsc::channel(8);
         let opener: ChannelOpener = Arc::new(move |target: String| {
             recorded.lock().unwrap().push(target);
@@ -1177,17 +2161,12 @@ mod tests {
         (opener, rx)
     }
 
-    fn client_iface(
-        dev: &mut ClientDev,
-    ) -> (Interface, ClientSocketSet<'static>, SocketHandle) {
+    fn client_iface(dev: &mut ClientDev) -> (Interface, ClientSocketSet<'static>, SocketHandle) {
         let cfg = IfaceConfig::new(HardwareAddress::Ip);
         let mut iface = Interface::new(cfg, dev, smol_now());
         iface.update_ip_addrs(|a| {
-            a.push(IpCidr::new(
-                IpAddress::Ipv4(Ipv4Address([10, 7, 0, 2])),
-                30,
-            ))
-            .unwrap();
+            a.push(IpCidr::new(IpAddress::Ipv4(Ipv4Address([10, 7, 0, 2])), 30))
+                .unwrap();
         });
         iface
             .routes_mut()
@@ -1229,14 +2208,16 @@ mod tests {
         let cfg = TunConfig::default();
         let shutdown = CancellationToken::new();
         let shutdown2 = shutdown.clone();
-        let stack_task = tokio::spawn(async move {
-            run_stack(transport, cfg, opener, shutdown2).await
-        });
+        let _stack_task =
+            tokio::spawn(async move { run_stack(transport, cfg, opener, shutdown2).await });
 
         // 客户端栈（模拟 TUN 后面的应用）
         let cin = Arc::new(Mutex::new(VecDeque::new()));
         let cout = Arc::new(Mutex::new(VecDeque::new()));
-        let mut cdev = ClientDev { inbound: cin.clone(), outbound: cout.clone() };
+        let mut cdev = ClientDev {
+            inbound: cin.clone(),
+            outbound: cout.clone(),
+        };
         let (mut ciface, mut csockets, _ch) = client_iface(&mut cdev);
 
         let rx = SocketBuffer::new(vec![0u8; TCP_BUF]);
@@ -1255,7 +2236,7 @@ mod tests {
         // 测试侧写 "pong"（模拟远端响应）+ 收 "pong" 断言透传
         let mut sent = false;
         let mut got_pong = false;
-                        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline && !got_pong {
             // stack 出包 → client 入队
             while let Ok(pkt) = to_client_rx.try_recv() {
@@ -1269,7 +2250,7 @@ mod tests {
             ciface.poll(smol_now(), &mut cdev, &mut csockets);
 
             // 连接建立后发 "ping"（opener 参数断言用 recorded，远端任务负责写 pong）
-                        {
+            {
                 let sock = csockets.get_mut::<ClientTcpSocket>(ch_data);
                 if !sent && sock.may_send() && sock.state() == State::Established {
                     let _ = sock.send_slice(b"ping");
@@ -1289,7 +2270,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        
+
         let opened_target = recorded.lock().unwrap().last().cloned();
         assert_eq!(
             opened_target.as_deref(),
@@ -1313,17 +2294,21 @@ mod tests {
             outbound: to_client_tx,
         });
 
-        let mut cfg = TunConfig::default();
-        cfg.max_flows = 1;
+        let cfg = TunConfig {
+            max_flows: 1,
+            ..TunConfig::default()
+        };
         let shutdown = CancellationToken::new();
         let shutdown2 = shutdown.clone();
-        let stack_task = tokio::spawn(async move {
-            run_stack(transport, cfg, opener, shutdown2).await
-        });
+        let stack_task =
+            tokio::spawn(async move { run_stack(transport, cfg, opener, shutdown2).await });
 
         let cin = Arc::new(Mutex::new(VecDeque::new()));
         let cout = Arc::new(Mutex::new(VecDeque::new()));
-        let mut cdev = ClientDev { inbound: cin.clone(), outbound: cout.clone() };
+        let mut cdev = ClientDev {
+            inbound: cin.clone(),
+            outbound: cout.clone(),
+        };
         let (mut ciface, mut csockets, _) = client_iface(&mut cdev);
 
         let mk = |ciface: &mut Interface| {
@@ -1334,7 +2319,10 @@ mod tests {
             s.connect(
                 ciface.context(),
                 (IpAddress::Ipv4(Ipv4Address([1, 2, 3, 4])), 443),
-                (Ipv4Address([10, 7, 0, 2]), 40000 + (rand::random::<u16>() % 1000)),
+                (
+                    Ipv4Address([10, 7, 0, 2]),
+                    40000 + (rand::random::<u16>() % 1000),
+                ),
             )
             .unwrap();
             s
@@ -1353,11 +2341,7 @@ mod tests {
             for p in out {
                 let _ = to_stack_tx.send(p);
             }
-            ciface.poll(
-                smol_now(),
-                &mut cdev,
-                &mut csockets,
-            );
+            ciface.poll(smol_now(), &mut cdev, &mut csockets);
             s1_state = csockets.get_mut::<ClientTcpSocket>(h1).state();
             s2_state = csockets.get_mut::<ClientTcpSocket>(h2).state();
             if s1_state == State::Established && s2_state != State::SynReceived {
@@ -1387,5 +2371,178 @@ mod tests {
         assert_eq!(s1_state, State::Established, "第一条流应正常建立");
         // 第二条流：收到 RST（Closed）或至少无法进入 Established/SynReceived 停留
         assert_ne!(s2_state, State::Established, "第二条流不应建立");
+    }
+
+    /// 06-P1-8 回归（慢流不阻塞快流）：流 A 的上行写端永远 Pending（模拟节点
+    /// 链路假死/窗口耗尽），流 B 在短超时内仍必须完成 ping/pong。
+    /// 修复前：step() 第 4 步的 `write_all().await` 在主循环内永久阻塞，
+    /// 流 B 的 SYN 都不会被处理——本测试即红。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn 栈回环_慢流不阻塞快流() {
+        use std::task::{Context, Poll};
+
+        /// 永远 Pending 的写端（链路假死模拟）
+        struct StuckWriter;
+        impl tokio::io::AsyncWrite for StuckWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Pending
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        /// 永远 Pending 的读端（慢流下行也不推进，聚焦上行阻塞场景）
+        struct NeverReader;
+        impl tokio::io::AsyncRead for NeverReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        // opener：9.9.9.9 = 慢流（假死链路）；其余 = 正常 duplex 交付测试侧
+        let (fast_tx, mut fast_rx) = mpsc::channel::<tokio::io::DuplexStream>(8);
+        let recorded: RecordedTargets = Arc::new(Mutex::new(Vec::new()));
+        let opener: ChannelOpener = {
+            let recorded = recorded.clone();
+            Arc::new(move |target: String| {
+                recorded.lock().unwrap().push(target.clone());
+                let fast_tx = fast_tx.clone();
+                Box::pin(async move {
+                    if target.starts_with("9.9.9.9") {
+                        Ok(ProxyDuplex {
+                            reader: Box::new(NeverReader),
+                            writer: Box::new(StuckWriter),
+                        })
+                    } else {
+                        let (test_side, stack_side) = tokio::io::duplex(64 * 1024);
+                        let _ = fast_tx.send(test_side).await;
+                        let (r, w) = tokio::io::split(stack_side);
+                        Ok(ProxyDuplex {
+                            reader: Box::new(r),
+                            writer: Box::new(w),
+                        })
+                    }
+                }) as OpenFuture
+            })
+        };
+
+        let (to_stack_tx, to_stack_rx) = mpsc::unbounded_channel();
+        let (to_client_tx, mut to_client_rx) = mpsc::unbounded_channel();
+        let transport = Arc::new(TestTransport {
+            inbound: tokio::sync::Mutex::new(to_stack_rx),
+            outbound: to_client_tx,
+        });
+
+        // 快流远端：收到 pingB 回 pongB（独立任务推进）
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            if let Some(mut side) = fast_rx.recv().await {
+                let mut buf = [0u8; 16];
+                if let Ok(n) = side.read(&mut buf).await {
+                    if n > 0 {
+                        use tokio::io::AsyncWriteExt;
+                        let _ = side.write_all(b"pongB").await;
+                        let _ = side.flush().await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        });
+
+        let cfg = TunConfig::default();
+        let shutdown = CancellationToken::new();
+        let shutdown2 = shutdown.clone();
+        let stack_task =
+            tokio::spawn(async move { run_stack(transport, cfg, opener, shutdown2).await });
+
+        // 客户端栈（模拟 TUN 后的应用）：两条 socket
+        let cin = Arc::new(Mutex::new(VecDeque::new()));
+        let cout = Arc::new(Mutex::new(VecDeque::new()));
+        let mut cdev = ClientDev {
+            inbound: cin.clone(),
+            outbound: cout.clone(),
+        };
+        let (mut ciface, mut csockets, _) = client_iface(&mut cdev);
+
+        let mut mk_sock = |ciface: &mut Interface, ip: [u8; 4], port: u16| {
+            let mut s = ClientTcpSocket::new(
+                SocketBuffer::new(vec![0u8; TCP_BUF]),
+                SocketBuffer::new(vec![0u8; TCP_BUF]),
+            );
+            s.connect(
+                ciface.context(),
+                (IpAddress::Ipv4(Ipv4Address(ip)), 443),
+                (Ipv4Address([10, 7, 0, 2]), port),
+            )
+            .unwrap();
+            csockets.add(s)
+        };
+        // 先建慢流 A 并发数据（其上行将卡死在写任务），再建快流 B
+        let h_slow = mk_sock(&mut ciface, [9, 9, 9, 9], 40011);
+        let h_fast = mk_sock(&mut ciface, [8, 8, 8, 8], 40012);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut slow_sent = false;
+        let mut fast_sent = false;
+        let mut got_pong = false;
+        while Instant::now() < deadline && !got_pong {
+            while let Ok(pkt) = to_client_rx.try_recv() {
+                cin.lock().unwrap().push_back(pkt);
+            }
+            let out: Vec<Vec<u8>> = cout.lock().unwrap().drain(..).collect();
+            for p in out {
+                let _ = to_stack_tx.send(p);
+            }
+            ciface.poll(smol_now(), &mut cdev, &mut csockets);
+
+            {
+                let sock = csockets.get_mut::<ClientTcpSocket>(h_slow);
+                if !slow_sent && sock.state() == State::Established && sock.may_send() {
+                    let _ = sock.send_slice(b"pingA");
+                    slow_sent = true;
+                }
+            }
+            {
+                let sock = csockets.get_mut::<ClientTcpSocket>(h_fast);
+                if !fast_sent && sock.state() == State::Established && sock.may_send() {
+                    let _ = sock.send_slice(b"pingB");
+                    fast_sent = true;
+                }
+                let mut buf = [0u8; 16];
+                if let Ok(n) = sock.recv_slice(&mut buf) {
+                    if buf[..n].windows(5).any(|w| w == b"pongB") {
+                        got_pong = true;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let slow_state = csockets.get_mut::<ClientTcpSocket>(h_slow).state();
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(3), stack_task).await;
+
+        assert!(slow_sent, "慢流应已建立并发送数据（state={slow_state:?}）");
+        assert!(
+            got_pong,
+            "慢流上行卡死时，快流必须在短超时内完成传输（队头阻塞回归！fast_sent={fast_sent}）"
+        );
     }
 }

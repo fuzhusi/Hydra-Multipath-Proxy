@@ -9,7 +9,7 @@
 //!   默认 ACL 仅本机当前用户、Administrators 与 SYSTEM 可读，无需额外处理；
 //! - Linux/macOS：本模块保存时以 `0600` 权限创建/写入文件；
 //!   但 `~/.config` 父目录若由用户手工改宽过权限，请自行收紧。
-//! （README 面向用户的说明由项目总控统一补充。）
+//!   （README 面向用户的说明由项目总控统一补充。）
 //!
 //! **优先级规则：配置文件 > 环境变量**。环境变量（`HYDRA_AUTH_KEY` 等）保留向后兼容：
 //! 仅当配置文件对应字段为空/缺失时，解析函数才回落读取环境变量——
@@ -253,6 +253,12 @@ pub fn save_to_file(path: &Path, cfg: &GuiConfig) -> Result<(), String> {
     }
     let json = serde_json::to_string_pretty(cfg).map_err(|e| format!("配置序列化失败: {}", e))?;
 
+    // 审查 R-29：原子写——此前直接 create+truncate 写 config.json，进程在写入
+    // 中途崩溃/断电会留下半截 JSON，下次启动加载失败降级为默认配置，auth_key、
+    // 全部节点、订阅一次性丢失。现先写同目录临时文件并 sync_all 落盘，再
+    // rename 原子替换（同文件系统内 rename 原子；Windows 下 std::fs::rename
+    // 以 MOVEFILE_REPLACE_EXISTING 语义覆盖旧文件）。
+    let tmp = path.with_extension("json.tmp");
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -260,18 +266,28 @@ pub fn save_to_file(path: &Path, cfg: &GuiConfig) -> Result<(), String> {
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600) // 密钥明文：仅文件属主可读写
-            .open(path)
-            .map_err(|e| format!("打开配置文件 {} 失败: {}", path.display(), e))?;
+            .mode(0o600) // 密钥明文：临时文件同样仅属主可读写
+            .open(&tmp)
+            .map_err(|e| format!("打开临时配置文件 {} 失败: {}", tmp.display(), e))?;
         f.write_all(json.as_bytes())
             .and_then(|_| f.flush())
-            .map_err(|e| format!("写入配置文件 {} 失败: {}", path.display(), e))
+            .and_then(|_| f.sync_all())
+            .map_err(|e| format!("写入临时配置文件 {} 失败: {}", tmp.display(), e))?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, json)
-            .map_err(|e| format!("写入配置文件 {} 失败: {}", path.display(), e))
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| format!("打开临时配置文件 {} 失败: {}", tmp.display(), e))?;
+        f.write_all(json.as_bytes())
+            .and_then(|_| f.flush())
+            .and_then(|_| f.sync_all())
+            .map_err(|e| format!("写入临时配置文件 {} 失败: {}", tmp.display(), e))?;
     }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp); // 失败清理临时文件，不阻塞下次保存
+        format!("替换配置文件 {} 失败: {}", path.display(), e)
+    })
 }
 
 /// 掩码显示密钥：长度 > 8 → 保留前 4 后 4（如 `a1b2****8f90`）；
@@ -420,6 +436,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 审查 R-29：保存为原子替换——两次覆盖保存后文件内容为最新且无 .tmp 残留
+    #[test]
+    fn test_save_atomic_no_tmp_leftover() {
+        let dir = std::env::temp_dir().join(format!(
+            "hydra-gui-test-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join(CONFIG_FILE_NAME);
+        let mut cfg = GuiConfig {
+            auth_key: "11".repeat(32),
+            ..GuiConfig::default()
+        };
+        save_to_file(&path, &cfg).expect("首次保存应成功");
+        cfg.auth_key = "22".repeat(32);
+        save_to_file(&path, &cfg).expect("覆盖保存（rename 替换）应成功");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "临时文件应在 rename 后消失"
+        );
+        let loaded = load_from_file(&path)
+            .expect("加载应成功")
+            .expect("应有配置");
+        assert_eq!(loaded.auth_key, "22".repeat(32), "覆盖后应为最新内容");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_mask_secret() {
         // 长度 > 8：前 4 + **** + 后 4（任务书示例样式）
@@ -539,10 +585,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old.auth_key, "ff");
-        assert_eq!(old, GuiConfig {
-            auth_key: "ff".into(),
-            ..Default::default()
-        });
+        assert_eq!(
+            old,
+            GuiConfig {
+                auth_key: "ff".into(),
+                ..Default::default()
+            }
+        );
     }
 
     // ===================== Exec-C：订阅字段持久化 =====================
@@ -707,7 +756,7 @@ mod tests {
         assert_eq!(cfg.node_display_name("1.2.3.4:1"), "A 节点");
         // 空串备注 = 清除，回落地址
         cfg.set_node_name("1.2.3.4:1", "   ");
-        assert!(cfg.node_names.get("1.2.3.4:1").is_none());
+        assert!(!cfg.node_names.contains_key("1.2.3.4:1"));
         assert_eq!(cfg.node_display_name("1.2.3.4:1"), "1.2.3.4:1");
     }
 
@@ -737,7 +786,7 @@ mod tests {
             vec!["10.0.0.9:9999".to_string()]
         );
         // 备注名随地址迁移
-        assert!(cfg.node_names.get("10.0.0.1:4433").is_none());
+        assert!(!cfg.node_names.contains_key("10.0.0.1:4433"));
         assert_eq!(cfg.node_names.get("10.0.0.9:9999").unwrap(), "旧名");
         assert_eq!(cfg.node_source_label("10.0.0.9:9999"), "订阅:主订阅");
 

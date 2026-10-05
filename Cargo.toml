@@ -6,3 +6,25 @@ members = [
     "hydra-client-gui",
 ]
 resolver = "2"
+
+# 审查 R-31（短期项，2026-10-05 Wave 2）：跨 crate 共享依赖统一在此声明版本，
+# 各成员以 `X = { workspace = true }` 引用——消除"4 个 crate 各自写字符串版本"
+# 的漂移土壤。rustls 0.23 + tokio-rustls 0.26 + ring 0.17 单栈升级为独立波次
+# （Wave 3，见全量清账执行计划），本表收敛后只需改一处。
+# ring 0.17 单栈（Wave 3，审查 R-46/N-09：rustls 0.21 EOL）。
+# rustls 0.23 关默认特性（默认 aws_lc_rs），显式选 ring 与 snow 的 ring-resolver
+# 统一为 ring 0.17 单版本；代码侧用 builder_with_provider 显式指定 ring provider，
+# 不依赖进程级默认（避免 ureq 等经特性统一启用 aws_lc_rs 后多 provider 歧义）。
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

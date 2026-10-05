@@ -10,11 +10,19 @@ use tracing::warn;
 ///
 /// 证书持久化到磁盘：客户端通过把该证书加入本地信任根（RootCertStore）实现
 /// 标准 webpki 校验，杜绝 SkipVerification 带来的中间人风险。
+/// rustls 0.23（Wave 3）：返回 pki-types 的 CertificateDer / PrivateKeyDer。
+/// 07-P1-1 修复：返回**整条证书链**（`Vec<CertificateDer>`，叶在前）——真证书
+/// 部署（ACME fullchain）下服务端必须向对端发送中间链，否则公共 CA 客户端
+/// 无法构链到根，TLS 握手必败；自签/DER 路径链长为 1，行为不变。
+/// 指纹/通道绑定仍取 `chain[0]`（叶证书），语义不变。
 pub fn load_or_generate(
     cert_file: &Path,
     key_file: &Path,
     domains: &[String],
-) -> Result<(rustls::Certificate, rustls::PrivateKey)> {
+) -> Result<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
     if cert_file.exists() || key_file.exists() {
         // 只剩其一时拒绝启动：静默重新生成会让客户端 pin 的证书指纹失效
         if !(cert_file.exists() && key_file.exists()) {
@@ -37,9 +45,10 @@ pub fn load_or_generate(
                 "已加载 PEM 真证书（{} 证书，含链）: {} (leaf SHA-256 指纹: {})",
                 certs.len(),
                 cert_file.display(),
-                fingerprint_hex(&certs[0].0)
+                fingerprint_hex(certs[0].as_ref())
             );
-            return Ok((certs[0].clone(), key));
+            // 07-P1-1：整链返回（叶在前），由 spawn_tcp_listener with_single_cert 下发
+            return Ok((certs, key));
         }
         let cert_der = cert_raw;
         let key_der = key_raw;
@@ -48,25 +57,83 @@ pub fn load_or_generate(
             cert_file.display(),
             fingerprint_hex(&cert_der)
         );
-        Ok((rustls::Certificate(cert_der), rustls::PrivateKey(key_der)))
+        // 单张 DER 证书 → 链长 1（与真证书整链路径同一返回形态）
+        Ok((
+            vec![rustls::pki_types::CertificateDer::from(cert_der)],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(key_der.into()),
+        ))
     } else {
         let cert = rcgen::generate_simple_self_signed(domains.to_vec())
             .map_err(|e| HydraError::NodeError(format!("生成自签证书失败: {}", e)))?;
-        let cert_der = cert
-            .serialize_der()
-            .map_err(|e| HydraError::NodeError(format!("证书序列化失败: {}", e)))?;
-        let key_der = cert.serialize_private_key_der();
+        // rcgen 0.13（Wave 3）：CertifiedKey { cert, key_pair }；cert.der() 取 DER
+        let cert_der = cert.cert.der().as_ref().to_vec();
+        let key_der = cert.key_pair.serialize_der();
 
-        fs::write(cert_file, &cert_der)?;
-        fs::write(key_file, &key_der)?;
-        set_unix_file_permissions(cert_file, key_file);
+        // 私钥先建后写（审查 N-07）：`create_new(true)` + unix `mode(0o600)` 使文件
+        // 以最终权限原子创建，消除"先 0644 创建后 chmod"的毫秒级可读竞态窗口。
+        // Windows 权限模型不同（ACL 继承，无 POSIX mode）：mode 扩展属性仅 unix
+        // 生效，Windows 保持默认 ACL（当前用户私有目录下为用户私有），行为不变。
+        // 失败时清理半成品，保持"证书+私钥要么同时存在要么都不存在"的加载不变量。
+        write_key_file_secure(key_file, &key_der)?;
+        if let Err(e) = fs::write(cert_file, &cert_der) {
+            let _ = fs::remove_file(key_file);
+            return Err(HydraError::NodeError(format!(
+                "证书写入失败（已回滚私钥半成品）: {}",
+                e
+            )));
+        }
         info!(
             "已生成新节点证书并保存到 {} (SHA-256 指纹: {})。请将证书文件分发给客户端用于校验。",
             cert_file.display(),
             fingerprint_hex(&cert_der)
         );
-        Ok((rustls::Certificate(cert_der), rustls::PrivateKey(key_der)))
+        // rcgen 0.10 KeyPair：serialize_private_key_der 产 PKCS#8 DER，
+        // 与 rustls 0.23 的 PrivateKeyDer::Pkcs8 直接兼容（Wave 3 核查项）
+        Ok((
+            vec![rustls::pki_types::CertificateDer::from(cert_der)],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(key_der.into()),
+        ))
     }
+}
+
+/// 以独占创建（create_new）+ unix 0600 权限写入私钥。
+/// create_new 失败（AlreadyExists）→ 保持"存在即加载"语义：转由上层下一次启动
+/// 走加载路径；此处直接报错并提示删除或检查（并发首次生成属异常场景）。
+fn write_key_file_secure(key_file: &Path, key_der: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    // Windows：无 POSIX mode，ACL 由目录继承决定（注释见调用点）
+    let mut f = opts.open(key_file).map_err(|e| {
+        HydraError::NodeError(format!(
+            "私钥文件独占创建失败（{}）: {}（已存在则删除后重试或走加载路径）",
+            key_file.display(),
+            e
+        ))
+    })?;
+    // 07-P2-2：write/flush/sync_all 任一失败都必须回滚半成品 key 文件——否则
+    // 下次启动走"存在即加载"分支并命中"证书/私钥不完整"检查，无人值守节点
+    // 从此无法自愈（启动死锁）。sync_all 保证掉电不留下"存在但截断"的密钥。
+    let write_res = (|| -> std::io::Result<()> {
+        f.write_all(key_der)?;
+        f.flush()?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = fs::remove_file(key_file);
+        return Err(HydraError::NodeError(format!(
+            "私钥写入失败（已回滚半成品文件）: {}",
+            e
+        )));
+    }
+    Ok(())
 }
 
 /// 证书 DER 的 SHA-256 指纹（hex）
@@ -76,14 +143,17 @@ pub fn fingerprint_hex(cert_der: &[u8]) -> String {
 
 /// 解析 PEM 证书链 + 私钥（真证书部署路径：HYDRA_CERT_FILE/HYDRA_KEY_FILE 指向
 /// acme.sh/certbot 产出的 fullchain 与 key）。key 依次尝试 PKCS8 → RSA → EC。
+/// rustls-pemfile 2.x（Wave 3）：迭代器产出 CertificateDer / 各类 key DER 新类型。
 fn parse_pem_pair(
     cert_pem: &[u8],
     key_pem: &[u8],
-) -> Result<(Vec<rustls::Certificate>, rustls::PrivateKey)> {
-    use std::io::BufRead;
-
+) -> Result<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
     let mut rd = std::io::BufReader::new(cert_pem);
-    let certs: Vec<Vec<u8>> = rustls_pemfile::certs(&mut rd)
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> = rustls_pemfile::certs(&mut rd)
+        .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| HydraError::NodeError(format!("PEM 证书解析失败: {e}")))?;
     if certs.is_empty() {
         return Err(HydraError::NodeError(
@@ -93,51 +163,31 @@ fn parse_pem_pair(
 
     let mut rd = std::io::BufReader::new(key_pem);
     let key_der = rustls_pemfile::pkcs8_private_keys(&mut rd)
+        .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| HydraError::NodeError(format!("PEM 私钥（PKCS8）解析失败: {e}")))?;
     let key_der = if !key_der.is_empty() {
-        key_der
+        rustls::pki_types::PrivateKeyDer::Pkcs8(key_der.into_iter().next().unwrap())
     } else {
         let mut rd = std::io::BufReader::new(key_pem);
-        rustls_pemfile::rsa_private_keys(&mut rd)
-            .map_err(|e| HydraError::NodeError(format!("PEM 私钥（RSA）解析失败: {e}")))?
-    };
-    let key_der = if !key_der.is_empty() {
-        key_der
-    } else {
-        let mut rd = std::io::BufReader::new(key_pem);
-        rustls_pemfile::ec_private_keys(&mut rd)
-            .map_err(|e| HydraError::NodeError(format!("PEM 私钥（EC）解析失败: {e}")))?
-    };
-    let key = key_der
-        .into_iter()
-        .next()
-        .ok_or_else(|| HydraError::NodeError("PEM 私钥文件中未找到私钥".to_string()))?;
-    Ok((
-        certs.into_iter().map(rustls::Certificate).collect(),
-        rustls::PrivateKey(key),
-    ))
-}
-
-/// Unix 下收紧落盘权限（遗留 G）：私钥 0600，证书 0644（需分发给客户端）。
-/// 收紧失败只告警不阻断启动（证书功能不受影响，但运维须关注）。
-#[cfg(unix)]
-fn set_unix_file_permissions(cert_file: &Path, key_file: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    for (path, mode, what) in [(key_file, 0o600, "私钥"), (cert_file, 0o644, "证书")] {
-        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
-            warn!(
-                "{}权限收紧失败（目标 {:o}）: {}: {}——请手动 chmod",
-                what,
-                mode,
-                path.display(),
-                e
-            );
+        let keys = rustls_pemfile::rsa_private_keys(&mut rd)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| HydraError::NodeError(format!("PEM 私钥（RSA）解析失败: {e}")))?;
+        if !keys.is_empty() {
+            rustls::pki_types::PrivateKeyDer::Pkcs1(keys.into_iter().next().unwrap())
+        } else {
+            let mut rd = std::io::BufReader::new(key_pem);
+            let keys = rustls_pemfile::ec_private_keys(&mut rd)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| HydraError::NodeError(format!("PEM 私钥（EC）解析失败: {e}")))?;
+            rustls::pki_types::PrivateKeyDer::Sec1(
+                keys.into_iter()
+                    .next()
+                    .ok_or_else(|| HydraError::NodeError("PEM 私钥文件中未找到私钥".to_string()))?,
+            )
         }
-    }
+    };
+    Ok((certs, key_der))
 }
-
-#[cfg(not(unix))]
-fn set_unix_file_permissions(_cert_file: &Path, _key_file: &Path) {}
 
 /// Unix 下加载既有私钥时，权限宽于 0600（group/other 任一可访问）则告警
 #[cfg(unix)]

@@ -5,8 +5,8 @@ use base64::{
 use hydra_protocol::{HydraError, NodeInfo, NodeStatus, Result};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use url::Url;
 use tracing::warn;
+use url::Url;
 
 /// legacy 传输模式（QUIC 时代 masquerade|obfs 双模式；QUIC/UDP 与 obfs 模块已
 /// 随 TCP 转型整体移除）。枚举仅为旧分享链接 / 旧 JSON 持久化数据的**兼容解析**
@@ -110,14 +110,27 @@ impl ShareLink {
             cert_fp: None,
             obfs_key: None,
             // TCP 转型后默认生成 tp=tcp（缺省语义同样解析为 tcp，双向一致）
-            transport: Some(crate::tcp_transport::TransportChoice::Tcp.as_str().to_string()),
+            transport: Some(
+                crate::tcp_transport::TransportChoice::Tcp
+                    .as_str()
+                    .to_string(),
+            ),
         }
     }
 
     // ═══════════ v2 密钥字段 builder（Team-Q）═══════════
 
-    /// 携带认证密钥原始字节（生成完整分享）
+    /// 携带认证密钥原始字节（生成完整分享）。
+    /// 长度必须恰好 32 字节（NNpsk2 PSK 约束）；非法长度静默丢弃会让
+    /// "链接生成成功但不可用"，故直接 panic 级 assert——调用方（GUI/CLI）
+    /// 均在密钥入口做过 `auth_key_from_hex` 的 32B 校验，此处为防御性兜底。
     pub fn with_auth_key_bytes(mut self, key: &[u8]) -> Self {
+        assert_eq!(
+            key.len(),
+            32,
+            "分享链接认证密钥必须恰好 32 字节（当前 {} 字节）；请走 auth_key_from_hex 入口完成校验",
+            key.len()
+        );
         self.auth_key = Some(BASE64URL.encode(key));
         self
     }
@@ -181,14 +194,25 @@ impl ShareLink {
         self.auth_key.is_some() || self.cert_der.is_some() || self.obfs_key.is_some()
     }
 
-    /// 解码认证密钥原始字节（None = 未携带）
+    /// 解码认证密钥原始字节（None = 未携带）。
+    ///
+    /// **长度校验**：解码后必须恰好 32 字节（snow NNpsk2 PSK 约束，与
+    /// `auth_key_from_hex`/节点侧 fail-fast 一致）——分享链接层同步把关，
+    /// 避免链接能生成/导入、对端启动/握手阶段才报错的错位体验。
     pub fn auth_key_bytes(&self) -> std::result::Result<Option<Vec<u8>>, HydraError> {
         self.auth_key
             .as_ref()
             .map(|s| {
-                BASE64URL
+                let key = BASE64URL
                     .decode(s)
-                    .map_err(|e| HydraError::ProtocolError(format!("Invalid k (auth key): {}", e)))
+                    .map_err(|e| HydraError::ProtocolError(format!("Invalid k (auth key): {}", e)))?;
+                if key.len() != 32 {
+                    return Err(HydraError::ProtocolError(format!(
+                        "分享链接携带的认证密钥长度非法：{} 字节（必须恰好 32 字节；生成：openssl rand -hex 32）",
+                        key.len()
+                    )));
+                }
+                Ok(key)
             })
             .transpose()
     }
@@ -350,6 +374,8 @@ impl ShareLink {
                         HydraError::ProtocolError(format!("Invalid ok (obfs key): {}", e))
                     })?;
                     obfs_key = Some(value.to_string());
+                    // 安全分审查 P3-3：legacy 字段导入时显式告警（生成侧早已不写）
+                    warn!("分享链接含 legacy obfs 字段 ok=（QUIC 时代遗留，QUIC/obfs 已移除，无运行时效果，忽略）");
                 }
                 "cf" => {
                     let v = value.as_ref();
@@ -600,7 +626,10 @@ hydra://192.168.1.100:8080?bandwidth=80&latency=15&loss_rate=0.02&status=online
         let url = "hydra://1.2.3.4:443?bandwidth=100&tp=tcp";
         let link = ShareLink::from_share_url(url).unwrap();
         assert!(link.transport_is_tcp());
-        assert_eq!(link.transport_choice().unwrap(), crate::tcp_transport::TransportChoice::Tcp);
+        assert_eq!(
+            link.transport_choice().unwrap(),
+            crate::tcp_transport::TransportChoice::Tcp
+        );
 
         // URL 往返
         let rt = ShareLink::from_share_url(&link.to_share_url()).unwrap();
@@ -624,7 +653,10 @@ hydra://192.168.1.100:8080?bandwidth=80&latency=15&loss_rate=0.02&status=online
         // legacy tp=quic：解析不报错，访问器告警回退 tcp；不生成 quic 链接
         let quic = ShareLink::from_share_url("hydra://1.2.3.4:443?tp=quic").unwrap();
         assert!(quic.transport_is_tcp(), "legacy quic 回退 tcp");
-        assert_eq!(quic.transport_choice().unwrap(), crate::tcp_transport::TransportChoice::Tcp);
+        assert_eq!(
+            quic.transport_choice().unwrap(),
+            crate::tcp_transport::TransportChoice::Tcp
+        );
         assert!(!quic.to_share_url().contains("tp="));
 
         // 非法值显式报错（不静默回落 tcp）
@@ -813,11 +845,30 @@ hydra://192.168.1.100:8080?bandwidth=80&latency=15&loss_rate=0.02&status=online
 
     #[test]
     fn tq_v2_parse_share_links_text_with_secrets() {
+        // 密钥必须恰好 32 字节（NNpsk2 PSK 约束，与 auth_key_from_hex/节点侧一致）
         let url = ShareLink::new_with_mode(&sample_node(), TransportMode::Masquerade)
-            .with_auth_key_bytes(&[9u8; 16])
+            .with_auth_key_bytes(&[9u8; 32])
             .to_share_url();
         let links = parse_share_links(&format!("# 注释\n{}\n", url)).unwrap();
         assert_eq!(links.len(), 1);
-        assert_eq!(links[0].auth_key_bytes().unwrap(), Some(vec![9u8; 16]));
+        assert_eq!(links[0].auth_key_bytes().unwrap(), Some(vec![9u8; 32]));
+    }
+
+    #[test]
+    fn tq_v2_auth_key_length_enforced() {
+        // 生成侧：非 32 字节密钥防御性拒绝（调用方应先过 auth_key_from_hex）
+        let result = std::panic::catch_unwind(|| {
+            ShareLink::new_with_mode(&sample_node(), TransportMode::Masquerade)
+                .with_auth_key_bytes(&[9u8; 16])
+        });
+        assert!(result.is_err(), "16 字节密钥必须被拒绝");
+
+        // 解析侧：携带非法长度密钥的链接 → auth_key_bytes 显式报错（导入即拦截，
+        // 不等对端启动/握手才发现）
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+        let bad_k = B64.encode([7u8; 16]);
+        let link = ShareLink::from_share_url(&format!("hydra://127.0.0.1:8080?k={bad_k}")).unwrap();
+        let err = link.auth_key_bytes().unwrap_err().to_string();
+        assert!(err.contains("32 字节"), "应提示 32 字节约束: {err}");
     }
 }

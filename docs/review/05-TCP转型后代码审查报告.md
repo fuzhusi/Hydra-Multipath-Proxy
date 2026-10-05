@@ -168,99 +168,99 @@
 
 ## P2 问题详单
 
-### R-21 [P2/bug] hex_decode 对含多字节 UTF-8 的输入 panic（字节切片越字符边界）
+### R-21 [P2/bug] hex_decode 对含多字节 UTF-8 的输入 panic（字节切片越字符边界）【已失效/已随 06 报告 P1-1 修复：hex_decode 改字节级处理 + 拒绝非 ASCII，含多字节输入测试】
 
 - **位置**：`hydra-protocol/src/auth.rs` `hex_decode` L169-180
 - **机理**：`hex.len()` 为字节长度，循环内 `&hex[i..i+2]` 按字节切片；含多字节字符且总字节长为偶数的输入（如 `"a密"`）会在字符内部切片，触发 `byte index not a char boundary` panic。该函数是节点（config.rs:305）与客户端（lib.rs:35）读取密钥的必经路径。
 - **影响**：一次误粘贴即让节点进程启动即崩而非报错。
 - **修复方案**：先拒绝非 ASCII（`!hex.is_ascii()` 返回 Err），再用 `hex.as_bytes()` + 手写 hex 值表或 base16ct/hex crate 按字节解码。
 
-### R-22 [P2/security] legacy AuthToken 仍公开导出且窗口内可重放、依赖系统时钟
+### R-22 [P2/security] legacy AuthToken 仍公开导出且窗口内可重放、依赖系统时钟【已修复 2026-10-05 Wave 2：AuthToken/AuthConfig/PBKDF2 凭据模块整体删除（零调用方），auth.rs 仅保留 hex 编解码与 P2P 属主证明】
 
 - **位置**：`hydra-protocol/src/auth.rs` `AuthToken::verify` L61-97；`lib.rs:10` 导出
 - **机理**：QUIC 路径已删，AuthToken 无任何调用方但仍经 `pub use auth::*` 导出。verify 无 nonce 重放表，max_age 窗口内同一 token 可无限重放，且依赖 SystemTime（与 v3 握手"全程不读系统时间"的设计相悖）。留存风险是未来代码误用静默回退到弱方案。
 - **修复方案**：删除 AuthToken（及无调用方的 AuthConfig/PBKDF2 函数）；或加 `#[deprecated]` 并文档标注"仅 QUIC legacy，窗口内可重放"。
 
-### R-23 [P2/security] error 级 dump 原始请求字节/请求行，含目标域名明文
+### R-23 [P2/security] error 级 dump 原始请求字节/请求行，含目标域名明文【已修复 2026-10-05 Wave 2：SOCKS5 greeting/request 的字节 dump 与 HTTP 请求行明文 error 全部改为结构信息/脱敏视图，字节 dump 降为 debug】
 
 - **位置**：`hydra-client/src/proxy.rs` L394、L592、L619
 - **机理**：L619 `error!("Invalid SOCKS5 request: {:?}", &buf[..n])` 把含目标域名/IP 的原始 SOCKS 请求字节打进 error 日志；L592 同理 dump greeting 字节；L394 输出完整 HTTP 请求行（含 URL）。虽只在畸形请求时触发，但与"info 及以上一律脱敏"冲突，且恶意方可用畸形请求把任意"明文目标+时间戳"写入日志。
 - **修复方案**：只记录长度/atyp/首字节等结构信息（脱敏后），字节 dump 降到 debug!。
 
-### R-24 [P2/security] 运行期在 UI 线程调用 std::env::set_var/remove_var，与后台线程的 env 读取构成数据竞争（UB）
+### R-24 [P2/security] 运行期在 UI 线程调用 std::env::set_var/remove_var，与后台线程的 env 读取构成数据竞争（UB）【已修复 2026-10-05 Wave 2（最小方案）：set_system_proxy/remove_system_proxy_static 的 6 个 proxy env var 写入删除；apply_env_overrides 仅保留 HydraApp::new（确认无线程）一次调用，start_proxy 的重复调用删除】
 
 - **位置**：`hydra-client-gui/src/main.rs` `set_system_proxy` L801-806、`remove_system_proxy_static` L911-916、`start_proxy` L626（`config::apply_env_overrides`，config.rs L326-330）
 - **机理**：`set_var`/`remove_var` 在进程存活期任意时刻对 6 个 env var 写入。Rust std 明确文档：多线程进程并发读写 env 是 UB（2024 edition 已把 set_var 标为 unsafe）。而进程内确定存在并发读者：代理线程、健康检查线程、订阅线程都可能调用 `std::env::var`。`apply_env_overrides` 虽设计为"spawn 前"调用，但 `start_proxy` L626 在代理停止后、其他后台线程可能仍存活时再次调用，"不会并发"的前提不成立。
 - **修复方案**：彻底去掉运行期 env 写入：① set_system_proxy 的 6 个 env var 对 GUI 自身进程无实际收益（子进程才继承），直接删除；② probe_interval_secs 不经 env 中转——给 ProxyServer/Scheduler 增加显式 `with_probe_interval_secs()` 构造参数（hydra-client 是自有 crate）；若暂不能改，则只在 `HydraApp::new`（确认尚无线程）时调用一次 set_var，start_proxy 中的重复调用删除。
 
-### R-25 [P2/security] Dockerfile COPY . . 且仓库无 .dockerignore：构建上下文吸入 target/ 与本地未忽略的密钥文件
+### R-25 [P2/security] Dockerfile COPY . . 且仓库无 .dockerignore：构建上下文吸入 target/ 与本地未忽略的密钥文件【已修复 2026-10-05 Wave 2：新增根 .dockerignore（target/.git/.e2e/.probe/*.der/*.pem 等）；Dockerfile 改先拷 manifests + 虚 src 建 cargo fetch 依赖缓存层】
 
 - **位置**：`deploy/docker/Dockerfile` L11（仓库根无 .dockerignore，已验证）
 - **机理**：.gitignore 只对 git 生效，docker build 的 COPY . . 会把整个构建上下文发进 daemon：target/（GB 级，上下文传输极慢）以及真实存在于工作区的敏感文件——`.probe/key.hex`（探测密钥）、`.e2e/` 下 cert/key、`hydra-node/hydra-node-key.der`（节点私钥）。这些文件虽未进最终镜像 runtime 层，但全部进入构建上下文与 builder 层缓存，私钥落进镜像层可被 docker history/layer 导出还原。
 - **修复方案**：新增 `.dockerignore`：`target/`、`.e2e/`、`.probe/`、`*.der`、`*.pem`、`*.log`、`node.toml`、`.git/`。同时 Dockerfile 改为先 COPY 各 Cargo.toml + 虚 src 做 `cargo fetch` 建依赖缓存层，再 COPY 全源（注释中"无法只拷 manifests"的说法不成立）。
 
-### R-26 [P2/security] 节点侧 DNS 解析无超时，可拖住已认证连接并占用并发配额
+### R-26 [P2/security] 节点侧 DNS 解析无超时，可拖住已认证连接并占用并发配额【已修复 2026-10-05 Wave 2：lookup_host 包 5s tokio::time::timeout，超时归入既有 ERR_DNS_FAIL(0x02) 路径（与 06-P2-3 同一修复）】
 
 - **位置**：`hydra-node/src/handler.rs` `lookup_host` L248（`tcp_server.rs:150` 复用）；15s 超时仅覆盖 L315 的 connect
 - **机理**：版本字节/握手/地址帧均有 AUTH_TIMEOUT=10s 包裹，但认证后的 `lookup_host` 无超时。上游 DNS 黑洞时（glibc 重试可拖 40s+）已认证连接远超客户端 20s 超时仍存活并持有 Semaphore permit；持有效 PSK 的攻击者可用大量慢解析域名请求占满 max_connections（默认 1000），饿死正常连接。
 - **修复方案**：`lookup_host` 用 `tokio::time::timeout(Duration::from_secs(5), ...)` 包裹，超时归入现有 ERR_DNS_FAIL(0x02) 路径，维持"DNS 5s < connect 15s < 客户端 20s"的层次。
 
-### R-27 [P2/bug] 下行先结束（远端 FIN）时直接 abort 上行任务，客户端未发完的数据被静默丢弃
+### R-27 [P2/bug] 下行先结束（远端 FIN）时直接 abort 上行任务，客户端未发完的数据被静默丢弃【已修复 2026-10-05 Wave 2：down 干净结束后给 up 5s 有限排水窗口（RELAY_DOWN_FIN_DRAIN），超时才 abort，告警保留】
 
 - **位置**：`hydra-client/src/proxy.rs` `relay_bidirectional()` 分支 `(false, None)` L983-988
 - **机理**：远端先 FIN（down 返回 Ok）时 `up.abort()` 直接杀掉上行任务。与浏览器半关闭路径（up 结束 → `up_sink.shutdown()` 优雅排水 30s）相比，该方向没有任何排水：up 任务中已读出、正在 write_all 途中的数据块被丢弃；写端经 drop 关闭，TLS 流不发送 close_notify。注释（L982）声称"drop → FIN 传给远端"，但语义上是 abort 而非 shutdown，与 README 宣称的对称半关闭语义不符。
 - **影响**：对"服务器推完响应、客户端还有尾巴数据"的协议造成尾部数据静默丢失。
 - **修复方案**：down 干净结束后不立即 abort up：对 up 施加有限排水窗口（较短的超时值如 5s，或直接等待 up 完成——up 侧客户端 EOF 逻辑已会 shutdown 远端写端），超时再 abort，保留现有超时告警。
 
-### R-28 [P2/bug] 全局 speed_history 互斥锁在每 64KB 数据块上竞争，且样本 Vec 每次写入做 O(n) retain
+### R-28 [P2/bug] 全局 speed_history 互斥锁在每 64KB 数据块上竞争，且样本 Vec 每次写入做 O(n) retain【延后（Wave 3+/中期）：即性能路线 R-17 两步走（本地累加 + 时间片桶去 Mutex），属结构性改动，> 半天工作量；此数据仅服务 GUI 速度显示，精度需求极低】
 
 - **位置**：`hydra-client/src/traffic.rs` `record_sent_sync/record_received_sync` L312-331、`SpeedHistory::add_sent_sample` L70-85；调用点 `ByteCounter::record` → poll_read/poll_write L245-285（另见横切面 L312-331）
 - **机理**：每次 `CountingStream::poll_write/poll_read`（64KB 块粒度）获取全局 `std::sync::Mutex`，push 一条样本后 retain 全量扫描 5 秒窗口。量化：64KB 块、单连接 100MB/s 双向 ≈ 每方向 ~1600 次/秒 lock+push+O(n) retain；窗口内样本 ~8000 条，所有连接所有方向在唯一一把锁上串行化，poll 上下文内的同步临界区还拉长任务调度延迟。此数据仅服务 GUI 速度显示，精度需求极低。
 - **修复方案**：见"性能提升方案" R-17（本地累加 + 时间片桶两步走）。
 
-### R-29 [P2/bug] 配置文件非原子写入：崩溃/断电可截断 config.json，导致全部配置（含密钥）丢失
+### R-29 [P2/bug] 配置文件非原子写入：崩溃/断电可截断 config.json，导致全部配置（含密钥）丢失【已修复 2026-10-05 Wave 2：save_to_file 改原子写——同目录 config.json.tmp（Unix mode 0600）+ sync_all + rename 替换；新增覆盖保存无 .tmp 残留测试】
 
 - **位置**：`hydra-client-gui/src/config.rs` `save_to_file` L249-275（非 unix 分支 `std::fs::write`；unix 分支 truncate(true) 直写）
 - **机理**：直接对 config.json 以 create+truncate 打开写入。进程在写入中途崩溃/断电（GUI 代理崩溃路径并不少见）会留下半截 JSON；下次启动 `load_from_file` 返回 Err，代码降级为默认配置——auth_key、全部节点、订阅列表一次性丢失，且下次编辑任何字段后即被覆盖写，无法恢复。对存有明文密钥和全部节点配置的唯一持久化文件，这是真实数据丢失路径。
 - **修复方案**：原子写：序列化后先写同目录临时文件 `config.json.tmp`（Unix 对 tmp 同样 mode 0600），`f.sync_all()` 后 rename/replace 到 config.json（同文件系统内 rename 原子；Windows 用 `std::fs::rename`，必要时先 remove 旧文件）。可选：load 失败时尝试读取 .tmp/备份而非直接丢弃。
 
-### R-30 [P2/maintainability] QUIC 时代死代码残留：session/packet/auth(v2)/node/splitter 整模块零生产引用；HYDRA_TRANSPORT 告警未接线导致 README 行为失实
+### R-30 [P2/maintainability] QUIC 时代死代码残留：session/packet/auth(v2)/node/splitter 整模块零生产引用；HYDRA_TRANSPORT 告警未接线导致 README 行为失实【已修复 2026-10-05 Wave 2：packet.rs/session.rs(Session/Stream 部分)/node.rs/splitter.rs/test_split.rs 删除；auth.rs 的 v2 Token 部分 R-22 一并删除；transport_from_env 在 client main 启动时调用（eprintln 改 tracing::warn），README 行为兑现】
 
 - **位置**：`hydra-protocol/src/{packet,session,auth,node}.rs`；`hydra-client/src/splitter.rs`；`tcp_transport.rs` L66-79
 - **机理**：grep 证实：splitter 仅被 lib.rs mod/re-export 和 test_split.rs 引用；packet 仅被 splitter 引用；session.rs 中 client 实际使用的只有 NodeInfo，Session/Stream 零引用；auth.rs（v2 HMAC token）、node.rs（NodeConfig）均无生产调用。`tcp_transport.rs` 的 `transport_from_env`（README 声称 `HYDRA_TRANSPORT=quic` 会告警回退 tcp）在 main.rs/gui 生产代码零调用——用户设该变量实际不会有任何告警，README L113 描述的行为不存在。
 - **修复方案**：删除 splitter.rs、session.rs、packet.rs、auth.rs、node.rs 及 test_split/test_tcp_ssrf 中对 v2 的引用；`transport_from_env` 要么在 client main.rs 启动时调用一次（兑现 README），要么连同 HYDRA_TRANSPORT 文档一并删除。
 
-### R-31 [P2/maintainability] 无 [workspace.dependencies] 统一版本；tokio 全 feature；rustls 0.21/tokio-rustls 0.24 已 EOL；ring 0.16+0.17 双份编译
+### R-31 [P2/maintainability] 无 [workspace.dependencies] 统一版本；tokio 全 feature；rustls 0.21/tokio-rustls 0.24 已 EOL；ring 0.16+0.17 双份编译【部分修复 2026-10-05 Wave 2：根 Cargo.toml 新增 [workspace.dependencies]（12 项共享依赖统一声明，各 crate 改 workspace = true）；rustls 0.23 升级与 tokio feature 收敛按计划延后至 Wave 3】
 
 - **位置**：workspace 根 Cargo.toml 与 4 个 crate 的 Cargo.toml
 - **机理**：tokio/rustls/bytes/serde/tracing 在 4 个 crate 各自声明版本字符串，已有漂移土壤（lock 里 rustls 0.21.x、ring 0.16 与 0.17 并存——两份 ring 静态编进每个二进制）。rustls 0.21/tokio-rustls 0.24 官方已停止维护（当前线 0.23/0.26），安全修复不再回移，对安全产品是实质风险。tokio 各 crate 均开 `features=["full"]`（含 fs/process/signal 等未用模块），拉长 node 交叉编译时间。
 - **修复方案**：短期：加 `[workspace.dependencies]` 统一版本、tokio 收敛到实际所需 feature（rt-multi-thread/net/io-util/time/sync/macros）；中期：规划升级 rustls 0.23 + tokio-rustls 0.26 + ring 0.17 单栈（snow 的 ring-resolver 随之自然去重，或暂只留 default-resolver 消除双 ring）。
 
-### R-32 [P2/maintainability] packet.rs / splitter.rs 死代码，且存在可量化的性能缺陷
+### R-32 [P2/maintainability] packet.rs / splitter.rs 死代码，且存在可量化的性能缺陷【已修复 2026-10-05 Wave 2：两文件及 re-export、test_split.rs 整体删除（与 R-30 同一清账）】
 
 - **位置**：`hydra-protocol/src/packet.rs` `Packet::new` L17-52；`hydra-client/src/splitter.rs`
 - **机理**：全仓无调用点（Splitter 仅定义未引用）。若启用：每 chunk 两次冗余拷贝（splitter.rs:22 `copy_from_slice` + packet.rs:33 `to_vec`，同一数据 3 份内存）；`calculate_checksum` 为逐位软件 CRC32（每字节 8 次内层迭代），比查表 crc32fast 慢约 8 倍以上（10MB 流约 8000 万次内层循环），且 TCP+TLS1.3 AEAD 已保证完整性，校验纯冗余。属 TCP 转型 Wave 3 删 QUIC 死路径的遗漏项。
 - **修复方案**：删除 packet.rs、splitter.rs 及 lib.rs 的 re-export。
 
-### R-33 [P2/bug] 节点数据期无任何超时，Semaphore permit 全程占用：1000 条空闲/慢连接即令 accept 循环停摆
+### R-33 [P2/bug] 节点数据期无任何超时，Semaphore permit 全程占用：1000 条空闲/慢连接即令 accept 循环停摆【已失效/已随附录 B N-02 修复：idle 看门狗（300s，HYDRA_IDLE_TIMEOUT_SECS 可调，双向共享活跃时间戳）】
 
 - **位置**：`hydra-node/src/tcp_server.rs` L55-75、L87-184
 - **机理**：`handle_tls_stream` 进入双向 pump 后没有任何 idle/生命周期上限；permit 在 accept 循环 `acquire_owned().await` 后贯穿整条连接。恶意或异常客户端（建立 TLS+Noise 后不发不收）每条永久占 1 个 permit；1000 条即满，accept 循环阻塞在 acquire，新 TCP 连接只能在内核 backlog 排队直至超时。对公网 443 节点是低成本的资源耗尽面（错 PSK 在握手期即被 10s AUTH_TIMEOUT 关闭，合法 PSK 持有者可无限挂起）。
 - **修复方案**：数据期为 pump 包 `tokio::time::timeout` 或用 interval 做写侧 idle 检测（如 300s 无字节即关）；或把 permit 拆为握手期短持有 + 数据期长持有两档额度。
 
-### R-34 [P2/performance] 每次节点健康检查（每 30s）新建并销毁一个多线程 tokio Runtime；certs 逐节点克隆且参数实际未用
+### R-34 [P2/performance] 每次节点健康检查（每 30s）新建并销毁一个多线程 tokio Runtime；certs 逐节点克隆且参数实际未用【部分修复 2026-10-05 Wave 2：进程级 probe_runtime()（OnceLock）复用，test_all_nodes/start_node_test 不再冷启动 runtime。"certs 参数未用"已失效——0-7 修复后 test_node_connection 完整走 connect_target，certs 实际用于 TlsTrust::pinned；逐节点 clone 保留（30s 一次，开销可忽略）】
 
 - **位置**：`hydra-client-gui/src/main.rs` `test_all_nodes` 约 L515-534（触发点：start_proxy L655、周期检查 L1586-1594、手动按钮 L2128/L2289）
 - **机理**：每次调用都在新 std::thread 里 `Runtime::new()`（多线程 runtime = num_cpus 个 worker 线程 + epoll/kqueue 实例 + 若干 SYSCALL），用完即丢。长期运行每 30 秒一次完整 runtime 冷启动/销毁，并有线程瞬时创建的调度毛刺。循环里 `certs.clone()`（L522）对每节点克隆整份证书 Vec，而 `test_node_connection`（L403-423）转型后只做 `TcpStream::connect`，certs 参数完全未使用。
 - **修复方案**：进程级创建一次探测 runtime（OnceLock 或专用探测线程 + 通道），所有健康检查复用；删除 node_certs 参数与逐节点 clone。若后续恢复"TLS 握手时延探测"，在共享 runtime 内加即可。
 
-### R-35 [P2/performance] stop_proxy 在 UI 线程阻塞 join 代理线程
+### R-35 [P2/performance] stop_proxy 在 UI 线程阻塞 join 代理线程【已修复 2026-10-05 Wave 2：删除 join——stop_proxy 只置 stop_flag 立即返回，update 新增非阻塞收敛分支（exit receiver 可读/断开时清理 handle），不再阻塞 UI】
 
 - **位置**：`hydra-client-gui/src/main.rs` `stop_proxy` 约 L973-975（触发点含托盘退出 L1991、on_exit L1539）
 - **机理**：设置 stop_flag 后立刻在 UI 线程 join 代理线程。停止信号靠代理线程内 `while !stop_flag { sleep(100ms) }` 轮询（L747-750），join 至少阻塞 UI ≥100ms；且 `tokio::select!` 无法打断不在 yield 点的 future——若 `proxy.start()` 正处于"节点预热（可能数十秒）"的阻塞/长 await 链，UI 将冻结同样长时间，托盘、按钮、窗口全部无响应。已有 `proxy_exit_receiver`（L697/763）这条非阻塞退出通知通道，join 完全多余。
 - **修复方案**：删除 `handle.join()`：stop_proxy 只置 stop_flag 并立即返回，退出确认交给 update 里已有的 proxy_exit_receiver 轮询分支（L1553-1583），UI 状态先置"停止中"；若必须同步等待，用带超时的 `exit_rx.try_recv()` 轮询。
 
-### R-36 [P2/performance] 节点列表每帧 O(节点数×订阅节点数) 的来源扫描 + 整表克隆，交互期 60fps 下放大数十倍
+### R-36 [P2/performance] 节点列表每帧 O(节点数×订阅节点数) 的来源扫描 + 整表克隆，交互期 60fps 下放大数十倍【延后：HashMap 缓存需在全部 config 变更点（增删/订阅更新/改名/另存）维护失效逻辑，属结构性改动且无法自动化回归 UI 正确性——并入 UI 方案 P0 阶段（GUI main.rs 拆分）一并实施】
 
 - **位置**：`hydra-client-gui/src/main.rs` `ui_nodes` 约 L2295-2310（heading 双重 filter）、L2355（每行 node_source_label）、L2319（node_addrs.clone()）；`ui_subscriptions` L2587 与 `ui_subscription_section` L2505（subs_clone.clone()）
 - **机理**：每帧对每节点调用 `config.node_source_label(a)`（内部线性扫描所有订阅的 nodes Vec 做 String 比较），heading 又调用两轮 filter（L2300-2308），同一行 L2355 再调一次。总量 = 每帧约 (节点数 × 订阅节点总数) × 3 次字符串比较 + 数千次 String 分配。量化：300 节点 × 300 行 = 每帧约 27 万次 String 比较；交互期 60fps 即 ~1600 万次比较/秒。另有每帧 `node_addrs.clone()`、`subscriptions.clone()`（每帧多次堆分配，节点多时数十 KB/帧）。`apply_subscription_update` 的 `contains`（L1447、L1488）也是 O(n²)，但为低频路径。
@@ -276,11 +276,15 @@
 - **机理**：test_all_nodes 是异步的（结果经 mpsc 在后续帧返回），下一行立即统计 node_status 里 connected 的数量打日志。本次探测结果此刻必然不在，online_count 反映上一次状态；首启恒为 0，用户每次启动都看到"警告: 没有可用的节点连接"与"代理已就绪"并存，日志自相矛盾。
 - **修复方案**：删掉该即时统计（探测结果由 poll_health_check_results 落地后自然更新 UI），或改为中性提示"正在后台检测节点连通性…"。
 
+> **【已修复 2026-10-05 Wave 3】** start_proxy 删除过期即时统计，改为中性提示"节点连通性检测已在后台启动，结果稍后自动更新"。
+
 ### R-38 [P3/bug] 监听地址为 IPv6 时 set_system_proxy 的字符串切分产出错误端口（Linux 分支）
 
 - **位置**：`hydra-client-gui/src/main.rs` `set_system_proxy` 约 L808-813（gsettings/KDE 分支）
 - **机理**：手工 `split(':')` 解析 proxy_url。IPv6 监听（GUI 明确支持 `[::1]:4433`）时 `"socks5://[::1]:1080"` 得 `addr_parts=["[", ":", "1]", "1080"]`，proxy_port 取到空或错误段——gsettings/kwriteconfig 写入空端口，桌面代理配置损坏；Windows 分支用整个 addr_port 字符串，不受影响。
 - **修复方案**：不要手写字符串切分：由调用方直接传入已解析的 SocketAddr（start_proxy 本就有 proxy_addr: SocketAddr），按平台惯例生成 host/port；或用 url::Url 解析。env var（http_proxy 等）惯例要求 IPv6 带方括号，注意区分。
+
+> **【已修复 2026-10-05 Wave 3】** 按 RFC 3986 authority 解析：剥 scheme 后区分方括号 IPv6（`[::1]:1080`）与 host:port（rsplit_once）；Windows 注册表分支继续用原串（WinINet 惯例）。
 
 ### R-39 [P3/bug] 本地代理入口三处初始读无超时、accept 后任务无并发上限
 
@@ -288,11 +292,15 @@
 - **机理**：三处初始读都不包 timeout：客户端连上后不发数据，任务与缓冲无限期挂起；`loop + tokio::spawn` 无并发上限。默认监听 127.0.0.1 风险低，但 README 支持 `--listen 0.0.0.0`，此时构成慢连接资源泄漏面。
 - **修复方案**：三处初始读包 `tokio::time::timeout`（如 30s，与节点侧 AUTH_TIMEOUT 语义对齐）；可选加全局 Semaphore 限并发（节点侧已有同款模式可复制）。
 
+> **【已修复 2026-10-05 Wave 3】** 协议探测 / HTTP 头循环（逐段）/ SOCKS5 请求三处初始读均包 30s 超时（INITIAL_READ_TIMEOUT）。全局 Semaphore 限并发【延后+理由】：默认监听 127.0.0.1 风险低，超时已封住"无限期挂起"，限并发需引入排队/拒绝语义与 UI 反馈，列结构性改动。
+
 ### R-40 [P3/performance] 每连接克隆整张 cert_by_node 证书 HashMap（Vec<u8> 深拷贝）
 
 - **位置**：`hydra-client/src/proxy.rs` TcpCreds 定义 L31-37；`start()` L134-139 与 L182 `creds.clone()`；`open_target` L281-285
 - **机理**：每条连接 `creds.clone()` 深拷贝 `cert_by_node: HashMap<SocketAddr, Vec<u8>>`——含全部节点证书 DER 的 Vec 拷贝（每张 ~500-800B），100 并发 = 100 份完整证书表副本；`open_target` 命中后再 `.cloned()` 拷贝一次传入 connect_target。相比每连接重建 TLS config 是小头，但同属无谓分配。
 - **修复方案**：见性能路线 R-13（`Arc<HashMap<.., Arc<[u8]>>>`，get 后传引用/Arc clone）。
+
+> **【已修复 Wave 2（R-13）】** 证书表迁入 `TlsTrust { pinned_certs: Arc<Vec<Vec<u8>>> }`，`TcpCreds.clone()` 退化为引用计数递增；另有按内容指纹缓存的 `Arc<TlsConnector>` 复用（见 06-P3-3 处置）。
 
 ### R-41 [P3/performance] 分享对话框打开期间每帧重生成含证书 base64 的完整 URL 字符串
 
@@ -300,11 +308,15 @@
 - **机理**：open_share_dialog 已把链接存入 self.share_link，但 Window 闭包内每帧调用 `l.to_share_url()` 重新生成完整 URL（完整模式含 base64(DER) 与 hex 密钥，约 1.5-2.5KB，每帧 1-2 次堆分配 + 编码计算），随后 L1660 又 clone 一次整串。拖动窗口（60fps）时 ~300KB/s 无谓分配。
 - **修复方案**：见性能路线 R-20（变化时生成一次并缓存；当前缓存被用作"上次渲染值"，语义反了）。
 
+> **【已修复 Wave 2（R-20）】** `share_url_cache` 现为"已渲染值"缓存：URL 与缓存一致且二维码纹理存在时直接复用，仅变化时重建。
+
 ### R-42 [P3/maintainability] TCP 转型后测试缺口：HTTP 代理路径、SOCKS5 畸形输入、故障切换 E2E 三大块零覆盖
 
 - **位置**：`hydra-client/tests/`、`hydra-node/tests/`
 - **机理**：现有集成测试仅覆盖 SOCKS5 大块回显/错 PSK/半关闭/SSRF/分流/配置。缺口：① handle_http/handle_http_connect 约 240 行零测试（CONNECT、明文 GET/POST 字节保真、64KB 头上限、Host 解析）——A6 刚修过 lossy 转码数据损坏 bug，回归风险最高处恰无测试；② SOCKS5 畸形/粘包/拆段零测试（R-03 一测即红）；③ 故障切换 E2E 缺失（节点宕→切下一候选、target-fail 不应标 Offline——正好覆盖 R-01、A2 恢复探测）；④ 客户端 TLS 证书校验失败（MITM 拒绝）无测试——防中间人是核心卖点；⑤ 远端先 FIN、relay 排水超时分支；⑥ 节点 max_connections Semaphore 生效性。
 - **修复方案**：优先补 ①②③；①② 可用 tests/common 的进程内 spawn + 本地 echo/HTTP 目标服务器覆盖，无需外网。
+
+> **【延后+理由 2026-10-05 Wave 3】** 列测试债专项：①②③ 合计需新增数百行集成测试（本地 HTTP 目标服务器、SOCKS5 分帧器、双节点故障切换编排），超出 P3 单波次体量；当前基线 190 测试全绿，R-39 修复等本轮行为变更均由既有集成测试回归覆盖。
 
 ### R-43 [P3/maintainability] 错误处理与脱敏基础设施的一致性问题
 
@@ -312,11 +324,15 @@
 - **机理**：traffic.rs 三处 `lock().expect("poisoned")`（node_entry/node_traffic_snapshot/get_stats）在持锁线程 panic 后会让 GUI 刷新或测速任务连锁 panic，而同文件热路径 L317 用 if let Ok 容忍式——策略不一致。tcp_transport.rs L74 用 `eprintln!` 输出 HYDRA_TRANSPORT 告警（绕过 tracing，GUI 场景不可见）。`probe_connect` 返回 `Result<_, String>`，与全仓 HydraError 风格割裂；错误文案中英混杂。
 - **修复方案**：三处 expect 改 `unwrap_or_else(|p| p.into_inner())`；eprintln 改 `tracing::warn!`；probe_connect 返回 HydraError 并统一文案语言。
 
+> **【部分修复（Wave 2 + 2026-10-05 Wave 3）】** traffic.rs 三处 poisoned expect 与 tcp_transport.rs eprintln→tracing::warn 已修（Wave 2 / R-30 收尾）；`probe_connect` 的 `Result<_, String>` 签名【延后+理由】：模块内部私有函数，错误仅作探测结果展示文案，改 HydraError 需连带调度层展示逻辑，收益不足。
+
 ### R-44 [P3/bug] Host 头提取按字节偏移切片，obs-fold/大小写混合多 Host 头时取值脆弱
 
 - **位置**：`hydra-client/src/proxy.rs` `handle_http()` L440-446
 - **机理**：非 CONNECT 请求从 Host 头提取用 `line[5..].trim()`，依赖 `starts_with("host:")` 恰好 5 字节前缀；未处理 RFC 7230 obs-fold（续行以空格开头），多 Host 头时取首个。取第一个匹配行是安全方向（多 Host 头本身非法），风险有限，列为提示级。
 - **修复方案**：如需更稳健可跳过以空白开头的续行再匹配；低优先级改进。
+
+> **【已修复 2026-10-05 Wave 3】** Host 头匹配前过滤 obs-fold 续行（以空格/Tab 开头的行）；多 Host 头取首行的安全方向语义保持。
 
 ### R-45 [P3/maintainability] splitter.split 每 chunk Bytes::copy_from_slice 全量深拷贝（QUIC 遗留死代码）
 
@@ -324,11 +340,15 @@
 - **机理**：对每个 chunk 执行 `Bytes::copy_from_slice` 深拷贝，而入参已是 Bytes（`slice()` 零拷贝引用计数+1 即可）。该模块只被 QUIC 时代测试引用，业务路径无调用者。
 - **修复方案**：若保留公共 API 改用 `Bytes::slice` 零拷贝；若确认为死路径，随 QUIC 清理一并删除（并入 R-30/R-32）。
 
+> **【已失效】** splitter.rs 已随 QUIC 清理（R-30/R-32）整文件删除，无代码可修。
+
 ### R-46 [P3/maintainability] deploy/install.sh：env 文件属主与注释不符；生成密钥明文回显终端
 
 - **位置**：`deploy/install.sh` chown 段与脚本头注释
 - **机理**：整体评价正面：systemd unit 的 User=hydra+CAP_NET_BIND_SERVICE、ProtectSystem=strict+ReadWritePaths、NoNewPrivileges、RestrictAddressFamilies、Docker 非 root+cap_drop ALL+no-new-privileges 都正确；env.example 密钥防泄漏指引准确。瑕疵：① 脚本头注释声称 env 文件"root:600，不进 history"，实际 `chown hydra:hydra`——hydra 用户可篡改自己的 EnvironmentFile（与 ProtectSystem 重叠后风险低，但注释应如实）；② 自动生成密钥时 echo 明文到终端（脚本自己注明会留滚动缓冲）。
 - **修复方案**：注释改为如实描述（hydra:hydra 0600），或改 chown root:hydra 并让 unit 以组读；密钥回显改为提示用户 grep 查看（删掉 echo 明文段即可）。
+
+> **【已修复 2026-10-05 Wave 3】** ① 脚本头注释如实化为 hydra:hydra 0600（含 ProtectSystem 下不可篡改 unit/二进制的说明）；② 自动生成密钥不再 echo 明文，统一提示 `sudo grep ^HYDRA_AUTH_KEY $ENV_FILE` 查看。同批：rustls 0.21→0.23 / tokio-rustls 0.24→0.26 / ring 0.16→0.17 单栈升级完成（R-46 编号在节点专项审查中亦指 TLS 栈 EOL，N-09 同源，见下表 N-09 处置）。
 
 ---
 
@@ -375,10 +395,10 @@
 | N-03 | P2/security | tcp_server.rs accept 循环 | 信号量满时 `acquire_owned().await` 无界排队，节点假死。修复：`try_acquire` 快速失败。**【已修复，见附录 B】** |
 | N-04 | P2/security | handler.rs resolve_and_connect | 4 处 `error!` 打印目标明文（与 R-09 同源，节点侧）。**【已修复，见附录 B】** |
 | N-05 | P2/security | main.rs parse_args | `--auth-key` 把 PSK 暴露进 /proc/<pid>/cmdline，与 config.rs "CLI 不暴露密钥"自相矛盾。**【已修复：参数移除，显式报错提示改用 env/密钥文件】** |
-| N-06 | P3/security | handler.rs classify_blocked_ip | SSRF 黑名单缺 CGNAT 100.64/10、198.18/15、multicast 224/4、reserved 240/4（纵深不足，非可利用洞）。**【待修复】** |
-| N-07 | P3/bug | cert.rs load_or_generate | 新私钥先 0644 创建后 chmod 0600，毫秒级可读竞态窗口。修复：`OpenOptions::create_new(true).mode(0o600)`。**【待修复】** |
-| N-08 | P3/bug | config.rs parse_u32_field | 空白 env 值导致启动失败，违反"空白视为未设置"约定。**【待修复】** |
-| N-09 | P3/maintainability | Cargo.toml | rustls 0.21 / tokio-rustls 0.24 / ring 0.16 已 EOL，TLS 栈新漏洞不回移；规划升级 0.23/0.26/0.17。**【技术债，与 R-46 同源】** |
+| N-06 | P3/security | handler.rs classify_blocked_ip | SSRF 黑名单缺 CGNAT 100.64/10、198.18/15、multicast 224/4、reserved 240/4（纵深不足，非可利用洞）。**【已修复 Wave 1】** |
+| N-07 | P3/bug | cert.rs load_or_generate | 新私钥先 0644 创建后 chmod 0600，毫秒级可读竞态窗口。修复：`OpenOptions::create_new(true).mode(0o600)`。**【已修复 Wave 1】** |
+| N-08 | P3/bug | config.rs parse_u32_field | 空白 env 值导致启动失败，违反"空白视为未设置"约定。**【已修复 Wave 1】**（空白 trim 后回落文件值/默认） |
+| N-09 | P3/maintainability | Cargo.toml | rustls 0.21 / tokio-rustls 0.24 / ring 0.16 已 EOL，TLS 栈新漏洞不回移；规划升级 0.23/0.26/0.17。**【已修复 2026-10-05 Wave 3】** rustls 0.23.45 + tokio-rustls 0.26.6 + ring 0.17.14 单版本（Cargo.lock 验证）+ webpki-roots 0.26 + rustls-pemfile 2.x + rcgen 0.13；全部 API 迁移点落地，190 测试全绿 |
 
 ## 附录 B：报告发布当轮已直接修复项（2026-10-05）
 
@@ -397,3 +417,22 @@
 | N-05 | `--auth-key` CLI 参数移除（显式报错提示替代路径），`CliOverrides.auth_key` 字段删除，测试同步更新 |
 
 **仍未修复（按优先级待排期）**：R-02（CLI 多节点证书配对）、R-03~R-07、R-12~R-20 中期性能项、N-06/N-07/N-08、R-46（rustls 0.23 升级）。建议下一轮按「P0 → P1/security、performance → 性能短期路线」顺序清账。
+
+## 附录 C：Wave 2 P2 清账处置（2026-10-05）
+
+`cargo test --workspace` **190 通过 / 0 失败**（基线 185：新增 6 条测试 − 删除 1 个死代码测试文件）；`cargo build -p hydra-client --features tun`、`cargo build -p hydra-client-gui` 零错误。逐条处置：
+
+| 条目 | 处置 |
+|---|---|
+| R-11 / R-12 / R-13 / R-14 | 已随 Wave 0/1 修复（附录 B / 清账计划 1-5~1-8），本轮核实未重复处理 |
+| R-15 / R-16（= R-07/R-06，P1 GUI 项） | 延后：并入 UI 方案 P0 阶段（GUI main.rs 拆分）一并实施 |
+| R-21 / R-33 | 已失效：分别随 06-P1-1（hex_decode 字节级）与附录 B N-02（idle 看门狗）修复 |
+| R-22 / R-23 / R-25 / R-29 | 已修复：legacy Auth 删除；error 级脱敏；.dockerignore + Dockerfile 缓存层；配置原子写（含测试） |
+| R-24 / R-26(=06-P2-3) / R-27 / R-30 / R-32 / R-35 | 已修复（详见各条目内标注） |
+| R-31 | 部分修复：[workspace.dependencies] 统一 12 项共享依赖；rustls 0.23 升级与 tokio feature 收敛按计划归 Wave 3 |
+| R-34 | 部分修复：进程级 probe_runtime 复用；"certs 未使用"已失效（0-7 后实际用于 TlsTrust::pinned） |
+| R-28（=R-17）/ R-36（=R-19） | 延后：结构性改动（热路径去锁两步走 / 全变更点维护 addr→source 缓存），且 UI 正确性无法自动化回归——并入 UI 方案 P0 阶段 |
+| R-18（=R-34 中期项） | 探测 runtime 已共享；专用探测线程+通道保留为后续优化 |
+| R-20（=R-41，P3） | 归 Wave 3 P3 清账 |
+
+GUI main.rs 巨石拆分：按执行计划跳过（属 UI 方案 P0 阶段先行项）。

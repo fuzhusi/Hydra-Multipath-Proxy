@@ -43,6 +43,11 @@ fn test_auth_key() -> Vec<u8> {
     b"signal-test-auth-key-0123456789a".to_vec()
 }
 
+/// peer_id 属主证明（与节点共享同一 PSK 派生，Wave1-7）
+fn owner_proof(peer_id: &str) -> String {
+    hydra_protocol::p2p_owner_proof(&test_auth_key(), peer_id)
+}
+
 /// 经客户端认证路径连到 `@hydra-p2p/<peer_id>`，返回（读半, 写半）
 async fn connect_signal(
     node: SocketAddr,
@@ -134,6 +139,7 @@ async fn 信令全链路_register_invite_incoming_accept_accepted() {
         &SignalMessage::Register {
             peer_id: "a1a1a1a1a1a1a1a1".into(),
             mapped: "127.0.0.1:40001".into(),
+            proof: owner_proof("a1a1a1a1a1a1a1a1"),
         },
     )
     .await;
@@ -142,6 +148,7 @@ async fn 信令全链路_register_invite_incoming_accept_accepted() {
         &SignalMessage::Register {
             peer_id: "b2b2b2b2b2b2b2b2".into(),
             mapped: "127.0.0.1:40002".into(),
+            proof: owner_proof("b2b2b2b2b2b2b2b2"),
         },
     )
     .await;
@@ -192,6 +199,7 @@ async fn invite_目标不在线回error() {
         &SignalMessage::Register {
             peer_id: "cccccccccccccccc".into(),
             mapped: "127.0.0.1:40003".into(),
+            proof: owner_proof("cccccccccccccccc"),
         },
     )
     .await;
@@ -222,6 +230,9 @@ async fn register_peer_id与地址帧不一致被拒绝() {
         &SignalMessage::Register {
             peer_id: "ffffffffffffffff".into(),
             mapped: "127.0.0.1:40004".into(),
+            // peer_id 属主证明按地址帧身份（eeee…）派生也无妨：peer_id_mismatch
+            // 检查在 proof 校验之前，此处触发的是身份不一致分支
+            proof: owner_proof("eeeeeeeeeeeeeeee"),
         },
     )
     .await;
@@ -270,4 +281,79 @@ async fn 信令目标peer_id非法_静默关流() {
         err.to_string().contains("静默关闭"),
         "应为静默关闭错误: {err}"
     );
+}
+
+/// Wave1-7 全链路：冒用者持有效 Noise-PSK（已认证连接）冒用他人 peer_id 注册，
+/// 伪造属主 proof → 节点回 error(owner_proof_invalid) 并断开其会话；
+/// 真实属主的注册不被顶替（invite 路由仍投递到原属主）。
+#[tokio::test]
+async fn 冒用顶替_伪造proof被拒且原属主不受影响() {
+    let (addr, cert) = spawn_signal_node().await;
+    let victim = "9999999999999999";
+
+    // 真实属主先注册
+    let (mut v_rd, mut v_wr) = connect_signal(addr, &cert, victim).await;
+    send(
+        &mut v_wr,
+        &SignalMessage::Register {
+            peer_id: victim.into(),
+            mapped: "127.0.0.1:40005".into(),
+            proof: owner_proof(victim),
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 冒用者：新连接、同 peer_id、错误 PSK 派生的 proof
+    let (mut f_rd, mut f_wr) = connect_signal(addr, &cert, victim).await;
+    let forged_proof =
+        hydra_protocol::p2p_owner_proof(b"wrong-key-wrong-key-wrong-key-32", victim);
+    send(
+        &mut f_wr,
+        &SignalMessage::Register {
+            peer_id: victim.into(),
+            mapped: "127.0.0.1:59999".into(),
+            proof: forged_proof,
+        },
+    )
+    .await;
+    match recv(&mut f_rd).await {
+        SignalDownMessage::Error { code, peer } => {
+            assert_eq!(code, "owner_proof_invalid");
+            assert_eq!(peer.as_deref(), Some(victim));
+        }
+        other => panic!("冒用注册应回 owner_proof_invalid，实际 {other:?}"),
+    }
+    // 冒用者会话被断开
+    let mut line = String::new();
+    match f_rd.read_line(&mut line).await {
+        Ok(0) => {}
+        Ok(_) => panic!("伪造 proof 后会话应被断开"),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        Err(e) => panic!("读 EOF 意外错误: {e}"),
+    }
+
+    // 原属主不受顶替影响：第三方 invite 仍投递到真实属主
+    let (mut c_rd, mut c_wr) = connect_signal(addr, &cert, "7777777777777777").await;
+    send(
+        &mut c_wr,
+        &SignalMessage::Register {
+            peer_id: "7777777777777777".into(),
+            mapped: "127.0.0.1:40006".into(),
+            proof: owner_proof("7777777777777777"),
+        },
+    )
+    .await;
+    invite_until_online(
+        &mut c_wr,
+        &mut c_rd,
+        victim,
+        vec!["127.0.0.1:40006".into()],
+    )
+    .await;
+    let incoming = recv(&mut v_rd).await;
+    match incoming {
+        SignalDownMessage::Incoming { from, .. } => assert_eq!(from, "7777777777777777"),
+        other => panic!("原属主应收到 incoming，实际 {other:?}"),
+    }
 }

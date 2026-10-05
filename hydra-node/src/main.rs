@@ -32,7 +32,9 @@ fn parse_args() -> CliArgs {
             }
             "--help" | "-h" => {
                 println!("用法: hydra-node [监听地址] [--config <node.toml>]");
-                println!("传输: TCP/TLS（TLS 1.3 + Noise-PSK 应用层握手；TCP 是唯一传输，推荐监听 443）");
+                println!(
+                    "传输: TCP/TLS（TLS 1.3 + Noise-PSK 应用层握手；TCP 是唯一传输，推荐监听 443）"
+                );
                 println!("配置读取优先级: CLI 参数 > 环境变量 > 配置文件 > 默认值");
                 println!("配置文件: --config 或 HYDRA_NODE_CONFIG 指定路径；未设时自动探测 ./node.toml → /etc/hydra/node.toml");
                 println!("环境变量:");
@@ -59,10 +61,7 @@ fn parse_args() -> CliArgs {
             }
         }
     }
-    CliArgs {
-        listen,
-        config,
-    }
+    CliArgs { listen, config }
 }
 
 #[tokio::main]
@@ -127,6 +126,8 @@ async fn main() -> Result<()> {
         cert_domains,
         // P2P 信令开关：main 未走 from_env（配置从 toml/env 解析而来），此处单独读 env
         p2p_signal: NodeOptions::from_env().p2p_signal,
+        // 07-P2-4：idle 超时无显式注入 → 回落 env/默认值
+        idle_timeout: None,
     };
 
     info!(

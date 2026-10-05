@@ -52,19 +52,22 @@ pub async fn connect_and_request(
     target: &str,
 ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
     // 证书 pinning：节点自签证书加入本地信任根，标准 webpki 校验
+    // （rustls 0.23 / Wave 3：pki-types + 显式 ring provider，语义不变）
     let mut roots = rustls::RootCertStore::empty();
     roots
-        .add(&rustls::Certificate(node_cert_der.to_vec()))
+        .add(rustls::pki_types::CertificateDer::from(node_cert_der.to_vec()))
         .expect("无效的节点证书");
-    let mut crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("TLS 协议版本配置失败")
         .with_root_certificates(roots)
         .with_no_client_auth();
     // 不做 ALPN（同节点侧）；禁会话恢复
     crypto.alpn_protocols = Vec::new();
     crypto.resumption = rustls::client::Resumption::disabled();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(crypto));
-    let server_name = rustls::ServerName::try_from("hydra.node").unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from("hydra.node".to_owned()).unwrap();
 
     let tcp = tokio::net::TcpStream::connect(node_addr)
         .await

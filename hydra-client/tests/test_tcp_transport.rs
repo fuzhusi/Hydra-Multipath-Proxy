@@ -58,7 +58,12 @@ async fn direct_echo_roundtrip(total: usize, seed: u64) {
             break;
         }
         for (i, b) in rbuf[..n].iter().enumerate() {
-            assert_eq!(*b, verify.next_byte(), "byte mismatch at offset {}", got + i);
+            assert_eq!(
+                *b,
+                verify.next_byte(),
+                "byte mismatch at offset {}",
+                got + i
+            );
         }
         got += n;
     }

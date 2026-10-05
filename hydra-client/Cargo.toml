@@ -1,6 +1,6 @@
 [package]
 name = "hydra-client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [[bin]]
@@ -15,20 +15,22 @@ default = ["tun"]
 tun = ["dep:tun2", "dep:smoltcp", "dep:tokio-util"]
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-rustls = "0.21"
-# TCP/TLS 传输（TCP 转型 Wave 1；与 rustls 0.21 匹配的 tokio 适配层）
-tokio-rustls = "0.24"
-# 真证书模式（HYDRA_TRUST=ca）：webpki 公共 CA 根，与 rustls 0.21 配套
-webpki-roots = "0.23"
-ring = "0.16"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-bytes = "1"
-tracing = "0.1"
-tracing-subscriber = "0.3"
+# 版本统一由根 [workspace.dependencies] 声明（审查 R-31）
+tokio = { workspace = true }
+rustls = { workspace = true }
+# TCP/TLS 传输（TCP 转型 Wave 1；Wave 3 起与 rustls 0.23 匹配的 tokio 适配层）
+tokio-rustls = { workspace = true }
+# 真证书模式（HYDRA_TRUST=ca）：webpki 公共 CA 根，与 rustls 0.23 配套（0.26）。
+# TrustAnchor 与 rustls-pki-types 统一，可直接 extend 进 RootCertStore。
+webpki-roots = "0.26"
+ring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 url = "2.5"
-base64 = "0.22"
+base64 = { workspace = true }
 # 恢复探测周期的随机抖动（±20%，防整周期被动特征）
 rand = "0.8"
 hydra-protocol = { path = "../hydra-protocol" }
@@ -50,3 +52,6 @@ tokio-util = { version = "0.7", optional = true }
 
 [dev-dependencies]
 hydra-node = { path = "../hydra-node" }
+# R-42 测试缺口专项：真证书 PEM 路径 E2E 用 rcgen 生成 PEM 证书/私钥
+# （0.13 与 hydra-node 主依赖同版本，内部 ring 0.17 与全工作区对齐）
+rcgen = "0.13"

@@ -1,19 +1,20 @@
 [package]
 name = "hydra-protocol"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-bytes = "1"
-thiserror = "1"
-tokio = { version = "1", features = ["full"] }
+# 版本统一由根 [workspace.dependencies] 声明（审查 R-31）
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
 # dangerous_configuration feature 已移除（审查 R-10：全仓无 danger:: 使用，
 # pinning 走 RootCertStore 标准校验；缩小供应链审计面）
-rustls = "0.21"
-ring = "0.16"
+rustls = { workspace = true }
+ring = { workspace = true }
 # V3.2 Noise-PSK 握手 v2：Noise_NNpsk2_25519_ChaChaPoly_SHA256。
-# 注意：snow 0.9 的 ring-resolver 绑 ring 0.17（任务指定）；rustls 0.21（已 EOL）
-# → 0.23 + ring 0.17 收敛为已知技术债（审查报告 R-46 / 节点专项审查 P3）。
+# snow 0.9 的 ring-resolver 绑 ring 0.17；rustls 0.23（Wave 3 起，R-46/N-09 关账）
+# 也统一走 ring 0.17 —— 全工作区 ring 单版本。
 snow = { version = "0.9", default-features = false, features = ["default-resolver", "ring-resolver"] }

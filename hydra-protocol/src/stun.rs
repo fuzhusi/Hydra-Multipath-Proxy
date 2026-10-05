@@ -125,10 +125,10 @@ pub fn parse_binding_response(buf: &[u8], tx_id: &[u8; TX_ID_LEN]) -> Result<Soc
                     mapped = Some(addr);
                 }
             }
-            ATTR_FINGERPRINT => {
+            ATTR_FINGERPRINT
                 // 尽力校验：CRC32 覆盖报文头 + 本属性之前的全部属性区
                 // （RFC 5389 §15.5：FINGERPRINT 的 CRC 输入含属性头，但不含 CRC 本身）
-                if attr_len == 4 {
+                if attr_len == 4 => {
                     let expect = u32::from_be_bytes([val[0], val[1], val[2], val[3]]);
                     let crc = crc32_ieee(&buf[..HEADER_LEN + off]) ^ 0x5354_554E;
                     if crc != expect {
@@ -137,11 +137,10 @@ pub fn parse_binding_response(buf: &[u8], tx_id: &[u8; TX_ID_LEN]) -> Result<Soc
                         ));
                     }
                 }
-            }
             _ => {} // 其他属性（SOFTWARE 等）忽略
         }
         // 载荷按 4 字节对齐推进
-        off = val_off + (attr_len + 3) / 4 * 4;
+        off = val_off + attr_len.div_ceil(4) * 4;
     }
 
     mapped.ok_or_else(|| {

@@ -139,33 +139,10 @@ async fn probe_connect(
     };
     let start = Instant::now();
 
-    let mut roots = rustls::RootCertStore::empty();
-    if trust.use_public_ca {
-        // rustls 0.21 的 RootCertStore 收 OwnedTrustAnchor（by value），
-// webpki-roots 0.23 的 TrustAnchor 是借引用，逐条转换
-        roots.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
-            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-                ta.subject.to_vec(),
-                ta.spki.to_vec(),
-                None::<Vec<u8>>, // webpki-roots 0.23 的 TrustAnchor 无 name-constraints 字段
-            )
-        }));
-    } else {
-        for der in &trust.pinned_certs {
-            roots
-                .add(&rustls::Certificate(der.clone()))
-                .map_err(|e| format!("无效的节点证书: {:?}", e))?;
-        }
-    }
-    let mut crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    // 与主链路一致：无 ALPN、禁会话恢复（session ticket 不用于跨连接关联追踪）
-    crypto.alpn_protocols = Vec::new();
-    crypto.resumption = rustls::client::Resumption::disabled();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(crypto));
-    let server_name = rustls::ServerName::try_from(sni)
+    // 共享 TLS 连接器（审查 R-12：与主链路同一份 ClientConfig 缓存，
+    // 探测与主链路配置天然一致，不再每探测定制重建）
+    let connector = crate::tcp_transport::build_tls_connector(trust).map_err(|e| e.to_string())?;
+    let server_name = rustls::pki_types::ServerName::try_from(sni.to_owned())
         .map_err(|e| format!("Invalid SNI '{}': {:?}", sni, e))?;
 
     let tcp = tokio::net::TcpStream::connect(addr)
@@ -258,8 +235,7 @@ async fn speedtest_online_node(
 ) {
     let addr = node.address;
     // 1. 主动延迟：TCP 建连 + TLS 握手总耗时（每周期一次，轻量）
-    let rtt = match tokio::time::timeout(PROBE_TIMEOUT, probe_connect(addr, sni, trust)).await
-    {
+    let rtt = match tokio::time::timeout(PROBE_TIMEOUT, probe_connect(addr, sni, trust)).await {
         Ok(Ok(d)) => Some(d),
         Ok(Err(e)) => {
             debug!("节点 {} 测速探测失败: {}", addr, e);
