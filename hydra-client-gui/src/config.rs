@@ -419,6 +419,7 @@ pub fn validate_leaf_pin(pin: &str) -> Result<(), String> {
 /// 信任根构造（配置文件 > 环境变量语义与 resolve_node_certs 一致）：
 /// - pin 模式（默认）：按「节点地址顺序收集证书」构造 TlsTrust::pinned；
 /// - ca 模式：TlsTrust::public_ca（可选叶证书 SHA-256 硬 pin）。
+///
 /// `node_addrs` 顺序必须与传入 ProxyServer 的节点顺序一致（with_node_certs 按序对应）。
 pub fn resolve_trust(
     cfg: &GuiConfig,

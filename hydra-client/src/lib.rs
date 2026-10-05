@@ -152,6 +152,18 @@ pub fn new_tun_shutdown_token() -> tokio_util::sync::CancellationToken {
     tokio_util::sync::CancellationToken::new()
 }
 
+/// 从逗号分隔的证书文件路径列表读取多节点证书（`HYDRA_NODE_CERTS`）。
+/// 顺序必须与节点地址顺序一一对应（仅用于 pin 模式信任根；Noise 指纹取对端
+/// 叶证书，配对错误不再导致握手失败——审查 R-02 的根治补全）。
+pub fn node_certs_from_paths(paths: &str) -> Result<Vec<Vec<u8>>, String> {
+    paths
+        .split(',')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map(|p| std::fs::read(p).map_err(|e| format!("读取节点证书 {} 失败: {}", p, e)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tun_settings_tests {
     use super::*;
@@ -198,16 +210,4 @@ mod tun_settings_tests {
         assert!(cfg.exclude_routes.contains(&std::net::Ipv4Addr::new(1, 2, 3, 4)));
         assert_eq!(cfg.exclude_routes_v6.len(), 1);
     }
-}
-
-/// 从逗号分隔的证书文件路径列表读取多节点证书（`HYDRA_NODE_CERTS`）。
-/// 顺序必须与节点地址顺序一一对应（仅用于 pin 模式信任根；Noise 指纹取对端
-/// 叶证书，配对错误不再导致握手失败——审查 R-02 的根治补全）。
-pub fn node_certs_from_paths(paths: &str) -> Result<Vec<Vec<u8>>, String> {
-    paths
-        .split(',')
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
-        .map(|p| std::fs::read(p).map_err(|e| format!("读取节点证书 {} 失败: {}", p, e)))
-        .collect()
 }

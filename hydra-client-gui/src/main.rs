@@ -479,7 +479,7 @@ impl HydraApp {
             return;
         }
         // 信任根按「配置文件 > 环境变量」构造（支持 ca 模式与逐节点证书）；失败根因直接进日志
-        let trust = match config::resolve_trust(&self.config, &[addr.clone()]) {
+        let trust = match config::resolve_trust(&self.config, std::slice::from_ref(&addr)) {
             Ok(t) => t,
             Err(e) => {
                 self.add_log(format!("节点 {} 测试失败: {}", addr, e));
