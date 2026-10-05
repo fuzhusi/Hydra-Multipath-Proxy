@@ -227,6 +227,7 @@ Hydra-Multipath-Proxy/
 ├── hydra-node/         # 节点：TCP/TLS 服务、握手认证、SSRF 过滤、健康检查、信号停机、toml 配置
 ├── hydra-client/       # 客户端：SOCKS5/HTTP、TCP 传输、故障切换、测速调度、分流、TUN、NAT/STUN、订阅
 ├── hydra-client-gui/   # GUI：五页导航、系统托盘、二维码分享、节点编辑、配置持久化
+│   └── assets/app.ico  # 应用图标（窗口/托盘/exe 资源三处共用；源文件为根目录 favicon.ico 副本）
 ├── config/             # 节点 toml 样例
 ├── deploy/             # systemd unit / Docker / install.sh / env.example / 99-hydra-bbr.conf（BBR+fq）
 └── docs/               # review（6 份审查报告）/ design / improvement / assessment / guides

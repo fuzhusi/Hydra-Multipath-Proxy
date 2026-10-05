@@ -45,7 +45,16 @@ impl HydraTray {
 
 /// 创建托盘并启动事件转发线程。失败返回 Err（GUI 仍可正常使用，仅无托盘）。
 pub fn create_tray(ctx: egui::Context) -> Result<HydraTray, String> {
-    let icon = tray_icon::Icon::from_rgba(generate_icon_rgba(), 32, 32)
+    // 优先用嵌入的应用图标（assets/app.ico 解码到 32×32）；
+    // 解码失败 fallback 到代码生成的默认图标（仅 warn，不阻断托盘）
+    let (icon_rgba, icon_size) = match crate::icon::load_tray_icon_rgba() {
+        Some(rgba) => (rgba, 32),
+        None => {
+            eprintln!("[Tray] 应用图标解码失败，托盘使用默认图标");
+            (generate_icon_rgba(), 32)
+        }
+    };
+    let icon = tray_icon::Icon::from_rgba(icon_rgba, icon_size, icon_size)
         .map_err(|e| format!("托盘图标生成失败: {}", e))?;
 
     let (tx, rx) = channel::<TrayCommand>();

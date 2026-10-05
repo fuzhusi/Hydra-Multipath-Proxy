@@ -20,7 +20,7 @@ ureq = "2"
 # Team-Q：二维码生成（fast_qr）与识别（rqrr + image，仅 png/jpeg 减体积）
 fast_qr = "0.12"
 rqrr = "0.7"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "ico"] }
 base64 = { workspace = true }
 # T2：系统托盘（Tauri 官方库；Windows 下事件经全局通道投递，GUI 线程轮询即可）
 tray-icon = "0.19"
@@ -32,3 +32,7 @@ hydra-protocol = { path = "../hydra-protocol" }
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 windows-sys = { version = "0.52", features = ["Win32_Networking_WinInet", "Win32_Foundation"] }
+
+# Windows exe 资源图标（桌面快捷方式/任务栏/资源管理器）：build.rs 仅在 Windows 宿主编译时生效
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
