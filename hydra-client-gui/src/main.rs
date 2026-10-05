@@ -28,6 +28,8 @@ mod palette {
     pub const BG_CARD: egui::Color32 = egui::Color32::from_rgb(0x22, 0x26, 0x2E);
     /// 输入框/极端底
     pub const BG_EXTREME: egui::Color32 = egui::Color32::from_rgb(0x12, 0x14, 0x18);
+    /// 斑马纹/弱分隔底
+    pub const BG_FAINT: egui::Color32 = egui::Color32::from_rgb(0x24, 0x28, 0x30);
     /// 卡片描边/分隔线
     pub const BORDER: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x33, 0x3D);
 
@@ -49,7 +51,7 @@ mod palette {
     /// 三级：占位/未验证状态点
     pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgb(0x7A, 0x82, 0x8F);
 
-    // ── 字号层级（全局统一）──
+    // ── 字号层级（全局统一，五级）──
     /// 页面标题
     pub const FONT_HEADING: f32 = 18.0;
     /// 卡片标题/节点名
@@ -58,6 +60,20 @@ mod palette {
     pub const FONT_BODY: f32 = 13.0;
     /// 次要文字/标签
     pub const FONT_SECONDARY: f32 = 11.5;
+    /// 徽标（来源标记/计数徽标，五级中最小）
+    pub const FONT_BADGE: f32 = 10.5;
+
+    // ── 间距节奏（4px 基准，frontend-design 理念落地：全部间距从常量取）──
+    /// 特小间距：行内元素间 / 卡片外边距
+    pub const SPACING_XS: f32 = 4.0;
+    /// 小间距：卡片间 / 表单行距
+    pub const SPACING_SM: f32 = 8.0;
+    /// 中间距：卡片内边距 / 网格列距
+    pub const SPACING_MD: f32 = 12.0;
+    /// 大间距：区块间距
+    pub const SPACING_LG: f32 = 16.0;
+    /// 特大间距：页面级分区
+    pub const SPACING_XL: f32 = 24.0;
 
     /// 延迟色标：<200ms 绿 / <500ms 黄 / 其余红；None（未测）= 灰。
     /// 与 v3 设计文档 §交互细节 的色阶一致。
@@ -203,6 +219,18 @@ fn next_import_group_name(subs: &[SubscriptionConfig]) -> String {
     let mut n = 1;
     loop {
         let candidate = format!("分享导入{}", n);
+        if !subs.iter().any(|s| s.name == candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// 手动添加分组的默认名称（手动节点1、手动节点2…按现有订阅名递增避重）
+fn next_manual_group_name(subs: &[SubscriptionConfig]) -> String {
+    let mut n = 1;
+    loop {
+        let candidate = format!("手动节点{}", n);
         if !subs.iter().any(|s| s.name == candidate) {
             return candidate;
         }
@@ -498,7 +526,7 @@ struct HydraApp {
     last_config_save: Option<std::time::Instant>,
 
     // 输入状态
-    new_node_input: String,
+    // （手动添加已表单化：原 new_node_input 单行 host:port 输入移除，见 manual_form_* 字段）
 
     // 订阅（Exec-C v1）：新订阅输入 + 后台更新线程/队列
     new_sub_name: String,
@@ -526,16 +554,20 @@ struct HydraApp {
     import_dialog_open: bool,
     /// 分享导入分组的名称输入（默认自动生成「分享导入N」避重；重名校验与 add_subscription 同规则）
     import_group_name: String,
-    /// 表单化导入 v2：服务器地址（IP 或域名均可）
-    import_form_addr: String,
-    /// 表单化导入 v2：端口文本（默认 443，提交时按 1..=65535 校验）
-    import_form_port: String,
-    /// 表单化导入 v2：证书文件路径（留空 = 不带证书，对方需自备）
-    import_form_cert_path: String,
-    /// 表单化导入 v2：认证密钥 hex（留空 = 使用全局密钥；填了则写入链接覆盖全局）
-    import_form_auth_key: String,
+    /// 分享导入粘贴文本（多行 hydra:// 链接 / base64 订阅文本；导入语义 = import_share_links_as_group）
+    import_paste_text: String,
     /// UI 重设计第一批：「＋ → 手动添加节点」对话框开关（原页顶输入行迁入）
     manual_add_open: bool,
+    /// 手动添加分组的名称输入（默认自动生成「手动节点N」避重）
+    manual_group_name: String,
+    /// 手动添加表单：服务器地址（IP 或域名均可）
+    manual_form_addr: String,
+    /// 手动添加表单：端口文本（默认 443，提交时按 1..=65535 校验）
+    manual_form_port: String,
+    /// 手动添加表单：证书文件路径（可选；写入 node_cert_paths 按节点独立证书）
+    manual_form_cert_path: String,
+    /// 手动添加对话框：最近一次提交结果提示（成功绿/失败红，失败不关窗）
+    manual_add_status: Option<(bool, String)>,
     /// UI 重设计第一批：「＋ → 分享节点」按节点选择对话框开关（批量导出也在其中）
     share_pick_open: bool,
     /// 正在单节点测速的节点地址（卡片上显示 spinner；None = 无进行中的单测）
@@ -620,7 +652,6 @@ impl Default for HydraApp {
             config: GuiConfig::default(),
             saved_snapshot: GuiConfig::default(),
             last_config_save: None,
-            new_node_input: String::new(),
             new_sub_name: String::new(),
             new_sub_source: String::new(),
             sub_update_receiver: None,
@@ -636,11 +667,13 @@ impl Default for HydraApp {
             import_status: None,
             import_dialog_open: false,
             import_group_name: String::new(),
-            import_form_addr: String::new(),
-            import_form_port: String::new(),
-            import_form_cert_path: String::new(),
-            import_form_auth_key: String::new(),
+            import_paste_text: String::new(),
             manual_add_open: false,
+            manual_group_name: String::new(),
+            manual_form_addr: String::new(),
+            manual_form_port: String::new(),
+            manual_form_cert_path: String::new(),
+            manual_add_status: None,
             share_pick_open: false,
             node_testing_addr: None,
             node_group: None,
@@ -871,7 +904,6 @@ impl HydraApp {
             saved_snapshot: cfg.clone(),
             last_config_save: None,
             config: cfg,
-            new_node_input: String::new(),
             new_sub_name: String::new(),
             new_sub_source: String::new(),
             sub_update_receiver: None,
@@ -887,11 +919,13 @@ impl HydraApp {
             import_status: None,
             import_dialog_open: false,
             import_group_name: String::new(),
-            import_form_addr: String::new(),
-            import_form_port: String::new(),
-            import_form_cert_path: String::new(),
-            import_form_auth_key: String::new(),
+            import_paste_text: String::new(),
             manual_add_open: false,
+            manual_group_name: String::new(),
+            manual_form_addr: String::new(),
+            manual_form_port: String::new(),
+            manual_form_cert_path: String::new(),
+            manual_add_status: None,
             share_pick_open: false,
             node_testing_addr: None,
             node_group: None,
@@ -962,7 +996,8 @@ impl HydraApp {
                 .to_string(),
             "② 选择节点证书文件：同区「节点证书」→ 点「浏览...」选择节点生成的 hydra-node-cert.der"
                 .to_string(),
-            "③ 添加节点：「🌐 节点」页右上角「＋」→「✏️ 手动添加节点」".to_string(),
+            "③ 添加节点/分组：「📡 订阅」页右上角「＋ 新建」→「✏️ 手动添加节点」（创建命名分组）"
+                .to_string(),
             "④ 点「📊 状态总览」页的大按钮「▶ 启动代理」即可使用".to_string(),
             format!(
                 "完成一次后配置自动保存到 {}，以后双击本程序即可直接使用",
@@ -2045,25 +2080,13 @@ impl HydraApp {
         self.import_status = Some((ok, msg));
     }
 
-    /// 「从分享链接导入」表单提交（表单化 v2）：
-    /// 1. `build_form_share_url` 校验表单并构造 `hydra://` 链接（地址/端口/密钥/证书）；
-    /// 2. 复用 `import_share_links_as_group` 创建命名分组（分组/认领/更新逻辑零改动）；
-    /// 3. 任何校验或导入失败 → 红字提示、不关窗；成功才关窗并清空表单。
-    fn import_form_submit(&mut self) {
+    /// 「从分享链接导入」提交（保持粘贴版：多行粘贴 / 链接文件文本）：
+    /// 1. 复用 `import_share_links_as_group` 创建命名分组（解析/认领/更新逻辑零改动）；
+    /// 2. 任何校验或导入失败 → 红字提示 + 日志、不关窗；成功才关窗并清空表单。
+    fn import_paste_submit(&mut self) {
         let name = self.import_group_name.clone();
-        let url = match build_form_share_url(
-            &self.import_form_addr,
-            &self.import_form_port,
-            &self.import_form_auth_key,
-            &self.import_form_cert_path,
-        ) {
-            Ok(url) => url,
-            Err(e) => {
-                self.set_import_status(false, e);
-                return;
-            }
-        };
-        match import_share_links_as_group(&mut self.config, &name, &url) {
+        let text = self.import_paste_text.clone();
+        match import_share_links_as_group(&mut self.config, &name, &text) {
             Ok(result) => {
                 // 运行时节点状态同步（与 apply_subscription_update 同一套收口）
                 for a in &result.added {
@@ -2076,37 +2099,119 @@ impl HydraApp {
                 for a in &result.removed {
                     self.node_status.remove(a);
                 }
-                let msg = if result.bad_lines > 0 {
-                    format!(
-                        "已导入分组「{}」：{} 个节点（地址 {}:{}，坏行 {} 条）",
-                        name.trim(),
-                        result.node_count,
-                        self.import_form_addr.trim(),
-                        self.import_form_port.trim(),
-                        result.bad_lines
-                    )
-                } else {
-                    format!(
-                        "已导入分组「{}」：{} 个节点（地址 {}:{}）",
-                        name.trim(),
-                        result.node_count,
-                        self.import_form_addr.trim(),
-                        self.import_form_port.trim()
-                    )
-                };
+                let mut msg = format!(
+                    "已导入分组「{}」：{} 个节点",
+                    name.trim(),
+                    result.node_count
+                );
+                if result.bad_lines > 0 {
+                    msg.push_str(&format!("（坏行 {} 条已跳过）", result.bad_lines));
+                }
                 self.set_import_status(true, msg);
                 // 成功才关窗并清表单：条目已在订阅列表，节点已进该分组的组标签
                 self.import_dialog_open = false;
-                self.import_form_addr.clear();
-                self.import_form_port.clear();
-                self.import_form_cert_path.clear();
-                self.import_form_auth_key.clear();
+                self.import_group_name.clear();
+                self.import_paste_text.clear();
             }
             Err(e) => {
-                // 失败不关窗：保留表单内容，便于就地修正后重试
+                // 失败不关窗：保留粘贴内容，便于就地修正后重试
                 self.set_import_status(false, e);
             }
         }
+    }
+
+    /// 「从链接文件导入」：把文本文件内容读进粘贴框（导入仍走统一提交，便于先检查再导入）
+    fn import_paste_load_file(&mut self) -> bool {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("链接/订阅文件", &["txt", "sub"])
+            .add_filter("全部文件", &["*"])
+            .pick_file()
+        else {
+            return false; // 用户取消
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                self.import_paste_text = text;
+                self.add_log(format!(
+                    "已从文件读入 {} 条待导入文本（检查后点「导入（创建分组）」）",
+                    path.display()
+                ));
+                true
+            }
+            Err(e) => {
+                self.set_import_status(
+                    false,
+                    format!("读取文件 {} 失败: {}", path.display(), e),
+                );
+                false
+            }
+        }
+    }
+
+    /// 「✏️ 手动添加节点」提交（表单 = 结构化字段 + 创建命名分组）：
+    /// 1. `build_form_share_url` 校验表单并构造 `hydra://` 链接
+    ///    （地址非空 / 端口 1..=65535 / 证书文件存在性在此校验）；
+    /// 2. 复用 `import_share_links_as_group` 创建命名分组（source =
+    ///    `hydra-text://` + 构造链接，分组出现在订阅列表 + 节点页同名组标签）；
+    /// 3. 证书路径写入 `node_cert_paths`（按节点独立证书，逐节点生效）；
+    /// 4. 校验失败 → 红字提示 + 日志、不关窗；成功才关窗并清空表单。
+    fn manual_add_submit(&mut self) {
+        let name = self.manual_group_name.clone();
+        let addr = self.manual_form_addr.clone();
+        let port = self.manual_form_port.clone();
+        let cert = self.manual_form_cert_path.clone();
+        let url = match build_form_share_url(&addr, &port, "", &cert) {
+            Ok(url) => url,
+            Err(e) => {
+                self.set_manual_status(false, e);
+                return;
+            }
+        };
+        match import_share_links_as_group(&mut self.config, &name, &url) {
+            Ok(result) => {
+                // 运行时节点状态同步（与分享导入同一套收口）
+                for a in &result.added {
+                    self.node_status.entry(a.clone()).or_insert(NodeStatusInfo {
+                        connected: false,
+                        last_check: None,
+                        latency_ms: None,
+                    });
+                }
+                for a in &result.removed {
+                    self.node_status.remove(a);
+                }
+                // 证书路径按节点落库（manual_form_cert 留空 = 不写，回落全局证书）
+                let node_addr = format!("{}:{}", addr.trim(), port.trim());
+                self.config.set_node_cert_path(&node_addr, cert.trim());
+                let msg = format!(
+                    "已创建分组「{}」：{} 个节点（地址 {}）",
+                    name.trim(),
+                    result.node_count,
+                    node_addr
+                );
+                self.set_manual_status(true, msg);
+                // 成功才关窗并清表单
+                self.manual_add_open = false;
+                self.manual_group_name.clear();
+                self.manual_form_addr.clear();
+                self.manual_form_port.clear();
+                self.manual_form_cert_path.clear();
+            }
+            Err(e) => {
+                // 失败不关窗：保留表单内容，便于就地修正后重试
+                self.set_manual_status(false, e);
+            }
+        }
+    }
+
+    /// 记录手动添加结果（UI 绿/红提示 + 日志；与 set_import_status 同一收口风格）
+    fn set_manual_status(&mut self, ok: bool, msg: String) {
+        if ok {
+            self.add_log(msg.clone());
+        } else {
+            self.add_log(format!("手动添加失败: {}", msg));
+        }
+        self.manual_add_status = Some((ok, msg));
     }
 
     /// 从二维码图片文件导入（R-15：rfd 选文件在 UI 线程，读文件+缩图+rqrr 解码
@@ -2472,7 +2577,7 @@ impl eframe::App for HydraApp {
                 .collapsible(false)
                 .resizable(true)
                 .show(ctx, |ui| {
-                    ui.add_space(4.0);
+                    ui.add_space(palette::SPACING_XS);
                     ui.horizontal(|ui| {
                         ui.label("模式:");
                         if ui
@@ -2512,7 +2617,7 @@ impl eframe::App for HydraApp {
                             });
                         }
                         None => {
-                            ui.colored_label(egui::Color32::RED, "✗ 二维码生成失败（链接过长？）");
+                            ui.colored_label(palette::DANGER, "✗ 二维码生成失败（链接过长？）");
                         }
                     }
 
@@ -2573,14 +2678,14 @@ impl eframe::App for HydraApp {
                     ));
                     ui.label("传输模式: TCP/TLS（TLS 1.3 + Noise-PSK）".to_string());
 
-                    // 红字安全提示
+                    // 红字安全提示（危险语义色，收口 palette::DANGER）
                     ui.separator();
                     ui.colored_label(
-                        egui::Color32::RED,
+                        palette::DANGER,
                         "⚠ 完整链接 = 持有节点（含密钥与证书），仅限可信渠道分享！",
                     );
                     ui.colored_label(
-                        egui::Color32::RED,
+                        palette::DANGER,
                         "  请勿粘贴到群聊/公开网页/明文 http；普通渠道请用「紧凑」模式。",
                     );
 
@@ -2622,7 +2727,7 @@ impl eframe::App for HydraApp {
         egui::SidePanel::left("nav_panel")
             .exact_width(160.0)
             .show(ctx, |ui| {
-                ui.add_space(10.0);
+                ui.add_space(palette::SPACING_SM);
                 ui.heading("Hydra");
                 ui.small("Multipath Proxy");
                 ui.add_space(6.0);
@@ -2908,21 +3013,26 @@ impl HydraApp {
     /// 含：运行状态、在线节点 x/y、实时上/下行速率、当前模式（传输+认证概要）、
     /// 最近日志摘要（点击跳日志页）。本页无任何配置项。
     fn ui_overview(&mut self, ui: &mut egui::Ui) {
-        ui.heading("状态总览");
+        ui.label(
+            egui::RichText::new("状态总览")
+                .size(palette::FONT_HEADING)
+                .strong(),
+        );
         ui.separator();
 
         // 状态卡：启停大开关 + 监听地址 + 在线节点 + 速率
         egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(12.0))
+            .inner_margin(egui::Margin::same(palette::SPACING_MD))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     // 状态文本三态（问题 1）：启动期也给可见反馈，不再"看似没反应"
+                    // （用色收口 palette：绿=运行 / 黄=启动中 / 灰=停止，语义色只用于状态）
                     let (status_text, status_color) = if self.proxy_running {
-                        ("● 运行中", egui::Color32::from_rgb(0x53, 0xC2, 0x6E))
+                        ("● 运行中", palette::SUCCESS)
                     } else if self.proxy_starting {
-                        ("◐ 启动中…", egui::Color32::from_rgb(0xE5, 0xA5, 0x0A))
+                        ("◐ 启动中…", palette::WARNING)
                     } else {
-                        ("○ 已停止", egui::Color32::GRAY)
+                        ("○ 已停止", palette::TEXT_FAINT)
                     };
                     ui.label(
                         egui::RichText::new(status_text)
@@ -2975,12 +3085,16 @@ impl HydraApp {
                 }
             });
 
-        // 概要卡：当前模式（传输 + 认证概要）与节点健康
-        ui.add_space(8.0);
+        // 概要卡：当前模式（传输 + 认证概要）与节点健康（区块间距 = lg）
+        ui.add_space(palette::SPACING_LG);
         egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(12.0))
+            .inner_margin(egui::Margin::same(palette::SPACING_MD))
             .show(ui, |ui| {
-                ui.heading("当前模式");
+                ui.label(
+                    egui::RichText::new("当前模式")
+                        .size(palette::FONT_TITLE)
+                        .strong(),
+                );
                 ui.separator();
                 let mode = "TCP/TLS（TLS 1.3 + Noise-PSK）";
                 let psk_ok = !self.config.auth_key.trim().is_empty();
@@ -3004,13 +3118,17 @@ impl HydraApp {
                 }
             });
 
-        // 最近日志摘要（最近 3 条，点击跳日志页）
-        ui.add_space(8.0);
+        // 最近日志摘要（最近 3 条，点击跳日志页；区块间距 = lg）
+        ui.add_space(palette::SPACING_LG);
         egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(12.0))
+            .inner_margin(egui::Margin::same(palette::SPACING_MD))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("最近日志");
+                    ui.label(
+                        egui::RichText::new("最近日志")
+                            .size(palette::FONT_TITLE)
+                            .strong(),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("查看全部 →").clicked() {
                             self.current_tab = Tab::Logs;
@@ -3073,8 +3191,11 @@ impl HydraApp {
             egui::Frame::none()
                 .fill(palette::BG_CARD)
                 .rounding(egui::Rounding::same(8.0))
-                .inner_margin(egui::Margin::symmetric(12.0_f32, 6.0_f32))
-                .outer_margin(egui::Margin::symmetric(0.0_f32, 4.0_f32))
+                .inner_margin(egui::Margin::symmetric(
+                    palette::SPACING_MD,
+                    palette::SPACING_XS + 2.0,
+                ))
+                .outer_margin(egui::Margin::symmetric(0.0_f32, palette::SPACING_XS))
                 .stroke(egui::Stroke::new(1.0_f32, palette::WARNING.gamma_multiply(0.5)))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -3099,7 +3220,7 @@ impl HydraApp {
                 self.node_group = None;
             }
         }
-        ui.add_space(4.0);
+        ui.add_space(palette::SPACING_XS);
 
         // ── 顶部组标签行：横排可滚动按钮组，选中高亮，含成员数量徽标 ──
         let all_count = self.config.node_addrs.len();
@@ -3150,8 +3271,11 @@ impl HydraApp {
         egui::Frame::none()
             .fill(palette::BG_CARD)
             .rounding(egui::Rounding::same(8.0))
-            .inner_margin(egui::Margin::symmetric(12.0_f32, 6.0_f32))
-            .outer_margin(egui::Margin::symmetric(0.0_f32, 4.0_f32))
+            .inner_margin(egui::Margin::symmetric(
+                    palette::SPACING_MD,
+                    palette::SPACING_XS + 2.0,
+                ))
+            .outer_margin(egui::Margin::symmetric(0.0_f32, palette::SPACING_XS))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -3180,8 +3304,8 @@ impl HydraApp {
             egui::Frame::none()
                 .fill(palette::BG_CARD)
                 .rounding(egui::Rounding::same(8.0))
-                .inner_margin(egui::Margin::same(12.0))
-                .outer_margin(egui::Margin::symmetric(0.0_f32, 4.0_f32))
+                .inner_margin(egui::Margin::same(palette::SPACING_MD))
+                .outer_margin(egui::Margin::symmetric(0.0_f32, palette::SPACING_XS))
                 .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new("还没有节点。")
@@ -3191,7 +3315,7 @@ impl HydraApp {
                     ui.small("多个节点自动更新 → 「📡 订阅」页右上「＋ 新建」添加订阅源；单个节点 → 从分享链接导入");
                 });
         } else if members.is_empty() {
-            ui.add_space(4.0);
+            ui.add_space(palette::SPACING_XS);
             ui.colored_label(palette::TEXT_WEAK, "（本组暂无节点）");
         }
         let mut indices_to_remove = Vec::new();
@@ -3208,12 +3332,15 @@ impl HydraApp {
         // 紧凑化：按可用宽度自适应 1–3 列（卡宽约 300px 起）
         let card_min = 300.0_f32;
         let cols = ((ui.available_width() / card_min).floor() as usize).clamp(1, 3);
-        let cell_width = ((ui.available_width() - 12.0 * (cols as f32 - 1.0)) / cols as f32
-            - 12.0)
+        // 列距 = SPACING_MD（与上方 Grid spacing 一致，卡片净宽相应扣减）
+        let cell_width = ((ui.available_width()
+            - palette::SPACING_MD * (cols as f32 - 1.0))
+            / cols as f32
+            - palette::SPACING_MD)
             .max(220.0);
         egui::Grid::new("node_group_grid")
             .num_columns(cols)
-            .spacing([12.0, 6.0])
+            .spacing([palette::SPACING_MD, palette::SPACING_SM])
             .show(ui, |ui| {
                 for chunk in entries.chunks(cols) {
                     for (i, node_addr) in chunk {
@@ -3240,7 +3367,7 @@ impl HydraApp {
                         egui::Frame::none()
                             .fill(palette::BG_CARD)
                             .rounding(egui::Rounding::same(8.0))
-                            .inner_margin(egui::Margin::same(10.0))
+                                                        .inner_margin(egui::Margin::same(palette::SPACING_MD))
                             .outer_margin(egui::Margin::same(2.0))
                             .stroke(egui::Stroke::new(1.0_f32, palette::BORDER))
                             .show(ui, |ui| {
@@ -3267,15 +3394,16 @@ impl HydraApp {
                                         )
                                         .on_hover_text(node_addr);
                                     }
-                                    // 「全部」组里来源混合，补小组来源标记；组内已由标签行表达
+                                    // 「全部」组里来源混合，补小组来源徽标（badge 字号）；组内已由标签行表达
                                     if self.node_group.is_none() {
-                                        ui.colored_label(
-                                            if is_manual {
-                                                palette::TEXT_FAINT
-                                            } else {
-                                                palette::ACCENT
-                                            },
-                                            format!("[{}]", source),
+                                        ui.label(
+                                            egui::RichText::new(format!("[{}]", source))
+                                                .size(palette::FONT_BADGE)
+                                                .color(if is_manual {
+                                                    palette::TEXT_FAINT
+                                                } else {
+                                                    palette::ACCENT
+                                                }),
                                         );
                                     }
                                     ui.with_layout(
@@ -3319,7 +3447,14 @@ impl HydraApp {
                                     {
                                         manual_target = Some(node_addr.to_string());
                                     }
-                                    if ui.small_button("🗑").on_hover_text("删除").clicked() {
+                                    // 破坏性操作用危险色文案（frontend-design 交互反馈约定）
+                                    if ui
+                                        .small_button(
+                                            egui::RichText::new("🗑").color(palette::DANGER),
+                                        )
+                                        .on_hover_text("删除节点")
+                                        .clicked()
+                                    {
                                         indices_to_remove.push(*i);
                                     }
                                 });
@@ -3355,26 +3490,29 @@ impl HydraApp {
         //   入口在「📡 订阅」页「＋ 新建」下拉与节点页「🔗 分享节点」，跨页不丢窗口）
 
         // 提示：订阅源的完整管理（增删改/更新/展开归属节点）在「📡 订阅」页
-        ui.add_space(4.0);
+        ui.add_space(palette::SPACING_XS);
         ui.small("订阅来源拉取的节点自动进入上方列表（来源标记为订阅名）；订阅源的添加与更新见「📡 订阅」页右上「＋ 新建」");
     }
 
     /// 节点/订阅共用的三个对话框窗口（UI 重设计第一批迁入，第二批起集中渲染）：
-    /// ① 从分享链接导入（粘贴多行 / 链接文件）
-    /// ② 手动添加节点（host:port 实时校验）
+    /// ① 从分享链接导入（粘贴版：多行粘贴 / 链接文件 → 创建命名分组「分享导入N」）
+    /// ② 手动添加节点（表单：分组名称/地址/端口/证书 → 创建命名分组「手动节点N」）
     /// ③ 分享节点（按节点选择打开分享对话框；批量导出 v1 也在其中）
     /// 改为直接持 ctx 渲染（跨页窗口不丢失），由 update() 每帧统一调用
     fn ui_nodes_dialogs(&mut self, ctx: &egui::Context) {
-        // ① 从分享链接导入（表单化 v2：不再粘贴原始链接，结构化字段 → 构造 ShareLink）
+        // ① 从分享链接导入（保持粘贴版：多行粘贴 hydra:// 链接 / base64 订阅文本 / 链接文件，
+        //    → import_share_links_as_group 创建命名分组「分享导入N」）
         if self.import_dialog_open {
+            let mut import_clicked = false;
+            let mut load_file_clicked = false;
             egui::Window::new("📋 从分享链接导入")
                 .collapsible(false)
                 .resizable(false)
-                .default_width(480.0)
+                .default_width(520.0)
                 .show(ctx, |ui| {
-                    egui::Grid::new("import_form_grid")
+                    egui::Grid::new("import_paste_grid")
                         .num_columns(2)
-                        .spacing([8.0, 6.0])
+                        .spacing([palette::SPACING_SM, palette::SPACING_SM])
                         .show(ui, |ui| {
                             // 分组名称（打开对话框时预填「分享导入N」避重；重名提交时报错不关窗）
                             ui.label("分组名称：");
@@ -3384,54 +3522,27 @@ impl HydraApp {
                                     .hint_text("分享导入1"),
                             );
                             ui.end_row();
-                            // 服务器地址（IP 或域名均可，单行固定 + 横向滚动）
-                            ui.label("服务器地址：");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.import_form_addr)
-                                    .desired_width(260.0)
-                                    .hint_text("IP 或域名，如 43.133.91.218"),
-                            );
-                            ui.end_row();
-                            // 端口（默认 443）
-                            ui.label("端口：");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.import_form_port)
-                                    .desired_width(260.0)
-                                    .hint_text("443"),
-                            );
-                            ui.end_row();
-                            // 证书文件：浏览选择；留空 = 不带证书（对方需自备）
-                            ui.label("证书文件：");
-                            ui.horizontal(|ui| {
-                                if ui.button("浏览...").clicked() {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .add_filter("证书文件", &["der", "crt", "cer"])
-                                        .add_filter("全部文件", &["*"])
-                                        .pick_file()
-                                    {
-                                        self.import_form_cert_path =
-                                            path.display().to_string();
-                                    }
-                                }
-                                // 单行显示路径（超宽横向滚动，不换行膨胀）
+                            // 分享链接文本（多行粘贴）
+                            ui.label("分享链接：");
+                            ui.vertical(|ui| {
                                 ui.add(
-                                    egui::TextEdit::singleline(&mut self.import_form_cert_path)
-                                        .desired_width(180.0)
-                                        .hint_text("留空 = 不带证书（对方需自备）"),
+                                    egui::TextEdit::multiline(&mut self.import_paste_text)
+                                        .desired_width(360.0)
+                                        .desired_rows(6)
+                                        .hint_text(
+                                            "每行一条 hydra:// 分享链接，\n或整段 base64 订阅文本",
+                                        ),
                                 );
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("从链接文件导入...").clicked() {
+                                        load_file_clicked = true;
+                                    }
+                                    ui.small(".txt：每行一条 hydra:// 链接，或整体 base64");
+                                });
                             });
                             ui.end_row();
-                            // 认证密钥：留空 = 使用全局密钥；填了则写入链接覆盖全局
-                            ui.label("认证密钥：");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.import_form_auth_key)
-                                    .desired_width(260.0)
-                                    .password(true)
-                                    .hint_text("留空 = 使用全局密钥"),
-                            );
-                            ui.end_row();
                         });
-                    ui.add_space(4.0);
+                    ui.add_space(palette::SPACING_XS);
                     ui.horizontal(|ui| {
                         if ui
                             .add(egui::Button::new(
@@ -3439,7 +3550,7 @@ impl HydraApp {
                             ))
                             .clicked()
                         {
-                            self.import_form_submit();
+                            import_clicked = true;
                         }
                         if ui.button("关闭").clicked() {
                             self.import_dialog_open = false;
@@ -3451,35 +3562,79 @@ impl HydraApp {
                             format!("{} {}", if *ok { "✓" } else { "✗" }, msg),
                         );
                     }
-                    ui.small("ℹ 创建命名分组：条目出现在「📡 订阅」列表、节点进入同名组标签；该分组的「立即更新」会重新解析链接（证书 cc 字段随链接保存）");
+                    ui.small("ℹ 创建命名分组：条目出现在「📡 订阅」列表、节点进入同名组标签；该分组的「立即更新」会重新解析粘贴文本");
                 });
+            if load_file_clicked {
+                self.import_paste_load_file();
+            }
+            if import_clicked {
+                self.import_paste_submit();
+            }
         }
 
-        // ② 手动添加节点（与旧「添加节点」同一套校验：非法地址直接提示不静默入库）
+        // ② 手动添加节点（表单 = 分组名称/地址/端口/证书文件 → 构造链接 → 创建命名分组；
+        //    校验失败红字提示不关窗，成功才关窗并清空表单）
         if self.manual_add_open {
             let mut add_clicked = false;
             egui::Window::new("✏️ 手动添加节点")
                 .collapsible(false)
                 .resizable(false)
-                .default_width(420.0)
+                .default_width(480.0)
                 .show(ctx, |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_node_input)
-                            .desired_width(320.0)
-                            .hint_text("host:port，如 1.2.3.4:4433"),
-                    );
-                    if !self.new_node_input.trim().is_empty()
-                        && self.new_node_input.trim().parse::<SocketAddr>().is_err()
-                    {
-                        ui.colored_label(
-                            palette::DANGER,
-                            "✗ 格式应为 地址:端口（示例 1.2.3.4:4433 / [::1]:4433）",
-                        );
-                    }
+                    egui::Grid::new("manual_add_grid")
+                        .num_columns(2)
+                        .spacing([palette::SPACING_SM, palette::SPACING_SM])
+                        .show(ui, |ui| {
+                            // 分组名称（打开对话框时预填「手动节点N」避重；重名提交时报错不关窗）
+                            ui.label("分组名称：");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.manual_group_name)
+                                    .desired_width(260.0)
+                                    .hint_text("手动节点1"),
+                            );
+                            ui.end_row();
+                            // 服务器地址（IP 或域名均可）
+                            ui.label("服务器地址：");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.manual_form_addr)
+                                    .desired_width(260.0)
+                                    .hint_text("IP 或域名，如 43.133.91.218"),
+                            );
+                            ui.end_row();
+                            // 端口（默认 443，提交时按 1..=65535 校验）
+                            ui.label("端口：");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.manual_form_port)
+                                    .desired_width(260.0)
+                                    .hint_text("443"),
+                            );
+                            ui.end_row();
+                            // 证书文件：浏览选择；留空 = 不带证书（回落全局证书）
+                            ui.label("证书文件：");
+                            ui.horizontal(|ui| {
+                                if ui.button("浏览...").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("证书文件", &["der", "crt", "cer"])
+                                        .add_filter("全部文件", &["*"])
+                                        .pick_file()
+                                    {
+                                        self.manual_form_cert_path = path.display().to_string();
+                                    }
+                                }
+                                // 单行显示路径（超宽横向滚动，不换行膨胀）
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.manual_form_cert_path)
+                                        .desired_width(180.0)
+                                        .hint_text("可选；留空 = 用全局证书"),
+                                );
+                            });
+                            ui.end_row();
+                        });
+                    ui.add_space(palette::SPACING_XS);
                     ui.horizontal(|ui| {
                         if ui
                             .add(egui::Button::new(
-                                egui::RichText::new("➕ 添加").strong(),
+                                egui::RichText::new("➕ 添加（创建分组）").strong(),
                             ))
                             .clicked()
                         {
@@ -3487,33 +3642,18 @@ impl HydraApp {
                         }
                         if ui.button("取消").clicked() {
                             self.manual_add_open = false;
-                            self.new_node_input.clear();
                         }
                     });
+                    if let Some((ok, msg)) = &self.manual_add_status {
+                        ui.colored_label(
+                            if *ok { palette::SUCCESS } else { palette::DANGER },
+                            format!("{} {}", if *ok { "✓" } else { "✗" }, msg),
+                        );
+                    }
+                    ui.small("ℹ 创建命名分组：条目出现在「📡 订阅」列表、节点进入同名组标签；证书路径按节点独立保存（写入 node_cert_paths）");
                 });
             if add_clicked {
-                let input = self.new_node_input.trim().to_string();
-                if input.is_empty() {
-                    self.add_log("请先输入节点地址（host:port）".to_string());
-                } else if input.parse::<SocketAddr>().is_err() {
-                    self.add_log(format!(
-                        "「{}」不是有效的 地址:端口（示例 1.2.3.4:4433 / [::1]:4433），未添加",
-                        input
-                    ));
-                } else {
-                    self.node_status.insert(
-                        input.clone(),
-                        NodeStatusInfo {
-                            connected: false,
-                            last_check: None,
-                            latency_ms: None,
-                        },
-                    );
-                    self.config.node_addrs.push(input.clone());
-                    self.add_log(format!("已添加节点: {}", input));
-                    self.new_node_input.clear();
-                    self.manual_add_open = false;
-                }
+                self.manual_add_submit();
             }
         }
 
@@ -3583,13 +3723,10 @@ impl HydraApp {
                             ui.close_menu();
                         }
                         if ui.button("📋 从分享链接导入").clicked() {
-                            // 打开时重置表单：预生成默认分组名（避重）、端口默认 443、清空其余字段与提示
+                            // 打开时重置粘贴版表单：预生成默认分组名（避重）、清空粘贴文本与提示
                             self.import_group_name =
                                 next_import_group_name(&self.config.subscriptions);
-                            self.import_form_addr.clear();
-                            self.import_form_port = "443".to_string();
-                            self.import_form_cert_path.clear();
-                            self.import_form_auth_key.clear();
+                            self.import_paste_text.clear();
                             self.import_status = None;
                             self.import_dialog_open = true;
                             ui.close_menu();
@@ -3600,7 +3737,13 @@ impl HydraApp {
                             ui.close_menu();
                         }
                         if ui.button("✏️ 手动添加节点").clicked() {
-                            self.new_node_input.clear();
+                            // 打开时重置表单：预生成默认分组名（避重）、端口默认 443、清空其余字段与提示
+                            self.manual_group_name =
+                                next_manual_group_name(&self.config.subscriptions);
+                            self.manual_form_addr.clear();
+                            self.manual_form_port = "443".to_string();
+                            self.manual_form_cert_path.clear();
+                            self.manual_add_status = None;
                             self.manual_add_open = true;
                             ui.close_menu();
                         }
@@ -3638,7 +3781,7 @@ impl HydraApp {
             ui.horizontal(|ui| {
                 ui.strong(&sub.name);
                 ui.colored_label(
-                    egui::Color32::from_rgb(0xA8, 0xB0, 0xBC),
+                    palette::TEXT_WEAK,
                     format!("{} 节点", sub.nodes.len()),
                 );
                 ui.weak(format!("更新于 {}", updated));
@@ -3664,7 +3807,11 @@ impl HydraApp {
                     self.sub_edit_name = sub.name.clone();
                     self.sub_edit_source = sub.source.clone();
                 }
-                if ui.small_button("删除").clicked() {
+                // 破坏性操作用危险色文案
+                if ui
+                    .small_button(egui::RichText::new("删除").color(palette::DANGER))
+                    .clicked()
+                {
                     subs_to_remove.push(i);
                 }
             });
@@ -3680,7 +3827,11 @@ impl HydraApp {
                     let testing_this = self.node_testing_addr.as_deref() == Some(addr.as_str());
                     ui.indent(addr.as_str(), |ui| {
                         ui.horizontal(|ui| {
-                            ui.colored_label(egui::Color32::from_rgb(0x7A, 0xB3, 0xFF), "[只读]");
+                            ui.label(
+                                egui::RichText::new("[只读]")
+                                    .size(palette::FONT_BADGE)
+                                    .color(palette::ACCENT),
+                            );
                             ui.label(addr);
                             // 测速中显示 spinner；结果进全局日志与调度器评分（与节点页一致）
                             if testing_this {
@@ -3740,7 +3891,7 @@ impl HydraApp {
                 .show(ui.ctx(), |ui| {
                     egui::Grid::new("sub_edit_grid")
                         .num_columns(2)
-                        .spacing([8.0, 6.0])
+                        .spacing([palette::SPACING_SM, palette::SPACING_SM])
                         .show(ui, |ui| {
                             ui.label("名称:");
                             ui.add(
@@ -3757,10 +3908,7 @@ impl HydraApp {
                             ui.end_row();
                         });
                     if self.sub_edit_source.trim().is_empty() {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(0xFF, 0x8A, 0x80),
-                            "✗ 来源不能为空",
-                        );
+                        ui.colored_label(palette::DANGER, "✗ 来源不能为空");
                     }
                     let name = self.sub_edit_name.trim();
                     let name_conflict = !name.is_empty()
@@ -3772,7 +3920,7 @@ impl HydraApp {
                             .any(|(j, s)| j != idx && s.name == name);
                     if name_conflict {
                         ui.colored_label(
-                            egui::Color32::from_rgb(0xFF, 0x8A, 0x80),
+                            palette::DANGER,
                             "✗ 订阅名称已存在（名称是来源标记与更新对号的键）",
                         );
                     }
@@ -3825,7 +3973,7 @@ impl HydraApp {
             .show(ctx, |ui| {
                 egui::Grid::new("sub_add_grid")
                     .num_columns(2)
-                    .spacing([8.0, 6.0])
+                    .spacing([palette::SPACING_SM, palette::SPACING_SM])
                     .show(ui, |ui| {
                         ui.label("名称:");
                         ui.add(
@@ -3992,7 +4140,7 @@ impl HydraApp {
                 ui.label("节点信息（仅本节点）");
                 egui::Grid::new("node_edit_grid")
                     .num_columns(2)
-                    .spacing([8.0, 6.0])
+                    .spacing([palette::SPACING_SM, palette::SPACING_SM])
                     .show(ui, |ui| {
                         ui.label("备注名:");
                         ui.add(
@@ -4020,7 +4168,7 @@ impl HydraApp {
                     && self.edit_addr.trim().parse::<SocketAddr>().is_err()
                 {
                     ui.colored_label(
-                        egui::Color32::from_rgb(0xFF, 0x8A, 0x80),
+                        palette::DANGER,
                         "✗ 地址格式应为 host:port（示例 1.2.3.4:4433 / [::1]:4433）",
                     );
                 }
@@ -4053,14 +4201,10 @@ impl HydraApp {
                 });
                 if self.edit_show_auth && !self.edit_auth_key.trim().is_empty() {
                     match hydra_client::auth_key_from_hex(self.edit_auth_key.trim()) {
-                        Ok(_) => ui.colored_label(
-                            egui::Color32::from_rgb(0x7D, 0xE2, 0x97),
-                            "✓ 密钥格式有效",
-                        ),
-                        Err(e) => ui.colored_label(
-                            egui::Color32::from_rgb(0xFF, 0x8A, 0x80),
-                            format!("✗ {}", e),
-                        ),
+                        Ok(_) => ui.colored_label(palette::SUCCESS, "✓ 密钥格式有效"),
+                        Err(e) => {
+                            ui.colored_label(palette::DANGER, format!("✗ {}", e))
+                        }
                     };
                 }
 
@@ -4092,10 +4236,7 @@ impl HydraApp {
 
                 if self.proxy_running {
                     ui.separator();
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0xFF, 0xD6, 0x66),
-                        "⚠ 代理正在运行：保存后需停止并重新启动代理，修改才会生效",
-                    );
+                    ui.colored_label(palette::WARNING, "⚠ 代理正在运行：保存后需停止并重新启动代理，修改才会生效");
                 }
 
                 // 方案 §4：诚实提示——认证密钥为全局单值；证书已支持逐节点独立路径（上）
@@ -4124,13 +4265,21 @@ impl HydraApp {
     /// 分区：代理核心 / 安全与信任 / TUN 透明代理（实验）/ 系统 / 外观与数据 / 关于。
     /// 认证密钥、全局证书在「🌐 节点」页「全局凭据」区；信任模式与 TUN 在本页。
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("设置");
+        ui.label(
+            egui::RichText::new("设置")
+                .size(palette::FONT_HEADING)
+                .strong(),
+        );
         ui.separator();
 
         // ◈ 全局凭据（UI 重设计第一批：自「🌐 节点」页迁入，独立折叠区）
         // 过渡期这些字段仍为全局单值（GuiConfig），后端节点级凭据落地前
         // 对所有节点生效——此处诚实标注，不假装是节点级凭据。
-        ui.heading("全局凭据（当前对所有节点生效）");
+        ui.label(
+            egui::RichText::new("全局凭据（当前对所有节点生效）")
+                .size(palette::FONT_TITLE)
+                .strong(),
+        );
         egui::CollapsingHeader::new("🔑 认证密钥 / 节点证书")
             .default_open(self.global_creds_open)
             .show(ui, |ui| {
@@ -4206,7 +4355,11 @@ impl HydraApp {
         ui.separator();
 
         // ◈ 代理核心
-        ui.heading("代理核心");
+        ui.label(
+            egui::RichText::new("代理核心")
+                .size(palette::FONT_TITLE)
+                .strong(),
+        );
         ui.horizontal(|ui| {
             ui.label("本地监听地址:");
             ui.add(
@@ -4240,7 +4393,11 @@ impl HydraApp {
         ui.separator();
 
         // ◈ 安全与信任（双信任模式：自签 pinning 默认 / 真证书 CA）
-        ui.heading("安全与信任");
+        ui.label(
+            egui::RichText::new("安全与信任")
+                .size(palette::FONT_TITLE)
+                .strong(),
+        );
         // 拷贝为 String：后续要可变借用 self.config（pin 输入框），避免借用冲突
         let mode = self.config.trust_mode_effective().to_string();
         ui.horizontal(|ui| {
@@ -4273,13 +4430,10 @@ impl HydraApp {
             match config::validate_leaf_pin(&self.config.ca_leaf_pin) {
                 Ok(()) if self.config.ca_leaf_pin.trim().is_empty() => {}
                 Ok(()) => {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0x7D, 0xE2, 0x97),
-                        "✓ 格式有效（64 hex）",
-                    );
+                    ui.colored_label(palette::SUCCESS, "✓ 格式有效（64 hex）");
                 }
                 Err(e) => {
-                    ui.colored_label(egui::Color32::from_rgb(0xFF, 0x8A, 0x80), format!("✗ {e}"));
+                    ui.colored_label(palette::DANGER, format!("✗ {e}"));
                 }
             }
             ui.small("ca 模式不使用节点证书文件；节点侧用真证书（如 ACME）部署，SNI 须与证书 SAN 一致");
@@ -4293,7 +4447,11 @@ impl HydraApp {
         ui.separator();
 
         // ◈ TUN 透明代理（实验性：需管理员/root；Windows 另需 wintun.dll）
-        ui.heading("TUN 透明代理（实验）");
+        ui.label(
+            egui::RichText::new("TUN 透明代理（实验）")
+                .size(palette::FONT_TITLE)
+                .strong(),
+        );
         if ui
             .checkbox(
                 &mut self.config.tun_enabled,
@@ -4328,7 +4486,7 @@ impl HydraApp {
         #[cfg(windows)]
         if tun_on && hydra_client::windows_system_proxy_enabled() {
             ui.colored_label(
-                egui::Color32::from_rgb(0xFF, 0xD6, 0x66),
+                palette::WARNING,
                 "⚠ 检测到 Windows 系统代理已开启：TUN 模式下经系统代理的流量会二次进入本代理形成环路，建议关闭系统代理",
             );
         }
@@ -4336,7 +4494,11 @@ impl HydraApp {
         ui.separator();
 
         // ◈ 系统
-        ui.heading("系统");
+        ui.label(
+            egui::RichText::new("系统")
+                .size(palette::FONT_TITLE)
+                .strong(),
+        );
         ui.add_enabled(false, egui::Checkbox::new(&mut false, "开机自启（规划中）"))
             .on_disabled_hover_text("规划中：需随 TUN 服务模式一并实现");
         if ui
@@ -4357,7 +4519,11 @@ impl HydraApp {
         ui.separator();
 
         // ◈ 外观与数据
-        ui.heading("外观与数据");
+        ui.label(
+            egui::RichText::new("外观与数据")
+                .size(palette::FONT_TITLE)
+                .strong(),
+        );
         ui.horizontal(|ui| {
             ui.label("主题:");
             ui.add_enabled(
@@ -4392,7 +4558,11 @@ impl HydraApp {
         ui.separator();
 
         // ◈ 关于
-        ui.heading("关于");
+        ui.label(
+            egui::RichText::new("关于")
+                .size(palette::FONT_TITLE)
+                .strong(),
+        );
         ui.label(format!(
             "Hydra Multipath Proxy v{}",
             env!("CARGO_PKG_VERSION")
@@ -4403,7 +4573,7 @@ impl HydraApp {
         );
         ui.small("检查更新：预留");
 
-        ui.separator();
+        ui.add_space(palette::SPACING_XL);
 
         // 退出入口（托盘菜单同样可退出）
         if ui.button("退出程序（停止代理并清理系统代理）").clicked() {
@@ -4416,7 +4586,11 @@ impl HydraApp {
 
     /// 运行日志（保留自动滚动 + 清空/刷新）
     fn ui_logs(&mut self, ui: &mut egui::Ui) {
-        ui.heading("运行日志");
+        ui.label(
+            egui::RichText::new("运行日志")
+                .size(palette::FONT_HEADING)
+                .strong(),
+        );
         ui.separator();
 
         // 日志显示区域（stick_to_bottom：新日志自动滚动到底）
@@ -4433,7 +4607,11 @@ impl HydraApp {
 
         // 底部控制栏
         ui.horizontal(|ui| {
-            if ui.button("清空日志").clicked() {
+            // 破坏性操作用危险色文案
+            if ui
+                .button(egui::RichText::new("清空日志").color(palette::DANGER))
+                .clicked()
+            {
                 self.logs.clear();
             }
             if ui.button("刷新").clicked() {
@@ -4476,7 +4654,7 @@ fn apply_dark_theme(ctx: &egui::Context) {
     vis.panel_fill = bg_panel;
     vis.window_fill = bg_window;
     vis.extreme_bg_color = bg_extreme; // TextEdit / 折叠区背景
-    vis.faint_bg_color = egui::Color32::from_rgb(0x24, 0x28, 0x30); // 斑马纹/弱分隔
+    vis.faint_bg_color = palette::BG_FAINT; // 斑马纹/弱分隔
                                                                     // 文字：正文高对比，次要文字（ui.small / weak）仍 ≥7:1
     vis.override_text_color = Some(text);
     vis.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, weak); // 分隔线文字等
@@ -4491,7 +4669,8 @@ fn apply_dark_theme(ctx: &egui::Context) {
     // 圆角 / 行间距
     vis.window_rounding = egui::Rounding::same(6.0);
     vis.menu_rounding = egui::Rounding::same(6.0);
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    // 全局元素间距：统一从 palette 间距常量取（水平/垂直同为 sm=8）
+    style.spacing.item_spacing = egui::vec2(palette::SPACING_SM, palette::SPACING_SM);
     ctx.set_style(style);
 }
 
@@ -5067,6 +5246,97 @@ mod tests {
         .unwrap();
         assert_eq!(reparsed.links.len(), 1);
         assert_eq!(reparsed.links[0].port, 9443);
+    }
+
+    // ── 手动添加节点（表单 + 创建命名分组）──
+
+    #[test]
+    fn next_manual_group_name_skips_existing_subscription_names() {
+        // 空列表 → 手动节点1
+        assert_eq!(next_manual_group_name(&[]), "手动节点1");
+        // 已有 手动节点1/2 → 顺延；与「分享导入N」序列互不干扰
+        let mut subs = vec![
+            SubscriptionConfig {
+                name: "手动节点1".to_string(),
+                source: String::new(),
+                last_updated_secs: None,
+                nodes: Vec::new(),
+            },
+            SubscriptionConfig {
+                name: "分享导入1".to_string(),
+                source: String::new(),
+                last_updated_secs: None,
+                nodes: Vec::new(),
+            },
+        ];
+        assert_eq!(next_manual_group_name(&subs), "手动节点2");
+        subs.push(SubscriptionConfig {
+            name: "手动节点2".to_string(),
+            source: String::new(),
+            last_updated_secs: None,
+            nodes: Vec::new(),
+        });
+        assert_eq!(next_manual_group_name(&subs), "手动节点3");
+    }
+
+    #[test]
+    fn manual_form_creates_named_group_and_filters() {
+        // 端到端：表单字段 → build_form_share_url 构造链接 → 创建命名分组「手动节点1」
+        // → 节点进列表 → 组视图可按该分组过滤（组能力对表单创建的分组通用）
+        let url = build_form_share_url("10.5.0.9", "443", "", "").unwrap();
+        let mut cfg = GuiConfig::default();
+        let result = import_share_links_as_group(&mut cfg, "手动节点1", &url).unwrap();
+        assert_eq!(result.node_count, 1);
+        // 分组条目出现在订阅列表，source = hydra-text:// + 构造链接
+        assert_eq!(cfg.subscriptions.len(), 1);
+        assert_eq!(cfg.subscriptions[0].name, "手动节点1");
+        assert!(cfg.subscriptions[0].source.starts_with(LOCAL_TEXT_SOURCE_PREFIX));
+        assert_eq!(cfg.node_addrs, vec!["10.5.0.9:443".to_string()]);
+        // 组过滤：该分组能看到节点；「手动」组为空
+        let filtered = filter_nodes_by_group(
+            &cfg,
+            &cfg.node_addrs.clone(),
+            &Some("手动节点1".to_string()),
+        );
+        assert_eq!(filtered, vec!["10.5.0.9:443".to_string()]);
+        assert!(filter_nodes_by_group(
+            &cfg,
+            &cfg.node_addrs.clone(),
+            &Some(GROUP_MANUAL.to_string())
+        )
+        .is_empty());
+        // 证书路径按节点独立落库（manual_add_submit 的收口行为）
+        cfg.set_node_cert_path("10.5.0.9:443", r"C:\certs\n1.der");
+        assert_eq!(
+            cfg.node_cert_paths.get("10.5.0.9:443").map(String::as_str),
+            Some(r"C:\certs\n1.der")
+        );
+    }
+
+    #[test]
+    fn manual_form_rejects_bad_input_and_duplicate_name() {
+        // 端口 0 / 越界 / 非数字、空地址 → build_form_share_url 拒绝（红字不建组的前置校验）
+        assert!(build_form_share_url("", "443", "", "").is_err());
+        assert!(build_form_share_url("1.2.3.4", "0", "", "").is_err());
+        assert!(build_form_share_url("1.2.3.4", "70000", "", "").is_err());
+        assert!(build_form_share_url("1.2.3.4", "abc", "", "").is_err());
+        // 证书路径不存在 → 拒绝
+        assert!(build_form_share_url("1.2.3.4", "443", "", "Z:/无此文件.der").is_err());
+        // 名称与现有订阅重名 → import_share_links_as_group 拒绝且不新建
+        let mut cfg = GuiConfig::default();
+        cfg.subscriptions.push(SubscriptionConfig {
+            name: "手动节点1".to_string(),
+            source: String::new(),
+            last_updated_secs: None,
+            nodes: Vec::new(),
+        });
+        let url = build_form_share_url("10.5.0.10", "443", "", "").unwrap();
+        let err = import_share_links_as_group(&mut cfg, "手动节点1", &url).unwrap_err();
+        assert!(err.contains("已存在"), "err: {}", err);
+        assert!(cfg.node_addrs.is_empty());
+        // 换避重名「手动节点2」后成功
+        assert!(import_share_links_as_group(&mut cfg, "手动节点2", &url).is_ok());
+        assert_eq!(cfg.node_addrs, vec!["10.5.0.10:443".to_string()]);
     }
 
     #[test]
