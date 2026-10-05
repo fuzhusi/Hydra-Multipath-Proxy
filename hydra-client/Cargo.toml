@@ -12,8 +12,14 @@ path = "src/main.rs"
 # TUN 透明代理模式（docs/design/TUN模式方案.md）：默认开启；
 # `--no-default-features` 可编出无 TUN 的最小客户端（若目标环境无法拉取
 # tun2/smoltcp 依赖，允许此降级）。
-default = ["tun"]
+default = ["tun", "fingerprint"]
 tun = ["dep:tun2", "dep:smoltcp", "dep:tokio-util"]
+# ClientHello 指纹"最大近似"（路线 C：stock rustls 全部可调项，见
+# docs/design/ClientHello指纹模仿方案与实施.md）。纯 stock 实现、无 fork 依赖，
+# 故默认开启；运行时 `HYDRA_FINGERPRINT=none` 可整体回退 stock rustls 行为。
+# brotli：Chrome ClientHello 携带 certCompression(brotli)，rustls 需启用对应
+# feature 才会声明该解压器。
+fingerprint = ["rustls/brotli"]
 
 [dependencies]
 # 版本统一由根 [workspace.dependencies] 声明（审查 R-31）

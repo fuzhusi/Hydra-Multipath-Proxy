@@ -43,3 +43,11 @@ health_addr = "127.0.0.1:8081"
 # 日志级别（RUST_LOG 存在时优先于本字段与 HYDRA_LOG_LEVEL）。
 # env: HYDRA_LOG_LEVEL ｜ 默认 "info"
 log_level = "info"
+
+# 反代静态页回退（抗主动探测增强）：true 时 TLS 建立后的认证失败路径回复
+# 内置静态页而非静默关流（标准反代行为）。
+# env: HYDRA_FALLBACK_PAGE ｜ 默认 false = 关闭（保守升级，行为零变化）
+# ⚠ 权衡：回退页提升"看起来像真网站"相似度，但"每次都同一页面"也可被批量
+#   探测统计；静默关流"有 TLS 却永不出字节"同样是指纹。真证书部署建议
+#   开启；自签无域名隐蔽部署建议保持关闭。详见 README 部署指南。
+# fallback_page = false

@@ -3,7 +3,7 @@
 
 use eframe::egui;
 use hydra_client::{
-    format_bytes, format_duration, format_speed, generate_share_links, hex_encode_lower,
+    format_bytes, format_speed, generate_share_links, hex_encode_lower,
     parse_share_links, parse_subscription, sha256_hex, ProxyServer, ShareLink, TrafficMonitor,
     TrafficStats, TransportChoice, TransportMode,
 };
@@ -105,6 +105,130 @@ mod palette {
 mod qr;
 mod subscription;
 mod tray;
+
+// ── UI 重设计第三批：总览页仪表盘速率历史序列 ──
+/// 速率采样历史 + 当日流量累计（UI 无关纯逻辑，UI 与单测共用）。
+/// - `samples`：最近 [`SpeedHistory::CAPACITY`] 个 (上行 B/s, 下行 B/s) 采样点
+///   （采样周期 500ms → 曲线窗口 = 60s）；
+/// - `daily_up/daily_down`：当日累计流量（由相邻采样的累计字节数差分得到；
+///   跨自然日自动清零；代理重启导致累计值回退时按新起点重新累计，不产生负数）。
+///
+/// 序列本身不落盘：应用退出即清零，「今日」语义 = 本次运行期间（同自然日内）。
+struct SpeedHistory {
+    samples: VecDeque<(f64, f64)>,
+    /// 上次采样的累计发送字节数（差分基准；None = 尚无基准）
+    last_sent: Option<u64>,
+    /// 上次采样的累计接收字节数
+    last_recv: Option<u64>,
+    daily_up: u64,
+    daily_down: u64,
+    /// 当日标记（本地日期）；日期变化时清空当日累计
+    day: chrono::NaiveDate,
+}
+
+impl SpeedHistory {
+    /// 曲线保留的最大采样点数（v3 方案 P1：最近 120 点）
+    const CAPACITY: usize = 120;
+
+    fn now_day() -> chrono::NaiveDate {
+        chrono::Local::now().date_naive()
+    }
+
+    fn new() -> Self {
+        Self {
+            samples: VecDeque::new(),
+            last_sent: None,
+            last_recv: None,
+            daily_up: 0,
+            daily_down: 0,
+            day: Self::now_day(),
+        }
+    }
+
+    /// 推入一次采样（每 500ms 由后台采样线程调用）：
+    /// 维护 120 点滑动窗口 + 当日流量差分累计 + 跨日清零。
+    fn push_sample(&mut self, stats: &TrafficStats) {
+        // 跨自然日：清空当日累计（「今日」语义）
+        let today = Self::now_day();
+        if today != self.day {
+            self.day = today;
+            self.daily_up = 0;
+            self.daily_down = 0;
+        }
+        // 当日流量差分：累计值回退（代理重启换了 TrafficMonitor）→ 以新值为新基准，不累计
+        match self.last_sent {
+            Some(prev) if stats.bytes_sent >= prev => self.daily_up += stats.bytes_sent - prev,
+            _ => {}
+        }
+        match self.last_recv {
+            Some(prev) if stats.bytes_received >= prev => {
+                self.daily_down += stats.bytes_received - prev
+            }
+            _ => {}
+        }
+        self.last_sent = Some(stats.bytes_sent);
+        self.last_recv = Some(stats.bytes_received);
+
+        self.samples.push_back((stats.upload_speed, stats.download_speed));
+        while self.samples.len() > Self::CAPACITY {
+            self.samples.pop_front();
+        }
+    }
+
+    /// 仅清空曲线序列（启停代理时调用）；当日累计保留（同一天内重启不清零）
+    fn reset_samples(&mut self) {
+        self.samples.clear();
+        self.last_sent = None;
+        self.last_recv = None;
+    }
+
+    /// 当前采样点数（≤ CAPACITY）
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// 上行序列（B/s，按时间先后）
+    fn up_series(&self) -> Vec<f64> {
+        self.samples.iter().map(|(up, _)| *up).collect()
+    }
+
+    /// 下行序列（B/s，按时间先后）
+    fn down_series(&self) -> Vec<f64> {
+        self.samples.iter().map(|(_, down)| *down).collect()
+    }
+}
+
+/// 在线节点延迟中位数（纯函数，总览统计卡与单测共用）：
+/// 仅统计「测过且在线」的节点；无在线节点返回 None。
+fn median_online_latency(status: &HashMap<String, NodeStatusInfo>) -> Option<u64> {
+    let mut lats: Vec<u64> = status
+        .values()
+        .filter(|s| s.connected)
+        .filter_map(|s| s.latency_ms)
+        .collect();
+    if lats.is_empty() {
+        return None;
+    }
+    lats.sort_unstable();
+    Some(lats[lats.len() / 2])
+}
+
+/// 当前节点候选（纯函数，总览统计卡与单测共用）：
+/// 在线节点中延迟最低者（与调度器「最低延迟优先」语义一致，作参考展示）。
+/// 返回 (地址, 延迟ms)；地址为 owned String——UI 在借用 cfg 前取快照，避免渲染闭包借用冲突。
+fn best_online_node(cfg: &GuiConfig, status: &HashMap<String, NodeStatusInfo>) -> Option<(String, u64)> {
+    cfg.node_addrs
+        .iter()
+        .filter_map(|a| {
+            status
+                .get(a)
+                .filter(|s| s.connected)
+                .and_then(|s| s.latency_ms.map(|ms| (a.clone(), ms)))
+        })
+        .min_by_key(|(_, ms)| *ms)
+}
+
 /// 应用图标：从嵌入的 assets/app.ico 解码窗口/托盘所需 RGBA（见 icon.rs）
 mod icon;
 use tray::TrayCommand;
@@ -132,11 +256,11 @@ impl Tab {
 
     fn label(self) -> &'static str {
         match self {
-            Tab::Overview => "📊 状态总览",
-            Tab::Nodes => "🌐 节点",
+            Tab::Overview => "🏠 首页",
+            Tab::Nodes => "🛰 节点",
             Tab::Subscriptions => "📡 订阅",
             Tab::Logs => "📜 日志",
-            Tab::Settings => "⚙️ 设置",
+            Tab::Settings => "⚙ 设置",
         }
     }
 }
@@ -584,9 +708,6 @@ struct HydraApp {
     // 密钥明文显示开关（默认掩码显示）
     show_auth_key: bool,
 
-    // ── UI 重设计 v2：节点页顶部「全局凭据」折叠区（过渡期全局生效，诚实标注）──
-    global_creds_open: bool,
-
     // ── UI 重设计 v2：订阅页展开查看归属节点 + 订阅编辑对话框 ──
     /// 当前展开归属节点列表的订阅名（None = 全部收起）
     expanded_sub: Option<String>,
@@ -627,6 +748,9 @@ struct HydraApp {
     traffic_stats_cache: Arc<std::sync::Mutex<Option<TrafficStats>>>,
     /// 流量采样线程停止标记（stop_proxy / 重新启动代理时置位，旧线程自行退出）
     traffic_sampler_stop: Option<Arc<AtomicBool>>,
+    /// UI 重设计第三批：速率历史 + 当日流量（采样线程每 500ms 追加一个点，
+    /// UI 帧只读快照供仪表盘曲线卡与统计卡使用）
+    traffic_history: Arc<std::sync::Mutex<SpeedHistory>>,
 
     // ── T2：托盘 + UI 重排 ──
     /// 当前导航页签
@@ -698,7 +822,6 @@ impl Default for HydraApp {
             edit_auth_key: String::new(),
             edit_show_auth: false,
             edit_cert_path: String::new(),
-            global_creds_open: false,
             expanded_sub: None,
             sub_edit_idx: None,
             sub_edit_name: String::new(),
@@ -714,8 +837,9 @@ impl Default for HydraApp {
             traffic_monitor: None,
             traffic_stats_cache: Arc::new(std::sync::Mutex::new(None)),
             traffic_sampler_stop: None,
-            current_tab: Tab::Overview,
+            traffic_history: Arc::new(std::sync::Mutex::new(SpeedHistory::new())),
             tray: None,
+            current_tab: Tab::Overview,
             really_quit: false,
             last_tray_tooltip: String::new(),
             tun_shutdown: None,
@@ -827,6 +951,17 @@ fn start_button_state(proxy_running: bool, proxy_starting: bool) -> (&'static st
     } else {
         ("▶ 启动代理", true)
     }
+}
+
+/// UI 重设计第三批：统一卡片 Frame 规范——卡片底色 + 1px 描边 + 圆角 8 + 内边距 MD、
+/// 外边距 XS（视觉规范收口：所有新卡片走本函数，不再散落 Frame::group）。
+fn card_frame(_ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::none()
+        .fill(palette::BG_CARD)
+        .stroke(egui::Stroke::new(1.0_f32, palette::BORDER))
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin::same(palette::SPACING_MD))
+        .outer_margin(egui::Margin::same(palette::SPACING_XS))
 }
 
 /// 单节点测速探测目标默认值（问题 3）。
@@ -954,7 +1089,6 @@ impl HydraApp {
             edit_auth_key: String::new(),
             edit_show_auth: false,
             edit_cert_path: String::new(),
-            global_creds_open: false,
             expanded_sub: None,
             sub_edit_idx: None,
             sub_edit_name: String::new(),
@@ -970,6 +1104,7 @@ impl HydraApp {
             traffic_monitor: None,
             traffic_stats_cache: Arc::new(std::sync::Mutex::new(None)),
             traffic_sampler_stop: None,
+            traffic_history: Arc::new(std::sync::Mutex::new(SpeedHistory::new())),
             current_tab: Tab::Overview,
             tray,
             really_quit: false,
@@ -992,7 +1127,7 @@ impl HydraApp {
             }
         } else if key_missing || cert_missing {
             app.add_log(
-                "配置已加载，但认证密钥或节点证书路径尚未填写，请在「⚙️ 设置」页「全局凭据」区补全"
+                "配置已加载，但认证密钥或节点证书路径尚未填写，请在「⚙ 设置」页「全局凭据」区补全"
                     .to_string(),
             );
         } else {
@@ -1011,13 +1146,13 @@ impl HydraApp {
             .unwrap_or_else(|| "(配置目录不可用)".to_string());
         vec![
             "═══ 首次使用向导 ═══".to_string(),
-            "① 填写认证密钥：「⚙️ 设置」页「全局凭据」折叠区 → 认证密钥 → 点「编辑/显示」输入 hex 密钥"
+            "① 填写认证密钥：「⚙ 设置」页「全局凭据」折叠区 → 认证密钥 → 点「编辑/显示」输入 hex 密钥"
                 .to_string(),
             "② 选择节点证书文件：同区「节点证书」→ 点「浏览...」选择节点生成的 hydra-node-cert.der"
                 .to_string(),
             "③ 添加节点/分组：「📡 订阅」页右上角「＋ 新建」→「✏️ 手动添加节点」（创建命名分组）"
                 .to_string(),
-            "④ 点「📊 状态总览」页的大按钮「▶ 启动代理」即可使用".to_string(),
+            "④ 点「🏠 首页」页的大按钮「▶ 启动代理」即可使用".to_string(),
             format!(
                 "完成一次后配置自动保存到 {}，以后双击本程序即可直接使用",
                 cfg_path
@@ -1367,6 +1502,13 @@ impl HydraApp {
             self.add_log("代理正在启动中（节点预热可能需要数十秒），请稍候".to_string());
             return;
         }
+        // 审查 P3-6：上一实例正在退出（TUN 收尾/端口释放可达数秒）时禁止立即
+        // 重启——否则新实例 bind SOCKS 端口失败，用户看到莫名的「启动失败」。
+        // proxy_exit_receiver 在退出完全收敛后才清空，是「正在退出」的权威信号。
+        if self.proxy_exit_receiver.is_some() {
+            self.add_log("上一代理实例正在退出（端口/TUN 清理中），请等几秒后再启动".to_string());
+            return;
+        }
 
         // Exec-1：探测间隔 env 覆盖已移至 HydraApp::new（审查 R-24：多线程进程
         // 运行期调用 std::env::set_var 与后台线程的 env 读取构成数据竞争 UB；
@@ -1488,13 +1630,24 @@ impl HydraApp {
         {
             let cache = self.traffic_stats_cache.clone();
             let monitor = traffic_monitor.clone();
+            // UI 重设计第三批：采样线程同步向历史序列追加（每 500ms 一个点）
+            let history = self.traffic_history.clone();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = stop.clone();
             std::thread::spawn(move || {
                 while !stop_clone.load(Ordering::Relaxed) {
                     let stats = probe_runtime().block_on(monitor.get_stats());
+                    // 审查 P3-5：get_stats 可能阻塞至数百毫秒——若此间 stop 被
+                    // 置位（快速重启场景），本次采样的陈旧累计值不得写入新
+                    // 会话的缓存/曲线（会被差分误计为当日流量并注入陈旧点）
+                    if stop_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
                     if let Ok(mut slot) = cache.lock() {
-                        *slot = Some(stats);
+                        *slot = Some(stats.clone());
+                    }
+                    if let Ok(mut hist) = history.lock() {
+                        hist.push_sample(&stats);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
@@ -1504,6 +1657,10 @@ impl HydraApp {
         // 新会话清空上一轮的过期统计快照，避免启动瞬间显示旧速率
         if let Ok(mut slot) = self.traffic_stats_cache.lock() {
             *slot = None;
+        }
+        // 曲线序列同步清空（当日累计保留，见 SpeedHistory::reset_samples）
+        if let Ok(mut hist) = self.traffic_history.lock() {
+            hist.reset_samples();
         }
 
         // 使用独立线程运行代理
@@ -1881,6 +2038,10 @@ impl HydraApp {
         }
         if let Ok(mut slot) = self.traffic_stats_cache.lock() {
             *slot = None;
+        }
+        // 曲线序列同步清空（当日累计保留）
+        if let Ok(mut hist) = self.traffic_history.lock() {
+            hist.reset_samples();
         }
         // handle/exit receiver 保留给 update 的退出通知分支收敛，避免泄漏：
         // 线程退出后 exit_rx 断开 → 该分支清理两者。
@@ -2776,10 +2937,14 @@ impl eframe::App for HydraApp {
                 ui.separator();
                 for tab in Tab::ALL {
                     let selected = self.current_tab == tab;
+                    // UI 重设计第三批：图标 + 标题统一用 palette 正文字号
                     if ui
                         .add_sized(
                             [ui.available_width(), 26.0],
-                            egui::SelectableLabel::new(selected, tab.label()),
+                            egui::SelectableLabel::new(
+                                selected,
+                                egui::RichText::new(tab.label()).size(palette::FONT_BODY),
+                            ),
                         )
                         .clicked()
                     {
@@ -3051,24 +3216,47 @@ impl HydraApp {
         }
     }
 
-    /// 状态总览（v2 方案 §2.1）：仪表盘 + 全局启停大开关。
-    /// 含：运行状态、在线节点 x/y、实时上/下行速率、当前模式（传输+认证概要）、
-    /// 最近日志摘要（点击跳日志页）。本页无任何配置项。
+    /// 首页（UI 重设计第三批：卡片式仪表盘，v3 方案 P1 §首页仪表盘）：
+    /// - 顶部四张统计卡：运行状态（含启停大按钮）/ 当前节点（调度参考）/
+    ///   今日流量上下行 / 活跃节点数与延迟中位；
+    /// - 下方大号实时速率曲线卡（egui_plot 双曲线，最近 120 个采样点 = 60s 窗口）；
+    /// - 快捷入口卡：「全部节点测试」「TUN 开关」「系统代理开关」+ 最近日志摘要。
+    ///
+    /// 本页无配置项；配置修改仍在「⚙ 设置」页。
     fn ui_overview(&mut self, ui: &mut egui::Ui) {
         ui.label(
-            egui::RichText::new("状态总览")
+            egui::RichText::new("首页")
                 .size(palette::FONT_HEADING)
                 .strong(),
         );
-        ui.separator();
+        ui.add_space(palette::SPACING_XS);
 
-        // 状态卡：启停大开关 + 监听地址 + 在线节点 + 速率
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(palette::SPACING_MD))
+        // ── 帧首快照：流量统计缓存与历史序列一次性读出（锁内只做 clone）──
+        let stats = self.traffic_stats_cache.lock().ok().and_then(|g| g.clone());
+        let (up_series, down_series, daily_up, daily_down) = self
+            .traffic_history
+            .lock()
+            .map(|h| (h.up_series(), h.down_series(), h.daily_up, h.daily_down))
+            .unwrap_or((Vec::new(), Vec::new(), 0, 0));
+        let online = self.node_status.values().filter(|s| s.connected).count();
+        let total = self.config.node_addrs.len();
+        let median_latency = median_online_latency(&self.node_status);
+        let best_node = best_online_node(&self.config, &self.node_status);
+
+    // ── 顶部四张统计卡（4 列网格，窄窗口自动换行由 Grid 列数固定保持简单）──
+        ui.add_space(palette::SPACING_LG);
+        egui::Grid::new("dashboard_stat_cards")
+            .num_columns(4)
+            .spacing([palette::SPACING_SM, palette::SPACING_SM])
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    // 状态文本三态（问题 1）：启动期也给可见反馈，不再"看似没反应"
-                    // （用色收口 palette：绿=运行 / 黄=启动中 / 灰=停止，语义色只用于状态）
+                // ① 运行状态卡：状态色点三态 + 启停大按钮
+                card_frame(ui).show(ui, |ui| {
+                    ui.set_min_width(150.0);
+                    ui.label(
+                        egui::RichText::new("运行状态")
+                            .size(palette::FONT_SECONDARY)
+                            .color(palette::TEXT_WEAK),
+                    );
                     let (status_text, status_color) = if self.proxy_running {
                         ("● 运行中", palette::SUCCESS)
                     } else if self.proxy_starting {
@@ -3078,121 +3266,263 @@ impl HydraApp {
                     };
                     ui.label(
                         egui::RichText::new(status_text)
-                            .size(24.0)
-                            .color(status_color),
+                            .size(palette::FONT_TITLE + 3.0)
+                            .color(status_color)
+                            .strong(),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // 问题 1：按钮文字/可用性走 start_button_state 状态机——
-                        // 启动期显示「⏳ 启动中…」并禁用，bound 就绪后变「停止代理」，
-                        // 失败复位后回「启动代理」（状态转换单测见 tests 模块）
-                        let (btn_text, btn_enabled) =
-                            start_button_state(self.proxy_running, self.proxy_starting);
-                        let btn = egui::Button::new(egui::RichText::new(btn_text).size(18.0));
-                        let resp = ui.add_enabled(btn_enabled, btn);
-                        if resp.clicked() {
-                            if self.proxy_running {
-                                self.stop_proxy();
-                            } else {
-                                self.start_proxy();
-                            }
+                    // 启停大按钮（按钮文字/可用性走 start_button_state 状态机，见其单测）
+                    let (btn_text, btn_enabled) =
+                        start_button_state(self.proxy_running, self.proxy_starting);
+                    let resp = ui.add_enabled(
+                        btn_enabled,
+                        egui::Button::new(egui::RichText::new(btn_text).size(palette::FONT_BODY)),
+                    );
+                    if resp.clicked() {
+                        if self.proxy_running {
+                            self.stop_proxy();
+                        } else {
+                            self.start_proxy();
                         }
-                    });
-                });
-                let online = self.node_status.values().filter(|s| s.connected).count();
-                let total = self.config.node_addrs.len();
-                ui.label(format!(
-                    "本地监听 {}   活动: {}/{} 节点在线",
-                    self.config.proxy_listen_addr, online, total
-                ));
-
-                // 实时流量（R-16：后台采样线程每 500ms 写缓存，UI 帧只读零阻塞）
-                if self.proxy_running {
-                    if let Some(stats) =
-                        self.traffic_stats_cache.lock().ok().and_then(|g| g.clone())
-                    {
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label(format!("⬆ {} /s", format_speed(stats.upload_speed)));
-                            ui.label(format!("⬇ {} /s", format_speed(stats.download_speed)));
-                            ui.label(format!("活跃连接: {}", stats.active_connections));
-                        });
-                        ui.label(format!(
-                            "累计 ⬆ {} ｜ ⬇ {} ｜ 总连接 {} ｜ 运行 {}",
-                            format_bytes(stats.bytes_sent),
-                            format_bytes(stats.bytes_received),
-                            stats.total_connections,
-                            format_duration(stats.uptime_secs)
-                        ));
                     }
-                }
+                    ui.small(format!("监听 {}", self.config.proxy_listen_addr));
+                });
+                // ② 当前节点卡：在线节点中延迟最低者（调度参考语义，诚实标注）
+                card_frame(ui).show(ui, |ui| {
+                    ui.set_min_width(150.0);
+                    ui.label(
+                        egui::RichText::new("当前节点（调度参考）")
+                            .size(palette::FONT_SECONDARY)
+                            .color(palette::TEXT_WEAK),
+                    );
+                    match &best_node {
+                        Some((addr, ms)) => {
+                            ui.label(
+                                egui::RichText::new(self.config.node_display_name(addr))
+                                    .size(palette::FONT_TITLE + 3.0)
+                                    .strong(),
+                            )
+                            .on_hover_text(addr);
+                            ui.label(
+                                egui::RichText::new(format!("{}ms", ms))
+                                    .size(palette::FONT_BODY)
+                                    .color(palette::latency_color(Some(*ms))),
+                            );
+                        }
+                        None => {
+                            ui.label(
+                                egui::RichText::new("—")
+                                    .size(palette::FONT_TITLE + 3.0)
+                                    .color(palette::TEXT_FAINT),
+                            );
+                            ui.small(if total == 0 { "暂无节点" } else { "无在线节点" });
+                        }
+                    }
+                    ui.small("自动按最低延迟调度");
+                });
+                // ③ 今日流量卡：上下行当日累计（差分自采样序列；重启不跨日不清零）
+                card_frame(ui).show(ui, |ui| {
+                    ui.set_min_width(150.0);
+                    ui.label(
+                        egui::RichText::new("今日流量")
+                            .size(palette::FONT_SECONDARY)
+                            .color(palette::TEXT_WEAK),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("⬇ {}", format_bytes(daily_down)))
+                            .size(palette::FONT_TITLE + 3.0)
+                            .color(palette::ACCENT)
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("⬆ {}", format_bytes(daily_up)))
+                            .size(palette::FONT_TITLE + 3.0)
+                            .color(palette::SUCCESS)
+                            .strong(),
+                    );
+                    if let Some(s) = &stats {
+                        ui.small(format!("速率 ⬇ {}/s", format_speed(s.download_speed)));
+                    }
+                });
+                // ④ 活跃节点卡：在线数/总数 + 在线节点延迟中位数
+                card_frame(ui).show(ui, |ui| {
+                    ui.set_min_width(150.0);
+                    ui.label(
+                        egui::RichText::new("活跃节点")
+                            .size(palette::FONT_SECONDARY)
+                            .color(palette::TEXT_WEAK),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("{}/{}", online, total))
+                            .size(palette::FONT_TITLE + 3.0)
+                            .strong(),
+                    );
+                    ui.label(match median_latency {
+                        Some(ms) => egui::RichText::new(format!("延迟中位 {}ms", ms))
+                            .size(palette::FONT_BODY)
+                            .color(palette::latency_color(Some(ms))),
+                        None => egui::RichText::new("延迟中位 —")
+                            .size(palette::FONT_BODY)
+                            .color(palette::TEXT_FAINT),
+                    });
+                    if let Some(s) = &stats {
+                        ui.small(format!("活跃连接 {}", s.active_connections));
+                    }
+                });
+                ui.end_row();
             });
 
-        // 概要卡：当前模式（传输 + 认证概要）与节点健康（区块间距 = lg）
-        ui.add_space(palette::SPACING_LG);
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(palette::SPACING_MD))
-            .show(ui, |ui| {
+        // ── 实时速率曲线卡（egui_plot 双曲线：上行=SUCCESS 绿 / 下行=ACCENT 主色；
+        //    数据源 = 采样线程维护的最近 120 点历史，UI 帧只读快照零阻塞）──
+        ui.add_space(palette::SPACING_SM);        card_frame(ui).show(ui, |ui| {
+            ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("当前模式")
+                    egui::RichText::new("实时速率")
                         .size(palette::FONT_TITLE)
                         .strong(),
                 );
-                ui.separator();
-                let mode = "TCP/TLS（TLS 1.3 + Noise-PSK）";
-                let psk_ok = !self.config.auth_key.trim().is_empty();
-                let cert_ok = !self.config.cert_path.trim().is_empty()
-                    || !self.config.cert_der_b64.trim().is_empty();
-                ui.label(format!(
-                    "传输: {} ｜ 认证: PSK {} ｜ 证书: {}",
-                    mode,
-                    if psk_ok { "已设置" } else { "未设置" },
-                    if cert_ok { "已设置" } else { "未设置" }
-                ));
-                ui.small("凭据为全局配置，在「⚙️ 设置」页「全局凭据」区修改");
-                if let Some(last_check) = self.last_health_check {
-                    ui.small(format!(
-                        "上次节点检测: {}秒前",
-                        last_check.elapsed().as_secs()
-                    ));
-                }
-                if ui.button("测试所有节点").clicked() {
+                ui.colored_label(
+                    palette::SUCCESS,
+                    format!("⬆ {}/s", format_speed(up_series.last().copied().unwrap_or(0.0))),
+                );
+                ui.colored_label(
+                    palette::ACCENT,
+                    format!("⬇ {}/s", format_speed(down_series.last().copied().unwrap_or(0.0))),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.small("最近 120 个采样点（500ms/点）");
+                });
+            });
+            // 固定高度的大号曲线区（约 12 行正文高）
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 180.0), egui::Sense::hover());
+            egui_plot::Plot::new("dashboard_speed_plot")
+                // 图例与坐标轴/网格配置在 Plot 构造器上（egui_plot 0.27 API）
+                .legend(egui_plot::Legend::default())
+                .show_axes(false)
+                .show_grid(false)
+                .show(ui, |plot| {
+                    // 曲线纵轴自适应，不显示坐标轴刻度（仪表盘装饰性图表）
+                    let up_points: egui_plot::PlotPoints =
+                        up_series.iter().enumerate().map(|(i, v)| [i as f64, *v]).collect();
+                    let down_points: egui_plot::PlotPoints =
+                        down_series.iter().enumerate().map(|(i, v)| [i as f64, *v]).collect();
+                    plot.line(
+                        egui_plot::Line::new(up_points)
+                            .name("上行")
+                            .color(palette::SUCCESS)
+                            .width(2.0_f32),
+                    );
+                    plot.line(
+                        egui_plot::Line::new(down_points)
+                            .name("下行")
+                            .color(palette::ACCENT)
+                            .width(2.0_f32),
+                    );
+                });
+            if !self.proxy_running {
+                ui.colored_label(
+                    palette::TEXT_FAINT,
+                    "代理未运行——启动代理后开始记录速率曲线",
+                );
+            }
+        });
+
+        // ── 快捷入口卡：全部节点测试 / TUN 开关 / 系统代理开关 + 最近日志摘要 ──
+        ui.add_space(palette::SPACING_SM);
+        card_frame(ui).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("快捷操作")
+                        .size(palette::FONT_TITLE)
+                        .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("查看全部日志 →").clicked() {
+                        self.current_tab = Tab::Logs;
+                    }
+                });
+            });
+            ui.add_space(palette::SPACING_XS);
+            ui.horizontal(|ui| {
+                // 全部节点测试（与节点页同一入口，进度/结果经健康检查通道落地）
+                if self.health_check_receiver.is_some() {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.label("全部测速中…");
+                } else if ui.button("⚡ 全部节点测试").clicked() {
                     self.test_all_nodes();
                 }
-            });
-
-        // 最近日志摘要（最近 3 条，点击跳日志页；区块间距 = lg）
-        ui.add_space(palette::SPACING_LG);
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(palette::SPACING_MD))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("最近日志")
-                            .size(palette::FONT_TITLE)
-                            .strong(),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("查看全部 →").clicked() {
-                            self.current_tab = Tab::Logs;
-                        }
+                // TUN 快捷开关（写入配置，下次启动代理生效，与设置页同一字段）
+                if ui
+                    .checkbox(&mut self.config.tun_enabled, "TUN 模式")
+                    .on_hover_text("TUN 透明代理（需管理员/root；下次启动代理生效；详细设置见「⚙ 设置」页）")
+                    .changed()
+                {
+                    self.add_log(if self.config.tun_enabled {
+                        "TUN 透明代理：已开启（下次启动代理生效）".to_string()
+                    } else {
+                        "TUN 透明代理：已关闭（下次启动代理生效）".to_string()
                     });
-                });
-                ui.separator();
-                let start = self.logs.len().saturating_sub(3);
-                if start == self.logs.len() {
-                    ui.weak("暂无日志");
+                    #[cfg(windows)]
+                    if self.config.tun_enabled {
+                        self.sys_proxy_check_cache = None;
+                    }
                 }
-                for line in &self.logs[start..] {
-                    ui.small(line);
+                // 系统代理快捷开关：代理运行且未开 TUN 时可手动开/关（TUN 全接管时无需叠加）
+                let tun_on = self.config.tun_enabled;
+                let sys_on = self.system_proxy_on_cached();
+                let toggle_text = if sys_on { "系统代理：开 ✓" } else { "系统代理：关" };
+                let resp = ui.add_enabled(
+                    self.proxy_running && !tun_on,
+                    egui::Button::new(egui::RichText::new(toggle_text).size(palette::FONT_BODY)),
+                )
+                .on_hover_text(match (self.proxy_running, tun_on) {
+                    (false, _) => "先启动代理后可用",
+                    (true, true) => "TUN 模式已全局接管流量，无需系统代理",
+                    (true, false) => "开关 Windows/桌面系统代理（指向本地 SOCKS 监听）",
+                });
+                if resp.clicked() {
+                    if sys_on {
+                        Self::remove_system_proxy_static();
+                        self.add_log("已关闭系统代理".to_string());
+                    } else {
+                        let url = format!("socks5://{}", self.config.proxy_listen_addr.trim());
+                        self.set_system_proxy(&url);
+                        self.add_log(format!("已开启系统代理 → {}", url));
+                    }
                 }
             });
+            ui.add_space(palette::SPACING_XS);
+            // 最近日志摘要（最近 3 条，与原总览一致）
+            ui.separator();
+            let start = self.logs.len().saturating_sub(3);
+            if start == self.logs.len() {
+                ui.weak("暂无日志");
+            }
+            for line in &self.logs[start..] {
+                ui.small(line);
+            }
+        });
+    }
+
+    /// 系统代理开关按钮所依据的状态：Windows 用后台检测缓存（缺省视为关）；
+    /// 非 Windows 无检测缓存，按「运行中默认已设置」的近似语义返回 proxy_running。
+    /// 只影响按钮文案，误判可再点一次纠正（幂等 enable/disable）。
+    #[allow(unused_variables)]
+    fn system_proxy_on_cached(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.sys_proxy_check_cache.map(|(_, on)| on).unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            self.proxy_running
+        }
     }
 
     /// 节点页（UI 重设计第一批，按老板构想重做）：
     /// - 页面主体 = 节点卡片列表（状态色点/名称/地址/延迟色标/操作按钮）；
     /// - 右上角固定「＋」按钮 → 下拉四项：从分享链接导入 / 扫描二维码导入 /
     ///   手动添加节点 / 分享节点（分享与导入全部收进菜单，不再平铺占页面）；
-    /// - 全局凭据（认证密钥/证书）移出本页，收敛到「⚙️ 设置」页「全局凭据」区，
+    /// - 全局凭据（认证密钥/证书）移出本页，收敛到「⚙ 设置」页「全局凭据」区，
     ///   本页仅在缺失时显示一条窄横幅提示并跳转；
     /// - 页尾订阅快捷管理区移除（完整生命周期全部在「📡 订阅」页，功能零丢失）。
     fn ui_nodes(&mut self, ui: &mut egui::Ui) {
@@ -3225,7 +3555,7 @@ impl HydraApp {
         });
         ui.separator();
 
-        // ── 全局凭据缺失横幅（凭据编辑已收敛到「⚙️ 设置」页，此处只提示不编辑）──
+        // ── 全局凭据缺失横幅（凭据编辑已收敛到「⚙ 设置」页，此处只提示不编辑）──
         let key_missing = self.config.auth_key.trim().is_empty();
         let cert_missing = self.config.cert_path.trim().is_empty()
             && self.config.cert_der_b64.trim().is_empty();
@@ -3743,7 +4073,7 @@ impl HydraApp {
 
     /// 订阅页（v2 方案 §2.3）：只管订阅源的生命周期（增/改/更新/删除）。
     /// 每条订阅可展开查看归属节点（只读标记 + 「另存为手动」）；
-    /// 节点的统一列表与来源标记见「🌐 节点」页。
+    /// 节点的统一列表与来源标记见「🛰 节点」页。
     fn ui_subscriptions(&mut self, ui: &mut egui::Ui) {
         // ── 页头：标题 + 右侧「更新全部订阅」+「＋ 新建」下拉（复刻 Clash Profiles 新建入口）──
         ui.horizontal(|ui| {
@@ -4303,29 +4633,33 @@ impl HydraApp {
         }
     }
 
-    /// 设置页（v2 方案 §2.5 / 裁决 C）：应用级配置，无任何凭据。
-    /// 分区：代理核心 / 安全与信任 / TUN 透明代理（需管理员/root；仅 TCP）/ 系统 / 外观与数据 / 关于。
-    /// 认证密钥、全局证书在「🌐 节点」页「全局凭据」区；信任模式与 TUN 在本页。
+    /// 设置页（UI 重设计第三批：7 分区 CollapsingHeader 折叠，标题带图标）：
+    /// ① 🔑 全局凭据（默认展开）② 🛰 代理核心（默认展开）③ 🛡 安全与信任（收起）
+    /// ④ 🌐 TUN 透明代理（收起）⑤ 🖥 系统（收起）⑥ 🎨 外观与数据（收起）⑦ ℹ 关于与退出（收起）。
+    /// 每个分区展开后首行为说明文字；全部配置项原样保留，功能零丢失。
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
         ui.label(
             egui::RichText::new("设置")
                 .size(palette::FONT_HEADING)
                 .strong(),
         );
-        ui.separator();
+        ui.add_space(palette::SPACING_XS);
 
-        // ◈ 全局凭据（UI 重设计第一批：自「🌐 节点」页迁入，独立折叠区）
+        // ◈ ① 全局凭据（UI 重设计第一批自「🛰 节点」页迁入，第三批改分区折叠；默认展开）
         // 过渡期这些字段仍为全局单值（GuiConfig），后端节点级凭据落地前
         // 对所有节点生效——此处诚实标注，不假装是节点级凭据。
-        ui.label(
-            egui::RichText::new("全局凭据（当前对所有节点生效）")
+        egui::CollapsingHeader::new(
+            egui::RichText::new("🔑 全局凭据（当前对所有节点生效）")
                 .size(palette::FONT_TITLE)
                 .strong(),
-        );
-        egui::CollapsingHeader::new("🔑 认证密钥 / 节点证书")
-            .default_open(self.global_creds_open)
-            .show(ui, |ui| {
-                ui.colored_label(
+        )
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.colored_label(
+                palette::TEXT_WEAK,
+                "说明：认证密钥与节点证书（全局回落）；逐节点独立证书在各节点的「编辑」对话框中设置",
+            );
+            ui.colored_label(
                     palette::WARNING,
                     "⚠ 当前 hydra-client 按全局凭据连接：以下配置对所有节点生效；节点级凭据将在后端改造后逐节点生效",
                 );
@@ -4392,16 +4726,20 @@ impl HydraApp {
 
                 // 传输为固定 TCP/TLS（TLS 1.3 + Noise-PSK）：Wave 3 起无其他模式
                 ui.label("传输模式: TCP/TLS（TLS 1.3 + Noise-PSK）");
-            });
+        });
 
-        ui.separator();
-
-        // ◈ 代理核心
-        ui.label(
-            egui::RichText::new("代理核心")
+        // ◈ ② 代理核心（默认展开：监听地址/探测间隔是常用配置）
+        egui::CollapsingHeader::new(
+            egui::RichText::new("🛰 代理核心")
                 .size(palette::FONT_TITLE)
                 .strong(),
-        );
+        )
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.colored_label(
+                palette::TEXT_WEAK,
+                "说明：本地 SOCKS5 监听地址与 Offline 节点自动恢复探测间隔",
+            );
         ui.horizontal(|ui| {
             ui.label("本地监听地址:");
             ui.add(
@@ -4431,15 +4769,20 @@ impl HydraApp {
                 self.add_log(line);
             }
         }
+        });
 
-        ui.separator();
-
-        // ◈ 安全与信任（双信任模式：自签 pinning 默认 / 真证书 CA）
-        ui.label(
-            egui::RichText::new("安全与信任")
+        // ◈ ③ 安全与信任（默认收起：信任模式属高级项）
+        egui::CollapsingHeader::new(
+            egui::RichText::new("🛡 安全与信任")
                 .size(palette::FONT_TITLE)
                 .strong(),
-        );
+        )
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.colored_label(
+                palette::TEXT_WEAK,
+                "说明：双信任模式——自签证书 pinning（默认） / 真证书 CA（可选叶证书硬 pin）",
+            );
         // 拷贝为 String：后续要可变借用 self.config（pin 输入框），避免借用冲突
         let mode = self.config.trust_mode_effective().to_string();
         ui.horizontal(|ui| {
@@ -4485,15 +4828,20 @@ impl HydraApp {
         if self.proxy_running {
             ui.small("⚠ 代理正在运行：信任模式修改需停止并重新启动代理后生效");
         }
+        });
 
-        ui.separator();
-
-        // ◈ TUN 透明代理（已交付：需管理员/root；Windows 另需 wintun.dll）
-        ui.label(
-            egui::RichText::new("TUN 透明代理（需管理员/root；仅 TCP）")
+        // ◈ ④ TUN 透明代理（默认收起：需管理员/root 的高级功能）
+        egui::CollapsingHeader::new(
+            egui::RichText::new("🌐 TUN 透明代理（需管理员/root；仅 TCP）")
                 .size(palette::FONT_TITLE)
                 .strong(),
-        );
+        )
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.colored_label(
+                palette::TEXT_WEAK,
+                "说明：全局透明接管 TCP 流量，应用无需配置代理；首页亦有快捷开关",
+            );
         if ui
             .checkbox(
                 &mut self.config.tun_enabled,
@@ -4559,15 +4907,20 @@ impl HydraApp {
                 }
             }
         }
+        });
 
-        ui.separator();
-
-        // ◈ 系统
-        ui.label(
-            egui::RichText::new("系统")
+        // ◈ ⑤ 系统（默认收起：托盘/关窗行为等系统级选项）
+        egui::CollapsingHeader::new(
+            egui::RichText::new("🖥 系统")
                 .size(palette::FONT_TITLE)
                 .strong(),
-        );
+        )
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.colored_label(
+                palette::TEXT_WEAK,
+                "说明：开机自启（规划中）、关窗隐藏到托盘与托盘菜单行为",
+            );
         ui.add_enabled(false, egui::Checkbox::new(&mut false, "开机自启（规划中）"))
             .on_disabled_hover_text("规划中：需随 TUN 服务模式一并实现");
         if ui
@@ -4584,15 +4937,20 @@ impl HydraApp {
             });
         }
         ui.small("托盘左键单击 = 显示/隐藏主窗；托盘右键菜单 = 显示主窗 / 启动 / 停止 / 退出");
+        });
 
-        ui.separator();
-
-        // ◈ 外观与数据
-        ui.label(
-            egui::RichText::new("外观与数据")
+        // ◈ ⑥ 外观与数据（默认收起：主题与配置目录）
+        egui::CollapsingHeader::new(
+            egui::RichText::new("🎨 外观与数据")
                 .size(palette::FONT_TITLE)
                 .strong(),
-        );
+        )
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.colored_label(
+                palette::TEXT_WEAK,
+                "说明：主题（当前仅深色）与配置目录/配置文件位置",
+            );
         ui.horizontal(|ui| {
             ui.label("主题:");
             ui.add_enabled(
@@ -4628,15 +4986,20 @@ impl HydraApp {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "(配置目录不可用)".to_string())
         ));
+        });
 
-        ui.separator();
-
-        // ◈ 关于
-        ui.label(
-            egui::RichText::new("关于")
+        // ◈ ⑦ 关于与退出（默认收起；退出入口收进分区，托盘菜单同样可退出）
+        egui::CollapsingHeader::new(
+            egui::RichText::new("ℹ 关于与退出")
                 .size(palette::FONT_TITLE)
                 .strong(),
-        );
+        )
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.colored_label(
+                palette::TEXT_WEAK,
+                "说明：版本信息、项目文档与程序退出入口（运行日志见「📜 日志」页）",
+            );
         ui.label(format!(
             "Hydra Multipath Proxy v{}",
             env!("CARGO_PKG_VERSION")
@@ -4647,15 +5010,20 @@ impl HydraApp {
         );
         ui.small("检查更新：预留");
 
-        ui.add_space(palette::SPACING_XL);
+        ui.add_space(palette::SPACING_SM);
 
         // 退出入口（托盘菜单同样可退出）
-        if ui.button("退出程序（停止代理并清理系统代理）").clicked() {
+        if ui
+            .button(egui::RichText::new("退出程序（停止代理并清理系统代理）").color(palette::DANGER))
+            .clicked()
+        {
             // 真退出：带超时等待代理线程退出（含 TUN 停机 + 路由清理）再关窗
             self.shutdown_and_wait_for_exit();
             self.really_quit = true;
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        });
+        ui.add_space(palette::SPACING_XL);
     }
 
     /// 运行日志（保留自动滚动 + 清空/刷新）
@@ -5444,5 +5812,122 @@ mod tests {
             "文件 · nodes.txt"
         );
         assert_eq!(subscription_source_label("nodes.txt"), "文件 · nodes.txt");
+    }
+
+    // ── UI 重设计第三批：仪表盘速率历史序列 / 统计纯函数 ──
+
+    /// 构造采样用 TrafficStats（其余字段填零即可）
+    fn sample_stats(sent: u64, recv: u64, up: f64, down: f64) -> TrafficStats {
+        TrafficStats {
+            bytes_sent: sent,
+            bytes_received: recv,
+            upload_speed: up,
+            download_speed: down,
+            active_connections: 0,
+            total_connections: 0,
+            uptime_secs: 0,
+        }
+    }
+
+    #[test]
+    fn speed_history_caps_at_120_and_keeps_latest() {
+        let mut h = SpeedHistory::new();
+        for i in 0..300u64 {
+            h.push_sample(&sample_stats(i * 10, i * 20, i as f64, (i * 2) as f64));
+        }
+        assert_eq!(h.len(), SpeedHistory::CAPACITY);
+        assert_eq!(h.len(), 120);
+        // 最新点在队尾：上行 = 299，下行 = 598
+        assert_eq!(h.up_series().last(), Some(&299.0));
+        assert_eq!(h.down_series().last(), Some(&598.0));
+        // 最旧点 = 第 180 个采样（300-120）
+        assert_eq!(h.up_series().first(), Some(&180.0));
+    }
+
+    #[test]
+    fn speed_history_daily_accumulates_deltas() {
+        let mut h = SpeedHistory::new();
+        // 首个采样只立基准不累计
+        h.push_sample(&sample_stats(100, 200, 0.0, 0.0));
+        assert_eq!((h.daily_up, h.daily_down), (0, 0));
+        h.push_sample(&sample_stats(350, 900, 0.0, 0.0));
+        assert_eq!((h.daily_up, h.daily_down), (250, 700));
+        h.push_sample(&sample_stats(400, 1000, 0.0, 0.0));
+        assert_eq!((h.daily_up, h.daily_down), (300, 800));
+    }
+
+    #[test]
+    fn speed_history_monitor_restart_does_not_go_negative() {
+        let mut h = SpeedHistory::new();
+        h.push_sample(&sample_stats(10_000, 20_000, 0.0, 0.0));
+        // 代理重启：新 TrafficMonitor 累计值回退 → 不累计负数，仅更新基准
+        h.push_sample(&sample_stats(50, 80, 0.0, 0.0));
+        assert_eq!((h.daily_up, h.daily_down), (0, 0));
+        h.push_sample(&sample_stats(150, 280, 0.0, 0.0));
+        assert_eq!((h.daily_up, h.daily_down), (100, 200));
+    }
+
+    #[test]
+    fn speed_history_reset_samples_keeps_daily_totals() {
+        let mut h = SpeedHistory::new();
+        h.push_sample(&sample_stats(100, 200, 1.0, 2.0));
+        h.push_sample(&sample_stats(300, 600, 1.0, 2.0));
+        assert_eq!((h.daily_up, h.daily_down), (200, 400));
+        h.reset_samples();
+        assert_eq!(h.len(), 0);
+        assert!(h.up_series().is_empty());
+        // 当日累计保留（同一天内启停代理不清零）
+        assert_eq!((h.daily_up, h.daily_down), (200, 400));
+        // 重置后基准也清空：下一采样重新立基准（不把重启前的累计续上）
+        h.push_sample(&sample_stats(1000, 2000, 0.0, 0.0));
+        assert_eq!((h.daily_up, h.daily_down), (200, 400));
+    }
+
+    #[test]
+    fn median_online_latency_ignores_offline_and_unchecked() {
+        let mk = |connected: bool, ms: Option<u64>| NodeStatusInfo {
+            connected,
+            last_check: Some(std::time::Instant::now()),
+            latency_ms: ms,
+        };
+        let mut status = HashMap::new();
+        assert_eq!(median_online_latency(&status), None);
+        // 离线/未测不计入
+        status.insert("a".to_string(), mk(false, None));
+        status.insert(
+            "b".to_string(),
+            NodeStatusInfo {
+                connected: false,
+                last_check: None,
+                latency_ms: Some(10),
+            },
+        );
+        assert_eq!(median_online_latency(&status), None);
+        status.insert("c".to_string(), mk(true, Some(300)));
+        status.insert("d".to_string(), mk(true, Some(100)));
+        status.insert("e".to_string(), mk(true, Some(500)));
+        // 在线延迟 {100,300,500} → 中位 300
+        assert_eq!(median_online_latency(&status), Some(300));
+    }
+
+    #[test]
+    fn best_online_node_picks_lowest_latency() {
+        let mk = |connected: bool, ms: Option<u64>| NodeStatusInfo {
+            connected,
+            last_check: Some(std::time::Instant::now()),
+            latency_ms: ms,
+        };
+        let cfg = GuiConfig {
+            node_addrs: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            ..GuiConfig::default()
+        };
+        let mut status = HashMap::new();
+        // 无在线 → None
+        assert_eq!(best_online_node(&cfg, &status), None);
+        status.insert("a".to_string(), mk(true, Some(210)));
+        status.insert("b".to_string(), mk(false, Some(1)));
+        status.insert("c".to_string(), mk(true, Some(80)));
+        // 在线中延迟最低者胜出（离线的 1ms 不参与）
+        assert_eq!(best_online_node(&cfg, &status), Some(("c".to_string(), 80)));
     }
 }

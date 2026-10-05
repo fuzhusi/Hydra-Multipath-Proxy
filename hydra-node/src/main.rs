@@ -46,6 +46,7 @@ fn parse_args() -> CliArgs {
                 println!("  HYDRA_CERT_DOMAINS    证书 SAN，逗号分隔 (默认 hydra.node,localhost)");
                 println!("  HYDRA_MAX_CONNECTIONS 最大并发连接数 (默认 1000)");
                 println!("  HYDRA_IDLE_TIMEOUT_SECS 转发空闲超时秒数 (默认 300，双向无数据即断开)");
+                println!("  HYDRA_FALLBACK_PAGE  反代静态页回退 (1=开启；默认 0 关闭=静默关流；权衡见 README 部署指南)");
                 println!("  HYDRA_HEALTH_ADDR     健康检查端点地址 (如 127.0.0.1:8081；未设置=关闭；GET /health)");
                 println!("  HYDRA_LOG_LEVEL       日志级别 (默认 info；RUST_LOG 存在时优先)");
                 println!("字段样例见 config/default.toml（每个字段注明对应 env 与默认值）");
@@ -116,6 +117,7 @@ async fn main() -> Result<()> {
         key_file,
         cert_domains,
         health_addr,
+        fallback_page,
         ..
     } = cfg;
 
@@ -126,15 +128,18 @@ async fn main() -> Result<()> {
         cert_domains,
         // P2P 信令开关：main 未走 from_env（配置从 toml/env 解析而来），此处单独读 env
         p2p_signal: NodeOptions::from_env().p2p_signal,
+        // 反代静态页回退开关：分层解析已含 env/toml/默认（默认关 = 保守升级）
+        fallback_page,
         // 07-P2-4：idle 超时无显式注入 → 回落 env/默认值
         idle_timeout: None,
     };
 
     info!(
-        "Starting Hydra node: listen={}, max_connections={}, cert={}, transport=tcp/tls",
+        "Starting Hydra node: listen={}, max_connections={}, cert={}, transport=tcp/tls, fallback_page={}",
         listen_addr,
         opts.max_connections,
         opts.cert_file.display(),
+        opts.fallback_page,
     );
 
     let server = HydraServer::new(listen_addr, auth_key, opts).await?;

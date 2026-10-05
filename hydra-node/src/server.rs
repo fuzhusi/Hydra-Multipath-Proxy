@@ -25,6 +25,10 @@ pub struct NodeOptions {
     pub cert_domains: Vec<String>,
     /// P2P 信令模式（NAT 穿透方案 §3.2）：默认关闭 = 行为零变化
     pub p2p_signal: bool,
+    /// 反代静态页回退（抗主动探测增强）：TLS 建立后的认证失败路径回复内置
+    /// 静态页而非静默关流。默认关闭 = 保守升级（行为零变化）；权衡见
+    /// `fallback.rs` 模块文档与 README 部署指南。env `HYDRA_FALLBACK_PAGE`。
+    pub fallback_page: bool,
     /// 转发空闲看门狗超时（07-P2-4：显式注入优先于 env `HYDRA_IDLE_TIMEOUT_SECS`，
     /// 避免测试进程内 set_var 与并行线程 env 读取的数据竞争；None = env/默认值）
     pub idle_timeout: Option<std::time::Duration>,
@@ -38,6 +42,7 @@ impl Default for NodeOptions {
             key_file: PathBuf::from("hydra-node-key.der"),
             cert_domains: vec!["hydra.node".to_string(), "localhost".to_string()],
             p2p_signal: false,
+            fallback_page: false,
             idle_timeout: None,
         }
     }
@@ -70,7 +75,21 @@ impl NodeOptions {
             }
         }
         if let Ok(v) = std::env::var("HYDRA_P2P_SIGNAL") {
-            opts.p2p_signal = v == "1";
+            opts.p2p_signal = v.trim() == "1";
+        }
+        if let Ok(v) = std::env::var("HYDRA_FALLBACK_PAGE") {
+            // 语义与 config.rs 三层解析一致（审查 P3-3）：空白=未设置、"1"/"0"，
+            // 非法值显式报错退出而非静默当关闭
+            let t = v.trim();
+            match t {
+                "" => {}
+                "1" => opts.fallback_page = true,
+                "0" => opts.fallback_page = false,
+                other => {
+                    eprintln!("错误：HYDRA_FALLBACK_PAGE=\"{other}\" 非法（期望 0 或 1）");
+                    std::process::exit(1);
+                }
+            }
         }
         opts
     }
@@ -108,6 +127,8 @@ impl HydraServer {
             handler.clone(),
             opts.max_connections.max(1) as usize,
             opts.p2p_signal,
+            // 反代静态页回退开关（默认关闭 = 静默关流语义不变）
+            opts.fallback_page,
             // 07-P2-4：显式注入优先，未注入回落 env/默认（spawn_tcp_listener 内解析）
             opts.idle_timeout,
         )

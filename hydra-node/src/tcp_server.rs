@@ -8,8 +8,11 @@
 //! - **认证**：V3.2 Noise-PSK（[`hydra_protocol::handshake`]，通用 AsyncRead/Write
 //!   实现直接平移到 TCP 流）。通道绑定 = 节点证书指纹 + TLS exporter（rustls
 //!   `export_keying_material`，两端同 label/context 即同值）。
-//! - **防探测**：版本字节非 0x03 / 握手失败 / 认证失败——一律**零字节静默关流**
-//!   （不回显应答码，与 QUIC 未认证路径语义一致）。
+//! - **防探测**：版本字节非 0x03 / 握手失败 / 认证失败——默认**零字节静默关流**
+//!   （不回显应答码，与 QUIC 未认证路径语义一致）；开启 `fallback_page`
+//!   （env `HYDRA_FALLBACK_PAGE=1`）后，TLS 已建立的认证失败路径改回内置
+//!   静态页（[`crate::fallback`]，反代伪装；两种策略各有指纹，权衡见该
+//!   模块文档与 README 部署指南）。TLS 握手本身失败恒静默（无层可回退）。
 //! - **SSRF 过滤 / DNS / 建连**：复用 [`ConnectionHandler::resolve_and_connect`]。
 //!   目标失败属已认证后的应用层错误，可回 2B 应答码（0x01 连接失败 / 0x02 DNS 失败）。
 //! - **半关闭**：`copy_bidirectional` 一侧 EOF 时显式 shutdown 对侧写端（验收门③）。
@@ -70,6 +73,10 @@ fn validate_peer_id(peer_id: &str) -> bool {
 /// 证书/密钥与主路径同一份（cert.rs 产物）；`max_connections` 用 Semaphore 强制。
 /// `p2p_signal` = 是否开启信令模式（NAT 穿透 §3.2；默认关闭 = 零行为变化）。
 /// `idle_timeout` = 转发空闲看门狗显式注入（07-P2-4；None = env/默认值）。
+/// `fallback_page` = 反代静态页回退开关（抗主动探测增强）：true 时 TLS 建立
+/// 后的认证失败路径回复内置静态页而非静默关流（默认 false = 行为零变化；
+/// 权衡见 [`crate::fallback`] 模块文档）。
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_tcp_listener(
     addr: SocketAddr,
     cert_chain: Vec<CertificateDer<'static>>,
@@ -77,6 +84,7 @@ pub async fn spawn_tcp_listener(
     handler: Arc<ConnectionHandler>,
     max_connections: usize,
     p2p_signal: bool,
+    fallback_page: bool,
     idle_timeout: Option<std::time::Duration>,
 ) -> Result<SocketAddr> {
     // rustls 0.23（Wave 3）：显式 ring provider（与客户端同一选择，全工作区 ring 0.17）；
@@ -131,6 +139,7 @@ pub async fn spawn_tcp_listener(
                     let handler = handler.clone();
                     let registry = registry.clone(); // 每连接一份 Arc 克隆（避免 move 出循环）
                     let idle = idle.clone();
+                    let fallback = fallback_page;
                     tokio::spawn(async move {
                         let _permit = permit; // 连接结束自动归还
                                               // TLS 握手超时：认证前 slowloris 防护（超时静默 drop，语义不变）
@@ -138,7 +147,8 @@ pub async fn spawn_tcp_listener(
                             .await
                         {
                             Ok(Ok(tls)) => {
-                                handle_tls_stream(tls, handler, registry.clone(), idle).await
+                                handle_tls_stream(tls, handler, registry.clone(), fallback, idle)
+                                    .await
                             }
                             Ok(Err(e)) => {
                                 // 握手失败（扫描/探测）不回显任何信息，仅 debug 记录
@@ -158,20 +168,34 @@ pub async fn spawn_tcp_listener(
 
 /// 单条 TLS 流的服务：Noise-PSK 认证 → 地址帧 → 建目标 → 2B 应答 → 双向裸转发。
 /// 认证/握手失败：静默关闭（无任何回显）；目标失败：回应答码后关闭。
+/// `fallback_page` = true 时，TLS 建立后的认证失败路径（版本字节非 0x03 /
+/// Noise 握手失败 / 地址帧失步）改回内置静态页（反代伪装，见
+/// [`crate::fallback`]）；TLS 握手本身失败仍静默（无 TLS 层可承载回退响应）。
+/// 回退路径复用既有认证阶段超时（`AUTH_TIMEOUT`）与连接额度语义，不新增
+/// 资源驻留面。
 /// `signal_registry` = Some 时，目标为 `@hydra-p2p/<peer_id>` 的连接进入信令会话
 /// （NAT 穿透方案 §3.2；None/未启用时该前缀走普通 connect 路径，语义不变）。
 async fn handle_tls_stream(
     mut tls: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     handler: Arc<ConnectionHandler>,
     signal_registry: Option<Arc<SignalRegistry>>,
+    fallback_page: bool,
     idle: Arc<std::time::Duration>,
 ) {
-    // ── 第 1 步：版本字节判别（0x03 = Noise-PSK；其他值静默关流，防探测语义不变）
+    // ── 第 1 步：版本字节判别（0x03 = Noise-PSK；其他值按开关回退页/静默关流）
     let mut version = [0u8; 1];
     match tokio::time::timeout(AUTH_TIMEOUT, tls.read_exact(&mut version)).await {
         Ok(Ok(_)) if version[0] == TCP_VERSION_BYTE && handler.auth_mode().accepts_v3() => {}
         _ => {
-            debug!("TCP stream bad version byte or v3 disabled, closing silently");
+            debug!("TCP stream bad version byte or v3 disabled");
+            // 反代静态页回退：任何非代理流量都得到同一页面（标准反代行为，
+            // 不要求输入构成合法 HTTP 请求）。受 AUTH_TIMEOUT 读超时与连接
+            // 额度保护；TLS 握手已建立故可承载响应。
+            if fallback_page {
+                let _ = crate::fallback::http_serve_fallback(&mut tls).await;
+            } else {
+                debug!("closing silently (fallback_page off)");
+            }
             return;
         }
     }
@@ -184,6 +208,7 @@ async fn handle_tls_stream(
         .export_keying_material(&mut exporter, handshake::EXPORTER_LABEL, Some(b""))
         .is_err()
     {
+        // TLS 层内部故障（非探测者可见路径）：保持静默，不参与回退页语义
         warn!("export_keying_material unavailable; closing silently");
         return;
     }
@@ -206,20 +231,32 @@ async fn handle_tls_stream(
     match hs {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
-            debug!("TCP Noise handshake failed, closing silently: {}", e);
+            // 审查 P2：握手失败点可能已写出部分 Noise 二进制消息（如 msg2 已发
+            // 出后 msg3 校验失败）——此时回退 HTTP 页会拼成「二进制+HTTP」混合
+            // 流，反而构成可区分指纹。故握手失败一律静默关流，不参与回退页。
+            debug!("TCP Noise handshake failed: {}", e);
             return;
         }
         Err(_) => {
-            debug!("TCP Noise handshake timed out, closing silently");
+            // 审查 P1：失败分支必须 return——否则落入第 4 步对未认证流
+            // read_target，白白多占连接额度 10s，fallback 开启时还会写出
+            // 第二份 HTTP 响应拼在第一份之后。
+            debug!("TCP Noise handshake timed out");
             return;
         }
     }
 
-    // ── 第 4 步：地址帧（已认证，读失败按协议失步静默关流）
+    // ── 第 4 步：地址帧（已认证，读失败按协议失步按开关回退页/静默关流）
     let target = match tokio::time::timeout(AUTH_TIMEOUT, read_target(&mut rd)).await {
         Ok(Ok(t)) => t,
         _ => {
-            debug!("TCP stream bad target frame, closing silently");
+            debug!("TCP stream bad target frame");
+            // 已通过 Noise 认证后的失步：真客户端不会走到这里，回退页/静默均可
+            if fallback_page {
+                let _ = crate::fallback::http_serve_fallback(&mut wr).await;
+            } else {
+                debug!("closing silently (fallback_page off)");
+            }
             return;
         }
     };

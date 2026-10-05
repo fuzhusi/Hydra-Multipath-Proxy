@@ -11,6 +11,11 @@
 //!   握手实现；PSK = HYDRA_AUTH_KEY。
 //! - **防中间人**：节点自签证书加入本地信任根（webpki 校验），同 QUIC 路径。
 //! - **禁会话恢复**：session ticket 不被用于跨连接关联追踪。
+//! - **ClientHello 指纹最大近似**（feature `fingerprint`，默认开启）：chrome 模式
+//!   （默认，`HYDRA_FINGERPRINT=chrome|none` 可切）将 stock rustls 可调项向 Chrome
+//!   对齐（ALPN h2,http/1.1、certCompression-brotli、TLS1.3 套件顺序）；扩展顺序/
+//!   key_share 等 rustls 不可调，故为"最大近似"而非 Chrome 同款 JA3/JA4——
+//!   调研与局限见 docs/design/ClientHello指纹模仿方案与实施.md。
 //! - 无 obfs（UDP 概念，不适用 TCP）。
 //!
 //! 返回 `tokio::io::split` 的读写两半：调用方（代理转发层）用带半关闭的泵
@@ -85,6 +90,64 @@ pub type TcpReadHalf = tokio::io::ReadHalf<TcpNodeStream>;
 /// 节点流写半（去往节点方向）
 pub type TcpWriteHalf = tokio::io::WriteHalf<TcpNodeStream>;
 
+/// ClientHello 指纹模式（`HYDRA_FINGERPRINT`；详见模块末"指纹模仿"注释与
+/// docs/design/ClientHello指纹模仿方案与实施.md）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FingerprintMode {
+    /// Chrome 近似指纹：stock rustls 全部可调项向 Chrome 对齐（ALPN h2,http/1.1、
+    /// 密码套件顺序、certCompression-brotli）。feature `fingerprint`（默认开启）
+    /// 才可用；feature 关闭时退化为 None。
+    #[default]
+    Chrome,
+    /// stock rustls 原行为（无 ALPN、默认套件顺序）——原"普通 HTTPS 客户端"伪装
+    None,
+}
+
+/// 指纹模式 env（`HYDRA_FINGERPRINT=chrome|none`；缺省 chrome）
+pub const HYDRA_FINGERPRINT_ENV: &str = "HYDRA_FINGERPRINT";
+
+/// 解析指纹模式；`chrome` 在 fingerprint feature 关闭时告警回退 stock（none）。
+/// 审查 P3-4：trim + 大小写不敏感比较；空白值视为未设置（此前 `"None"`、
+/// `" none "` 会被当非法值回退默认 chrome，与用户关闭指纹的意图相反）。
+pub fn fingerprint_mode_from_env() -> FingerprintMode {
+    let parsed = match std::env::var(HYDRA_FINGERPRINT_ENV) {
+        Ok(v) => match v.trim() {
+            "" => None,
+            s if s.eq_ignore_ascii_case("none") => Some(FingerprintMode::None),
+            s if s.eq_ignore_ascii_case("chrome") => Some(FingerprintMode::Chrome),
+            other => {
+                tracing::warn!("HYDRA_FINGERPRINT={other} 非法（chrome|none），回退默认 chrome");
+                None
+            }
+        },
+        Err(_) => None,
+    };
+    match parsed {
+        Some(m) => m,
+        // 缺省值受 feature 约束：feature 关闭时 chrome profile 不参与编译
+        None => {
+            #[cfg(feature = "fingerprint")]
+            {
+                FingerprintMode::Chrome
+            }
+            #[cfg(not(feature = "fingerprint"))]
+            {
+                FingerprintMode::None
+            }
+        }
+    }
+}
+
+/// 显式 `chrome` 请求按 feature 可用性收敛（env 解析与显式请求共用该规则）
+fn resolve_chrome(m: FingerprintMode) -> FingerprintMode {
+    #[cfg(not(feature = "fingerprint"))]
+    if m == FingerprintMode::Chrome {
+        tracing::warn!("HYDRA_FINGERPRINT=chrome 但 fingerprint feature 未启用，回退 stock rustls");
+        return FingerprintMode::None;
+    }
+    m
+}
+
 /// 建连超时（TCP + TLS 两段各 5s）
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 握手 + 应答等待超时（须大于节点侧目标连接超时 15s，同 QUIC 路径 20s）
@@ -157,10 +220,29 @@ static CONNECTOR_CACHE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<[u8; 32], Arc<TlsConnector>>>,
 > = std::sync::OnceLock::new();
 
+/// Chrome 密码套件顺序：TLS 1.3 三套件按 1301/1302/1303 前置，其余（TLS 1.2
+/// ECDHE 套件）稳定跟随 provider 原顺序。独立函数便于单测断言排序。
+fn chrome_order_cipher_suites(
+    base: Vec<rustls::SupportedCipherSuite>,
+) -> Vec<rustls::SupportedCipherSuite> {
+    let rank = |cs: &rustls::SupportedCipherSuite| match cs.suite() {
+        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256 => 0, // 0x1301
+        rustls::CipherSuite::TLS13_AES_256_GCM_SHA384 => 1, // 0x1302
+        rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => 2, // 0x1303
+        _ => 3,
+    };
+    let mut suites = base;
+    suites.sort_by_key(rank);
+    suites
+}
+
 /// 由 [`TlsTrust`] 构建（或命中缓存取回）共享 TLS 连接器。
 /// pin 模式且无证书时返回 Err（拒绝建立不经验证的连接，语义与原实现一致）。
 pub(crate) fn build_tls_connector(trust: &TlsTrust) -> Result<Arc<TlsConnector>> {
-    let fp = trust.cache_fingerprint();
+    let mode = resolve_chrome(fingerprint_mode_from_env());
+    // 指纹模式参与缓存键：同信任内容、不同模式不得复用同一份 ClientConfig
+    let mut fp = trust.cache_fingerprint();
+    fp[0] ^= mode as u8; // 仅两模式，单字节混入足够区分
     let cache =
         CONNECTOR_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Ok(map) = cache.lock() {
@@ -168,7 +250,7 @@ pub(crate) fn build_tls_connector(trust: &TlsTrust) -> Result<Arc<TlsConnector>>
             return Ok(c.clone());
         }
     }
-    let connector = Arc::new(build_tls_connector_uncached(trust)?);
+    let connector = Arc::new(build_tls_connector_uncached(trust, mode)?);
     if let Ok(mut map) = cache.lock() {
         map.insert(fp, connector.clone());
     }
@@ -176,7 +258,27 @@ pub(crate) fn build_tls_connector(trust: &TlsTrust) -> Result<Arc<TlsConnector>>
 }
 
 /// 缓存未命中时的实际构建（原 connect_target / probe_connect 的重复 ~30 行合并为此一份）
-fn build_tls_connector_uncached(trust: &TlsTrust) -> Result<TlsConnector> {
+///
+/// `mode = Chrome` 时应用"Chrome 近似指纹"（stock rustls 可调项全集，Route C）：
+/// - ALPN `h2, http/1.1`（Chrome 顺序；节点侧 rustls server 未配 ALPN 不会选择，
+///   客户端 `check_selected_alpn` 仅在校验"服务器选了但不在我方列表"时才报错，
+///   服务器不选即通过——连通性不受影响）；
+/// - 密码套件顺序：TLS 1.3 三套件按 Chrome 顺序前置（1301/1302/1303）；
+/// - certCompression：启用 brotli 解压器（feature `fingerprint` → rustls/brotli）；
+/// - 不可调项（扩展顺序、GREASE、key_share/签名算法顺序、padding）如实保留
+///   rustls 形态——见设计文档"局限"一节。
+fn build_tls_connector_uncached(trust: &TlsTrust, mode: FingerprintMode) -> Result<TlsConnector> {
+    Ok(TlsConnector::from(Arc::new(build_client_config(
+        trust, mode,
+    )?)))
+}
+
+/// 构建共享 `ClientConfig`（[`build_tls_connector_uncached`] 的配置主体，
+/// 独立暴露供单测对 ALPN/解压器/套件顺序直接断言——`TlsConnector` 不透出字段）。
+fn build_client_config(
+    trust: &TlsTrust,
+    mode: FingerprintMode,
+) -> Result<rustls::ClientConfig> {
     // 信任根：pin 模式 = 节点自签证书入本地信任根；CA 模式 = webpki 公共根
     let mut roots = rustls::RootCertStore::empty();
     if trust.use_public_ca {
@@ -201,16 +303,34 @@ fn build_tls_connector_uncached(trust: &TlsTrust) -> Result<TlsConnector> {
     // rustls 0.23（Wave 3）：显式指定 ring provider（工作区统一 ring 0.17），
     // 不依赖进程级默认——避免 ureq 经特性统一启用 aws_lc_rs 后的多 provider 歧义。
     // 协议版本 = 安全默认（TLS 1.2 + 1.3，与 0.21 with_safe_defaults 等价）。
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut provider = rustls::crypto::ring::default_provider();
+    if mode == FingerprintMode::Chrome {
+        provider.cipher_suites = chrome_order_cipher_suites(provider.cipher_suites);
+    }
+    let provider = Arc::new(provider);
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| HydraError::ProtocolError(format!("TLS 协议版本配置失败: {:?}", e)))?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    // 不做 ALPN（同节点侧）；禁会话恢复防跨连接关联追踪
-    crypto.alpn_protocols = Vec::new();
+    match mode {
+        // Chrome 近似：ALPN = 浏览器标准（h2 优先）。取舍见函数文档与设计文档。
+        FingerprintMode::Chrome => {
+            crypto.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            // certCompression：feature fingerprint → rustls/brotli → 声明 brotli
+            // 解压器（与 Chrome certCompression 对齐；zstd Chrome 有而 rustls 无，
+            // 如实缺席）
+            crypto.cert_decompressors =
+                rustls::compress::default_cert_decompressors().to_vec();
+        }
+        // stock rustls：原"无 ALPN = 普通 HTTPS 客户端"伪装策略不变
+        FingerprintMode::None => {
+            crypto.alpn_protocols = Vec::new();
+        }
+    }
+    // 禁会话恢复防跨连接关联追踪（两模式一致；与 Chrome 行为不同，如实差异）
     crypto.resumption = rustls::client::Resumption::disabled();
-    Ok(TlsConnector::from(Arc::new(crypto)))
+    Ok(crypto)
 }
 
 /// 从 TLS 会话取对端叶证书 DER（两种信任模式下都已被 TLS 握手认证）。
@@ -422,5 +542,59 @@ mod tests {
         assert!(build_tls_connector(&TlsTrust::pinned(Vec::new())).is_err());
         // pin 模式非法证书 DER：构建期即报错
         assert!(build_tls_connector(&TlsTrust::pinned(vec![vec![1u8, 2, 3]])).is_err());
+    }
+
+    /// 指纹模式显式收敛规则：None 恒等；Chrome 由 feature 可用性决定
+    /// （feature 关闭时降级 None 并告警）。env 缺省值逻辑见
+    /// fingerprint_mode_from_env（不在此处改进程 env，测试并发安全）。
+    #[test]
+    fn fingerprint_mode_解析与收敛() {
+        assert_eq!(resolve_chrome(FingerprintMode::None), FingerprintMode::None);
+        let _ = fingerprint_mode_from_env; // 公开 API 可达性
+    }
+
+    #[cfg(feature = "fingerprint")]
+    #[test]
+    fn chrome_order_cipher_suites_1301_1302_1303前置() {
+        let base = rustls::crypto::ring::default_provider().cipher_suites;
+        let ordered = chrome_order_cipher_suites(base.clone());
+        // 前三个 = Chrome TLS 1.3 顺序；其余保持原相对顺序（稳定排序）
+        let want = [
+            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+            rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+        ];
+        for (cs, w) in ordered.iter().zip(want.iter()) {
+            assert_eq!(cs.suite(), *w);
+        }
+        let rest_in: Vec<_> = base.iter().map(|c| c.suite()).collect();
+        let rest_out: Vec<_> = ordered[3..].iter().map(|c| c.suite()).collect();
+        let rest_in_rest: Vec<_> = rest_in
+            .iter()
+            .filter(|s| !want.contains(s))
+            .copied()
+            .collect();
+        assert_eq!(rest_in_rest, rest_out);
+    }
+
+    /// feature fingerprint 下：chrome 模式 ALPN=h2,http/1.1 且声明 brotli 证书
+    /// 解压器；none 模式 = stock（无 ALPN）。证书 pinning 语义两模式一致。
+    #[cfg(feature = "fingerprint")]
+    #[test]
+    fn chrome_与none_配置断言() {
+        let trust = TlsTrust::public_ca(None);
+        let chrome = build_client_config(&trust, FingerprintMode::Chrome).unwrap();
+        assert_eq!(
+            chrome.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        assert!(
+            !chrome.cert_decompressors.is_empty(),
+            "chrome 模式应声明 certCompression 解压器（brotli）"
+        );
+        let none = build_client_config(&trust, FingerprintMode::None).unwrap();
+        assert!(none.alpn_protocols.is_empty(), "none 模式保持无 ALPN");
+        // 禁会话恢复两模式一致（resumption 无公开读取口，禁恢复由既有行为覆盖）
+        let _ = (&chrome, &none);
     }
 }

@@ -9,7 +9,7 @@
 > **交付状态：v1.0 可交付产品**（2026-10）。三档如实划分：
 > - **已交付**：TCP/TLS + Noise-PSK 隧道、自签 pinning 与 ACME 真证书双路线、多节点加权分发与故障自愈、GUI 全功能（托盘/分享/订阅/配置持久化）、CI。
 > - **已交付**：NAT 穿透 v1（TCP STUN 分类 + 同时打开打洞 + 中继兜底；真实 NAT 组合环境需人工实网验证）。
-> - **规划中**：UI 重设计实施（方案 v3 已定稿）、ClientHello 指纹模仿、多节点并行下载。
+> - **规划中**：UI 重设计实施（方案 v3 已定稿）、多节点并行下载。（ClientHello 指纹模仿已交付：最大近似方案，见 docs/design/ClientHello指纹模仿方案与实施.md）
 
 > **项目性质**：个人自用工具，AI 辅助开发。经多轮独立代码审查（[docs/review/](docs/review/)），本 README 与代码逐项核对——未列出的能力即为未实现，不做夸大宣传。
 >
@@ -111,6 +111,30 @@ export HYDRA_SNI=your.domain
 export HYDRA_CERT_SHA256=<叶证书指纹，64 hex，可选加固>
 ```
 
+真证书部署建议同时开启**反代静态页回退**（见下节）。
+
+### 反代静态页（抗主动探测，可选）
+
+默认情况下，非代理流量访问 443（TLS 建立后版本字节/握手/认证失败）节点会
+**零字节静默关流**——「有真 TLS 却永不出字节」本身可被主动探测统计为弱指纹。
+开启后（Trojan 经典手法），这些路径改回一份内置的自包含静态网页（伪装成普通
+个人博客落地页，无本项目字样、无外部资源），即标准反向代理行为：
+
+```bash
+export HYDRA_FALLBACK_PAGE=1   # 默认 0 关闭（保守升级）
+# toml 等价字段: fallback_page = true
+```
+
+**取舍（两种策略各有指纹，无免费午餐）**：
+
+- 静默关流：不泄露应用层数据，但「总被无数据关闭」是指纹；
+- 回退静态页：对单个探测者像真网站，但「每次都同一页面」也可被批量探测统计
+  （字节级一致，无真实站点的路由/内容多样性）。
+
+**建议**：真证书部署（`HYDRA_TRUST=ca` + 真域名）建议开启——TLS 层已与真实
+站点难以区分，回退页补齐应用层相似度，收益大于固定页面指纹的代价；自签证书
+无域名的隐蔽部署建议保持默认关闭。回退路径仍受认证阶段超时与连接额度保护。
+
 ### 5. 启动客户端
 
 ```bash
@@ -171,6 +195,7 @@ curl -x socks5h://127.0.0.1:1080 https://www.google.com
 | `HYDRA_NODE_CONFIG` | toml 配置路径（自动探测 `./node.toml` → `/etc/hydra/node.toml`） |
 | `HYDRA_ALLOW_PRIVATE_TARGETS` | `1` 放行私有目标（默认拒绝，仅测试/本地开发） |
 | `HYDRA_P2P_SIGNAL` | `1` 开启 P2P 信令模式（NAT 穿透） |
+| `HYDRA_FALLBACK_PAGE` | `1` 开启反代静态页回退（TLS 后认证失败回复内置网页而非静默关流；默认 `0` 关闭；取舍见[反代静态页](#反代静态页抗主动探测)） |
 
 **客户端**
 
@@ -245,7 +270,7 @@ Hydra-Multipath-Proxy/
 cargo test --workspace
 ```
 
-**215 通过 / 0 失败**（v0.2.0；rustls 0.23 + ring 0.17 单版本收敛，clippy `-D warnings` 零告警；CI 为 Windows + Ubuntu 双矩阵，badge 见顶部）。
+**268 通过 / 0 失败**（v0.2.0；rustls 0.23 + ring 0.17 单版本收敛，clippy `--all-targets` 零告警；CI 为 Windows + Ubuntu 双矩阵，badge 见顶部）。
 
 **Linux 构建系统依赖**（tray-icon/egui 的 GTK 后端需要，CI 已内置）：
 
@@ -267,7 +292,7 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 | 能力 | 防 | 不防 |
 |---|---|---|
 | 证书固定 + Noise-PSK 握手（前向安全） | 中间人解密/篡改、PSK 泄漏后历史握手回溯解密、握手重放/跨连接转发 | 端点被攻破；CA 模式依赖公共 CA 体系（可用叶证书硬 pin 收紧） |
-| 无 ALPN 标准 HTTPS 形态 | 特征匹配 DPI | TLS 指纹级深度分析（Rust 栈与浏览器有差异，ja-tools 路线为规划项）；自签模式有固有证书指纹（真证书路线消除） |
+| 无 ALPN 标准 HTTPS 形态 → **已升级为 Chrome 近似指纹**（`HYDRA_FINGERPRINT`，ALPN h2/http1.1、certCompression-brotli、TLS1.3 套件序前置） | 特征匹配 DPI | TLS 指纹级深度分析仍可识别（rustls 扩展顺序/key_share 不可调，仅为"最大近似"非 Chrome 同款 JA3/JA4，见 [指纹方案](docs/design/ClientHello指纹模仿方案与实施.md)）；自签模式有固有证书指纹（真证书路线消除） |
 | 域名节点侧解析 + 日志脱敏 | 本机/节点明文浏览记录泄漏 | 应用层泄漏（WebRTC 等需应用侧处理） |
 | 私有线缆格式 | 现有公共协议（Trojan/SS/VMess 等）DPI 规则 | 为本项目定制的新规则（用户基数小，性价比低） |
 
@@ -280,7 +305,7 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 - 分享链接含完整凭据时等同于交付节点，仅限可信渠道
 - TCP 链路认证失败与目标失败在客户端侧均表现为建连失败（节点侧已认证后的目标失败有 2B 应答码）
 - GUI 暂仅支持自签 pin 模式（真证书部署走 CLI；GUI 支持按 [UI 方案 v3](docs/design/UI重设计方案-v3.md) P1 补齐）
-- 非认证 IP 反代静态页（抗主动探测）待实施
+
 
 ## 开发路线
 
@@ -292,9 +317,9 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 - [x] **交付批次：真证书（PEM/ACME）路线 + 多节点证书配对根治 + BBR 部署加固（2026-10）**
 - [x] **NAT 穿透 v1：TCP STUN + 节点信令（属主证明/限速）+ 同时打开打洞 + 中继兜底（docs/design/NAT穿透方案.md）**
 - [x] **TUN 透明代理 v1 完整版：smoltcp 栈 + 路由豁免 + IPv6 双栈正向代理（动态 AnyIP）+ UDP ICMP 快速回落（docs/design/TUN模式方案.md）**
-- [ ] UI 重设计实施（[方案 v3](docs/design/UI重设计方案-v3.md) 已定稿，P0-P2 约 10 人日）
+- [x] UI 重设计 P0-P2 第一至三批：节点页组视图/卡片化、订阅「＋ 新建」聚合入口、首页卡片式仪表盘（egui_plot 速率曲线）、设置页七分区折叠、palette 视觉规范全量应用（[方案 v3](docs/design/UI重设计方案-v3.md)；剩余：main.rs 模块化拆分、连接页）
 - [ ] 多节点并行下载（HTTP Range 切块多节点拼装——TCP 下的差异化方向）
-- [ ] ClientHello 指纹模仿（ja-tools 路线，[协议优化评估](docs/design/TCP传输协议优化评估.md) P1）
+- [x] ClientHello 指纹模仿（调研结论：ja-tools fork 供应链风险高，落地为 stock rustls 最大近似 + `HYDRA_FINGERPRINT=chrome|none`，[方案与实施](docs/design/ClientHello指纹模仿方案与实施.md)）
 - [ ] rekey 密钥轮换；门③重放测试以 TCP 形态重写
 
 完整依据：[docs/design/TCP转型与加密选型方案.md](docs/design/TCP转型与加密选型方案.md) · [docs/review/00-审查总览与改进目标.md](docs/review/00-审查总览与改进目标.md)

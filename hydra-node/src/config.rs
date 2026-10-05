@@ -38,6 +38,9 @@ pub struct NodeFileConfig {
     pub cert_domains: Option<Vec<String>>,
     pub health_addr: Option<String>,
     pub log_level: Option<String>,
+    /// 反代静态页回退开关（env `HYDRA_FALLBACK_PAGE`；默认 None = 关闭，
+    /// 行为零变化；权衡见 fallback.rs 模块文档）
+    pub fallback_page: Option<bool>,
 }
 
 /// 解析 toml 文本；未知字段 / 类型错误显式报错
@@ -71,6 +74,8 @@ pub struct EffectiveConfig {
     pub health_addr: Option<SocketAddr>,
     pub log_level: String,
     pub auth_key_source: AuthKeySource,
+    /// 反代静态页回退开关（默认 false = 静默关流语义不变）
+    pub fallback_page: bool,
 }
 
 /// 自动探测顺序：./node.toml → /etc/hydra/node.toml
@@ -246,6 +251,19 @@ pub fn resolve(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "info".to_string());
 
+    // 反代静态页回退：env "1"=开 "0"=关 > 文件 bool 字段 > 默认关（保守升级）
+    let fallback_page = match env.get("HYDRA_FALLBACK_PAGE").map(|s| s.trim()) {
+        Some("1") => true,
+        Some("0") => false,
+        Some(v) if !v.is_empty() => {
+            return Err(format!(
+                "HYDRA_FALLBACK_PAGE 非法（期望 0 或 1）: {v}"
+            ));
+        }
+        // 空白 env 值 = 未设置该层（模块约定）
+        _ => f.fallback_page.unwrap_or(d.fallback_page),
+    };
+
     // 认证密钥：HYDRA_AUTH_KEY > HYDRA_AUTH_KEY_FILE > 文件 auth_key_file
     // （CLI 不承接密钥——进 cmdline 全机可读；空白值视为未设置该层，防 systemd EnvironmentFile 空值踩坑）
     let non_blank = |s: &String| !s.trim().is_empty();
@@ -272,6 +290,7 @@ pub fn resolve(
         health_addr,
         log_level,
         auth_key_source,
+        fallback_page,
     })
 }
 
@@ -370,5 +389,47 @@ mod tests {
         // env 未设置：文件值 > 默认
         assert_eq!(parse_u32_field(None, Some(7), "X", 1000).unwrap(), 7);
         assert_eq!(parse_u32_field(None, None, "X", 1000).unwrap(), 1000);
+    }
+
+    /// 反代静态页开关：env > toml 字段 > 默认关；非法值显式报错
+    #[test]
+    fn fallback_page_分层解析与非法值() {
+        fn env_of(v: Option<&str>) -> BTreeMap<String, String> {
+            let mut m = BTreeMap::new();
+            m.insert(
+                "HYDRA_AUTH_KEY".to_string(),
+                "a1".to_string(), // 密钥占位（resolve 只查来源，此处只需命中 Inline 分支）
+            );
+            if let Some(v) = v {
+                m.insert("HYDRA_FALLBACK_PAGE".to_string(), v.to_string());
+            }
+            m
+        }
+        let cli = CliOverrides::default();
+        let file = |fb: Option<bool>| NodeFileConfig {
+            fallback_page: fb,
+            ..NodeFileConfig::default()
+        };
+
+        // 默认关（保守升级）
+        assert!(!resolve(&cli, &env_of(None), None).unwrap().fallback_page);
+        // env "1" 开 / "0" 关；空白 = 未设置回落默认
+        assert!(resolve(&cli, &env_of(Some("1")), None).unwrap().fallback_page);
+        assert!(!resolve(&cli, &env_of(Some("0")), None).unwrap().fallback_page);
+        assert!(!resolve(&cli, &env_of(Some("  ")), None).unwrap().fallback_page);
+        // toml 字段：true 生效；env "0" 覆盖 toml true（env 优先）
+        assert!(
+            resolve(&cli, &env_of(None), Some(&file(Some(true))))
+                .unwrap()
+                .fallback_page
+        );
+        assert!(
+            !resolve(&cli, &env_of(Some("0")), Some(&file(Some(true))))
+                .unwrap()
+                .fallback_page
+        );
+        // 非法值显式报错（绝不静默回落）
+        assert!(resolve(&cli, &env_of(Some("true")), None).is_err());
+        assert!(resolve(&cli, &env_of(Some("yes")), None).is_err());
     }
 }
