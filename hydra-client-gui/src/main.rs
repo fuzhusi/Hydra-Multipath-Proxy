@@ -3873,9 +3873,7 @@ mod tests {
                 }),
             )
             .await
-            .expect(
-                format!("第 {round} 轮 bound_addr 未在 3s 内就绪").as_str(),
-            )
+            .unwrap_or_else(|_| panic!("第 {round} 轮 bound_addr 未在 3s 内就绪"))
             .expect("阻塞接收任务失败")
             .expect("recv 失败");
             match signal {
