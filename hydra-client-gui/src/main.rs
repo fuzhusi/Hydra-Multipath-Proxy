@@ -5,7 +5,7 @@ use eframe::egui;
 use hydra_client::{
     format_bytes, format_duration, format_speed, generate_share_links, hex_encode_lower,
     parse_share_links, parse_subscription, sha256_hex, ProxyServer, ShareLink, TrafficMonitor,
-    TrafficStats,
+    TrafficStats, TransportChoice, TransportMode,
 };
 use hydra_protocol::{NodeInfo, NodeStatus};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -373,6 +373,113 @@ fn import_share_links_as_group(
     })
 }
 
+/// 「从分享链接导入」表单字段 → 构造 `hydra://` 分享链接文本（纯逻辑，UI 与单测共用）。
+/// 全部校验通过才返回链接文本；任何失败返回给用户的错误消息（调用方红字提示、不关窗）：
+/// - 地址：非空；IP 或域名均可（`SocketAddr` 解析失败按域名处理，链接 host 直接存域名）；
+/// - 端口：1..=65535 的数字；
+/// - 密钥：留空 = 不带密钥字段（导入端回落全局密钥）；填了按 hex 校验（32 字节）；
+/// - 证书：留空 = 不带证书（cc= 字段缺席，对方需自备）；填了必须存在且可读。
+fn build_form_share_url(
+    address: &str,
+    port: &str,
+    auth_key_hex: &str,
+    cert_path: &str,
+) -> Result<String, String> {
+    let address = address.trim();
+    if address.is_empty() {
+        return Err("服务器地址不能为空".to_string());
+    }
+    let port_text = port.trim();
+    let port: u16 = port_text
+        .parse()
+        .map_err(|_| format!("端口非法：「{}」（需要 1..=65535 的数字）", port_text))?;
+    if port == 0 {
+        return Err(format!("端口非法：「{}」（需要 1..=65535 的数字）", port_text));
+    }
+
+    // 认证密钥：填了则覆盖全局（与 build_share_link 的 with_auth_key_bytes 一致）
+    let key_bytes = if auth_key_hex.trim().is_empty() {
+        None
+    } else {
+        Some(
+            hydra_client::auth_key_from_hex(auth_key_hex.trim())
+                .map_err(|e| format!("认证密钥非法: {}", e))?,
+        )
+    };
+
+    // 证书文件：填了则必须可读（DER 本体进链接 cc= 字段）
+    let cert_der = if cert_path.trim().is_empty() {
+        None
+    } else {
+        Some(std::fs::read(cert_path.trim()).map_err(|e| {
+            format!(
+                "读取证书 {} 失败: {}（留空 = 不带证书，对方需自备）",
+                cert_path.trim(),
+                e
+            )
+        })?)
+    };
+
+    // NodeInfo 需要 SocketAddr：IP:port 直接解析；域名时用 0.0.0.0 占位，
+    // 再把 ShareLink.address 覆盖为域名字符串（链接本就支持域名 host）
+    let (node_addr, link_address) = match format!("{}:{}", address, port).parse::<SocketAddr>() {
+        Ok(a) => (a, address.to_string()),
+        Err(_) => (
+            format!("0.0.0.0:{}", port)
+                .parse()
+                .expect("0.0.0.0:port 必然可解析"),
+            address.to_string(),
+        ),
+    };
+    let node_info = NodeInfo {
+        address: node_addr,
+        bandwidth: 100.0,
+        latency: 10.0,
+        loss_rate: 0.01,
+        load: 0.5,
+        status: NodeStatus::Online,
+    };
+    let mut link = ShareLink::new_with_mode(&node_info, TransportMode::Masquerade)
+        .with_transport(TransportChoice::Tcp);
+    link.address = link_address;
+    if let Some(key) = &key_bytes {
+        link = link.with_auth_key_bytes(key);
+    }
+    if let Some(der) = &cert_der {
+        link = link.with_cert_der(der);
+    }
+    Ok(link.to_share_url())
+}
+
+/// 订阅列表「来源」列的展示标签（纯逻辑，UI 与单测共用）。
+/// 不再外显原始 `hydra-text://…` 长链接：
+/// - `hydra-text://` 前缀 →「本地导入」（分享表单构造的链接，原文内嵌不外显）；
+/// - `hydra-sub://` 前缀 → 剥除后按剩余部分判定（仅作来源类型标记）；
+/// - http/https →「订阅 · 域名」（只显示域名，不泄露完整路径）；
+/// - 其余按本地文件路径处理 →「文件 · 文件名」。
+fn subscription_source_label(source: &str) -> String {
+    let source = source.trim();
+    if source.starts_with(LOCAL_TEXT_SOURCE_PREFIX) {
+        return "本地导入".to_string();
+    }
+    let inner = source.strip_prefix("hydra-sub://").unwrap_or(source);
+    if let Some(rest) = inner
+        .strip_prefix("https://")
+        .or_else(|| inner.strip_prefix("http://"))
+    {
+        // 手工取 host：截到第一个 '/'（不引 url crate，GUI 侧零新依赖）
+        let host = rest.split(['/']).next().unwrap_or("");
+        if host.is_empty() {
+            return "订阅".to_string();
+        }
+        return format!("订阅 · {}", host);
+    }
+    match std::path::Path::new(inner).file_name() {
+        Some(name) => format!("文件 · {}", name.to_string_lossy()),
+        None => "文件".to_string(),
+    }
+}
+
 struct HydraApp {
     // 应用状态
     proxy_running: bool,
@@ -410,15 +517,20 @@ struct HydraApp {
     share_link: Option<ShareLink>,
     share_url_cache: String,
     share_qr_texture: Option<egui::TextureHandle>,
-    // Team-Q 导入区状态：粘贴文本 + 最近一次导入结果提示（成功绿/失败红）
-    import_text: String,
+    // 「＋ → 从分享链接导入」对话框：最近一次导入结果提示（成功绿/失败红）
     import_status: Option<(bool, String)>,
     /// UI 重设计第一批：「＋ → 从分享链接导入」对话框开关（原节点页内联导入区迁入）
     import_dialog_open: bool,
     /// 分享导入分组的名称输入（默认自动生成「分享导入N」避重；重名校验与 add_subscription 同规则）
     import_group_name: String,
-    /// 分享导入旧行为开关：false（默认）= 创建命名分组；true = 不建分组、直接导入为手动节点
-    import_as_manual: bool,
+    /// 表单化导入 v2：服务器地址（IP 或域名均可）
+    import_form_addr: String,
+    /// 表单化导入 v2：端口文本（默认 443，提交时按 1..=65535 校验）
+    import_form_port: String,
+    /// 表单化导入 v2：证书文件路径（留空 = 不带证书，对方需自备）
+    import_form_cert_path: String,
+    /// 表单化导入 v2：认证密钥 hex（留空 = 使用全局密钥；填了则写入链接覆盖全局）
+    import_form_auth_key: String,
     /// UI 重设计第一批：「＋ → 手动添加节点」对话框开关（原页顶输入行迁入）
     manual_add_open: bool,
     /// UI 重设计第一批：「＋ → 分享节点」按节点选择对话框开关（批量导出也在其中）
@@ -518,11 +630,13 @@ impl Default for HydraApp {
             share_link: None,
             share_url_cache: String::new(),
             share_qr_texture: None,
-            import_text: String::new(),
             import_status: None,
             import_dialog_open: false,
             import_group_name: String::new(),
-            import_as_manual: false,
+            import_form_addr: String::new(),
+            import_form_port: String::new(),
+            import_form_cert_path: String::new(),
+            import_form_auth_key: String::new(),
             manual_add_open: false,
             share_pick_open: false,
             node_testing_addr: None,
@@ -767,11 +881,13 @@ impl HydraApp {
             share_link: None,
             share_url_cache: String::new(),
             share_qr_texture: None,
-            import_text: String::new(),
             import_status: None,
             import_dialog_open: false,
             import_group_name: String::new(),
-            import_as_manual: false,
+            import_form_addr: String::new(),
+            import_form_port: String::new(),
+            import_form_cert_path: String::new(),
+            import_form_auth_key: String::new(),
             manual_add_open: false,
             share_pick_open: false,
             node_testing_addr: None,
@@ -1926,50 +2042,25 @@ impl HydraApp {
         self.import_status = Some((ok, msg));
     }
 
-    /// 导入粘贴文本中的分享链接（支持多行，每行一条）。
-    /// 默认（导入为分组）→ 创建命名分组（Clash Profile 语义）；
-    /// 勾选「不建分组，直接导入为手动节点」→ 保留旧行为（节点进「手动」组）。
-    fn import_pasted_links(&mut self) {
-        if !self.import_as_manual {
-            self.import_pasted_links_as_group();
-            return;
-        }
-        let text = self.import_text.clone();
-        if text.trim().is_empty() {
-            self.set_import_status(false, "请先粘贴 hydra:// 分享链接".to_string());
-            return;
-        }
-        match parse_share_links(&text) {
-            Ok(links) if links.is_empty() => {
-                self.set_import_status(false, "未在文本中找到 hydra:// 分享链接".to_string());
-            }
-            Ok(links) => {
-                let (ok_count, fail_msgs) = self.apply_many_links(&links);
-                if ok_count > 0 {
-                    self.set_import_status(
-                        true,
-                        format!(
-                            "成功导入 {} 个节点（失败 {} 条）",
-                            ok_count,
-                            fail_msgs.len()
-                        ),
-                    );
-                } else {
-                    self.set_import_status(false, fail_msgs.into_iter().next().unwrap_or_default());
-                }
-            }
-            Err(e) => self.set_import_status(false, format!("链接解析失败: {}", e)),
-        }
-    }
-
-    /// 导入粘贴文本为**命名分组**（默认路径）：
-    /// 创建 `SubscriptionConfig` 条目（source = hydra-text:// + 粘贴原文），节点按
-    /// 认领合并进该分组；成功后关闭对话框（条目即时出现在订阅列表）。
-    /// 任何校验失败（重名 / 全坏行 / 空分组）→ 报错不关窗、不创建。
-    fn import_pasted_links_as_group(&mut self) {
-        let text = self.import_text.clone();
+    /// 「从分享链接导入」表单提交（表单化 v2）：
+    /// 1. `build_form_share_url` 校验表单并构造 `hydra://` 链接（地址/端口/密钥/证书）；
+    /// 2. 复用 `import_share_links_as_group` 创建命名分组（分组/认领/更新逻辑零改动）；
+    /// 3. 任何校验或导入失败 → 红字提示、不关窗；成功才关窗并清空表单。
+    fn import_form_submit(&mut self) {
         let name = self.import_group_name.clone();
-        match import_share_links_as_group(&mut self.config, &name, &text) {
+        let url = match build_form_share_url(
+            &self.import_form_addr,
+            &self.import_form_port,
+            &self.import_form_auth_key,
+            &self.import_form_cert_path,
+        ) {
+            Ok(url) => url,
+            Err(e) => {
+                self.set_import_status(false, e);
+                return;
+            }
+        };
+        match import_share_links_as_group(&mut self.config, &name, &url) {
             Ok(result) => {
                 // 运行时节点状态同步（与 apply_subscription_update 同一套收口）
                 for a in &result.added {
@@ -1982,35 +2073,37 @@ impl HydraApp {
                 for a in &result.removed {
                     self.node_status.remove(a);
                 }
-                let msg = format!(
-                    "已导入分组「{}」：{} 个节点（坏行 {} 条）",
-                    name.trim(),
-                    result.node_count,
-                    result.bad_lines
-                );
+                let msg = if result.bad_lines > 0 {
+                    format!(
+                        "已导入分组「{}」：{} 个节点（地址 {}:{}，坏行 {} 条）",
+                        name.trim(),
+                        result.node_count,
+                        self.import_form_addr.trim(),
+                        self.import_form_port.trim(),
+                        result.bad_lines
+                    )
+                } else {
+                    format!(
+                        "已导入分组「{}」：{} 个节点（地址 {}:{}）",
+                        name.trim(),
+                        result.node_count,
+                        self.import_form_addr.trim(),
+                        self.import_form_port.trim()
+                    )
+                };
                 self.set_import_status(true, msg);
-                // 成功才关窗：条目已在订阅列表，节点已进该分组的组标签
+                // 成功才关窗并清表单：条目已在订阅列表，节点已进该分组的组标签
                 self.import_dialog_open = false;
-                self.import_text.clear();
+                self.import_form_addr.clear();
+                self.import_form_port.clear();
+                self.import_form_cert_path.clear();
+                self.import_form_auth_key.clear();
             }
             Err(e) => {
-                // 失败不关窗：保留已粘贴文本与名称，便于就地修正后重试
+                // 失败不关窗：保留表单内容，便于就地修正后重试
                 self.set_import_status(false, e);
             }
         }
-    }
-
-    /// 逐条应用链接，返回（成功数, 失败原因列表）
-    fn apply_many_links(&mut self, links: &[ShareLink]) -> (usize, Vec<String>) {
-        let mut ok = 0;
-        let mut fails = Vec::new();
-        for link in links {
-            match self.apply_imported_link(link) {
-                Ok(()) => ok += 1,
-                Err(e) => fails.push(format!("{}:{}: {}", link.address, link.port, e)),
-            }
-        }
-        (ok, fails)
     }
 
     /// 从二维码图片文件导入（R-15：rfd 选文件在 UI 线程，读文件+缩图+rqrr 解码
@@ -2083,42 +2176,6 @@ impl HydraApp {
                 },
                 Err(e) => self.set_import_status(false, e),
             }
-        }
-    }
-
-    /// 从 .txt 链接文件导入（每行一条，支持 v1/v2 混排）
-    fn import_from_link_file(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("链接文件", &["txt"])
-            .add_filter("全部文件", &["*"])
-            .pick_file()
-        else {
-            return;
-        };
-        let result = std::fs::read_to_string(&path)
-            .map_err(|e| format!("读取文件 {} 失败: {}", path.display(), e))
-            .and_then(|text| parse_share_links(&text).map_err(|e| format!("链接解析失败: {}", e)));
-        match result {
-            Ok(links) if links.is_empty() => {
-                self.set_import_status(false, "文件中未找到 hydra:// 分享链接".to_string());
-            }
-            Ok(links) => {
-                let (ok_count, fails) = self.apply_many_links(&links);
-                if ok_count > 0 {
-                    self.set_import_status(
-                        true,
-                        format!(
-                            "从 {} 导入 {} 个节点（失败 {} 条）",
-                            path.display(),
-                            ok_count,
-                            fails.len()
-                        ),
-                    );
-                } else {
-                    self.set_import_status(false, fails.into_iter().next().unwrap_or_default());
-                }
-            }
-            Err(e) => self.set_import_status(false, e),
         }
     }
 
@@ -3305,57 +3362,93 @@ impl HydraApp {
     /// ③ 分享节点（按节点选择打开分享对话框；批量导出 v1 也在其中）
     /// 改为直接持 ctx 渲染（跨页窗口不丢失），由 update() 每帧统一调用
     fn ui_nodes_dialogs(&mut self, ctx: &egui::Context) {
-        // ① 从分享链接导入
+        // ① 从分享链接导入（表单化 v2：不再粘贴原始链接，结构化字段 → 构造 ShareLink）
         if self.import_dialog_open {
             egui::Window::new("📋 从分享链接导入")
                 .collapsible(false)
-                .resizable(true)
+                .resizable(false)
                 .default_width(480.0)
                 .show(ctx, |ui| {
-                    // 分组名称（默认自动生成「分享导入N」，重名报错不关窗）
+                    egui::Grid::new("import_form_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            // 分组名称（打开对话框时预填「分享导入N」避重；重名提交时报错不关窗）
+                            ui.label("分组名称：");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.import_group_name)
+                                    .desired_width(260.0)
+                                    .hint_text("分享导入1"),
+                            );
+                            ui.end_row();
+                            // 服务器地址（IP 或域名均可，单行固定 + 横向滚动）
+                            ui.label("服务器地址：");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.import_form_addr)
+                                    .desired_width(260.0)
+                                    .hint_text("IP 或域名，如 43.133.91.218"),
+                            );
+                            ui.end_row();
+                            // 端口（默认 443）
+                            ui.label("端口：");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.import_form_port)
+                                    .desired_width(260.0)
+                                    .hint_text("443"),
+                            );
+                            ui.end_row();
+                            // 证书文件：浏览选择；留空 = 不带证书（对方需自备）
+                            ui.label("证书文件：");
+                            ui.horizontal(|ui| {
+                                if ui.button("浏览...").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("证书文件", &["der", "crt", "cer"])
+                                        .add_filter("全部文件", &["*"])
+                                        .pick_file()
+                                    {
+                                        self.import_form_cert_path =
+                                            path.display().to_string();
+                                    }
+                                }
+                                // 单行显示路径（超宽横向滚动，不换行膨胀）
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.import_form_cert_path)
+                                        .desired_width(180.0)
+                                        .hint_text("留空 = 不带证书（对方需自备）"),
+                                );
+                            });
+                            ui.end_row();
+                            // 认证密钥：留空 = 使用全局密钥；填了则写入链接覆盖全局
+                            ui.label("认证密钥：");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.import_form_auth_key)
+                                    .desired_width(260.0)
+                                    .password(true)
+                                    .hint_text("留空 = 使用全局密钥"),
+                            );
+                            ui.end_row();
+                        });
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.label("分组名称：");
-                        let name_edit = egui::TextEdit::singleline(&mut self.import_group_name)
-                            .desired_width(220.0)
-                            .hint_text("分享导入1");
-                        ui.add_enabled(!self.import_as_manual, name_edit);
-                        ui.small("（必填，将作为一条条目出现在「📡 订阅」列表）");
-                    });
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.import_text)
-                            .desired_rows(4)
-                            .hint_text("粘贴 hydra:// 分享链接（支持多行，每行一条）"),
-                    );
-                    ui.horizontal(|ui| {
-                        let import_label = if self.import_as_manual {
-                            "导入粘贴的链接（手动节点）"
-                        } else {
-                            "📥 导入（创建分组）"
-                        };
-                        if ui.button(import_label).clicked() {
-                            self.import_pasted_links();
-                        }
-                        if ui.button("从链接文件导入 (.txt)").clicked() {
-                            self.import_from_link_file();
+                        if ui
+                            .add(egui::Button::new(
+                                egui::RichText::new("📥 导入（创建分组）").strong(),
+                            ))
+                            .clicked()
+                        {
+                            self.import_form_submit();
                         }
                         if ui.button("关闭").clicked() {
                             self.import_dialog_open = false;
                         }
                     });
-                    // 旧行为保留开关（默认关 = 建分组，Clash Profile 语义）
-                    ui.checkbox(
-                        &mut self.import_as_manual,
-                        "不建分组，直接导入为手动节点",
-                    )
-                    .on_hover_text("勾选后节点进入「手动」组（旧行为）；默认不勾选 = 创建命名分组，条目出现在订阅列表");
                     if let Some((ok, msg)) = &self.import_status {
                         ui.colored_label(
                             if *ok { palette::SUCCESS } else { palette::DANGER },
                             format!("{} {}", if *ok { "✓" } else { "✗" }, msg),
                         );
                     }
-                    ui.small("完整分享含密钥/证书，导入后自动配置，无需再填密钥与证书文件");
-                    ui.small("ℹ 默认创建命名分组：分组出现在「📡 订阅」列表、节点进入同名组标签；该分组的「立即更新」会重新解析粘贴的原文");
+                    ui.small("ℹ 创建命名分组：条目出现在「📡 订阅」列表、节点进入同名组标签；该分组的「立即更新」会重新解析链接（证书 cc 字段随链接保存）");
                 });
         }
 
@@ -3487,10 +3580,13 @@ impl HydraApp {
                             ui.close_menu();
                         }
                         if ui.button("📋 从分享链接导入").clicked() {
-                            // 打开时预生成默认分组名（按现有订阅名避重）并清上次提示
+                            // 打开时重置表单：预生成默认分组名（避重）、端口默认 443、清空其余字段与提示
                             self.import_group_name =
                                 next_import_group_name(&self.config.subscriptions);
-                            self.import_as_manual = false;
+                            self.import_form_addr.clear();
+                            self.import_form_port = "443".to_string();
+                            self.import_form_cert_path.clear();
+                            self.import_form_auth_key.clear();
                             self.import_status = None;
                             self.import_dialog_open = true;
                             ui.close_menu();
@@ -3569,7 +3665,8 @@ impl HydraApp {
                     subs_to_remove.push(i);
                 }
             });
-            ui.small(&sub.source);
+            // 来源列只显示类型标签（本地导入/订阅·域名/文件·文件名），不外显原始长链接
+            ui.small(subscription_source_label(&sub.source));
 
             // 展开归属节点：只读清单 + 单条「另存为手动」
             if expanded {
@@ -4876,5 +4973,129 @@ mod tests {
             addrs,
             vec!["10.3.0.1:3001".to_string(), "10.3.0.2:3002".to_string()]
         );
+    }
+
+    // ── 表单化导入 v2：build_form_share_url / subscription_source_label ──
+
+    #[test]
+    fn form_share_url_builds_parseable_link_from_addr_and_port() {
+        // 地址 + 端口 → 构造成功，且能被分享链接解析层还原（零新后端验证）
+        let url = build_form_share_url("43.133.91.218", "443", "", "").unwrap();
+        let parsed = ShareLink::from_share_url(&url).unwrap();
+        assert_eq!(parsed.address, "43.133.91.218");
+        assert_eq!(parsed.port, 443);
+        // 默认 TCP 传输 + Masquerade 模式；不带密钥/证书
+        assert!(parsed.transport_is_tcp());
+        assert_eq!(parsed.mode, TransportMode::Masquerade);
+        assert!(parsed.auth_key.is_none());
+        assert!(parsed.cert_der.is_none());
+    }
+
+    #[test]
+    fn form_share_url_accepts_domain_address() {
+        // 域名地址：SocketAddr 解析不行 → 域名:port 形式照常进链接
+        let url = build_form_share_url("  node.example.com ", "8443", "", "").unwrap();
+        let parsed = ShareLink::from_share_url(&url).unwrap();
+        assert_eq!(parsed.address, "node.example.com");
+        assert_eq!(parsed.port, 8443);
+    }
+
+    #[test]
+    fn form_share_url_rejects_invalid_port_and_empty_address() {
+        // 端口非法：非数字 / 0 / 越界
+        assert!(build_form_share_url("1.2.3.4", "abc", "", "").is_err());
+        assert!(build_form_share_url("1.2.3.4", "0", "", "").is_err());
+        assert!(build_form_share_url("1.2.3.4", "70000", "", "").is_err());
+        assert!(build_form_share_url("1.2.3.4", "", "", "").is_err());
+        // 地址为空（含纯空白）→ 拒绝
+        assert!(build_form_share_url("", "443", "", "").is_err());
+        assert!(build_form_share_url("   ", "443", "", "").is_err());
+    }
+
+    #[test]
+    fn form_share_url_embeds_auth_key_when_given() {
+        // 填了密钥 → 写入链接（覆盖全局）；非法 hex → 拒绝
+        let hex = "ab".repeat(32);
+        let url = build_form_share_url("10.0.0.9", "443", &hex, "").unwrap();
+        let parsed = ShareLink::from_share_url(&url).unwrap();
+        assert_eq!(parsed.auth_key_bytes().unwrap().unwrap(), {
+            let mut v = Vec::new();
+            for i in 0..32 {
+                v.push(u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap());
+            }
+            v
+        });
+        assert!(build_form_share_url("10.0.0.9", "443", "不是hex", "").is_err());
+    }
+
+    #[test]
+    fn form_share_url_requires_readable_cert_file() {
+        // 证书路径不存在 → 拒绝
+        assert!(build_form_share_url("10.0.0.9", "443", "", "Z:/不存在的证书.der").is_err());
+        // 证书文件存在 → DER 进链接 cc 字段（指纹随之写入）
+        let dir = std::env::temp_dir().join(format!("hydra_form_cert_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("node.der");
+        let der: Vec<u8> = (0..=255u8).cycle().take(512).collect();
+        std::fs::write(&cert_path, &der).unwrap();
+        let url = build_form_share_url("10.0.0.9", "443", "", &cert_path.display().to_string())
+            .unwrap();
+        let parsed = ShareLink::from_share_url(&url).unwrap();
+        assert_eq!(parsed.cert_der_bytes().unwrap().unwrap(), der);
+        assert!(parsed.cert_fp.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn form_share_url_feeds_group_import_end_to_end() {
+        // 端到端：表单 → 构造链接 → import_share_links_as_group 创建分组（复用全部分组逻辑）
+        let url = build_form_share_url("10.4.0.7", "9443", "", "").unwrap();
+        let mut cfg = GuiConfig::default();
+        let result = import_share_links_as_group(&mut cfg, "分享导入1", &url).unwrap();
+        assert_eq!(result.node_count, 1);
+        assert_eq!(cfg.node_addrs, vec!["10.4.0.7:9443".to_string()]);
+        assert!(cfg.subscriptions[0].source.starts_with(LOCAL_TEXT_SOURCE_PREFIX));
+        // 「更新」语义：hydra-text:// 存的是构造出的链接文本，重解析照常工作
+        let reparsed = subscription::fetch_and_parse_subscription(
+            "分享导入1".to_string(),
+            cfg.subscriptions[0].source.clone(),
+            subscription::SUBSCRIPTION_FETCH_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(reparsed.links.len(), 1);
+        assert_eq!(reparsed.links[0].port, 9443);
+    }
+
+    #[test]
+    fn subscription_source_label_classifies_sources() {
+        // 本地导入：hydra-text:// 前缀（原文再长也不外显）
+        assert_eq!(
+            subscription_source_label(&format!(
+                "{}{}",
+                LOCAL_TEXT_SOURCE_PREFIX,
+                share_link_line("10.0.0.1", 1)
+            )),
+            "本地导入"
+        );
+        // 订阅：http/https 只显示域名
+        assert_eq!(
+            subscription_source_label("https://sub.example.com/path/sub?token=abc"),
+            "订阅 · sub.example.com"
+        );
+        assert_eq!(
+            subscription_source_label("http://1.2.3.4:8080/sub"),
+            "订阅 · 1.2.3.4:8080"
+        );
+        // hydra-sub:// 前缀：剥除后按剩余部分判定
+        assert_eq!(
+            subscription_source_label("hydra-sub://https://sub.example.com/sub"),
+            "订阅 · sub.example.com"
+        );
+        // 文件：显示文件名
+        assert_eq!(
+            subscription_source_label(r"C:\Users\me\nodes.txt"),
+            "文件 · nodes.txt"
+        );
+        assert_eq!(subscription_source_label("nodes.txt"), "文件 · nodes.txt");
     }
 }
