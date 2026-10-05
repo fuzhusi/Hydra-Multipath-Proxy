@@ -335,6 +335,7 @@ pub fn save_to_file(path: &Path, cfg: &GuiConfig) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
