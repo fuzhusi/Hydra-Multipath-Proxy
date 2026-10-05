@@ -640,6 +640,14 @@ struct HydraApp {
     /// TUN 停机令牌（审查修复：从代理线程内部提升到 HydraApp，真退出路径
     /// 可直接 cancel，确保 RouteGuard 执行路由清理，不再依赖线程内时序）
     tun_shutdown: Option<hydra_client::ShutdownToken>,
+
+    // ── 系统代理检测缓存（修复：移出渲染路径，杜绝每帧 spawn reg 子进程）──
+    /// Windows 系统代理状态缓存：(检测完成时刻, 是否开启)。UI 只读缓存；
+    /// 缓存缺失或超过 10s 过期时由后台线程刷新（node_test_receiver 同范式）
+    sys_proxy_check_cache: Option<(std::time::Instant, bool)>,
+    /// 在途检测结果接收端（Some = 后台检测进行中，防止每帧重复 spawn 线程）
+    #[cfg(windows)]
+    sys_proxy_check_receiver: Option<std::sync::mpsc::Receiver<bool>>,
 }
 
 impl Default for HydraApp {
@@ -708,6 +716,9 @@ impl Default for HydraApp {
             really_quit: false,
             last_tray_tooltip: String::new(),
             tun_shutdown: None,
+            sys_proxy_check_cache: None,
+            #[cfg(windows)]
+            sys_proxy_check_receiver: None,
         }
     }
 }
@@ -960,6 +971,9 @@ impl HydraApp {
             really_quit: false,
             last_tray_tooltip: "Hydra 代理已停止".to_string(),
             tun_shutdown: None,
+            sys_proxy_check_cache: None,
+            #[cfg(windows)]
+            sys_proxy_check_receiver: None,
         };
 
         // ── 首启向导（轻量版）：无配置文件且关键字段为空 → 日志区中文引导 ──
@@ -1118,6 +1132,26 @@ impl HydraApp {
             let _ = tx.send((addr, result));
         });
         self.node_test_receiver = Some(rx);
+    }
+
+    /// 在 update 循环中非阻塞地收取后台系统代理检测结果并写入缓存
+    /// （UI 线程零阻塞：只 try_recv，检测本身在后台线程执行）
+    #[cfg(windows)]
+    fn poll_sys_proxy_check(&mut self) {
+        if let Some(rx) = &self.sys_proxy_check_receiver {
+            match rx.try_recv() {
+                Ok(enabled) => {
+                    // 结果落地：写缓存并清空在途标记，允许 TTL 过期后再次刷新
+                    self.sys_proxy_check_cache = Some((std::time::Instant::now(), enabled));
+                    self.sys_proxy_check_receiver = None;
+                }
+                // 后台线程异常退出（panic 等）：清空在途标记，下帧可重试
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.sys_proxy_check_receiver = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
     }
 
     /// 在 update 循环中非阻塞地收取单节点测试结果
@@ -2569,6 +2603,10 @@ impl eframe::App for HydraApp {
         self.poll_subscription_updates();
         // 非阻塞地处理二维码图片导入结果（R-15：解码在后台线程）
         self.poll_qr_import_result();
+
+        // 系统代理检测缓存刷新（仅 Windows；后台线程结果回投）
+        #[cfg(windows)]
+        self.poll_sys_proxy_check();
 
         // ── Team-Q v2：单节点分享对话框（二维码 + 完整链接 + 安全提示）──
         if self.share_dialog_open {
@@ -4464,6 +4502,11 @@ impl HydraApp {
             } else {
                 "TUN 透明代理：已关闭（下次启动代理生效）".to_string()
             });
+            // 切换为开时立即触发一次后台检测（作废旧缓存，不阻塞 UI）
+            #[cfg(windows)]
+            if self.config.tun_enabled {
+                self.sys_proxy_check_cache = None;
+            }
         }
         let tun_on = self.config.tun_enabled;
         ui.add_enabled(
@@ -4482,13 +4525,35 @@ impl HydraApp {
         .on_disabled_hover_text("先开启 TUN 透明代理");
         ui.small("TUN 全流量接管，应用无需配置代理；仅 TCP（UDP 含 QUIC 丢弃）、无 DNS 劫持；\n节点 IP 与系统 DNS 自动豁免防环路；退出/崩溃自动清理路由");
         // 与 CLI（hydra-client main.rs warn_system_proxy_loop）一致的环路告警：
-        // Windows 系统代理 + TUN 全流量接管 → 经系统代理的流量二次进本代理
+        // Windows 系统代理 + TUN 全流量接管 → 经系统代理的流量二次进本代理。
+        // 修复：检测移出渲染路径——此前每帧同步 spawn `reg query`（每秒几十个
+        // 控制台窗口 + UI 线程反复阻塞）。现在 UI 只读缓存；缓存缺失/过期 10s
+        // 时由后台线程检测并经 mpsc 回投（与 node_test_receiver 同范式）。
         #[cfg(windows)]
-        if tun_on && hydra_client::windows_system_proxy_enabled() {
-            ui.colored_label(
-                palette::WARNING,
-                "⚠ 检测到 Windows 系统代理已开启：TUN 模式下经系统代理的流量会二次进入本代理形成环路，建议关闭系统代理",
-            );
+        if tun_on {
+            // 缓存有效期 10s：过期后在 UI 线程仅发起后台检测（不等待结果）
+            const SYS_PROXY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+            let expired = match self.sys_proxy_check_cache {
+                Some((at, _)) => at.elapsed() >= SYS_PROXY_CACHE_TTL,
+                None => true,
+            };
+            if expired && self.sys_proxy_check_receiver.is_none() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    // 后台线程同步执行 reg query（已加 CREATE_NO_WINDOW 不弹窗）
+                    let _ = tx.send(hydra_client::windows_system_proxy_enabled());
+                });
+                self.sys_proxy_check_receiver = Some(rx);
+            }
+            // 缓存缺失时告警行先不显示（后台检测落地后的下一帧即显示）
+            if let Some((_, sys_proxy_on)) = self.sys_proxy_check_cache {
+                if sys_proxy_on {
+                    ui.colored_label(
+                        palette::WARNING,
+                        "⚠ 检测到 Windows 系统代理已开启：TUN 模式下经系统代理的流量会二次进入本代理形成环路，建议关闭系统代理",
+                    );
+                }
+            }
         }
 
         ui.separator();
@@ -4542,7 +4607,12 @@ impl HydraApp {
             if ui.button("打开目录").clicked() {
                 if let Some(dir) = config::config_dir() {
                     #[cfg(windows)]
-                    let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                    {
+                        // CREATE_NO_WINDOW：打开目录不闪控制台窗口（点击时一次性调用）
+                        let mut c = std::process::Command::new("explorer");
+                        c.arg(&dir);
+                        let _ = hydra_client::hide_console_window(&mut c).spawn();
+                    }
                     #[cfg(not(windows))]
                     let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
                 }

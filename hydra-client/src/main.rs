@@ -88,13 +88,15 @@ fn tun_config_from_env(nodes: &[SocketAddr]) -> hydra_client::tun::TunConfig {
 /// Windows 系统代理开启时 TUN 流量会二次进代理形成环路（方案 §5）：检测并告警（不自动关闭）
 #[cfg(all(windows, feature = "tun"))]
 fn warn_system_proxy_loop() {
-    let ok = std::process::Command::new("reg")
-        .args([
-            "query",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-            "/v",
-            "ProxyEnable",
-        ])
+    // CREATE_NO_WINDOW：后台检测不弹控制台窗口
+    let mut cmd = std::process::Command::new("reg");
+    cmd.args([
+        "query",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        "/v",
+        "ProxyEnable",
+    ]);
+    let ok = hydra_client::hide_console_window(&mut cmd)
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains("0x1"))
         .unwrap_or(false);

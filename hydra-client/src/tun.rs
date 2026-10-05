@@ -342,7 +342,10 @@ impl RouteExecutor for SystemRouteExecutor {
         {
             let args = cmd.windows_args(action);
             debug!("route {}", args.join(" "));
-            let out = std::process::Command::new("route").args(&args).output()?;
+            // CREATE_NO_WINDOW：TUN 路由操作不弹控制台窗口
+            let mut c = std::process::Command::new("route");
+            c.args(&args);
+            let out = crate::hide_console_window(&mut c).output()?;
             if !out.status.success() {
                 return Err(std::io::Error::other(format!(
                     "route {} 失败: {}",
@@ -394,7 +397,10 @@ impl RouteExecutor for SystemRouteExecutor {
             }
             let args = cmd.windows_args(action, ifname.trim());
             debug!("netsh {}", args.join(" "));
-            let out = std::process::Command::new("netsh").args(&args).output()?;
+            // CREATE_NO_WINDOW：netsh IPv6 路由操作不弹控制台窗口
+            let mut c = std::process::Command::new("netsh");
+            c.args(&args);
+            let out = crate::hide_console_window(&mut c).output()?;
             if !out.status.success() {
                 return Err(std::io::Error::other(format!(
                     "netsh {} 失败: {}",
@@ -541,9 +547,10 @@ pub fn detect_physical_gateway() -> Option<Ipv4Addr> {
     }
     #[cfg(windows)]
     {
-        if let Ok(out) = std::process::Command::new("route")
-            .args(["print", "-4", "0.0.0.0"])
-            .output()
+        // CREATE_NO_WINDOW：网关探测不弹控制台窗口
+        let mut c = std::process::Command::new("route");
+        c.args(["print", "-4", "0.0.0.0"]);
+        if let Ok(out) = crate::hide_console_window(&mut c).output()
         {
             let text = String::from_utf8_lossy(&out.stdout);
             for line in text.lines() {
@@ -593,9 +600,10 @@ pub fn detect_physical_gateway_v6() -> Option<Ipv6Addr> {
     }
     #[cfg(windows)]
     {
-        if let Ok(out) = std::process::Command::new("route")
-            .args(["print", "-6"])
-            .output()
+        // CREATE_NO_WINDOW：IPv6 网关探测不弹控制台窗口
+        let mut c = std::process::Command::new("route");
+        c.args(["print", "-6"]);
+        if let Ok(out) = crate::hide_console_window(&mut c).output()
         {
             let text = String::from_utf8_lossy(&out.stdout);
             for line in text.lines() {
@@ -652,13 +660,14 @@ pub fn detect_dns_servers() -> Vec<Ipv4Addr> {
     {
         // reg query 递归导出各接口的静态/动态 DNS（输出含 REG_SZ 等噪声 token，
         // 统一按「能解析成 IPv4 就收」过滤，best-effort）
-        if let Ok(outp) = std::process::Command::new("reg")
-            .args([
-                "query",
-                r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces",
-                "/s",
-            ])
-            .output()
+        // CREATE_NO_WINDOW：DNS 探测不弹控制台窗口
+        let mut c = std::process::Command::new("reg");
+        c.args([
+            "query",
+            r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces",
+            "/s",
+        ]);
+        if let Ok(outp) = crate::hide_console_window(&mut c).output()
         {
             let text = String::from_utf8_lossy(&outp.stdout);
             for tok in text.split_whitespace() {

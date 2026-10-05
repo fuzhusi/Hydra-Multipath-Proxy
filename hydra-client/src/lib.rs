@@ -125,6 +125,19 @@ pub fn tun_config_from_settings(
     Ok(cfg)
 }
 
+/// 为子进程命令附加 Windows `CREATE_NO_WINDOW (0x0800_0000)` 标志：
+/// 后台调用 reg/route/netsh/ip 等系统命令时不再弹出控制台窗口。
+/// 非 Windows 平台为 no-op（跨平台统一走本封装，调用方无需 cfg 门控）。
+pub fn hide_console_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // 0x0800_0000 = CREATE_NO_WINDOW：不为子进程创建控制台窗口
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
+}
+
 /// Windows 系统代理是否已启用（HKCU Internet Settings ProxyEnable=0x1）。
 /// TUN 全流量接管与系统代理叠加会形成环路，GUI 据此展示与 CLI 一致的告警。
 /// 审查修复：精确比较 REG_DWORD 数值——此前 `contains("0x1")` 会把
@@ -132,13 +145,15 @@ pub fn tun_config_from_settings(
 /// 本 crate 保持 reg 子进程读取，但按行取末列做全等比较）。
 #[cfg(all(windows, feature = "tun"))]
 pub fn windows_system_proxy_enabled() -> bool {
-    std::process::Command::new("reg")
-        .args([
-            "query",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-            "/v",
-            "ProxyEnable",
-        ])
+    // CREATE_NO_WINDOW：避免 reg query 弹控制台窗口（GUI 曾因渲染路径每帧调用而狂闪）
+    let mut cmd = std::process::Command::new("reg");
+    cmd.args([
+        "query",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        "/v",
+        "ProxyEnable",
+    ]);
+    crate::hide_console_window(&mut cmd)
         .output()
         .map(|o| {
             // reg query 输出形如 `    ProxyEnable    REG_DWORD    0x1`，
