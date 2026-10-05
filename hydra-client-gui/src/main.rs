@@ -415,7 +415,8 @@ impl HydraApp {
     }
 
     /// Test connectivity to a single node（A5：失败根因以 Err 透出，不再吞掉）
-    /// Exec-1：证书由调用方先按「配置文件 > 环境变量」解析后传入（config.rs resolve_node_certs）
+    /// 信任根由调用方按「配置文件 > 环境变量」构造后传入（config.rs resolve_trust，
+    /// 支持 pin/ca 双信任模式与逐节点证书）
     /// 0-7 修复"测速假绿"：不再只做 TCP connect（测不出密钥错误），而是完整走
     /// `connect_target`（TCP+TLS+Noise-PSK 认证 + 节点应答）。探测目标用
     /// `192.0.0.1:9`（TEST-NET-3 测试网段 discard 端口，节点侧快速失败、完整走认证），
@@ -426,18 +427,16 @@ impl HydraApp {
     /// - TCP 连接失败/超时 → 节点不可达 ✗。
     async fn test_node_connection(
         addr_str: &str,
-        node_certs: Vec<Vec<u8>>,
+        trust: hydra_client::tcp_transport::TlsTrust,
         auth_key: Vec<u8>,
     ) -> std::result::Result<u64, String> {
-        use hydra_client::tcp_transport::{connect_target, TlsTrust};
+        use hydra_client::tcp_transport::connect_target;
         use hydra_protocol::HydraError;
 
         let addr: SocketAddr = addr_str
             .parse()
             .map_err(|e| format!("地址解析失败: {}", e))?;
 
-        // GUI 现状仅支持自签 pin 模式（README 如实声明）：证书入本地信任根
-        let trust = TlsTrust::pinned(node_certs);
         let start = std::time::Instant::now();
         // 总时限 10s：目标探测在节点侧快速失败，正常远小于该值；覆盖 TCP/TLS 5s+握手
         let probe = tokio::time::timeout(
@@ -479,9 +478,9 @@ impl HydraApp {
             self.add_log("已有节点测试正在进行，请稍候".to_string());
             return;
         }
-        // 证书按「配置文件 > 环境变量」解析；失败根因直接进日志（A5 行为保持）
-        let certs = match config::resolve_node_certs(&self.config) {
-            Ok(c) => c,
+        // 信任根按「配置文件 > 环境变量」构造（支持 ca 模式与逐节点证书）；失败根因直接进日志
+        let trust = match config::resolve_trust(&self.config, &[addr.clone()]) {
+            Ok(t) => t,
             Err(e) => {
                 self.add_log(format!("节点 {} 测试失败: {}", addr, e));
                 return;
@@ -500,7 +499,7 @@ impl HydraApp {
         std::thread::spawn(move || {
             // 审查 R-34：复用进程级探测 runtime（不再每次冷启动一个多线程 runtime）
             let result =
-                probe_runtime().block_on(HydraApp::test_node_connection(&addr, certs, auth_key));
+                probe_runtime().block_on(HydraApp::test_node_connection(&addr, trust, auth_key));
             let _ = tx.send((addr, result));
         });
         self.node_test_receiver = Some(rx);
@@ -553,9 +552,9 @@ impl HydraApp {
     /// Test all nodes and update status (non-blocking)
     fn test_all_nodes(&mut self) {
         let node_addrs = self.config.node_addrs.clone();
-        // 证书按「配置文件 > 环境变量」解析一次；失败根因直接进日志
-        let certs = match config::resolve_node_certs(&self.config) {
-            Ok(c) => c,
+        // 信任根按「配置文件 > 环境变量」构造（支持 ca 模式与逐节点证书）；失败根因直接进日志
+        let trust = match config::resolve_trust(&self.config, &node_addrs) {
+            Ok(t) => t,
             Err(e) => {
                 self.add_log(format!("全部节点测试失败: {}", e));
                 return;
@@ -580,11 +579,11 @@ impl HydraApp {
                 let mut handles = Vec::new();
                 for addr in &node_addrs {
                     let addr = addr.clone();
-                    let certs = certs.clone();
+                    let trust = trust.clone();
                     let auth_key = auth_key.clone();
                     let tx = tx.clone();
                     handles.push(tokio::spawn(async move {
-                        let result = Self::test_node_connection(&addr, certs, auth_key).await;
+                        let result = Self::test_node_connection(&addr, trust, auth_key).await;
                         let _ = tx.send((addr, result));
                     }));
                 }
@@ -693,17 +692,10 @@ impl HydraApp {
             }
         };
 
-        // ── 认证密钥与节点证书：先读配置文件，缺项再回落环境变量（config.rs）──
+        // ── 认证密钥：先读配置文件，缺项再回落环境变量（config.rs）──
         // 在 GUI 线程解析完成后再移交代理线程；失败根因直接进日志。
         let auth_key = match config::resolve_auth_key(&self.config) {
             Ok(k) => k,
-            Err(e) => {
-                self.add_log(format!("代理启动失败: {}", e));
-                return;
-            }
-        };
-        let node_certs = match config::resolve_node_certs(&self.config) {
-            Ok(c) => c,
             Err(e) => {
                 self.add_log(format!("代理启动失败: {}", e));
                 return;
@@ -724,6 +716,7 @@ impl HydraApp {
         // 现不再按可能过期的健康状态拦截，仅过滤非法地址；不可达节点
         // 由代理自身的故障切换与调度器 Offline 标记处理。
         let mut nodes = Vec::new();
+        let mut valid_node_addrs = Vec::new();
         let node_addrs = self.config.node_addrs.clone();
         for node_addr in &node_addrs {
             if let Ok(addr) = node_addr.parse::<SocketAddr>() {
@@ -733,6 +726,7 @@ impl HydraApp {
                     _ => "未验证",
                 };
                 nodes.push(addr);
+                valid_node_addrs.push(node_addr.clone());
                 self.add_log(format!("添加节点: {} ({})", addr, state));
             } else {
                 self.add_log(format!("跳过无效节点地址: {}", node_addr));
@@ -743,6 +737,55 @@ impl HydraApp {
             self.add_log("错误: 没有有效的节点地址，代理启动取消".to_string());
             return;
         }
+
+        // ── 信任根：pin（默认，逐节点证书按序收集）/ ca（真证书 + 可选叶 pin）──
+        // 节点顺序与 with_nodes 传入顺序一致（with_node_certs 按序对应）
+        let trust = match config::resolve_trust(&self.config, &valid_node_addrs) {
+            Ok(t) => t,
+            Err(e) => {
+                self.add_log(format!("代理启动失败: {}", e));
+                return;
+            }
+        };
+        let trust_for_proxy = trust.clone();
+
+        // ── TUN 透明代理（实验性）：GUI 与代理同进程，TUN 需在 ProxyServer::start
+        // 之外叠加（run_tun 独立任务，共享同一调度器/凭据）。配置在此解析，
+        // 权限不足等错误经就绪通道透传到日志区。
+        let tun_enabled = self.config.tun_enabled;
+        let tun_cfg = if tun_enabled {
+            match hydra_client::tun_config_from_settings(
+                Some(self.config.tun_addr_or_default()),
+                Some(self.config.tun_ports_or_default()),
+                &nodes,
+            ) {
+                Ok(c) => {
+                    // 与 CLI（main.rs warn_system_proxy_loop）一致的环路告警：
+                    // TUN 全流量接管 + 系统代理 → 经系统代理的流量二次进本代理
+                    #[cfg(windows)]
+                    if hydra_client::windows_system_proxy_enabled() {
+                        self.add_log(
+                            "⚠ 检测到 Windows 系统代理已开启：TUN 模式下经系统代理的流量会\
+                             二次进入本代理形成环路，建议关闭系统代理后使用 TUN 模式"
+                                .to_string(),
+                        );
+                    }
+                    self.add_log(format!(
+                        "TUN 透明代理开启（实验性）：地址 {} 端口 {:?}（需管理员/root；\
+                         Windows 还需 wintun.dll）",
+                        self.config.tun_addr_or_default(),
+                        c.listen_ports
+                    ));
+                    Some(c)
+                }
+                Err(e) => {
+                    self.add_log(format!("代理启动失败: {}", e));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
 
         // 创建流量统计器
         let traffic_monitor = Arc::new(TrafficMonitor::new());
@@ -789,15 +832,59 @@ impl HydraApp {
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                // 认证密钥/证书已由 GUI 线程按「配置文件 > 环境变量」解析完毕（见上）
+                // 认证密钥/信任根已由 GUI 线程按「配置文件 > 环境变量」解析完毕（见上）
                 let proxy = std::sync::Arc::new(
                     ProxyServer::new(proxy_addr_clone)
                         .with_nodes(nodes_clone)
                         .with_traffic_monitor(traffic_monitor_clone)
                         .with_auth_key(auth_key)
-                        .with_node_certs(node_certs),
+                        .with_trust(trust_for_proxy),
                 );
                 println!("[Proxy Thread] Starting proxy server...");
+                // ── TUN 叠加（实验性）：与 SOCKS 监听并存。register_nodes 需在
+                // start 之前让调度器已有节点（tun_channel_opener 依赖节点优先级表）
+                // tun_task = (停机令牌, TUN 栈任务句柄)；None = 未开启或启动失败
+                let tun_task: Option<(
+                    hydra_client::ShutdownToken,
+                    tokio::task::JoinHandle<()>,
+                )> = if let Some(tcfg) = tun_cfg {
+                    // GUI 依赖 hydra-client 默认 features（含 tun）；配置构造失败已在
+                    // GUI 线程拦截，此处失败（设备创建/路由）经通道透传日志区
+                    {
+                        proxy.register_nodes().await;
+                        match proxy.tun_channel_opener() {
+                            Ok(opener) => {
+                                // 令牌本体留在任务外：停止代理时 cancel → 栈任务退出
+                                // → RouteGuard Drop 清理路由。tx 用独立克隆（任务内发送
+                                // 失败根因，不占用主通道所有权）
+                                let tun_tx = tx.clone();
+                                let shutdown = hydra_client::new_tun_shutdown_token();
+                                let shutdown2 = shutdown.clone();
+                                let task = tokio::spawn(async move {
+                                    if let Err(e) =
+                                        hydra_client::tun::run_tun(tcfg, opener, shutdown2).await
+                                    {
+                                        // 权限不足（非管理员/root）/ 缺 wintun.dll 等根因
+                                        // 经就绪通道透传到 GUI 日志区，不静默
+                                        let _ = tun_tx.send(Err(std::io::Error::other(format!(
+                                            "TUN 模式启动失败: {e}（设备创建需管理员/root；\
+                                             Windows 还需 wintun.dll）"
+                                        ))));
+                                    }
+                                });
+                                Some((shutdown, task))
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(std::io::Error::other(format!(
+                                    "TUN 模式启动失败: {e}"
+                                ))));
+                                None
+                            }
+                        }
+                    }
+                } else {
+                    None
+                };
                 // 就绪信号以真实 bound_addr 置位为准（start 内部含 endpoint 创建与节点预热，
                 // 可能数十秒）——不再用"测试绑定后丢弃"的 TOCTOU 假信号
                 let p2 = proxy.clone();
@@ -835,6 +922,16 @@ impl HydraApp {
                         }
                     } => {
                         println!("[Proxy Thread] Received stop signal");
+                        // TUN 任务优雅停机：取消令牌 → 栈任务退出 → RouteGuard Drop 清理路由；
+                        // 最多等 5s（与 CLI 停机超时一致），超时则随 runtime 关闭强收
+                        if let Some((token, task)) = tun_task {
+                            token.cancel();
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                task,
+                            )
+                            .await;
+                        }
                     }
                 }
             });
@@ -2929,7 +3026,14 @@ impl HydraApp {
         self.edit_addr = addr.to_string();
         self.edit_auth_key = self.config.auth_key.clone();
         self.edit_show_auth = false;
-        self.edit_cert_path = self.config.cert_path.clone();
+        // 逐节点独立证书路径（多节点证书 HYDRA_NODE_CERTS 的 GUI 形态）；
+        // 缺项 = 空串，回落全局证书（cert_path / 内嵌 DER / 环境变量）
+        self.edit_cert_path = self
+            .config
+            .node_cert_paths
+            .get(addr)
+            .cloned()
+            .unwrap_or_default();
         self.node_edit_open = true;
     }
 
@@ -3000,7 +3104,9 @@ impl HydraApp {
         }
         self.config.set_node_name(&new_addr, self.edit_name.trim());
         self.config.auth_key = key;
-        self.config.cert_path = cert_path;
+        // 逐节点独立证书路径（空串 = 清除，回落全局证书）；rename_node 已随迁旧键，
+        // 此处以编辑值覆盖新地址键（清除场景同步移除）
+        self.config.set_node_cert_path(&new_addr, &cert_path);
         self.node_edit_open = false;
         self.add_log(format!("节点 {} 已保存", new_addr));
         // 全局参数（密钥/证书）只在代理启动时读取，运行中修改必须重启才生效
@@ -3095,16 +3201,15 @@ impl HydraApp {
                     };
                 }
 
-                // 证书：当前状态（路径/内嵌指纹短哈希）+ 浏览替换
-                ui.label("节点证书:");
-                ui.small(Self::cert_status_text(&self.config));
+                // 证书：逐节点独立路径（仅本节点）；全局证书为回落
+                ui.label("节点证书路径（仅本节点）:");
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.edit_cert_path)
                             .desired_width(320.0)
-                            .hint_text("证书文件路径（清空则使用内嵌证书）"),
+                            .hint_text("本节点独立证书（留空 = 用全局证书）"),
                     );
-                    if ui.small_button("浏览替换...").clicked() {
+                    if ui.small_button("浏览...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("证书文件", &["der", "pem", "crt", "cer"])
                             .add_filter("全部文件", &["*"])
@@ -3114,6 +3219,10 @@ impl HydraApp {
                         }
                     }
                 });
+                ui.small(format!(
+                    "全局证书（回落）: {}",
+                    Self::cert_status_text(&self.config)
+                ));
 
                 // 传输为固定 TCP/TLS（TLS 1.3 + Noise-PSK）：Wave 3 起无其他模式
                 ui.label("传输模式: TCP/TLS（TLS 1.3 + Noise-PSK）");
@@ -3126,9 +3235,9 @@ impl HydraApp {
                     );
                 }
 
-                // 方案 §4：诚实提示——当前凭据为全局单值，节点级凭据待后端改造
+                // 方案 §4：诚实提示——认证密钥为全局单值；证书已支持逐节点独立路径（上）
                 ui.separator();
-                ui.small("当前 hydra-client 按全局凭据连接（上述密钥/证书/模式对所有节点生效），节点级凭据将在后端改造后逐节点生效");
+                ui.small("当前认证密钥为全局单值（所有节点共用）；节点证书已支持逐节点独立路径，留空回落全局证书");
 
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -3149,8 +3258,8 @@ impl HydraApp {
     }
 
     /// 设置页（v2 方案 §2.5 / 裁决 C）：应用级配置，无任何凭据。
-    /// 分区：代理核心 / TUN 模式（预留）/ 系统 / 外观与数据 / 关于。
-    /// 认证密钥、证书已全部迁出到「🌐 节点」页「全局凭据」区。
+    /// 分区：代理核心 / 安全与信任 / TUN 透明代理（实验）/ 系统 / 外观与数据 / 关于。
+    /// 认证密钥、全局证书在「🌐 节点」页「全局凭据」区；信任模式与 TUN 在本页。
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("设置");
         ui.separator();
@@ -3189,23 +3298,99 @@ impl HydraApp {
 
         ui.separator();
 
-        // ◈ TUN 模式（预留，方案 §5：占位不实现，不驱动任何行为）
-        ui.heading("TUN 模式（预留）");
-        let tun = ui
-            .add_enabled(false, egui::Checkbox::new(&mut false, "启用 TUN 模式"))
-            .on_hover_text("TUN 模式规划中，当前请使用本地代理 127.0.0.1:1080");
-        tun.on_disabled_hover_text("TUN 模式规划中，当前请使用本地代理 127.0.0.1:1080");
+        // ◈ 安全与信任（双信任模式：自签 pinning 默认 / 真证书 CA）
+        ui.heading("安全与信任");
+        // 拷贝为 String：后续要可变借用 self.config（pin 输入框），避免借用冲突
+        let mode = self.config.trust_mode_effective().to_string();
+        ui.horizontal(|ui| {
+            ui.label("信任模式:");
+            if ui
+                .radio(mode == "pin", "自签 pinning（默认）")
+                .clicked()
+            {
+                self.config.trust_mode = String::new(); // 空串 = 默认 pin（配置语义与 serde 默认一致）
+                self.add_log("信任模式：自签 pinning（节点证书入本地信任根）".to_string());
+            }
+            if ui.radio(mode == "ca", "真证书 CA").clicked() {
+                self.config.trust_mode = "ca".to_string();
+                self.add_log(
+                    "信任模式：真证书 CA（节点需 ACME 等真证书部署；自定义域名需另设 SNI，见 README）"
+                        .to_string(),
+                );
+            }
+        });
+        // ca 模式：可选叶证书 SHA-256 硬 pin（64 hex，防 CA 误签发）
+        if mode == "ca" {
+            ui.horizontal(|ui| {
+                ui.label("叶证书 SHA-256 硬 pin（可选）:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.config.ca_leaf_pin)
+                        .desired_width(380.0)
+                        .hint_text("64 位 hex，留空 = 仅信任公共 CA"),
+                );
+            });
+            match config::validate_leaf_pin(&self.config.ca_leaf_pin) {
+                Ok(()) if self.config.ca_leaf_pin.trim().is_empty() => {}
+                Ok(()) => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0x7D, 0xE2, 0x97),
+                        "✓ 格式有效（64 hex）",
+                    );
+                }
+                Err(e) => {
+                    ui.colored_label(egui::Color32::from_rgb(0xFF, 0x8A, 0x80), format!("✗ {e}"));
+                }
+            }
+            ui.small("ca 模式不使用节点证书文件；节点侧用真证书（如 ACME）部署，SNI 须与证书 SAN 一致");
+        } else {
+            ui.small("pin 模式使用「🌐 节点」页的节点证书（支持逐节点独立证书，见节点编辑）");
+        }
+        if self.proxy_running {
+            ui.small("⚠ 代理正在运行：信任模式修改需停止并重新启动代理后生效");
+        }
+
+        ui.separator();
+
+        // ◈ TUN 透明代理（实验性：需管理员/root；Windows 另需 wintun.dll）
+        ui.heading("TUN 透明代理（实验）");
+        if ui
+            .checkbox(
+                &mut self.config.tun_enabled,
+                "TUN 透明代理（实验，需管理员/root）",
+            )
+            .changed()
+        {
+            self.add_log(if self.config.tun_enabled {
+                "TUN 透明代理：已开启（下次启动代理生效；仅拦截 TCP，按端口列表）".to_string()
+            } else {
+                "TUN 透明代理：已关闭（下次启动代理生效）".to_string()
+            });
+        }
+        let tun_on = self.config.tun_enabled;
         ui.add_enabled(
-            false,
-            egui::Checkbox::new(&mut false, "服务模式安装（规划中）"),
+            tun_on,
+            egui::TextEdit::singleline(&mut self.config.tun_addr)
+                .desired_width(200.0)
+                .hint_text("TUN 地址（默认 10.7.0.1/30）"),
         )
-        .on_disabled_hover_text("规划中");
+        .on_disabled_hover_text("先开启 TUN 透明代理");
         ui.add_enabled(
-            false,
-            egui::Checkbox::new(&mut false, "TUN 栈：gVisor / System（规划中）"),
+            tun_on,
+            egui::TextEdit::singleline(&mut self.config.tun_ports)
+                .desired_width(200.0)
+                .hint_text("拦截端口列表（默认 80,443,8080,8443）"),
         )
-        .on_disabled_hover_text("规划中");
-        self.config.tun_enabled = false; // 预留字段恒 false，不驱动任何行为
+        .on_disabled_hover_text("先开启 TUN 透明代理");
+        ui.small("TUN 全流量接管，应用无需配置代理；仅 TCP（UDP 含 QUIC 丢弃）、无 DNS 劫持；\n节点 IP 与系统 DNS 自动豁免防环路；退出/崩溃自动清理路由");
+        // 与 CLI（hydra-client main.rs warn_system_proxy_loop）一致的环路告警：
+        // Windows 系统代理 + TUN 全流量接管 → 经系统代理的流量二次进本代理
+        #[cfg(windows)]
+        if tun_on && hydra_client::windows_system_proxy_enabled() {
+            ui.colored_label(
+                egui::Color32::from_rgb(0xFF, 0xD6, 0x66),
+                "⚠ 检测到 Windows 系统代理已开启：TUN 模式下经系统代理的流量会二次进入本代理形成环路，建议关闭系统代理",
+            );
+        }
 
         ui.separator();
 

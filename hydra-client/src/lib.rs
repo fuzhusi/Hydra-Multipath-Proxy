@@ -72,7 +72,7 @@ pub fn node_certs_from_env() -> Result<Vec<Vec<u8>>, String> {
 pub fn tun_config_from_settings(
     addr: Option<&str>,
     ports: Option<&str>,
-    nodes: &[SocketAddr],
+    nodes: &[std::net::SocketAddr],
 ) -> std::result::Result<crate::tun::TunConfig, String> {
     use std::net::Ipv4Addr;
     let mut cfg = crate::tun::TunConfig::default();
@@ -140,6 +140,10 @@ pub fn windows_system_proxy_enabled() -> bool {
         .map(|o| String::from_utf8_lossy(&o.stdout).contains("0x1"))
         .unwrap_or(false)
 }
+
+/// TUN 任务停机令牌类型别名（调用方无需直接依赖 tokio_util）
+#[cfg(feature = "tun")]
+pub type ShutdownToken = tokio_util::sync::CancellationToken;
 
 /// TUN 任务停机令牌（tokio_util CancellationToken 组装点，此前为 main.rs 私有）。
 /// GUI 代理线程用它在「停止代理」时同步取消 TUN 栈任务（RouteGuard Drop 清理路由）。

@@ -93,9 +93,25 @@ pub struct GuiConfig {
     /// Team-UI：节点备注名（地址 "host:port" → 展示名）。缺项 = 无备注，显示地址本身。
     #[serde(default)]
     pub node_names: HashMap<String, String>,
-    /// UI 重设计 v2：TUN 模式预留字段（固定 false，不驱动任何行为——见方案 §5）。
+    /// TUN 透明代理开关（实验性，需管理员/root；true = 代理启动时叠加 TUN 模式）
     #[serde(default)]
     pub tun_enabled: bool,
+    /// TUN 虚拟网卡地址（形如 "10.7.0.1/30"）；空串 = 用库默认 10.7.0.1/30
+    #[serde(default)]
+    pub tun_addr: String,
+    /// TUN 拦截端口列表（逗号分隔）；空串 = 用库默认 80,443,8080,8443
+    #[serde(default)]
+    pub tun_ports: String,
+    /// 信任模式："pin"（自签 pinning，默认；空串同 pin）| "ca"（真证书/公共 CA）
+    #[serde(default)]
+    pub trust_mode: String,
+    /// ca 模式可选：叶证书 SHA-256 硬 pin（64 hex，防 CA 误签发；对应 HYDRA_CERT_SHA256）
+    #[serde(default)]
+    pub ca_leaf_pin: String,
+    /// 多节点证书：节点地址 "host:port" → 该节点独立证书文件路径。
+    /// 缺项节点回落全局 cert_path / cert_der_b64 / HYDRA_NODE_CERT（三级回落不变）。
+    #[serde(default)]
+    pub node_cert_paths: HashMap<String, String>,
 }
 
 /// serde 默认值：true（关窗默认隐藏到托盘）
@@ -117,6 +133,11 @@ impl Default for GuiConfig {
             close_to_tray: true,
             node_names: HashMap::new(),
             tun_enabled: false,
+            tun_addr: String::new(),
+            tun_ports: String::new(),
+            trust_mode: String::new(),
+            ca_leaf_pin: String::new(),
+            node_cert_paths: HashMap::new(),
         }
     }
 }
@@ -181,6 +202,50 @@ impl GuiConfig {
         }
         if let Some(name) = self.node_names.remove(old) {
             self.node_names.entry(new.to_string()).or_insert(name);
+        }
+        // 节点独立证书路径随地址迁移（与备注名同语义：新地址已有条目则不覆盖）
+        if let Some(p) = self.node_cert_paths.remove(old) {
+            self.node_cert_paths.entry(new.to_string()).or_insert(p);
+        }
+    }
+
+    /// 生效信任模式："ca" → ca；其余（含空串/未知值）→ 默认 pin。
+    pub fn trust_mode_effective(&self) -> &str {
+        if self.trust_mode.trim() == "ca" {
+            "ca"
+        } else {
+            "pin"
+        }
+    }
+
+    /// 生效 TUN 地址：空串回落库默认 10.7.0.1/30
+    pub fn tun_addr_or_default(&self) -> &str {
+        let s = self.tun_addr.trim();
+        if s.is_empty() {
+            "10.7.0.1/30"
+        } else {
+            s
+        }
+    }
+
+    /// 生效 TUN 端口列表：空串回落库默认 80,443,8080,8443
+    pub fn tun_ports_or_default(&self) -> &str {
+        let s = self.tun_ports.trim();
+        if s.is_empty() {
+            "80,443,8080,8443"
+        } else {
+            s
+        }
+    }
+
+    /// 设置/清除节点独立证书路径（trim 后为空 = 清除该条目，不存空串）
+    pub fn set_node_cert_path(&mut self, addr: &str, path: &str) {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            self.node_cert_paths.remove(addr);
+        } else {
+            self.node_cert_paths
+                .insert(addr.to_string(), trimmed.to_string());
         }
     }
 }
@@ -336,6 +401,68 @@ pub fn resolve_node_certs(cfg: &GuiConfig) -> Result<Vec<Vec<u8>>, String> {
     hydra_client::node_certs_from_env()
 }
 
+/// 校验 ca 模式叶证书 SHA-256 硬 pin：空串 = 不 pin（合法）；非空须恰好 64 hex。
+pub fn validate_leaf_pin(pin: &str) -> Result<(), String> {
+    let s = pin.trim();
+    if s.is_empty() {
+        return Ok(());
+    }
+    if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "叶证书 SHA-256 非法：需要 64 位 hex 字符（当前 {} 字符）",
+            s.chars().count()
+        ));
+    }
+    Ok(())
+}
+
+/// 信任根构造（配置文件 > 环境变量语义与 resolve_node_certs 一致）：
+/// - pin 模式（默认）：按「节点地址顺序收集证书」构造 TlsTrust::pinned；
+/// - ca 模式：TlsTrust::public_ca（可选叶证书 SHA-256 硬 pin）。
+/// `node_addrs` 顺序必须与传入 ProxyServer 的节点顺序一致（with_node_certs 按序对应）。
+pub fn resolve_trust(
+    cfg: &GuiConfig,
+    node_addrs: &[String],
+) -> Result<hydra_client::tcp_transport::TlsTrust, String> {
+    if cfg.trust_mode_effective() == "ca" {
+        validate_leaf_pin(&cfg.ca_leaf_pin)?;
+        let pin = cfg.ca_leaf_pin.trim();
+        let pin = if pin.is_empty() {
+            None
+        } else {
+            Some(pin.to_string())
+        };
+        // ca 模式信任公共 CA，节点证书文件不入信任根
+        return Ok(hydra_client::tcp_transport::TlsTrust::public_ca(pin));
+    }
+    let certs = resolve_node_certs_for_nodes(cfg, node_addrs)?;
+    Ok(hydra_client::tcp_transport::TlsTrust::pinned(certs))
+}
+
+/// 多节点证书按序收集（对应 HYDRA_NODE_CERTS 的 GUI 形态）：
+/// 每个节点先取 node_cert_paths[addr]（独立证书文件），缺项回落
+/// 全局 resolve_node_certs（cert_path > cert_der_b64 > HYDRA_NODE_CERT）。
+/// 返回向量顺序与 `node_addrs` 一一对应。
+pub fn resolve_node_certs_for_nodes(
+    cfg: &GuiConfig,
+    node_addrs: &[String],
+) -> Result<Vec<Vec<u8>>, String> {
+    node_addrs
+        .iter()
+        .map(|addr| {
+            let der = match cfg.node_cert_paths.get(addr).map(|s| s.trim()) {
+                Some(p) if !p.is_empty() => std::fs::read(p)
+                    .map_err(|e| format!("读取节点 {} 的证书 {} 失败: {}", addr, p, e)),
+                _ => resolve_node_certs(cfg).and_then(|mut v| {
+                    v.pop()
+                        .ok_or_else(|| "节点证书解析结果为空".to_string())
+                }),
+            }?;
+            Ok(der)
+        })
+        .collect()
+}
+
 /// 将配置中的探测间隔覆盖写入进程环境变量（仅当配置值非空时覆盖，
 /// 留空则保持 env 原值 = 向后兼容回落）。必须在任何工作线程 spawn 之前调用，
 /// 避免与其他线程的 env 读取并发竞争。
@@ -362,6 +489,7 @@ mod tests {
             close_to_tray: true,
             node_names: Default::default(),
             tun_enabled: false,
+            ..Default::default()
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: GuiConfig = serde_json::from_str(&json).unwrap();
@@ -414,6 +542,7 @@ mod tests {
             close_to_tray: true,
             node_names: Default::default(),
             tun_enabled: false,
+            ..Default::default()
         };
         save_to_file(&path, &cfg).expect("保存应成功");
         let loaded = load_from_file(&path)
@@ -676,13 +805,13 @@ mod tests {
 
     #[test]
     fn test_tun_enabled_reserved_default_false() {
-        // 缺省 / 旧版本配置文件 → tun_enabled=false（预留字段，不驱动任何行为）
+        // 缺省 / 旧版本配置文件 → tun_enabled=false
         let cfg: GuiConfig = serde_json::from_str("{}").unwrap();
         assert!(!cfg.tun_enabled);
         let old: GuiConfig = serde_json::from_str(r#"{"auth_key":"ff"}"#).unwrap();
         assert!(!old.tun_enabled);
 
-        // 显式 true 也能往返（序列化兼容），但 UI 恒回写 false
+        // 显式 true 也能往返（TUN 开关现驱动代理线程叠加 TUN 模式）
         let cfg = GuiConfig {
             tun_enabled: true,
             ..Default::default()
@@ -690,6 +819,144 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let back: GuiConfig = serde_json::from_str(&json).unwrap();
         assert!(back.tun_enabled);
+    }
+
+    // ===================== TUN 地址/端口 + 信任模式 + 多节点证书 =====================
+
+    #[test]
+    fn test_tun_settings_serde_and_defaults() {
+        // 新字段全量往返
+        let cfg = GuiConfig {
+            tun_enabled: true,
+            tun_addr: "10.9.0.1/24".into(),
+            tun_ports: "80,443".into(),
+            ..Default::default()
+        };
+        let back: GuiConfig = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
+
+        // 空串回落库默认（与 GUI 提示一致）
+        assert_eq!(GuiConfig::default().tun_addr_or_default(), "10.7.0.1/30");
+        assert_eq!(
+            GuiConfig::default().tun_ports_or_default(),
+            "80,443,8080,8443"
+        );
+        // 旧版本配置文件（缺字段）→ 空串，不报错
+        let old: GuiConfig = serde_json::from_str(r#"{"auth_key":"ff"}"#).unwrap();
+        assert_eq!(old.tun_addr_or_default(), "10.7.0.1/30");
+    }
+
+    #[test]
+    fn test_trust_mode_and_leaf_pin() {
+        // 空串/未知值 → 默认 pin；"ca" → ca
+        assert_eq!(GuiConfig::default().trust_mode_effective(), "pin");
+        let ca = GuiConfig {
+            trust_mode: "ca".into(),
+            ..Default::default()
+        };
+        assert_eq!(ca.trust_mode_effective(), "ca");
+        let weird = GuiConfig {
+            trust_mode: "bogus".into(),
+            ..Default::default()
+        };
+        assert_eq!(weird.trust_mode_effective(), "pin");
+
+        // 叶证书 pin 校验：空 = 不 pin（合法）；非空须 64 hex
+        assert!(validate_leaf_pin("").is_ok());
+        assert!(validate_leaf_pin("  ").is_ok());
+        assert!(validate_leaf_pin(&"a".repeat(64)).is_ok());
+        assert!(validate_leaf_pin(&"A1".repeat(32)).is_ok());
+        assert!(validate_leaf_pin(&"a".repeat(63)).is_err());
+        assert!(validate_leaf_pin(&"g".repeat(64)).is_err());
+
+        // ca 模式 + 非法 pin → resolve_trust 报错（不静默忽略）
+        let bad = GuiConfig {
+            trust_mode: "ca".into(),
+            ca_leaf_pin: "zz".into(),
+            ..Default::default()
+        };
+        assert!(resolve_trust(&bad, &[]).is_err());
+
+        // ca 模式 + 合法（空）pin → public_ca 成功
+        assert!(resolve_trust(&ca, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_node_cert_paths_per_node_and_migration() {
+        let dir = std::env::temp_dir().join(format!(
+            "hydra-gui-nodes-cert-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.der");
+        let b = dir.join("b.der");
+        std::fs::write(&a, [0xAA]).unwrap();
+        std::fs::write(&b, [0xBB]).unwrap();
+
+        let cfg = GuiConfig {
+            node_addrs: vec!["10.0.0.1:4433".into(), "10.0.0.2:4433".into()],
+            node_cert_paths: [
+                ("10.0.0.1:4433".to_string(), a.to_string_lossy().into_owned()),
+                ("10.0.0.2:4433".to_string(), b.to_string_lossy().into_owned()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        // 按节点顺序独立收集
+        let certs = resolve_node_certs_for_nodes(&cfg, &cfg.node_addrs).unwrap();
+        assert_eq!(certs, vec![vec![0xAA], vec![0xBB]]);
+
+        // 缺项节点回落全局证书路径
+        let mut cfg2 = GuiConfig {
+            node_addrs: vec!["10.0.0.1:4433".into(), "10.0.0.2:4433".into()],
+            ..Default::default()
+        };
+        cfg2.set_node_cert_path("10.0.0.1:4433", a.to_string_lossy().as_ref());
+        assert!(cfg2.node_cert_paths.contains_key("10.0.0.1:4433"));
+        // 全局 cert_path 由 resolve_node_certs 覆盖，此处给缺失路径验证回落错误来源
+        cfg2.cert_path = dir.join("global.der").to_string_lossy().into_owned();
+        let err = resolve_node_certs_for_nodes(&cfg2, &cfg2.node_addrs).unwrap_err();
+        assert!(err.contains("global.der"), "缺项应回落全局: {}", err);
+
+        // 空串 = 清除
+        cfg2.set_node_cert_path("10.0.0.1:4433", "  ");
+        assert!(!cfg2.node_cert_paths.contains_key("10.0.0.1:4433"));
+
+        // 地址改名随迁（与备注名同语义）
+        let mut cfg3 = GuiConfig {
+            node_addrs: vec!["10.0.0.1:4433".into()],
+            ..Default::default()
+        };
+        cfg3.set_node_cert_path("10.0.0.1:4433", "C:\\x.der");
+        cfg3.rename_node("10.0.0.1:4433", "10.0.0.9:9999");
+        assert_eq!(
+            cfg3.node_cert_paths.get("10.0.0.9:9999").unwrap(),
+            "C:\\x.der"
+        );
+        assert!(!cfg3.node_cert_paths.contains_key("10.0.0.1:4433"));
+
+        // serde 往返
+        let back: GuiConfig = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_trust_pinned_collects_in_order() {
+        // pin 模式（默认）：按节点顺序收集 → resolve_trust 成功（TlsTrust 内部持有证书）
+        let dir = std::env::temp_dir().join(format!("hydra-gui-trust-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("n.der");
+        std::fs::write(&p, [0x01]).unwrap();
+        let mut cfg = GuiConfig::default();
+        cfg.set_node_cert_path("1.2.3.4:443", p.to_string_lossy().as_ref());
+        assert!(resolve_trust(&cfg, &["1.2.3.4:443".to_string()]).is_ok());
+        // pin 模式证书缺失 → 报错透出根因
+        let _ = std::fs::remove_file(&p);
+        assert!(resolve_trust(&cfg, &["1.2.3.4:443".to_string()]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
