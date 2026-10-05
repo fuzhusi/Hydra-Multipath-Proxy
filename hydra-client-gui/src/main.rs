@@ -4,7 +4,8 @@
 use eframe::egui;
 use hydra_client::{
     format_bytes, format_duration, format_speed, generate_share_links, hex_encode_lower,
-    parse_share_links, sha256_hex, ProxyServer, ShareLink, TrafficMonitor, TrafficStats,
+    parse_share_links, parse_subscription, sha256_hex, ProxyServer, ShareLink, TrafficMonitor,
+    TrafficStats,
 };
 use hydra_protocol::{NodeInfo, NodeStatus};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -189,6 +190,188 @@ fn group_summary(
     (online, offline)
 }
 
+// ── 「从分享链接导入」→ 创建命名分组（复刻 Clash Profile 语义）──
+
+/// 本地文本来源前缀：分享导入创建的分组把**粘贴的原始文本**（可多行）存进
+/// `SubscriptionConfig::source`，对该分组点「立即更新」= 重新解析这段文本并按
+/// 认领合并（见 `subscription::fetch_subscription` 的 `hydra-text://` 分支）。
+/// 与 `hydra-sub://`（来源指针）约定并行不冲突：一个指向外部来源，一个内嵌原文。
+const LOCAL_TEXT_SOURCE_PREFIX: &str = "hydra-text://";
+
+/// 分享导入分组的默认名称（分享导入1、分享导入2…按现有订阅名递增避重）
+fn next_import_group_name(subs: &[SubscriptionConfig]) -> String {
+    let mut n = 1;
+    loop {
+        let candidate = format!("分享导入{}", n);
+        if !subs.iter().any(|s| s.name == candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// 订阅节点「合并替换」纯逻辑（UI 无关；`apply_subscription_update` 与分享导入共用）：
+/// - 手动节点与其它订阅的节点全部保留；
+/// - 本订阅旧节点被新列表替换（仅移除"仅本订阅认领"的地址，返回给调用方清状态）；
+/// - 与手动/其它订阅冲突的地址不重复添加，归属保持原状（单一事实来源 =
+///   各订阅 nodes 列表，见 [`GuiConfig::node_source_label`]）。
+/// 返回 (新增地址, 被移除地址)；本订阅 nodes 认领列表与 last_updated 在此一并落库。
+fn apply_subscription_node_update(
+    cfg: &mut GuiConfig,
+    name: &str,
+    links: &[ShareLink],
+) -> (Vec<String>, Vec<String>) {
+    let Some(idx) = cfg.subscriptions.iter().position(|s| s.name == name) else {
+        return (Vec::new(), Vec::new());
+    };
+
+    // 新地址列表（去重保序）
+    let mut new_addrs: Vec<String> = Vec::new();
+    for link in links {
+        let addr = format!("{}:{}", link.address, link.port);
+        if !new_addrs.contains(&addr) {
+            new_addrs.push(addr);
+        }
+    }
+
+    let old_sub_nodes = cfg.subscriptions[idx].nodes.clone();
+    let owned_before: HashSet<String> = cfg.subscription_owned_addrs().into_iter().collect();
+    let manual_set: HashSet<String> = cfg
+        .node_addrs
+        .iter()
+        .filter(|a| !owned_before.contains(*a))
+        .cloned()
+        .collect();
+    let others_set: HashSet<String> = cfg
+        .subscriptions
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != idx)
+        .flat_map(|(_, s)| s.nodes.iter().cloned())
+        .collect();
+    let new_set: HashSet<String> = new_addrs.iter().cloned().collect();
+
+    // 1) 移除：仅本订阅认领、且新列表不再包含的旧节点
+    let to_remove: Vec<String> = old_sub_nodes
+        .iter()
+        .filter(|a| !new_set.contains(*a) && !manual_set.contains(*a) && !others_set.contains(*a))
+        .cloned()
+        .collect();
+    cfg.node_addrs.retain(|a| !to_remove.contains(a));
+    for a in &to_remove {
+        // 审查修复：订阅更新移除旧节点时清残留状态（remove_node_state 收口）
+        cfg.remove_node_state(a);
+    }
+
+    // 2) 追加：新地址中尚未在列表、且不被其他订阅认领的
+    let mut added = Vec::new();
+    for a in &new_addrs {
+        if cfg.node_addrs.contains(a) || others_set.contains(a) {
+            continue;
+        }
+        cfg.node_addrs.push(a.clone());
+        added.push(a.clone());
+    }
+
+    // 3) 本订阅新认领列表：最终在列表中、非手动、非其他订阅的地址
+    let claimed: Vec<String> = new_addrs
+        .iter()
+        .filter(|a| {
+            cfg.node_addrs.contains(*a) && !manual_set.contains(*a) && !others_set.contains(*a)
+        })
+        .cloned()
+        .collect();
+    cfg.subscriptions[idx].nodes = claimed;
+    cfg.subscriptions[idx].last_updated_secs = Some(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
+
+    (added, to_remove)
+}
+
+/// 一次「创建分组导入」的结果（节点状态同步所需的最小信息）
+#[derive(Debug)]
+struct GroupImportResult {
+    /// 新加入节点列表的地址（调用方补 node_status 初始记录）
+    added: Vec<String>,
+    /// 被移出节点列表的地址（调用方清理 node_status；config 内部状态已由纯函数清理）
+    removed: Vec<String>,
+    /// 最终归属该分组的节点数
+    node_count: usize,
+    /// 解析失败的坏行数（不致命，日志展示）
+    bad_lines: usize,
+}
+
+/// 从粘贴文本创建**命名分组**（纯逻辑，UI 与单测共用）：
+/// 1. 名称必填且不得与现有订阅重名（与 add_subscription 同规则）；
+/// 2. 用 `parse_subscription` 逐行解析（坏行跳过并计数；整体 base64 兼容）；
+/// 3. 全部链接解析失败 → 报错，不创建分组；
+/// 4. 创建 `SubscriptionConfig`，source 存 `hydra-text://` + 粘贴原文（更新语义）；
+/// 5. 节点按认领合并进该分组；合并后分组认领 0 个节点 → 撤销创建并报错。
+fn import_share_links_as_group(
+    cfg: &mut GuiConfig,
+    name: &str,
+    text: &str,
+) -> Result<GroupImportResult, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("请先填写分组名称".to_string());
+    }
+    if cfg.subscriptions.iter().any(|s| s.name == name) {
+        return Err(format!("分组名称「{}」已存在，请换一个名称", name));
+    }
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("请先粘贴 hydra:// 分享链接".to_string());
+    }
+    // 逐行解析（坏行跳过不致命；整体 base64 订阅文本也兼容）
+    let parsed = parse_subscription(text);
+    if parsed.links.is_empty() {
+        let detail = if parsed.errors.is_empty() {
+            "未在文本中找到 hydra:// 分享链接".to_string()
+        } else {
+            format!("全部链接解析失败（{} 条坏行），未创建分组", parsed.errors.len())
+        };
+        return Err(detail);
+    }
+
+    // 先建分组条目（source = 粘贴原文 + hydra-text:// 前缀，供「立即更新」重解析）
+    cfg.subscriptions.push(SubscriptionConfig {
+        name: name.to_string(),
+        source: format!("{}{}", LOCAL_TEXT_SOURCE_PREFIX, text),
+        last_updated_secs: None,
+        nodes: Vec::new(),
+    });
+
+    // 按认领合并节点（复用订阅更新的同一套纯逻辑）
+    let (added, removed) = apply_subscription_node_update(cfg, name, &parsed.links);
+
+    // 空分组清理：合并后该分组未认领任何节点（如地址全被手动/其他订阅认领）→ 撤销
+    let node_count = cfg
+        .subscriptions
+        .iter()
+        .find(|s| s.name == name)
+        .map(|s| s.nodes.len())
+        .unwrap_or(0);
+    if node_count == 0 {
+        cfg.subscriptions.retain(|s| s.name != name);
+        return Err(format!(
+            "分组「{}」未认领到任何节点（地址可能已被手动/其他订阅持有），未创建",
+            name
+        ));
+    }
+
+    Ok(GroupImportResult {
+        added,
+        removed,
+        node_count,
+        bad_lines: parsed.errors.len(),
+    })
+}
+
 struct HydraApp {
     // 应用状态
     proxy_running: bool,
@@ -231,6 +414,10 @@ struct HydraApp {
     import_status: Option<(bool, String)>,
     /// UI 重设计第一批：「＋ → 从分享链接导入」对话框开关（原节点页内联导入区迁入）
     import_dialog_open: bool,
+    /// 分享导入分组的名称输入（默认自动生成「分享导入N」避重；重名校验与 add_subscription 同规则）
+    import_group_name: String,
+    /// 分享导入旧行为开关：false（默认）= 创建命名分组；true = 不建分组、直接导入为手动节点
+    import_as_manual: bool,
     /// UI 重设计第一批：「＋ → 手动添加节点」对话框开关（原页顶输入行迁入）
     manual_add_open: bool,
     /// UI 重设计第一批：「＋ → 分享节点」按节点选择对话框开关（批量导出也在其中）
@@ -333,6 +520,8 @@ impl Default for HydraApp {
             import_text: String::new(),
             import_status: None,
             import_dialog_open: false,
+            import_group_name: String::new(),
+            import_as_manual: false,
             manual_add_open: false,
             share_pick_open: false,
             node_testing_addr: None,
@@ -580,6 +769,8 @@ impl HydraApp {
             import_text: String::new(),
             import_status: None,
             import_dialog_open: false,
+            import_group_name: String::new(),
+            import_as_manual: false,
             manual_add_open: false,
             share_pick_open: false,
             node_testing_addr: None,
@@ -1734,8 +1925,14 @@ impl HydraApp {
         self.import_status = Some((ok, msg));
     }
 
-    /// 导入粘贴文本中的分享链接（支持多行，每行一条）
+    /// 导入粘贴文本中的分享链接（支持多行，每行一条）。
+    /// 默认（导入为分组）→ 创建命名分组（Clash Profile 语义）；
+    /// 勾选「不建分组，直接导入为手动节点」→ 保留旧行为（节点进「手动」组）。
     fn import_pasted_links(&mut self) {
+        if !self.import_as_manual {
+            self.import_pasted_links_as_group();
+            return;
+        }
         let text = self.import_text.clone();
         if text.trim().is_empty() {
             self.set_import_status(false, "请先粘贴 hydra:// 分享链接".to_string());
@@ -1761,6 +1958,44 @@ impl HydraApp {
                 }
             }
             Err(e) => self.set_import_status(false, format!("链接解析失败: {}", e)),
+        }
+    }
+
+    /// 导入粘贴文本为**命名分组**（默认路径）：
+    /// 创建 `SubscriptionConfig` 条目（source = hydra-text:// + 粘贴原文），节点按
+    /// 认领合并进该分组；成功后关闭对话框（条目即时出现在订阅列表）。
+    /// 任何校验失败（重名 / 全坏行 / 空分组）→ 报错不关窗、不创建。
+    fn import_pasted_links_as_group(&mut self) {
+        let text = self.import_text.clone();
+        let name = self.import_group_name.clone();
+        match import_share_links_as_group(&mut self.config, &name, &text) {
+            Ok(result) => {
+                // 运行时节点状态同步（与 apply_subscription_update 同一套收口）
+                for a in &result.added {
+                    self.node_status.entry(a.clone()).or_insert(NodeStatusInfo {
+                        connected: false,
+                        last_check: None,
+                        latency_ms: None,
+                    });
+                }
+                for a in &result.removed {
+                    self.node_status.remove(a);
+                }
+                let msg = format!(
+                    "已导入分组「{}」：{} 个节点（坏行 {} 条）",
+                    name.trim(),
+                    result.node_count,
+                    result.bad_lines
+                );
+                self.set_import_status(true, msg);
+                // 成功才关窗：条目已在订阅列表，节点已进该分组的组标签
+                self.import_dialog_open = false;
+                self.import_text.clear();
+            }
+            Err(e) => {
+                // 失败不关窗：保留已粘贴文本与名称，便于就地修正后重试
+                self.set_import_status(false, e);
+            }
         }
     }
 
@@ -2041,99 +2276,39 @@ impl HydraApp {
         links: Vec<ShareLink>,
         errors: Vec<String>,
     ) {
-        let Some(idx) = self
-            .config
-            .subscriptions
-            .iter()
-            .position(|s| s.name == name)
-        else {
+        if !self.config.subscriptions.iter().any(|s| s.name == name) {
             self.add_log(format!("订阅「{}」已在更新期间被删除，丢弃更新结果", name));
             return;
-        };
-
-        // 新地址列表（去重保序）
-        let mut new_addrs: Vec<String> = Vec::new();
-        for link in links {
-            let addr = format!("{}:{}", link.address, link.port);
-            if !new_addrs.contains(&addr) {
-                new_addrs.push(addr);
-            }
         }
 
-        let old_sub_nodes = self.config.subscriptions[idx].nodes.clone();
-        let owned_before: HashSet<String> =
-            self.config.subscription_owned_addrs().into_iter().collect();
-        let manual_set: HashSet<String> = self
-            .config
-            .node_addrs
-            .iter()
-            .filter(|a| !owned_before.contains(*a))
-            .cloned()
-            .collect();
-        let others_set: HashSet<String> = self
+        // 合并替换的纯逻辑（与分享导入分组共用，见 apply_subscription_node_update）
+        let (added, to_remove) = apply_subscription_node_update(&mut self.config, name, &links);
+        let new_addrs_len = self
             .config
             .subscriptions
             .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != idx)
-            .flat_map(|(_, s)| s.nodes.iter().cloned())
-            .collect();
-        let new_set: HashSet<String> = new_addrs.iter().cloned().collect();
+            .find(|s| s.name == name)
+            .map(|s| s.nodes.len())
+            .unwrap_or(0);
 
-        // 1) 移除：仅本订阅认领、且新列表不再包含的旧节点
-        let to_remove: Vec<String> = old_sub_nodes
-            .iter()
-            .filter(|a| {
-                !new_set.contains(*a) && !manual_set.contains(*a) && !others_set.contains(*a)
-            })
-            .cloned()
-            .collect();
-        self.config.node_addrs.retain(|a| !to_remove.contains(a));
-        for a in &to_remove {
-            self.node_status.remove(a);
-            // 审查修复：订阅更新移除旧节点时同样清残留状态（remove_node_state 收口）
-            self.config.remove_node_state(a);
-        }
-
-        // 2) 追加：新地址中尚未在列表、且不被其他订阅认领的
-        let mut added = 0usize;
-        for a in &new_addrs {
-            if self.config.node_addrs.contains(a) || others_set.contains(a) {
-                continue;
-            }
+        // 运行时节点状态同步（纯函数只动 config，不持 node_status）
+        for a in &added {
             self.node_status.entry(a.clone()).or_insert(NodeStatusInfo {
                 connected: false,
                 last_check: None,
                 latency_ms: None,
             });
-            self.config.node_addrs.push(a.clone());
-            added += 1;
         }
-
-        // 3) 本订阅新认领列表：最终在列表中、非手动、非其他订阅的地址
-        let claimed: Vec<String> = new_addrs
-            .iter()
-            .filter(|a| {
-                self.config.node_addrs.contains(*a)
-                    && !manual_set.contains(*a)
-                    && !others_set.contains(*a)
-            })
-            .cloned()
-            .collect();
-        self.config.subscriptions[idx].nodes = claimed;
-        self.config.subscriptions[idx].last_updated_secs = Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-        );
+        for a in &to_remove {
+            self.node_status.remove(a);
+        }
 
         self.add_log(format!(
             "订阅「{}」更新成功：{} 个节点（坏行 {} 条跳过，新增 {}、移除 {}）",
             name,
-            new_addrs.len(),
+            new_addrs_len,
             errors.len(),
-            added,
+            added.len(),
             to_remove.len()
         ));
         for e in errors.iter().take(3) {
@@ -3136,13 +3311,27 @@ impl HydraApp {
                 .resizable(true)
                 .default_width(480.0)
                 .show(ctx, |ui| {
+                    // 分组名称（默认自动生成「分享导入N」，重名报错不关窗）
+                    ui.horizontal(|ui| {
+                        ui.label("分组名称：");
+                        let name_edit = egui::TextEdit::singleline(&mut self.import_group_name)
+                            .desired_width(220.0)
+                            .hint_text("分享导入1");
+                        ui.add_enabled(!self.import_as_manual, name_edit);
+                        ui.small("（必填，将作为一条条目出现在「📡 订阅」列表）");
+                    });
                     ui.add(
                         egui::TextEdit::multiline(&mut self.import_text)
                             .desired_rows(4)
                             .hint_text("粘贴 hydra:// 分享链接（支持多行，每行一条）"),
                     );
                     ui.horizontal(|ui| {
-                        if ui.button("导入粘贴的链接").clicked() {
+                        let import_label = if self.import_as_manual {
+                            "导入粘贴的链接（手动节点）"
+                        } else {
+                            "📥 导入（创建分组）"
+                        };
+                        if ui.button(import_label).clicked() {
                             self.import_pasted_links();
                         }
                         if ui.button("从链接文件导入 (.txt)").clicked() {
@@ -3152,6 +3341,12 @@ impl HydraApp {
                             self.import_dialog_open = false;
                         }
                     });
+                    // 旧行为保留开关（默认关 = 建分组，Clash Profile 语义）
+                    ui.checkbox(
+                        &mut self.import_as_manual,
+                        "不建分组，直接导入为手动节点",
+                    )
+                    .on_hover_text("勾选后节点进入「手动」组（旧行为）；默认不勾选 = 创建命名分组，条目出现在订阅列表");
                     if let Some((ok, msg)) = &self.import_status {
                         ui.colored_label(
                             if *ok { palette::SUCCESS } else { palette::DANGER },
@@ -3159,7 +3354,7 @@ impl HydraApp {
                         );
                     }
                     ui.small("完整分享含密钥/证书，导入后自动配置，无需再填密钥与证书文件");
-                    ui.small("ℹ 导入的节点是「手动节点」（单个分享链接 ≠ 订阅源）：可自由编辑、不随订阅更新；如需多节点自动更新，请到「📡 订阅」页添加订阅源");
+                    ui.small("ℹ 默认创建命名分组：分组出现在「📡 订阅」列表、节点进入同名组标签；该分组的「立即更新」会重新解析粘贴的原文");
                 });
         }
 
@@ -3291,6 +3486,11 @@ impl HydraApp {
                             ui.close_menu();
                         }
                         if ui.button("📋 从分享链接导入").clicked() {
+                            // 打开时预生成默认分组名（按现有订阅名避重）并清上次提示
+                            self.import_group_name =
+                                next_import_group_name(&self.config.subscriptions);
+                            self.import_as_manual = false;
+                            self.import_status = None;
                             self.import_dialog_open = true;
                             ui.close_menu();
                         }
@@ -4531,5 +4731,149 @@ mod tests {
         let addrs: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
         assert_eq!(group_summary(&status, &addrs), (1, 1));
         assert_eq!(group_summary(&status, &[]), (0, 0));
+    }
+
+    // ── 「从分享链接导入」→ 创建命名分组 ──
+
+    /// 构造一条合法的 v1 分享链接（与 subscription 层测试同一格式）
+    fn share_link_line(addr: &str, port: u16) -> String {
+        format!(
+            "hydra://{}:{}?bandwidth=100&latency=10&loss_rate=0.01&status=online",
+            addr, port
+        )
+    }
+
+    #[test]
+    fn next_import_group_name_skips_existing_subscription_names() {
+        // 空列表 → 分享导入1
+        assert_eq!(next_import_group_name(&[]), "分享导入1");
+        // 已有 分享导入1 → 分享导入2；连号占用逐个后移
+        let mut subs = vec![SubscriptionConfig {
+            name: "分享导入1".to_string(),
+            source: String::new(),
+            last_updated_secs: None,
+            nodes: Vec::new(),
+        }];
+        assert_eq!(next_import_group_name(&subs), "分享导入2");
+        subs.push(SubscriptionConfig {
+            name: "分享导入2".to_string(),
+            source: String::new(),
+            last_updated_secs: None,
+            nodes: Vec::new(),
+        });
+        assert_eq!(next_import_group_name(&subs), "分享导入3");
+        // 与普通订阅名不冲突（只对「分享导入N」序列避重）
+        subs.push(SubscriptionConfig {
+            name: "分享导入3".to_string(),
+            source: String::new(),
+            last_updated_secs: None,
+            nodes: Vec::new(),
+        });
+        assert_eq!(next_import_group_name(&subs), "分享导入4");
+    }
+
+    #[test]
+    fn import_as_group_creates_named_group_and_filters() {
+        let mut cfg = GuiConfig::default();
+        let text = format!(
+            "{}\n坏行\n{}\n",
+            share_link_line("10.1.0.1", 1001),
+            share_link_line("10.1.0.2", 1002)
+        );
+        let result = import_share_links_as_group(&mut cfg, "分享导入1", &text).unwrap();
+        // 分组条目出现在订阅列表；source 存粘贴原文（hydra-text:// 前缀，更新语义）
+        assert_eq!(cfg.subscriptions.len(), 1);
+        assert_eq!(cfg.subscriptions[0].name, "分享导入1");
+        assert!(cfg.subscriptions[0]
+            .source
+            .starts_with(LOCAL_TEXT_SOURCE_PREFIX));
+        assert!(cfg.subscriptions[0].source.contains(&share_link_line("10.1.0.1", 1001)));
+        // 2 个节点认领进该分组，1 条坏行
+        assert_eq!(result.node_count, 2);
+        assert_eq!(result.bad_lines, 1);
+        assert_eq!(cfg.subscriptions[0].nodes.len(), 2);
+        assert_eq!(result.added.len(), 2);
+        // 节点已进入节点列表，且组视图可按该分组过滤
+        assert_eq!(cfg.node_addrs.len(), 2);
+        let filtered = filter_nodes_by_group(
+            &cfg,
+            &cfg.node_addrs.clone(),
+            &Some("分享导入1".to_string()),
+        );
+        assert_eq!(filtered.len(), 2);
+        // 「手动」组为空（节点全归分组）
+        assert!(filter_nodes_by_group(
+            &cfg,
+            &cfg.node_addrs.clone(),
+            &Some(GROUP_MANUAL.to_string())
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn import_as_group_rejects_duplicate_and_invalid() {
+        let mut cfg = GuiConfig::default();
+        cfg.subscriptions.push(SubscriptionConfig {
+            name: "已有分组".to_string(),
+            source: String::new(),
+            last_updated_secs: None,
+            nodes: Vec::new(),
+        });
+        // 名称重复 → 报错，不新建
+        let err = import_share_links_as_group(
+            &mut cfg,
+            "已有分组",
+            &share_link_line("10.2.0.1", 2001),
+        )
+        .unwrap_err();
+        assert!(err.contains("已存在"), "err: {}", err);
+        assert_eq!(cfg.subscriptions.len(), 1);
+        // 空名称 → 报错
+        assert!(import_share_links_as_group(&mut cfg, "  ", "x").is_err());
+        // 全部链接解析失败 → 报错，不创建分组
+        let err = import_share_links_as_group(&mut cfg, "新分组", "不是链接\n也不是链接").unwrap_err();
+        assert!(err.contains("未创建分组"), "err: {}", err);
+        assert!(cfg.subscriptions.len() == 1 && cfg.node_addrs.is_empty());
+        // 空文本 → 报错
+        assert!(import_share_links_as_group(&mut cfg, "新分组", "   ").is_err());
+    }
+
+    #[test]
+    fn import_as_group_rolls_back_when_no_node_claimed() {
+        // 目标地址已被其他订阅认领 → 新分组认领 0 节点 → 撤销创建（空分组清理）
+        let mut cfg = group_fixture();
+        let owned = "10.0.0.2:2"; // 已被「订阅A」认领
+        let err = import_share_links_as_group(&mut cfg, "分享导入X", &share_link_line("10.0.0.2", 2))
+            .unwrap_err();
+        assert!(err.contains("未认领到任何节点"), "err: {}", err);
+        // 未留下空分组，节点列表无变化
+        assert!(!cfg.subscriptions.iter().any(|s| s.name == "分享导入X"));
+        assert_eq!(cfg.node_addrs.len(), 4);
+        let _ = owned;
+    }
+
+    #[test]
+    fn local_text_source_reparse_produces_same_links() {
+        // 「更新」语义：source（hydra-text:// + 原文）重解析 = 原导入同样的节点集合
+        let text = format!("{}\n{}\n", share_link_line("10.3.0.1", 3001), share_link_line("10.3.0.2", 3002));
+        let mut cfg = GuiConfig::default();
+        import_share_links_as_group(&mut cfg, "分享导入1", &text).unwrap();
+        let source = cfg.subscriptions[0].source.clone();
+        let reparsed = subscription::fetch_and_parse_subscription(
+            "分享导入1".to_string(),
+            source,
+            subscription::SUBSCRIPTION_FETCH_TIMEOUT,
+        )
+        .unwrap();
+        let mut addrs: Vec<String> = reparsed
+            .links
+            .iter()
+            .map(|l| format!("{}:{}", l.address, l.port))
+            .collect();
+        addrs.sort();
+        assert_eq!(
+            addrs,
+            vec!["10.3.0.1:3001".to_string(), "10.3.0.2:3002".to_string()]
+        );
     }
 }

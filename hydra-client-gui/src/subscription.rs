@@ -63,6 +63,16 @@ pub fn fetch_subscription(source: &str, timeout: Duration) -> Result<FetchedSubs
         return Err("订阅来源为空".to_string());
     }
 
+    // 「从分享链接导入」创建的命名分组：source = hydra-text:// + 粘贴原文（内嵌文本，
+    // 非外部来源指针）。更新 = 直接把原文交给解析层重解析，与「立即更新」同一入口。
+    // 与 hydra-sub://（指向 URL/文件的指针）约定并行，互不影响。
+    if let Some(text) = src.strip_prefix("hydra-text://") {
+        return Ok(FetchedSubscription {
+            text: text.to_string(),
+            plaintext_http: false,
+        });
+    }
+
     if src.starts_with("http://") || src.starts_with("https://") {
         let plaintext_http = src.starts_with("http://");
         let agent = ureq::AgentBuilder::new().timeout(timeout).build();
@@ -157,6 +167,24 @@ mod tests {
         .is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_local_text_source_is_parsed_directly() {
+        // 分享导入分组（hydra-text:// 前缀 = 内嵌原文）：更新时直接重解析原文，
+        // 不走 http/文件路径；多行原文逐行解析，坏行计入 errors
+        let pasted = "hydra://127.0.0.1:8080?bandwidth=100&latency=10&loss_rate=0.01&status=online\n坏行\n";
+        let outcome = fetch_and_parse_subscription(
+            "分享导入1".to_string(),
+            format!("hydra-text://{}", pasted),
+            SUBSCRIPTION_FETCH_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(outcome.name, "分享导入1");
+        assert_eq!(outcome.links.len(), 1);
+        assert_eq!(outcome.links[0].address, "127.0.0.1");
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(!outcome.plaintext_http);
     }
 
     #[test]
