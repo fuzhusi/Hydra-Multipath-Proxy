@@ -240,6 +240,111 @@ fn probe_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// 代理线程异步主体（抽出为自由函数以便单测时序回归）。
+///
+/// 【问题 2 根因与修复】此前版本在此处先 `let _ = watcher.await;` 再进 select 跑
+/// `proxy.start()`——watcher 的完成条件是 bound_addr 就绪，而 bound_addr 只有
+/// start() 里的 bind 才会置位，于是 watcher 在等 start、start 却排在 watcher
+/// 之后从未开始执行：两者互相等待，每次启动必然干等 60s 超时
+///（用户日志 16:56:34 启动 → 16:57:39 "60s 内未就绪"即此）。
+/// 修复：就绪 watcher 保持 tokio 后台任务并发运行（发出就绪/超时信号即返回，
+/// 克隆的 ready_tx 丢弃无副作用），不再阻塞等待；start() 立即进入 select 执行
+/// 认证检查 → register_nodes → bind → 置 bound_addr（正常数毫秒完成）。
+/// stop 信号通过 stop_flag 轮询分支优雅停机（含 TUN 任务取消与路由清理）。
+async fn run_proxy_until_stopped(
+    proxy: Arc<ProxyServer>,
+    tx: std::sync::mpsc::Sender<std::result::Result<SocketAddr, std::io::Error>>,
+    stop_flag: Arc<AtomicBool>,
+    tun_task: Option<(hydra_client::ShutdownToken, tokio::task::JoinHandle<()>)>,
+) {
+    // 就绪信号以真实 bound_addr 置位为准——后台并发 watcher，绝不阻塞 start()
+    let p2 = proxy.clone();
+    let ready_tx = tx.clone();
+    tokio::spawn(async move {
+        for _ in 0..600 {
+            if let Some(bound) = p2.bound_addr() {
+                let _ = ready_tx.send(Ok(bound));
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let _ = ready_tx.send(Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "代理监听 60s 内未就绪（地址被占用或节点预热超时）",
+        )));
+    });
+    tokio::select! {
+        result = proxy.start() => {
+            match result {
+                Ok(()) => {
+                    println!("[Proxy Thread] Proxy server exited normally");
+                }
+                Err(e) => {
+                    eprintln!("[Proxy Thread] Proxy server error: {}", e);
+                    // release 版无控制台：失败必须回传 UI 可见
+                    let _ = tx.send(Err(std::io::Error::other(format!("代理异常退出: {e}"))));
+                }
+            }
+        }
+        _ = async {
+            while !stop_flag.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        } => {
+            println!("[Proxy Thread] Received stop signal");
+            // TUN 任务优雅停机：取消令牌 → 栈任务退出 → RouteGuard Drop 清理路由；
+            // 最多等 5s（与 CLI 停机超时一致），超时则随 runtime 关闭强收
+            if let Some((token, task)) = tun_task {
+                token.cancel();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+            }
+        }
+    }
+}
+
+/// 启动大按钮状态机（问题 1）：把「按钮文字 + 是否可点」收口为纯函数，
+/// UI 渲染与单测共用同一套转换规则。
+/// - 停止态：「▶ 启动代理」可点；
+/// - 启动期（proxy_starting，bound 未就绪）：「⏳ 启动中…」且禁用——用户点击后
+///   立即可见反馈，不再"看似没反应"；重复点击也被禁用天然拦截；
+/// - 运行态（bound 就绪）：「■ 停止代理」可点；
+/// - 失败/异常退出：poll_start_receiver / 异常退出分支把两个状态位复位，
+///   自然回到「▶ 启动代理」，日志区给出失败根因。
+fn start_button_state(proxy_running: bool, proxy_starting: bool) -> (&'static str, bool) {
+    if proxy_running {
+        ("■ 停止代理", true)
+    } else if proxy_starting {
+        ("⏳ 启动中…", false)
+    } else {
+        ("▶ 启动代理", true)
+    }
+}
+
+/// 单节点测速探测目标默认值（问题 3）。
+///
+/// 此前用 `192.0.0.1:9`（TEST-NET-3 文档段 discard 端口）：该网段不路由，多数
+/// 防火墙对不可路由地址静默丢包 → 节点侧建连挂满超时 → 节点明明健康却报
+/// "测速超时"。改为 `1.1.1.1:443`（Cloudflare，TCP 443 全球快速可连，节点侧
+/// 建连 ~1ms 级）：节点回 TargetUnreachable（0x01 应答）仍代表"认证通过、
+/// 节点健康"（目标侧失败不影响节点判定），成功/握手失败/连接超时三分逻辑不变。
+const PROBE_TARGET_DEFAULT: &str = "1.1.1.1:443";
+
+/// 探测目标 env 覆盖键（特殊网络环境下可指向自选可达地址）
+const PROBE_TARGET_ENV: &str = "HYDRA_PROBE_TARGET";
+
+/// 探测目标解析（纯函数便于单测）：env 值非空（去首尾空白）则覆盖，否则用默认值。
+fn probe_target_from(env_value: Option<&str>) -> String {
+    match env_value {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => PROBE_TARGET_DEFAULT.to_string(),
+    }
+}
+
+/// 当前生效的探测目标（读 env 覆盖；只读不写，无 R-24 数据竞争面）
+fn probe_target() -> String {
+    probe_target_from(std::env::var(PROBE_TARGET_ENV).ok().as_deref())
+}
+
 impl HydraApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // 设置自定义字体
@@ -423,8 +528,9 @@ impl HydraApp {
     /// 信任根由调用方按「配置文件 > 环境变量」构造后传入（config.rs resolve_trust，
     /// 支持 pin/ca 双信任模式与逐节点证书）
     /// 0-7 修复"测速假绿"：不再只做 TCP connect（测不出密钥错误），而是完整走
-    /// `connect_target`（TCP+TLS+Noise-PSK 认证 + 节点应答）。探测目标用
-    /// `192.0.0.1:9`（TEST-NET-3 测试网段 discard 端口，节点侧快速失败、完整走认证），
+    /// `connect_target`（TCP+TLS+Noise-PSK 认证 + 节点应答）。探测目标默认
+    /// `1.1.1.1:443`（问题 3：原 `192.0.0.1:9` 撞静默丢包防火墙导致健康节点被
+    /// 误判"测速超时"；现可用 `HYDRA_PROBE_TARGET` env 覆盖，见 PROBE_TARGET_*），
     /// 错误分类：
     /// - 节点回"目标不可达"（TargetUnreachable / 应答 0x01）→ **认证已通过，节点健康 ✓**，
     ///   返回耗时 ms（测速语义不变）；
@@ -443,20 +549,15 @@ impl HydraApp {
             .map_err(|e| format!("地址解析失败: {}", e))?;
 
         let start = std::time::Instant::now();
-        // 总时限 10s：目标探测在节点侧快速失败，正常远小于该值；覆盖 TCP/TLS 5s+握手
+        // 总时限 10s：目标探测在节点侧快速失败（1.1.1.1:443 节点侧建连 ~1ms 级），
+        // 正常远小于该值；覆盖 TCP/TLS 5s+握手
         let probe = tokio::time::timeout(
             std::time::Duration::from_millis(10_000),
-            connect_target(
-                addr,
-                hydra_client::DEFAULT_SNI,
-                &trust,
-                &auth_key,
-                "192.0.0.1:9",
-            ),
+            connect_target(addr, hydra_client::DEFAULT_SNI, &trust, &auth_key, &probe_target()),
         )
         .await;
         match probe {
-            // 目标探测成功（理论不可能，TEST-NET 不路由）——握手已通过，同样算节点健康
+            // 目标探测成功（1.1.1.1:443 可直连时可能发生）——握手已通过，同样算节点健康
             Ok(Ok(_)) => Ok(start.elapsed().as_millis() as u64),
             Ok(Err(e)) => match &e {
                 // 节点存活且完成了 Noise 认证，只是目标连不上（含 SSRF 拒绝/DNS 失败）
@@ -908,55 +1009,7 @@ impl HydraApp {
                 } else {
                     None
                 };
-                // 就绪信号以真实 bound_addr 置位为准（start 内部含 endpoint 创建与节点预热，
-                // 可能数十秒）——不再用"测试绑定后丢弃"的 TOCTOU 假信号
-                let p2 = proxy.clone();
-                let ready_tx = tx.clone();
-                let watcher = tokio::spawn(async move {
-                    for _ in 0..600 {
-                        if let Some(bound) = p2.bound_addr() {
-                            let _ = ready_tx.send(Ok(bound));
-                            return;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                    let _ = ready_tx.send(Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "代理监听 60s 内未就绪（地址被占用或节点预热超时）",
-                    )));
-                });
-                let _ = watcher.await;
-                tokio::select! {
-                    result = proxy.start() => {
-                        match result {
-                            Ok(()) => {
-                                println!("[Proxy Thread] Proxy server exited normally");
-                            }
-                            Err(e) => {
-                                eprintln!("[Proxy Thread] Proxy server error: {}", e);
-                                // release 版无控制台：失败必须回传 UI 可见
-                                let _ = tx.send(Err(std::io::Error::other(format!("代理异常退出: {e}"))));
-                            }
-                        }
-                    }
-                    _ = async {
-                        while !stop_flag_clone.load(Ordering::Relaxed) {
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                    } => {
-                        println!("[Proxy Thread] Received stop signal");
-                        // TUN 任务优雅停机：取消令牌 → 栈任务退出 → RouteGuard Drop 清理路由；
-                        // 最多等 5s（与 CLI 停机超时一致），超时则随 runtime 关闭强收
-                        if let Some((token, task)) = tun_task {
-                            token.cancel();
-                            let _ = tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                task,
-                            )
-                            .await;
-                        }
-                    }
-                }
+                run_proxy_until_stopped(proxy, tx, stop_flag_clone, tun_task).await;
             });
             println!("[Proxy Thread] Thread exiting...");
             // 代理线程退出时发送通知
@@ -971,6 +1024,9 @@ impl HydraApp {
         self.proxy_start_receiver = Some(rx);
         self.proxy_starting = true;
         self.add_log("代理启动中…（节点预热可能需要数十秒，视网络质量而定）".to_string());
+        // 启动阶段性日志（问题 1/2 附加）：让用户知道当前卡在哪一步，
+        // 就绪后 poll_start_receiver 会接续输出「✓ 代理已就绪」
+        self.add_log(format!("正在绑定 {}…", proxy_addr));
     }
 
     /// update 轮询：消费代理就绪信号（非阻塞，替代原先冻结 UI 的阻塞 recv）
@@ -1027,7 +1083,8 @@ impl HydraApp {
         match signal {
             Ok(addr) => {
                 self.proxy_running = true;
-                self.add_log(format!("代理已就绪，监听地址: {addr}"));
+                // 阶段性日志收尾（问题 1/2 附加）：明确告知用户代理可用
+                self.add_log(format!("✓ 代理已就绪，监听地址: {addr}"));
                 self.maybe_save_config(true);
                 // 审查修复：TUN 模式已全局接管流量，就绪后不再叠加系统代理
                 //（否则制造"系统代理 + TUN"二次进本代理的被警示终态）
@@ -2399,6 +2456,8 @@ impl HydraApp {
     fn sync_tray_tooltip(&mut self) {
         let tip = if self.proxy_running {
             "Hydra 代理运行中"
+        } else if self.proxy_starting {
+            "Hydra 代理启动中…"
         } else {
             "Hydra 代理已停止"
         };
@@ -2422,8 +2481,11 @@ impl HydraApp {
             .inner_margin(egui::Margin::same(12.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    // 状态文本三态（问题 1）：启动期也给可见反馈，不再"看似没反应"
                     let (status_text, status_color) = if self.proxy_running {
                         ("● 运行中", egui::Color32::from_rgb(0x53, 0xC2, 0x6E))
+                    } else if self.proxy_starting {
+                        ("◐ 启动中…", egui::Color32::from_rgb(0xE5, 0xA5, 0x0A))
                     } else {
                         ("○ 已停止", egui::Color32::GRAY)
                     };
@@ -2433,15 +2495,14 @@ impl HydraApp {
                             .color(status_color),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let btn_text = if self.proxy_running {
-                            "■ 停止代理"
-                        } else {
-                            "▶ 启动代理"
-                        };
-                        if ui
-                            .add(egui::Button::new(egui::RichText::new(btn_text).size(18.0)))
-                            .clicked()
-                        {
+                        // 问题 1：按钮文字/可用性走 start_button_state 状态机——
+                        // 启动期显示「⏳ 启动中…」并禁用，bound 就绪后变「停止代理」，
+                        // 失败复位后回「启动代理」（状态转换单测见 tests 模块）
+                        let (btn_text, btn_enabled) =
+                            start_button_state(self.proxy_running, self.proxy_starting);
+                        let btn = egui::Button::new(egui::RichText::new(btn_text).size(18.0));
+                        let resp = ui.add_enabled(btn_enabled, btn);
+                        if resp.clicked() {
                             if self.proxy_running {
                                 self.stop_proxy();
                             } else {
@@ -3699,4 +3760,172 @@ async fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Box::new(HydraApp::new(cc))),
     )
+}
+
+/// 单元测试：GUI 状态机（问题 1）、代理启动时序（问题 2）、探测目标解析（问题 3）
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── 问题 1：启动按钮状态机转换 ──
+
+    #[test]
+    fn start_button_state_transitions() {
+        // 停止态：可点「启动代理」
+        assert_eq!(start_button_state(false, false), ("▶ 启动代理", true));
+        // 启动期（proxy_starting，bound 未就绪）：显示「启动中…」且禁用——
+        // 用户点击后立即可见反馈，修复"点了没反应"
+        assert_eq!(start_button_state(false, true), ("⏳ 启动中…", false));
+        // bound 就绪：变「停止代理」可点
+        assert_eq!(start_button_state(true, false), ("■ 停止代理", true));
+        // 运行态下 starting 残留（不可能出现，但规则应保持确定）：以 running 优先
+        assert_eq!(start_button_state(true, true), ("■ 停止代理", true));
+    }
+
+    // ── 问题 3：测速探测目标常量与 env 覆盖 ──
+
+    #[test]
+    fn probe_target_defaults_to_cloudflare_443() {
+        // 默认目标必须是 1.1.1.1:443（修复 192.0.0.1:9 静默丢包导致的测速误判）
+        assert_eq!(probe_target_from(None), "1.1.1.1:443");
+        assert_eq!(probe_target_from(Some("")), "1.1.1.1:443");
+        assert_eq!(probe_target_from(Some("   ")), "1.1.1.1:443");
+        assert_eq!(PROBE_TARGET_DEFAULT, "1.1.1.1:443");
+        assert_eq!(PROBE_TARGET_ENV, "HYDRA_PROBE_TARGET");
+    }
+
+    #[test]
+    fn probe_target_env_override() {
+        // env 覆盖生效（去首尾空白）；纯函数无进程 env 副作用，可并行
+        assert_eq!(probe_target_from(Some("10.0.0.1:8080")), "10.0.0.1:8080");
+        assert_eq!(
+            probe_target_from(Some("  1.2.3.4:443  ")),
+            "1.2.3.4:443"
+        );
+    }
+
+    // ── 问题 2：bound_addr 时序回归（run_proxy_until_stopped）──
+
+    /// 构造一个不依赖真实节点证书的代理实例：带 auth key + 显式 trust（空 pin 列表
+    /// 即可通过 start() 的前置检查），监听地址由调用方给定。bind 在任何连接发生前
+    /// 完成，因此无需真实节点。
+    fn test_proxy(addr: SocketAddr) -> Arc<ProxyServer> {
+        Arc::new(
+            ProxyServer::new(addr)
+                .with_auth_key(vec![0x42u8; 32])
+                .with_trust(hydra_client::tcp_transport::TlsTrust::pinned(Vec::new())),
+        )
+    }
+
+    /// 抓一个当前空闲的 TCP 端口（临时监听后立即释放）
+    fn free_port() -> SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("绑定临时端口失败")
+            .local_addr()
+            .expect("读取临时端口失败")
+    }
+
+    /// 根因回归：修复前 watcher 在 proxy.start() 之前被 await（互相等待），
+    /// bound_addr 永远等不到、必然 60s 超时；修复后 start() 立即执行 bind，
+    /// 就绪信号应在 3s 内到达。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_binds_within_3s() {
+        let addr = free_port();
+        let proxy = test_proxy(addr);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let task =
+            tokio::spawn(run_proxy_until_stopped(proxy, tx, stop.clone(), None));
+        // 阻塞 recv 移入 spawn_blocking，避免冻结异步测试执行器
+        let signal = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::task::spawn_blocking(move || {
+                rx.recv_timeout(std::time::Duration::from_secs(3))
+            }),
+        )
+        .await
+        .expect("bound_addr 未在 3s 内就绪（问题 2 回归）")
+        .expect("阻塞接收任务失败")
+        .expect("recv 失败");
+        match signal {
+            Ok(bound) => assert_eq!(bound, addr),
+            Err(e) => panic!("启动失败信号: {e}"),
+        }
+        // 收尾：置 stop 让 select 的停机分支结束，任务正常退出
+        stop.store(true, Ordering::Relaxed);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+    }
+
+    /// 场景回归：「启动 → 立即 stop → 再启动」同一端口两轮都应在 3s 内就绪
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_stop_restart_binds_within_3s_each_round() {
+        let addr = free_port();
+        for round in 1..=2 {
+            let proxy = test_proxy(addr);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let task =
+                tokio::spawn(run_proxy_until_stopped(proxy, tx, stop.clone(), None));
+            let signal = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                tokio::task::spawn_blocking(move || {
+                    rx.recv_timeout(std::time::Duration::from_secs(3))
+                }),
+            )
+            .await
+            .expect(
+                format!("第 {round} 轮 bound_addr 未在 3s 内就绪").as_str(),
+            )
+            .expect("阻塞接收任务失败")
+            .expect("recv 失败");
+            match signal {
+                Ok(bound) => assert_eq!(bound, addr),
+                Err(e) => panic!("第 {round} 轮启动失败信号: {e}"),
+            }
+            // 立即 stop：停机分支退出 select，端口释放后下一轮可复用
+            stop.store(true, Ordering::Relaxed);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+            // 给内核一点时间释放监听套接字
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// 场景回归：「并发测速负载 + 启动」——启动路径不得被后台负载拖过 3s
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_load_does_not_delay_bind() {
+        let addr = free_port();
+        // 模拟并发测速负载：持续 2s 的小睡眠任务（真实测速为网络 IO，同样是
+        // 独立任务不占用启动路径；此前根因是启动路径自我串行死锁）
+        let load = tokio::spawn(async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+        let proxy = test_proxy(addr);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let task =
+            tokio::spawn(run_proxy_until_stopped(proxy, tx, stop.clone(), None));
+        let started = std::time::Instant::now();
+        let signal = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::task::spawn_blocking(move || {
+                rx.recv_timeout(std::time::Duration::from_secs(3))
+            }),
+        )
+        .await
+        .expect("并发负载下 bound_addr 未在 3s 内就绪")
+        .expect("阻塞接收任务失败")
+        .expect("recv 失败");
+        assert!(
+            matches!(signal, Ok(bound) if bound == addr),
+            "信号异常: {signal:?}"
+        );
+        // 额外断言实际耗时远小于 3s（一般毫秒级）
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        stop.store(true, Ordering::Relaxed);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+        let _ = load.await;
+    }
 }
