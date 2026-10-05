@@ -1064,7 +1064,9 @@ impl HydraApp {
         // 错误端口段，gsettings/kwriteconfig 写入损坏的桌面代理配置。
         // 按 RFC 3986 authority 解析：先剥 scheme，再区分方括号 IPv6 与 host:port。
         let after_scheme = proxy_url.split("://").nth(1).unwrap_or(proxy_url);
-        // Windows 注册表分支直接用 host:port 原串（含 IPv6 方括号形态，WinINet 惯例）
+        // Windows 注册表分支直接用 host:port 原串（含 IPv6 方括号形态，WinINet 惯例）；
+        // Linux/macOS 分支自行动构造代理串，不用该绑定
+        #[cfg(windows)]
         let addr_port = after_scheme;
         let (proxy_host, proxy_port) = if let Some(rest) = after_scheme.strip_prefix('[') {
             // IPv6 字面量：`[::1]:1080`

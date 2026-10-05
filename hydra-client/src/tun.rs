@@ -361,14 +361,11 @@ impl RouteExecutor for SystemRouteExecutor {
                 .args(&args)
                 .output()?;
             if !out.status.success() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "ip route {} 失败: {}",
-                        args.join(" "),
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "ip route {} 失败: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
             }
             Ok(())
         }
@@ -413,14 +410,11 @@ impl RouteExecutor for SystemRouteExecutor {
             debug!("ip {}", args.join(" "));
             let out = std::process::Command::new("ip").args(&args).output()?;
             if !out.status.success() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "ip {} 失败: {}",
-                        args.join(" "),
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "ip {} 失败: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
             }
             Ok(())
         }

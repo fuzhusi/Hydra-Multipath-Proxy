@@ -286,18 +286,15 @@ fn read_auth_key_file(path: &Path) -> Result<String, String> {
 #[cfg(unix)]
 fn check_key_file_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
-    match std::fs::metadata(path) {
-        Ok(m) => {
-            let mode = m.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                eprintln!(
-                    "警告：认证密钥文件 {} 权限为 {:o}，同机其他用户可读；建议 chmod 600",
-                    path.display(),
-                    mode
-                );
-            }
+    if let Ok(m) = std::fs::metadata(path) {
+        let mode = m.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "警告：认证密钥文件 {} 权限为 {:o}，同机其他用户可读；建议 chmod 600",
+                path.display(),
+                mode
+            );
         }
-        Err(_) => {}
     }
 }
 
