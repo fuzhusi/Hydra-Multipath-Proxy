@@ -131,6 +131,64 @@ struct NodeStatusInfo {
     latency_ms: Option<u64>,
 }
 
+// ── UI 重设计第二批：节点页组视图（复刻 Clash Meta 代理组 tabs）──
+/// 组标签的保留键：手动组（未被任何订阅认领的节点）。
+const GROUP_MANUAL: &str = "manual";
+
+/// 节点所属组的组键（与 GuiConfig 认领机制一致，单一事实来源 = 各订阅 nodes 列表）：
+/// 被某订阅认领 → Some(订阅名)；否则 → None（手动）。多订阅含同一地址取先匹配者。
+fn node_group_of(cfg: &GuiConfig, addr: &str) -> Option<String> {
+    cfg.subscriptions
+        .iter()
+        .find(|s| s.nodes.iter().any(|n| n == addr))
+        .map(|s| s.name.clone())
+}
+
+/// 按组过滤节点列表（组视图纯函数，供 UI 与单测共用）：
+/// group=None → 全部；Some(GROUP_MANUAL) → 未被任何订阅认领的手动节点；
+/// Some(订阅名) → 该订阅认领且仍在节点列表中的地址。
+fn filter_nodes_by_group(
+    cfg: &GuiConfig,
+    node_addrs: &[String],
+    group: &Option<String>,
+) -> Vec<String> {
+    match group.as_deref() {
+        None => node_addrs.to_vec(),
+        Some(GROUP_MANUAL) => node_addrs
+            .iter()
+            .filter(|a| node_group_of(cfg, a).is_none())
+            .cloned()
+            .collect(),
+        Some(name) => node_addrs
+            .iter()
+            .filter(|a| node_group_of(cfg, a).as_deref() == Some(name))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// 组成员的在线/离线摘要（测过且连通=在线；测过但失败=离线；未测不计入）。
+fn group_summary(
+    status: &HashMap<String, NodeStatusInfo>,
+    addrs: &[String],
+) -> (usize, usize) {
+    let mut online = 0;
+    let mut offline = 0;
+    for a in addrs {
+        match status.get(a) {
+            Some(s) if s.last_check.is_some() => {
+                if s.connected {
+                    online += 1;
+                } else {
+                    offline += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    (online, offline)
+}
+
 struct HydraApp {
     // 应用状态
     proxy_running: bool,
@@ -179,6 +237,14 @@ struct HydraApp {
     share_pick_open: bool,
     /// 正在单节点测速的节点地址（卡片上显示 spinner；None = 无进行中的单测）
     node_testing_addr: Option<String>,
+
+    // ── UI 重设计第二批：节点页组视图（复刻 Clash Meta 代理组 tabs）──
+    /// 当前选中的节点组：None=全部，Some("manual")=手动，Some(订阅名)=该订阅认领
+    node_group: Option<String>,
+    /// 组级测速队列（逐个 start_node_test，复用单测互斥通道；完成后自动取下一个）
+    pending_node_tests: VecDeque<String>,
+    /// 订阅页「＋ 新建 → 📡 添加订阅源」对话框开关（原平铺添加行收进对话框）
+    sub_add_open: bool,
 
     // 密钥明文显示开关（默认掩码显示）
     show_auth_key: bool,
@@ -270,6 +336,9 @@ impl Default for HydraApp {
             manual_add_open: false,
             share_pick_open: false,
             node_testing_addr: None,
+            node_group: None,
+            pending_node_tests: VecDeque::new(),
+            sub_add_open: false,
             show_auth_key: false,
             node_edit_open: false,
             edit_orig_addr: String::new(),
@@ -514,6 +583,9 @@ impl HydraApp {
             manual_add_open: false,
             share_pick_open: false,
             node_testing_addr: None,
+            node_group: None,
+            pending_node_tests: VecDeque::new(),
+            sub_add_open: false,
             show_auth_key: false,
             node_edit_open: false,
             edit_orig_addr: String::new(),
@@ -748,6 +820,11 @@ impl HydraApp {
                     self.add_log(format!("节点 {} 测试失败: {}", addr, reason));
                 }
             }
+            // UI 重设计第二批：组级测速——上一个单测完成后自动取队列中的下一个成员
+            // （复用 start_node_test 的互斥通道，逐个串行，不与「全部测速」并发通道冲突）
+            if let Some(next) = self.pending_node_tests.pop_front() {
+                self.start_node_test(next);
+            }
         }
     }
 
@@ -805,6 +882,24 @@ impl HydraApp {
         // 存储 receiver 以便在 update 循环中非阻塞地收集结果
         self.health_check_receiver = Some(rx);
         self.last_health_check = Some(std::time::Instant::now());
+    }
+
+    /// UI 重设计第二批：组级测速——对本组成员逐个发起单节点测试。
+    /// 复用 start_node_test 的互斥逻辑：已有单测进行中时直接提示并放弃本次排队；
+    /// 后续成员进入 pending_node_tests 队列，poll_node_test_results 串行接续。
+    fn start_group_test(&mut self, addrs: Vec<String>) {
+        if addrs.is_empty() {
+            self.add_log("本组没有节点可测试".to_string());
+            return;
+        }
+        if self.node_test_receiver.is_some() {
+            self.add_log("已有节点测试正在进行，请稍候".to_string());
+            return;
+        }
+        let mut it = addrs.into_iter();
+        let first = it.next().expect("非空队列必有首元素");
+        self.pending_node_tests.extend(it);
+        self.start_node_test(first);
     }
 
     /// 在 update 循环中非阻塞地处理健康检查结果
@@ -1799,13 +1894,13 @@ impl HydraApp {
     // 单条后台通道 + 待更新队列：多订阅串行拉取，UI 零阻塞。
 
     /// 添加订阅（名称可留空自动编号；名称重复拒绝——名称是来源标记与更新对号的键）
-    fn add_subscription(&mut self) {
+    fn add_subscription(&mut self) -> bool {
         let source = self.new_sub_source.trim().to_string();
         if source.is_empty() {
             self.add_log(
                 "订阅来源不能为空（http(s) URL、文件路径或 hydra-sub:// 前缀）".to_string(),
             );
-            return;
+            return false;
         }
         let name = if self.new_sub_name.trim().is_empty() {
             format!("订阅{}", self.config.subscriptions.len() + 1)
@@ -1814,7 +1909,7 @@ impl HydraApp {
         };
         if self.config.subscriptions.iter().any(|s| s.name == name) {
             self.add_log(format!("订阅名称「{}」已存在，请换一个名称", name));
-            return;
+            return false;
         }
         self.config.subscriptions.push(SubscriptionConfig {
             name: name.clone(),
@@ -1825,6 +1920,7 @@ impl HydraApp {
         self.add_log(format!("已添加订阅「{}」，点「更新」拉取节点", name));
         self.new_sub_name.clear();
         self.new_sub_source.clear();
+        true
     }
 
     /// 删除订阅：连带清理仅该订阅认领的节点（手动/其他订阅认领的保留）
@@ -2334,6 +2430,13 @@ impl eframe::App for HydraApp {
             self.ui_node_edit_dialog(ctx);
         }
 
+        // ── UI 重设计第二批：导入/手动添加/分享选择/添加订阅 对话框集中渲染 ──
+        // （入口分布在订阅页「＋ 新建」下拉与节点页「🔗 分享节点」，跨页切换窗口不丢失）
+        self.ui_nodes_dialogs(ctx);
+        if self.sub_add_open {
+            self.ui_sub_add_dialog(ctx);
+        }
+
         // T2：托盘 tooltip 随代理状态同步；隐藏到托盘后仍需周期重绘
         // （轮询代理退出通道 / 托盘命令 / 实时速率刷新）
         self.sync_tray_tooltip();
@@ -2697,7 +2800,9 @@ impl HydraApp {
     ///   本页仅在缺失时显示一条窄横幅提示并跳转；
     /// - 页尾订阅快捷管理区移除（完整生命周期全部在「📡 订阅」页，功能零丢失）。
     fn ui_nodes(&mut self, ui: &mut egui::Ui) {
-        // ── 页头：标题 + 右侧「全部测速」+「＋」下拉菜单 ──
+        // ── 页头：标题 + 右侧「分享节点」+「全部测速」──
+        // （UI 重设计第二批：「＋」菜单及其对话框入口整体迁往「📡 订阅」页「＋ 新建」；
+        //   分享节点（含批量导出）不是"新建"动作，保留在节点页页头）
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("节点")
@@ -2705,29 +2810,6 @@ impl HydraApp {
                     .strong(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // 「＋」按钮：导入 / 添加 / 分享统一入口（老板构想）
-                ui.menu_button(egui::RichText::new("＋").size(18.0), |ui| {
-                    if ui.button("📋 从分享链接导入").clicked() {
-                        self.import_dialog_open = true;
-                        ui.close_menu();
-                    }
-                    if ui.button("📷 扫描二维码导入").clicked() {
-                        // 复用现有二维码文件识别（后台解码，结果经通道回收）
-                        self.import_from_qr_image();
-                        ui.close_menu();
-                    }
-                    if ui.button("✏️ 手动添加节点").clicked() {
-                        self.new_node_input.clear();
-                        self.manual_add_open = true;
-                        ui.close_menu();
-                    }
-                    if ui.button("🔗 分享节点").clicked() {
-                        self.share_pick_open = true;
-                        ui.close_menu();
-                    }
-                })
-                .response
-                .on_hover_text("导入 / 添加 / 分享节点");
                 // 全部测速（测速进行中显示 spinner + 进度提示）
                 if self.health_check_receiver.is_some() {
                     ui.add(egui::Spinner::new().size(14.0));
@@ -2735,6 +2817,13 @@ impl HydraApp {
                 }
                 if ui.button("⚡ 全部测速").clicked() {
                     self.test_all_nodes();
+                }
+                if ui
+                    .button("🔗 分享节点")
+                    .on_hover_text("按节点分享（二维码/完整/紧凑链接），或批量导出分享链接")
+                    .clicked()
+                {
+                    self.share_pick_open = true;
                 }
             });
         });
@@ -2764,28 +2853,93 @@ impl HydraApp {
                 });
         }
 
-        // ── 节点卡片列表（手动 + 订阅同一列表，来源标记区分）──
+        // ── 组视图（复刻 Clash Meta 代理组 tabs）──
+        // 组 = 数据来源过滤：全部 / 手动认领 / 某订阅认领的地址（与 GuiConfig 认领机制一致）。
+        // 选中的订阅组已被删除时回落「全部」（订阅在「📡 订阅」页删除的场景）
+        if let Some(g) = &self.node_group {
+            if g != GROUP_MANUAL
+                && !self.config.subscriptions.iter().any(|s| &s.name == g)
+            {
+                self.node_group = None;
+            }
+        }
         ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(format!(
-                "手动 {} ｜ 订阅 {} ｜ 共 {} 个节点",
-                self.config
-                    .node_addrs
-                    .iter()
-                    .filter(|a| self.config.node_source_label(a) == config::NODE_SOURCE_MANUAL)
-                    .count(),
-                self.config.node_addrs.len()
-                    - self
-                        .config
-                        .node_addrs
-                        .iter()
-                        .filter(|a| self.config.node_source_label(a) == config::NODE_SOURCE_MANUAL)
-                        .count(),
-                self.config.node_addrs.len()
-            ))
-            .size(palette::FONT_SECONDARY)
-            .color(palette::TEXT_WEAK),
-        );
+
+        // ── 顶部组标签行：横排可滚动按钮组，选中高亮，含成员数量徽标 ──
+        let all_count = self.config.node_addrs.len();
+        let manual_count = self
+            .config
+            .node_addrs
+            .iter()
+            .filter(|a| node_group_of(&self.config, a).is_none())
+            .count();
+        let mut tabs: Vec<(Option<String>, String)> = Vec::new();
+        tabs.push((None, format!("全部 · {}", all_count)));
+        tabs.push((
+            Some(GROUP_MANUAL.to_string()),
+            format!("✏️ 手动 · {}", manual_count),
+        ));
+        for sub in &self.config.subscriptions {
+            let cnt = self
+                .config
+                .node_addrs
+                .iter()
+                .filter(|a| node_group_of(&self.config, a).as_deref() == Some(sub.name.as_str()))
+                .count();
+            tabs.push((Some(sub.name.clone()), format!("📡 {} · {}", sub.name, cnt)));
+        }
+        egui::ScrollArea::new([true, false]).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for (key, label) in &tabs {
+                    let selected = self.node_group.as_deref() == key.as_deref();
+                    if ui
+                        .selectable_label(selected, egui::RichText::new(label).size(palette::FONT_BODY))
+                        .clicked()
+                    {
+                        self.node_group = key.clone();
+                    }
+                }
+            });
+        });
+        ui.separator();
+
+        // ── 组头栏：组名 + 节点数 + 在线/离线摘要 +「⚡ 全部测速（本组）」──
+        let members = filter_nodes_by_group(&self.config, &self.config.node_addrs, &self.node_group);
+        let (online, offline) = group_summary(&self.node_status, &members);
+        let group_name = match &self.node_group {
+            None => "全部节点".to_string(),
+            Some(g) if g == GROUP_MANUAL => "✏️ 手动节点".to_string(),
+            Some(name) => format!("📡 {}", name),
+        };
+        egui::Frame::none()
+            .fill(palette::BG_CARD)
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::symmetric(12.0_f32, 6.0_f32))
+            .outer_margin(egui::Margin::symmetric(0.0_f32, 4.0_f32))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(&group_name)
+                            .size(palette::FONT_TITLE)
+                            .strong(),
+                    );
+                    ui.colored_label(
+                        palette::TEXT_WEAK,
+                        format!("{} 节点 ｜ 在线 {} / 离线 {}", members.len(), online, offline),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("⚡ 全部测速（本组）")
+                            .on_hover_text("对本组成员逐个发起握手测速（串行，复用单测通道）")
+                            .clicked()
+                        {
+                            self.start_group_test(members.clone());
+                        }
+                    });
+                });
+            });
+
+        // ── 组内节点卡片（紧凑双列/三列自适应网格，沿用第一批卡片元素）──
         if self.config.node_addrs.is_empty() {
             egui::Frame::none()
                 .fill(palette::BG_CARD)
@@ -2798,119 +2952,150 @@ impl HydraApp {
                             .size(palette::FONT_BODY)
                             .color(palette::TEXT_WEAK),
                     );
-                    ui.small("点右上角「＋」：从分享链接导入、扫描二维码，或手动添加节点；订阅拉取见「📡 订阅」页");
+                    ui.small("多个节点自动更新 → 「📡 订阅」页右上「＋ 新建」添加订阅源；单个节点 → 从分享链接导入");
                 });
+        } else if members.is_empty() {
+            ui.add_space(4.0);
+            ui.colored_label(palette::TEXT_WEAK, "（本组暂无节点）");
         }
         let mut indices_to_remove = Vec::new();
         let mut edit_target: Option<String> = None;
         let mut manual_target: Option<String> = None;
         let node_addrs_clone = self.config.node_addrs.clone();
-        for (i, node_addr) in node_addrs_clone.iter().enumerate() {
-            // 状态三态（先拷贝快照，避免与下方 &mut self 闭包借用冲突）：
-            // 绿=Online / 黄=Degraded（在线但延迟≥500ms）/ 红=Offline / 灰=未验证
-            let (connected, checked, latency) = match self.node_status.get(node_addr.as_str()) {
-                Some(s) => (s.connected, s.last_check.is_some(), s.latency_ms),
-                None => (false, false, None),
-            };
-            let dot = palette::status_color(connected, checked, latency);
-            let name = self.config.node_display_name(node_addr);
-            let source = self.config.node_source_label(node_addr);
-            let is_manual = source == config::NODE_SOURCE_MANUAL;
-            let latency_text = match latency {
-                Some(ms) => format!("{}ms", ms),
-                None if checked => "超时".to_string(),
-                None => "未测试".to_string(),
-            };
-            let testing_this =
-                self.node_testing_addr.as_deref() == Some(node_addr.as_str());
-
-            // ── 节点卡片：圆角 + 内边距统一（视觉规范化第一步）──
-            egui::Frame::none()
-                .fill(palette::BG_CARD)
-                .rounding(egui::Rounding::same(8.0))
-                .inner_margin(egui::Margin::same(12.0))
-                .outer_margin(egui::Margin::symmetric(0.0_f32, 4.0_f32))
-                .stroke(egui::Stroke::new(1.0_f32, palette::BORDER))
-                .show(ui, |ui| {
-                    // 第一行：状态色点 + 名称/地址 + 来源标记 + 右侧延迟色标
-                    ui.horizontal(|ui| {
-                        // 自绘状态圆点（绿/黄/红/灰）
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                        ui.painter().circle_filled(rect.center(), 5.0, dot);
-                        if name == node_addr.as_str() {
-                            ui.label(
-                                egui::RichText::new(node_addr.as_str())
-                                    .size(palette::FONT_TITLE)
-                                    .strong(),
-                            );
-                        } else {
-                            ui.label(
-                                egui::RichText::new(&name)
-                                    .size(palette::FONT_TITLE)
-                                    .strong(),
-                            )
-                            .on_hover_text(node_addr.as_str());
-                            ui.label(
-                                egui::RichText::new(node_addr.as_str())
-                                    .size(palette::FONT_SECONDARY)
-                                    .monospace()
-                                    .color(palette::TEXT_WEAK),
-                            );
-                        }
-                        ui.colored_label(
-                            if is_manual {
-                                palette::TEXT_WEAK
-                            } else {
-                                palette::ACCENT
-                            },
-                            format!("[{}]", source),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new(latency_text)
-                                    .size(palette::FONT_BODY)
-                                    .color(palette::latency_color(latency)),
-                            );
-                        });
-                    });
-                    // 第二行：操作按钮（测速/分享/编辑（或另存为手动）/删除）
-                    ui.horizontal(|ui| {
-                        // 测速中显示 spinner，完成后色点 + 延迟色标自然刷新
-                        if testing_this {
-                            ui.add(egui::Spinner::new().size(14.0));
-                            ui.label(
-                                egui::RichText::new("测速中…")
-                                    .size(palette::FONT_SECONDARY)
-                                    .color(palette::TEXT_WEAK),
-                            );
-                        } else if ui.small_button("⚡ 测速").clicked() {
-                            self.start_node_test(node_addr.clone());
-                        }
-                        if ui.small_button("🔗 分享").clicked() {
-                            self.open_share_dialog(node_addr.clone());
-                        }
-                        // 订阅节点默认只读（地址/凭据随订阅更新覆盖），不提供编辑；
-                        // 可「另存为手动」解除认领后再改
-                        if is_manual {
-                            if ui.small_button("✏ 编辑").clicked() {
-                                edit_target = Some(node_addr.clone());
-                            }
-                        } else if ui
-                            .small_button("另存为手动")
-                            .on_hover_text(
-                                "解除订阅认领，变为可编辑的手动节点（后续订阅更新不再覆盖/认领它）",
-                            )
-                            .clicked()
-                        {
-                            manual_target = Some(node_addr.clone());
-                        }
-                        if ui.small_button("🗑 删除").clicked() {
-                            indices_to_remove.push(i);
-                        }
-                    });
-                });
-        }
+        // 组成员（按原列表顺序保留原始下标，供删除与操作定位）
+        let entries: Vec<(usize, String)> = node_addrs_clone
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| members.contains(a))
+            .map(|(i, a)| (i, a.clone()))
+            .collect();
+        // 紧凑化：按可用宽度自适应 1–3 列（卡宽约 300px 起）
+        let card_min = 300.0_f32;
+        let cols = ((ui.available_width() / card_min).floor() as usize).clamp(1, 3);
+        let cell_width = ((ui.available_width() - 12.0 * (cols as f32 - 1.0)) / cols as f32
+            - 12.0)
+            .max(220.0);
+        egui::Grid::new("node_group_grid")
+            .num_columns(cols)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                for chunk in entries.chunks(cols) {
+                    for (i, node_addr) in chunk {
+                        let node_addr = node_addr.as_str();
+                        // 状态三态：绿=Online / 黄=Degraded（在线但延迟≥500ms）/
+                        // 红=Offline / 灰=未验证
+                        let (connected, checked, latency) =
+                            match self.node_status.get(node_addr) {
+                                Some(s) => (s.connected, s.last_check.is_some(), s.latency_ms),
+                                None => (false, false, None),
+                            };
+                        let dot = palette::status_color(connected, checked, latency);
+                        let name = self.config.node_display_name(node_addr);
+                        let source = self.config.node_source_label(node_addr);
+                        let is_manual = source == config::NODE_SOURCE_MANUAL;
+                        let latency_text = match latency {
+                            Some(ms) => format!("{}ms", ms),
+                            None if checked => "超时".to_string(),
+                            None => "未测试".to_string(),
+                        };
+                        let testing_this =
+                            self.node_testing_addr.as_deref() == Some(node_addr);
+                        // ── 紧凑节点卡片：圆角 + 统一内边距，宽度锁定为网格列宽 ──
+                        egui::Frame::none()
+                            .fill(palette::BG_CARD)
+                            .rounding(egui::Rounding::same(8.0))
+                            .inner_margin(egui::Margin::same(10.0))
+                            .outer_margin(egui::Margin::same(2.0))
+                            .stroke(egui::Stroke::new(1.0_f32, palette::BORDER))
+                            .show(ui, |ui| {
+                                ui.set_min_width(cell_width);
+                                // 第一行：状态色点 + 名称/地址 + 延迟色标（来源已由组标签表达）
+                                ui.horizontal(|ui| {
+                                    let (rect, _) = ui
+                                        .allocate_exact_size(
+                                            egui::vec2(10.0, 10.0),
+                                            egui::Sense::hover(),
+                                        );
+                                    ui.painter().circle_filled(rect.center(), 5.0, dot);
+                                    if name == node_addr {
+                                        ui.label(
+                                            egui::RichText::new(node_addr)
+                                                .size(palette::FONT_TITLE)
+                                                .strong(),
+                                        );
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new(&name)
+                                                .size(palette::FONT_TITLE)
+                                                .strong(),
+                                        )
+                                        .on_hover_text(node_addr);
+                                    }
+                                    // 「全部」组里来源混合，补小组来源标记；组内已由标签行表达
+                                    if self.node_group.is_none() {
+                                        ui.colored_label(
+                                            if is_manual {
+                                                palette::TEXT_FAINT
+                                            } else {
+                                                palette::ACCENT
+                                            },
+                                            format!("[{}]", source),
+                                        );
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new(latency_text.as_str())
+                                                    .size(palette::FONT_BODY)
+                                                    .color(palette::latency_color(latency)),
+                                            );
+                                        },
+                                    );
+                                });
+                                // 第二行：操作按钮（测速/分享/编辑（或另存为手动）/删除）
+                                ui.horizontal(|ui| {
+                                    if testing_this {
+                                        ui.add(egui::Spinner::new().size(14.0));
+                                        ui.label(
+                                            egui::RichText::new("测速中…")
+                                                .size(palette::FONT_SECONDARY)
+                                                .color(palette::TEXT_WEAK),
+                                        );
+                                    } else if ui.small_button("⚡").on_hover_text("测速（完整握手）").clicked() {
+                                        self.start_node_test(node_addr.to_string());
+                                    }
+                                    if ui.small_button("🔗").on_hover_text("分享").clicked() {
+                                        self.open_share_dialog(node_addr.to_string());
+                                    }
+                                    // 订阅节点默认只读（地址/凭据随订阅更新覆盖），不提供编辑；
+                                    // 可「另存为手动」解除认领后再改
+                                    if is_manual {
+                                        if ui.small_button("✏").on_hover_text("编辑").clicked() {
+                                            edit_target = Some(node_addr.to_string());
+                                        }
+                                    } else if ui
+                                        .small_button("⇥")
+                                        .on_hover_text(
+                                            "另存为手动：解除订阅认领，变为可编辑的手动节点（后续订阅更新不再覆盖/认领它）",
+                                        )
+                                        .clicked()
+                                    {
+                                        manual_target = Some(node_addr.to_string());
+                                    }
+                                    if ui.small_button("🗑").on_hover_text("删除").clicked() {
+                                        indices_to_remove.push(*i);
+                                    }
+                                });
+                            });
+                    }
+                    // 末行补空位，保持网格对齐
+                    for _ in chunk.len()..cols {
+                        ui.label("");
+                    }
+                    ui.end_row();
+                }
+            });
 
         // 删除节点并添加日志
         for &i in indices_to_remove.iter().rev() {
@@ -2930,26 +3115,27 @@ impl HydraApp {
             }
         }
 
-        // ── 三个「＋」菜单对应的对话框（导入 / 手动添加 / 分享选择）──
-        self.ui_nodes_dialogs(ui);
+        // （导入/手动添加/分享选择对话框已集中到 update() 统一渲染：
+        //   入口在「📡 订阅」页「＋ 新建」下拉与节点页「🔗 分享节点」，跨页不丢窗口）
 
         // 提示：订阅源的完整管理（增删改/更新/展开归属节点）在「📡 订阅」页
         ui.add_space(4.0);
-        ui.small("订阅来源拉取的节点自动进入上方列表（来源标记为订阅名）；订阅源的添加与更新见「📡 订阅」页");
+        ui.small("订阅来源拉取的节点自动进入上方列表（来源标记为订阅名）；订阅源的添加与更新见「📡 订阅」页右上「＋ 新建」");
     }
 
-    /// 节点页三个对话框窗口（UI 重设计第一批）：
-    /// ① 从分享链接导入（粘贴多行 / 链接文件，原页尾「导入节点」区迁入）
-    /// ② 手动添加节点（host:port 实时校验，原页顶输入行迁入）
+    /// 节点/订阅共用的三个对话框窗口（UI 重设计第一批迁入，第二批起集中渲染）：
+    /// ① 从分享链接导入（粘贴多行 / 链接文件）
+    /// ② 手动添加节点（host:port 实时校验）
     /// ③ 分享节点（按节点选择打开分享对话框；批量导出 v1 也在其中）
-    fn ui_nodes_dialogs(&mut self, ui: &mut egui::Ui) {
+    /// 改为直接持 ctx 渲染（跨页窗口不丢失），由 update() 每帧统一调用
+    fn ui_nodes_dialogs(&mut self, ctx: &egui::Context) {
         // ① 从分享链接导入
         if self.import_dialog_open {
             egui::Window::new("📋 从分享链接导入")
                 .collapsible(false)
                 .resizable(true)
                 .default_width(480.0)
-                .show(ui.ctx(), |ui| {
+                .show(ctx, |ui| {
                     ui.add(
                         egui::TextEdit::multiline(&mut self.import_text)
                             .desired_rows(4)
@@ -2973,6 +3159,7 @@ impl HydraApp {
                         );
                     }
                     ui.small("完整分享含密钥/证书，导入后自动配置，无需再填密钥与证书文件");
+                    ui.small("ℹ 导入的节点是「手动节点」（单个分享链接 ≠ 订阅源）：可自由编辑、不随订阅更新；如需多节点自动更新，请到「📡 订阅」页添加订阅源");
                 });
         }
 
@@ -2983,7 +3170,7 @@ impl HydraApp {
                 .collapsible(false)
                 .resizable(false)
                 .default_width(420.0)
-                .show(ui.ctx(), |ui| {
+                .show(ctx, |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.new_node_input)
                             .desired_width(320.0)
@@ -3044,7 +3231,7 @@ impl HydraApp {
                 .collapsible(false)
                 .resizable(true)
                 .default_width(460.0)
-                .show(ui.ctx(), |ui| {
+                .show(ctx, |ui| {
                     ui.label("选择要分享的节点：");
                     let addrs = self.config.node_addrs.clone();
                     if addrs.is_empty() {
@@ -3084,48 +3271,54 @@ impl HydraApp {
     /// 每条订阅可展开查看归属节点（只读标记 + 「另存为手动」）；
     /// 节点的统一列表与来源标记见「🌐 节点」页。
     fn ui_subscriptions(&mut self, ui: &mut egui::Ui) {
-        ui.heading("订阅");
-        ui.small("订阅来源拉取的节点会自动加入「🌐 节点」页列表，并以订阅名作为来源标记；订阅节点默认只读");
-        ui.separator();
-
-        // 添加订阅
+        // ── 页头：标题 + 右侧「更新全部订阅」+「＋ 新建」下拉（复刻 Clash Profiles 新建入口）──
         ui.horizontal(|ui| {
-            ui.label("名称:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.new_sub_name)
-                    .desired_width(110.0)
-                    .hint_text("可留空自动编号"),
+            ui.label(
+                egui::RichText::new("订阅")
+                    .size(palette::FONT_HEADING)
+                    .strong(),
             );
-        });
-        ui.horizontal(|ui| {
-            ui.label("来源:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.new_sub_source)
-                    .desired_width(ui.available_width() - 80.0)
-                    .hint_text("https://… / 文件路径 / hydra-sub://…"),
-            );
-            if ui.button("浏览...").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("订阅文件", &["txt", "sub"])
-                    .add_filter("全部文件", &["*"])
-                    .pick_file()
-                {
-                    self.new_sub_source = path.display().to_string();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 「＋ 新建」：四种创建/导入入口统一收纳（原节点页「＋」整体迁来）
+                ui.menu_button(
+                    egui::RichText::new("＋ 新建").size(palette::FONT_TITLE),
+                    |ui| {
+                        if ui.button("📡 添加订阅源").clicked() {
+                            // 展开添加对话框（交互选定：对话框比内联展开少一次布局跳动）
+                            self.new_sub_name.clear();
+                            self.new_sub_source.clear();
+                            self.sub_add_open = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("📋 从分享链接导入").clicked() {
+                            self.import_dialog_open = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("📷 扫描二维码导入").clicked() {
+                            // 复用现有二维码文件识别（后台解码，结果经通道回收）
+                            self.import_from_qr_image();
+                            ui.close_menu();
+                        }
+                        if ui.button("✏️ 手动添加节点").clicked() {
+                            self.new_node_input.clear();
+                            self.manual_add_open = true;
+                            ui.close_menu();
+                        }
+                    },
+                )
+                .response
+                .on_hover_text("添加订阅源 / 从分享链接导入 / 扫描二维码导入 / 手动添加节点");
+                if self.sub_update_receiver.is_some() {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.label("更新中...");
                 }
-            }
+                if ui.button("🔄 更新全部订阅").clicked() {
+                    self.update_all_subscriptions();
+                }
+            });
         });
-        ui.horizontal(|ui| {
-            if ui.button("➕ 添加订阅").clicked() {
-                self.add_subscription();
-            }
-            if ui.button("🔄 更新全部订阅").clicked() {
-                self.update_all_subscriptions();
-            }
-            if self.sub_update_receiver.is_some() {
-                ui.label("⏳ 更新中...");
-            }
-        });
-
+        ui.add_space(2.0);
+        ui.small("节点分两种归属：订阅节点由订阅源拉取、随订阅更新自动覆盖（只读，可「另存为手动」解除认领）；手动节点通过「＋ 新建」导入/添加、可自由编辑且不受订阅影响。节点页顶部组标签按下方订阅动态分组");
         ui.separator();
 
         // 订阅列表：名称 / 来源 / 更新时间 / 节点数 + 立即更新 / 展开节点 / 编辑 / 删除
@@ -3183,11 +3376,35 @@ impl HydraApp {
                     ui.small("  （该订阅暂无归属节点，请先「立即更新」）");
                 }
                 for addr in &sub.nodes {
+                    let testing_this = self.node_testing_addr.as_deref() == Some(addr.as_str());
                     ui.indent(addr.as_str(), |ui| {
                         ui.horizontal(|ui| {
                             ui.colored_label(egui::Color32::from_rgb(0x7A, 0xB3, 0xFF), "[只读]");
                             ui.label(addr);
-                            if ui.small_button("另存为手动").clicked()
+                            // 测速中显示 spinner；结果进全局日志与调度器评分（与节点页一致）
+                            if testing_this {
+                                ui.add(egui::Spinner::new().size(14.0));
+                                ui.label(
+                                    egui::RichText::new("测速中…")
+                                        .size(palette::FONT_SECONDARY)
+                                        .color(palette::TEXT_WEAK),
+                                );
+                            }
+                            // 紧凑操作行：分享 / 测速 / 另存为手动（原位）
+                            if ui.small_button("🔗 分享").clicked() {
+                                // 订阅节点不带密钥本体：build_share_link 按地址解析失败时
+                                // 自动退化为仅地址信息（能带证书则带），与现有分享行为一致
+                                self.open_share_dialog(addr.clone());
+                            }
+                            if ui.small_button("⚡ 测速").clicked() {
+                                self.start_node_test(addr.clone());
+                            }
+                            if ui
+                                .small_button("另存为手动")
+                                .on_hover_text(
+                                    "解除订阅认领，变为可编辑的手动节点（后续订阅更新不再覆盖/认领它）",
+                                )
+                                .clicked()
                                 && self.config.save_subscription_node_as_manual(addr)
                             {
                                 self.add_log(format!(
@@ -3291,6 +3508,69 @@ impl HydraApp {
                     self.add_log(format!("订阅「{}」已保存", name));
                 }
             }
+        }
+
+        // （导入/手动添加对话框已由 update() 集中渲染，本页不再重复调用）
+    }
+
+    /// 「＋ 新建 → 📡 添加订阅源」对话框（原平铺添加行收进对话框，交互更顺：
+    /// 添加是低频动作，不必常驻占位；校验逻辑与原 add_subscription 完全一致）
+    fn ui_sub_add_dialog(&mut self, ctx: &egui::Context) {
+        let mut add_clicked = false;
+        egui::Window::new("📡 添加订阅源")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                egui::Grid::new("sub_add_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("名称:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.new_sub_name)
+                                .desired_width(320.0)
+                                .hint_text("可留空自动编号"),
+                        );
+                        ui.end_row();
+                        ui.label("来源:");
+                        ui.vertical(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.new_sub_source)
+                                    .desired_width(320.0)
+                                    .hint_text("https://… / 文件路径 / hydra-sub://…"),
+                            );
+                            if ui.small_button("浏览...").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("订阅文件", &["txt", "sub"])
+                                    .add_filter("全部文件", &["*"])
+                                    .pick_file()
+                                {
+                                    self.new_sub_source = path.display().to_string();
+                                }
+                            }
+                        });
+                        ui.end_row();
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("➕ 添加订阅").strong()))
+                        .clicked()
+                    {
+                        add_clicked = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        self.sub_add_open = false;
+                        self.new_sub_name.clear();
+                        self.new_sub_source.clear();
+                    }
+                });
+                ui.small("支持 http(s) 订阅 URL、本地订阅文件路径与 hydra-sub:// 分享订阅");
+            });
+        if add_clicked && self.add_subscription() {
+            // 添加成功才关闭对话框；校验失败保留窗口让用户修改
+            self.sub_add_open = false;
         }
     }
 
@@ -4147,5 +4427,105 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
         let _ = load.await;
+    }
+
+    // ── UI 重设计第二批：节点页组视图（组过滤纯函数）──
+
+    /// 组过滤测试夹具：手动 1 节点 + 订阅A 认领 2 节点 + 订阅B 认领 1 节点
+    fn group_fixture() -> GuiConfig {
+        let mut cfg = GuiConfig::default();
+        cfg.node_addrs = vec![
+            "10.0.0.1:1".to_string(),  // 手动
+            "10.0.0.2:2".to_string(),  // 订阅A
+            "10.0.0.3:3".to_string(),  // 订阅A
+            "10.0.0.4:4".to_string(),  // 订阅B
+        ];
+        cfg.subscriptions.push(SubscriptionConfig {
+            name: "订阅A".to_string(),
+            source: "https://a.example".to_string(),
+            last_updated_secs: None,
+            nodes: vec!["10.0.0.2:2".to_string(), "10.0.0.3:3".to_string()],
+        });
+        cfg.subscriptions.push(SubscriptionConfig {
+            name: "订阅B".to_string(),
+            source: "https://b.example".to_string(),
+            last_updated_secs: None,
+            nodes: vec!["10.0.0.4:4".to_string()],
+        });
+        cfg
+    }
+
+    #[test]
+    fn node_group_of_claims_follow_subscription_nodes() {
+        let cfg = group_fixture();
+        // 被订阅认领 → Some(订阅名)；未被认领 → None（手动）
+        assert_eq!(node_group_of(&cfg, "10.0.0.1:1"), None);
+        assert_eq!(node_group_of(&cfg, "10.0.0.2:2"), Some("订阅A".to_string()));
+        assert_eq!(node_group_of(&cfg, "10.0.0.4:4"), Some("订阅B".to_string()));
+        // 不在节点列表但被订阅认领：组归属仍按订阅 nodes 判定（过滤时被列表约束）
+        assert_eq!(node_group_of(&cfg, "9.9.9.9:9"), None);
+    }
+
+    #[test]
+    fn filter_nodes_by_group_none_all_manual_and_sub() {
+        let cfg = group_fixture();
+        let addrs = cfg.node_addrs.clone();
+        // None = 全部
+        assert_eq!(filter_nodes_by_group(&cfg, &addrs, &None), addrs);
+        // Some("manual") = 未被任何订阅认领的手动节点
+        assert_eq!(
+            filter_nodes_by_group(&cfg, &addrs, &Some(GROUP_MANUAL.to_string())),
+            vec!["10.0.0.1:1".to_string()]
+        );
+        // Some(订阅名) = 该订阅认领的地址
+        assert_eq!(
+            filter_nodes_by_group(&cfg, &addrs, &Some("订阅A".to_string())),
+            vec!["10.0.0.2:2".to_string(), "10.0.0.3:3".to_string()]
+        );
+        // 不存在的组名 = 空列表（UI 侧已回落「全部」，此处仅保证纯函数确定性）
+        assert!(filter_nodes_by_group(&cfg, &addrs, &Some("不存在".to_string())).is_empty());
+    }
+
+    #[test]
+    fn filter_nodes_by_group_empty_config_and_no_subs() {
+        // 无订阅配置：全部 = 手动 = 节点列表
+        let mut cfg = GuiConfig::default();
+        cfg.node_addrs = vec!["1.2.3.4:4433".to_string()];
+        let addrs = cfg.node_addrs.clone();
+        assert_eq!(filter_nodes_by_group(&cfg, &addrs, &None), addrs);
+        assert_eq!(
+            filter_nodes_by_group(&cfg, &addrs, &Some(GROUP_MANUAL.to_string())),
+            addrs
+        );
+        assert!(
+            filter_nodes_by_group(&cfg, &addrs, &Some("订阅A".to_string())).is_empty()
+        );
+        // 空列表
+        assert!(filter_nodes_by_group(&cfg, &[], &None).is_empty());
+    }
+
+    #[test]
+    fn group_summary_counts_online_offline_only_when_checked() {
+        let mut status = HashMap::new();
+        let mk = |connected: bool| NodeStatusInfo {
+            connected,
+            last_check: Some(std::time::Instant::now()),
+            latency_ms: None,
+        };
+        status.insert("a".to_string(), mk(true));
+        status.insert("b".to_string(), mk(false));
+        // 未测（last_check=None）不计入摘要
+        status.insert(
+            "c".to_string(),
+            NodeStatusInfo {
+                connected: false,
+                last_check: None,
+                latency_ms: None,
+            },
+        );
+        // 无记录的 d 同样不计入
+        let addrs: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(group_summary(&status, &addrs), (1, 1));
+        assert_eq!(group_summary(&status, &[]), (0, 0));
     }
 }
