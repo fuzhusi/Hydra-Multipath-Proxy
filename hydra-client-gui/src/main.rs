@@ -215,6 +215,7 @@ fn next_import_group_name(subs: &[SubscriptionConfig]) -> String {
 /// - 本订阅旧节点被新列表替换（仅移除"仅本订阅认领"的地址，返回给调用方清状态）；
 /// - 与手动/其它订阅冲突的地址不重复添加，归属保持原状（单一事实来源 =
 ///   各订阅 nodes 列表，见 [`GuiConfig::node_source_label`]）。
+///
 /// 返回 (新增地址, 被移除地址)；本订阅 nodes 认领列表与 last_updated 在此一并落库。
 fn apply_subscription_node_update(
     cfg: &mut GuiConfig,
