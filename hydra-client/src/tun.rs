@@ -1357,17 +1357,26 @@ pub async fn run_stack<T: PacketTransport>(
                                 );
                                 warned_v6 = true;
                             }
-                            // 活跃流 v6 目的地址集合（动态地址淘汰保护）
-                            let protected: std::collections::HashSet<std::net::Ipv6Addr> = flows
-                                .keys()
-                                .filter_map(|h| sockets.get::<TcpSocket>(*h).local_endpoint())
-                                .filter_map(|ep| match ep.addr {
-                                    IpAddress::Ipv6(a) => {
-                                        Some(std::net::Ipv6Addr::from(a.0))
-                                    }
-                                    _ => None,
-                                })
-                                .collect();
+                            // 活跃 v6 目的地址集合（动态地址淘汰保护）。
+                            // 审查修复：保护来源从 flows 改为整个 SocketSet——accept
+                            // 循环在 poll 之后执行，SYN 已被投喂但 Flow 尚未登记的
+                            // 一轮里，仅按 flows 保护会漏掉握手期连接，池满时其
+                            // 地址被误淘汰（重传才恢复）。遍历 SocketSet 覆盖
+                            // SynReceived/Established/CloseWait 全部状态；监听
+                            // socket 的 local 地址未指定，被 filter_map 自然过滤。
+                            let protected: std::collections::HashSet<std::net::Ipv6Addr> =
+                                sockets
+                                    .iter()
+                                    .filter_map(|(_h, socket)| match socket {
+                                        smoltcp::socket::Socket::Tcp(s) => s.local_endpoint(),
+                                    })
+                                    .filter_map(|ep| match ep.addr {
+                                        IpAddress::Ipv6(a) => {
+                                            Some(std::net::Ipv6Addr::from(a.0))
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
                             let mut dst = [0u8; 16];
                             dst.copy_from_slice(&pkt[24..40]);
                             ensure_v6_dst(
@@ -1390,6 +1399,11 @@ pub async fn run_stack<T: PacketTransport>(
                                 if let Err(e) = transport.send(&rst).await {
                                     error!("TUN 写 IPv6 RST 失败: {}", e);
                                 }
+                            } else if pkt.len() > 6 && pkt[6] == 58 {
+                                // 入站 ICMPv6：RFC 4443 §2.4(e) 禁止对差错报文再回
+                                // 差错（防差错风暴/反射），静默丢弃；ping 不通属设
+                                // 计内（无 v6 转发能力，回不可达反而让 ping 失真）
+                                debug!("TUN 丢弃入站 IPv6 ICMPv6 包（无 v6 转发能力）");
                             } else {
                                 let icmp = build_icmpv6_unreachable_v6(pkt);
                                 if let Err(e) = transport.send(&icmp).await {
