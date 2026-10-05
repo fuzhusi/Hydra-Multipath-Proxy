@@ -474,7 +474,10 @@ fn subscription_source_label(source: &str) -> String {
         }
         return format!("订阅 · {}", host);
     }
-    match std::path::Path::new(inner).file_name() {
+    // 路径分隔符归一：Windows 风格路径（C:\a\b.txt）在 Linux 上 '\' 不是分隔符，
+    // 直接 Path 解析取不到文件名——先统一 '\' → '/' 再取（跨平台显示一致）
+    let normalized = inner.replace('\\', "/");
+    match std::path::Path::new(&normalized).file_name() {
         Some(name) => format!("文件 · {}", name.to_string_lossy()),
         None => "文件".to_string(),
     }
