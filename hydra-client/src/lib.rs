@@ -58,6 +58,144 @@ pub fn node_certs_from_env() -> Result<Vec<Vec<u8>>, String> {
     Ok(vec![der])
 }
 
+// ── TUN 公共入口（feature = "tun"）──────────────────────────────────────────
+// 此前 CLI 专用的 TUN 接线（配置构造 / 环路检测 / 停机令牌）全部私有在 src/main.rs，
+// GUI（hydra-client-gui，与代理同进程）无法复用。此处抽出轻量 pub 入口，
+// CLI 行为不变（main.rs 私有版本保留），向后兼容。
+
+/// GUI 场景的 TUN 配置构造：显式参数（非 env），豁免清单 = 节点 IP + 系统 DNS。
+/// - `addr`：形如 "10.7.0.1/30"（可省略前缀，默认 /30）；None = 全默认
+/// - `ports`：逗号分隔拦截端口列表；None = 默认 80,443,8080,8443
+/// - 解析失败返回 Err（GUI 先行校验后仍需兜底，与 CLI 的「告警+回落默认」不同：
+///   GUI 用户输入场景应显式报错而非静默换值）
+#[cfg(feature = "tun")]
+pub fn tun_config_from_settings(
+    addr: Option<&str>,
+    ports: Option<&str>,
+    nodes: &[SocketAddr],
+) -> std::result::Result<crate::tun::TunConfig, String> {
+    use std::net::Ipv4Addr;
+    let mut cfg = crate::tun::TunConfig::default();
+    if let Some(s) = addr.map(str::trim).filter(|s| !s.is_empty()) {
+        match s.split_once('/') {
+            Some((ip, prefix)) => {
+                let ip: Ipv4Addr = ip
+                    .trim()
+                    .parse()
+                    .map_err(|e| format!("TUN 地址非法（应为形如 10.7.0.1/30）: {e}"))?;
+                let prefix: u8 = prefix
+                    .trim()
+                    .parse()
+                    .map_err(|e| format!("TUN 前缀长度非法: {e}"))?;
+                // 审查 06-P2-9 同源约束：prefix>32 会使掩码计算下溢
+                if prefix > 32 {
+                    return Err(format!("TUN 前缀长度 {prefix} 非法（须 ≤32）"));
+                }
+                cfg.addr = ip;
+                cfg.prefix = prefix;
+            }
+            None => {
+                cfg.addr = s
+                    .parse()
+                    .map_err(|e| format!("TUN 地址非法（应为形如 10.7.0.1/30）: {e}"))?;
+            }
+        }
+    }
+    if let Some(s) = ports.map(str::trim).filter(|s| !s.is_empty()) {
+        let list: Vec<u16> = s
+            .split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect();
+        if list.is_empty() {
+            return Err(format!("TUN 端口列表非法（应为逗号分隔端口，如 80,443,8080,8443）: {s}"));
+        }
+        cfg.listen_ports = list;
+    }
+    // 防环路关键：节点 IP 豁免（IPv4 /32；IPv6 节点进 v6 豁免清单），与 CLI 同构
+    for n in nodes {
+        match n.ip() {
+            std::net::IpAddr::V4(ip) => cfg.exclude_routes.push(ip),
+            std::net::IpAddr::V6(ip) => cfg.exclude_routes_v6.push(ip),
+        }
+    }
+    // 系统 DNS 豁免（best-effort；v1 无 DNS 劫持，DNS 明文直出物理网卡）
+    for dns in crate::tun::detect_dns_servers() {
+        cfg.exclude_routes.push(dns);
+    }
+    Ok(cfg)
+}
+
+/// Windows 系统代理是否已启用（HKCU Internet Settings ProxyEnable=0x1）。
+/// TUN 全流量接管与系统代理叠加会形成环路，GUI 据此展示与 CLI 一致的告警。
+#[cfg(all(windows, feature = "tun"))]
+pub fn windows_system_proxy_enabled() -> bool {
+    std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "/v",
+            "ProxyEnable",
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("0x1"))
+        .unwrap_or(false)
+}
+
+/// TUN 任务停机令牌（tokio_util CancellationToken 组装点，此前为 main.rs 私有）。
+/// GUI 代理线程用它在「停止代理」时同步取消 TUN 栈任务（RouteGuard Drop 清理路由）。
+#[cfg(feature = "tun")]
+pub fn new_tun_shutdown_token() -> tokio_util::sync::CancellationToken {
+    tokio_util::sync::CancellationToken::new()
+}
+
+#[cfg(test)]
+mod tun_settings_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn tun_settings_defaults() {
+        // 全 None → 库默认（10.7.0.1/30 + 80,443,8080,8443）
+        let cfg = tun_config_from_settings(None, None, &[]).unwrap();
+        assert_eq!(cfg.addr, std::net::Ipv4Addr::new(10, 7, 0, 1));
+        assert_eq!(cfg.prefix, 30);
+        assert_eq!(cfg.listen_ports, vec![80, 443, 8080, 8443]);
+        // 空串等价 None（GUI 未填写场景）
+        let cfg = tun_config_from_settings(Some("  "), Some("  "), &[]).unwrap();
+        assert_eq!(cfg.prefix, 30);
+        assert_eq!(cfg.listen_ports, vec![80, 443, 8080, 8443]);
+    }
+
+    #[test]
+    fn tun_settings_parse_addr_ports() {
+        let cfg = tun_config_from_settings(Some("10.9.9.1/24"), Some("80, 443"), &[]).unwrap();
+        assert_eq!(cfg.addr, std::net::Ipv4Addr::new(10, 9, 9, 1));
+        assert_eq!(cfg.prefix, 24);
+        assert_eq!(cfg.listen_ports, vec![80, 443]);
+        // 裸 IP（无前缀）→ 默认 /30
+        let cfg = tun_config_from_settings(Some("10.9.9.1"), None, &[]).unwrap();
+        assert_eq!(cfg.prefix, 30);
+    }
+
+    #[test]
+    fn tun_settings_rejects_bad_input() {
+        assert!(tun_config_from_settings(Some("10.7.0.1/33"), None, &[]).is_err());
+        assert!(tun_config_from_settings(Some("no-host/30"), None, &[]).is_err());
+        assert!(tun_config_from_settings(None, Some("http,abc"), &[]).is_err());
+    }
+
+    #[test]
+    fn tun_settings_excludes_node_ips() {
+        let nodes = vec![
+            "1.2.3.4:443".parse::<SocketAddr>().unwrap(),
+            "[::1]:443".parse::<SocketAddr>().unwrap(),
+        ];
+        let cfg = tun_config_from_settings(None, None, &nodes).unwrap();
+        assert!(cfg.exclude_routes.contains(&std::net::Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(cfg.exclude_routes_v6.len(), 1);
+    }
+}
+
 /// 从逗号分隔的证书文件路径列表读取多节点证书（`HYDRA_NODE_CERTS`）。
 /// 顺序必须与节点地址顺序一一对应（仅用于 pin 模式信任根；Noise 指纹取对端
 /// 叶证书，配对错误不再导致握手失败——审查 R-02 的根治补全）。

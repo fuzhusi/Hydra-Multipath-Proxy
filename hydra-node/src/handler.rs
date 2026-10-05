@@ -108,6 +108,7 @@ fn classify_blocked_ip(ip: IpAddr) -> Option<&'static str> {
 /// - `::/96`（IPv4 兼容）：前 96 位全 0；
 /// - `::ffff:0:0/96`（RFC 2765 IPv4-translated）：seg[4]==0xffff 且 seg[5]==0；
 /// - `64:ff9b::/96`（NAT64）。
+///
 /// 命中返回重组的 `Ipv4Addr`，由调用方递归按 IPv4 规则复查。
 fn embedded_ipv4_of_v6(seg: [u16; 8]) -> Option<Ipv4Addr> {
     let v4 = Ipv4Addr::new(

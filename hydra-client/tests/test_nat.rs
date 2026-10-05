@@ -404,7 +404,7 @@ async fn 打洞核心_nonce相同判自连拒绝() {
 /// 拒绝（nonce 同源防线单测覆盖）。两条防线叠加 → 窗口内必须回落 None，
 /// 不得建成静默回环隧道。
 #[tokio::test]
-async fn hairpin_自连候选_双防线拒绝回落None() {
+async fn hairpin_self_connect_dual_defense_rejects_to_none() {
     // 取一个端口并释放，供 punch listener 绑定（REUSEADDR 下亦可共存，先释放更稳）
     let self_addr = free_loopback_port().await;
     let self_cand: SocketAddr = format!("127.0.0.1:{self_addr}").parse().unwrap();
