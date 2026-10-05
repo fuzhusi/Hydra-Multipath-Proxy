@@ -1,5 +1,7 @@
 # Hydra Multipath Proxy
 
+[![CI](https://github.com/fuzhusi/Hydra-Multipath-Proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/fuzhusi/Hydra-Multipath-Proxy/actions/workflows/ci.yml)
+
 基于 Rust 的多节点安全代理：本地 SOCKS5/HTTP 代理 → **TCP/TLS + Noise-PSK 握手** → 自建节点集群 → 互联网。
 
 > **关于 "Multipath" 命名**：指**连接级多节点加权分发与故障自愈**——每条连接走单一节点，多节点按评分分流新连接、故障自动切换。QUIC 时代的字节级多路径聚合（V3.4）已随 UDP 路径移除，如实声明避免名实脱钩。
@@ -236,7 +238,14 @@ Hydra-Multipath-Proxy/
 cargo test --workspace
 ```
 
-**205 通过 / 0 失败**（v0.2.0；rustls 0.23 + ring 0.17 单版本收敛，clippy 零告警，CI 见 [.github/workflows/](.github/workflows/)）。
+**215 通过 / 0 失败**（v0.2.0；rustls 0.23 + ring 0.17 单版本收敛，clippy `-D warnings` 零告警；CI 为 Windows + Ubuntu 双矩阵，badge 见顶部）。
+
+**Linux 构建系统依赖**（tray-icon/egui 的 GTK 后端需要，CI 已内置）：
+
+```bash
+sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
+  libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+```
 
 TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_transport.rs)）：
 - 64KB / 1MB / 10MB 三档 E2E 回显逐字节相等（10MB 走 SOCKS5 代理全链路）
