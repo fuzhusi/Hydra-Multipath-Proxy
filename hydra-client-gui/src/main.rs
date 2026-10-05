@@ -4433,13 +4433,15 @@ mod tests {
 
     /// 组过滤测试夹具：手动 1 节点 + 订阅A 认领 2 节点 + 订阅B 认领 1 节点
     fn group_fixture() -> GuiConfig {
-        let mut cfg = GuiConfig::default();
-        cfg.node_addrs = vec![
-            "10.0.0.1:1".to_string(),  // 手动
-            "10.0.0.2:2".to_string(),  // 订阅A
-            "10.0.0.3:3".to_string(),  // 订阅A
-            "10.0.0.4:4".to_string(),  // 订阅B
-        ];
+        let mut cfg = GuiConfig {
+            node_addrs: vec![
+                "10.0.0.1:1".to_string(),  // 手动
+                "10.0.0.2:2".to_string(),  // 订阅A
+                "10.0.0.3:3".to_string(),  // 订阅A
+                "10.0.0.4:4".to_string(),  // 订阅B
+            ],
+            ..GuiConfig::default()
+        };
         cfg.subscriptions.push(SubscriptionConfig {
             name: "订阅A".to_string(),
             source: "https://a.example".to_string(),
@@ -4489,8 +4491,10 @@ mod tests {
     #[test]
     fn filter_nodes_by_group_empty_config_and_no_subs() {
         // 无订阅配置：全部 = 手动 = 节点列表
-        let mut cfg = GuiConfig::default();
-        cfg.node_addrs = vec!["1.2.3.4:4433".to_string()];
+        let cfg = GuiConfig {
+            node_addrs: vec!["1.2.3.4:4433".to_string()],
+            ..GuiConfig::default()
+        };
         let addrs = cfg.node_addrs.clone();
         assert_eq!(filter_nodes_by_group(&cfg, &addrs, &None), addrs);
         assert_eq!(
