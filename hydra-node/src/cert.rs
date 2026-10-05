@@ -27,8 +27,22 @@ pub fn load_or_generate(
             )));
         }
         warn_if_key_permissions_too_open(key_file);
-        let cert_der = fs::read(cert_file)?;
-        let key_der = fs::read(key_file)?;
+        let cert_raw = fs::read(cert_file)?;
+        let key_raw = fs::read(key_file)?;
+        // 真证书部署（ACME/Let's Encrypt，审查报告协议评估 P0）：检测 PEM 并解析。
+        // cert_file 可为 fullchain（leaf + 中间链），key 支持 PKCS8/RSA/EC。
+        if cert_raw.starts_with(b"-----BEGIN") {
+            let (certs, key) = parse_pem_pair(&cert_raw, &key_raw)?;
+            info!(
+                "已加载 PEM 真证书（{} 证书，含链）: {} (leaf SHA-256 指纹: {})",
+                certs.len(),
+                cert_file.display(),
+                fingerprint_hex(&certs[0].0)
+            );
+            return Ok((certs[0].clone(), key));
+        }
+        let cert_der = cert_raw;
+        let key_der = key_raw;
         info!(
             "已加载持久化节点证书: {} (SHA-256 指纹: {})",
             cert_file.display(),
@@ -58,6 +72,50 @@ pub fn load_or_generate(
 /// 证书 DER 的 SHA-256 指纹（hex）
 pub fn fingerprint_hex(cert_der: &[u8]) -> String {
     hex_encode(digest(&SHA256, cert_der).as_ref())
+}
+
+/// 解析 PEM 证书链 + 私钥（真证书部署路径：HYDRA_CERT_FILE/HYDRA_KEY_FILE 指向
+/// acme.sh/certbot 产出的 fullchain 与 key）。key 依次尝试 PKCS8 → RSA → EC。
+fn parse_pem_pair(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<(Vec<rustls::Certificate>, rustls::PrivateKey)> {
+    use std::io::BufRead;
+
+    let mut rd = std::io::BufReader::new(cert_pem);
+    let certs: Vec<Vec<u8>> = rustls_pemfile::certs(&mut rd)
+        .map_err(|e| HydraError::NodeError(format!("PEM 证书解析失败: {e}")))?;
+    if certs.is_empty() {
+        return Err(HydraError::NodeError(
+            "PEM 证书文件中未找到任何证书（-----BEGIN CERTIFICATE-----）".to_string(),
+        ));
+    }
+
+    let mut rd = std::io::BufReader::new(key_pem);
+    let key_der = rustls_pemfile::pkcs8_private_keys(&mut rd)
+        .map_err(|e| HydraError::NodeError(format!("PEM 私钥（PKCS8）解析失败: {e}")))?;
+    let key_der = if !key_der.is_empty() {
+        key_der
+    } else {
+        let mut rd = std::io::BufReader::new(key_pem);
+        rustls_pemfile::rsa_private_keys(&mut rd)
+            .map_err(|e| HydraError::NodeError(format!("PEM 私钥（RSA）解析失败: {e}")))?
+    };
+    let key_der = if !key_der.is_empty() {
+        key_der
+    } else {
+        let mut rd = std::io::BufReader::new(key_pem);
+        rustls_pemfile::ec_private_keys(&mut rd)
+            .map_err(|e| HydraError::NodeError(format!("PEM 私钥（EC）解析失败: {e}")))?
+    };
+    let key = key_der
+        .into_iter()
+        .next()
+        .ok_or_else(|| HydraError::NodeError("PEM 私钥文件中未找到私钥".to_string()))?;
+    Ok((
+        certs.into_iter().map(rustls::Certificate).collect(),
+        rustls::PrivateKey(key),
+    ))
 }
 
 /// Unix 下收紧落盘权限（遗留 G）：私钥 0600，证书 0644（需分发给客户端）。

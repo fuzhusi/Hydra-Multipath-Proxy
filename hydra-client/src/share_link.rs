@@ -2,11 +2,46 @@ use base64::{
     engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64URL},
     Engine as _,
 };
-pub use hydra_obfs::TransportMode;
 use hydra_protocol::{HydraError, NodeInfo, NodeStatus, Result};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use url::Url;
+use tracing::warn;
+
+/// legacy 传输模式（QUIC 时代 masquerade|obfs 双模式；QUIC/UDP 与 obfs 模块已
+/// 随 TCP 转型整体移除）。枚举仅为旧分享链接 / 旧 JSON 持久化数据的**兼容解析**
+/// 而保留：解析不报错（旧链接继续可用），但对运行时不再有任何效果——现行唯一
+/// 传输为 TCP/TLS（TLS 1.3 + Noise-PSK）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportMode {
+    /// QUIC 伪装模式（legacy，无运行时效果；缺省值）
+    #[default]
+    Masquerade,
+    /// QUIC obfs 混淆模式（legacy，无运行时效果；UDP 概念不适用 TCP）
+    Obfs,
+}
+
+impl TransportMode {
+    /// 解析模式字符串（legacy 分享链接 mode 参数用；非法值显式报错，同旧行为）
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "masquerade" => Ok(TransportMode::Masquerade),
+            "obfs" => Ok(TransportMode::Obfs),
+            other => Err(HydraError::ProtocolError(format!(
+                "Invalid mode '{}': expected masquerade|obfs",
+                other
+            ))),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TransportMode::Masquerade => "masquerade",
+            TransportMode::Obfs => "obfs",
+        }
+    }
+}
 
 /// Hydra节点分享链接格式（Team-Q 分享体系 v2）
 ///
@@ -53,8 +88,8 @@ pub struct ShareLink {
     /// v2 obfs 独立第二密码（base64url(UTF-8 字节)）；仅 obfs 模式
     #[serde(default)]
     pub obfs_key: Option<String>,
-    /// Team-T 传输选择（链接参数 `tp=tcp|quic`）；None/缺省 = quic（既有链接零改动）。
-    /// 序列化仅在 tcp 时写 `tp=tcp`（quic 为缺省不写，与 mode 字段同一惯例）
+    /// Team-T 传输选择（链接参数 `tp=tcp|quic`）；None/缺省 = tcp（TCP 转型后默认）。
+    /// 序列化在 tcp 时写 `tp=tcp`（quic 为 legacy 值，解析时告警回退 tcp）
     #[serde(default)]
     pub transport: Option<String>,
 }
@@ -74,7 +109,8 @@ impl ShareLink {
             cert_der: None,
             cert_fp: None,
             obfs_key: None,
-            transport: None,
+            // TCP 转型后默认生成 tp=tcp（缺省语义同样解析为 tcp，双向一致）
+            transport: Some(crate::tcp_transport::TransportChoice::Tcp.as_str().to_string()),
         }
     }
 
@@ -111,17 +147,26 @@ impl ShareLink {
         self
     }
 
-    /// 节点是否使用 TCP/TLS 传输（Team-T；缺省 = quic）
+    /// 节点是否使用 TCP/TLS 传输（Team-T；缺省与 legacy `tp=quic` 均按 tcp 处理——
+    /// QUIC 路径已移除，现行唯一传输为 TCP/TLS；非法存量值返回 false）
     pub fn transport_is_tcp(&self) -> bool {
-        matches!(self.transport.as_deref(), Some("tcp"))
+        matches!(
+            self.transport_choice(),
+            Ok(crate::tcp_transport::TransportChoice::Tcp)
+        )
     }
 
-    /// 解析传输选择字段（None/非法缺省按 quic 由调用方决定；此处非法值显式报错）
+    /// 解析传输选择字段（缺省 = [`crate::tcp_transport::DEFAULT_TRANSPORT`] = tcp；
+    /// legacy `tp=quic` 告警回退 tcp——QUIC 路径已移除，保证旧链接/旧配置不黑洞）
     pub fn transport_choice(
         &self,
     ) -> std::result::Result<crate::tcp_transport::TransportChoice, HydraError> {
         match self.transport.as_deref() {
-            None => Ok(crate::tcp_transport::TransportChoice::Quic),
+            None => Ok(crate::tcp_transport::DEFAULT_TRANSPORT),
+            Some("quic") => {
+                warn!("分享链接 tp=quic（legacy）的 QUIC/UDP 路径已移除，回退 tcp");
+                Ok(crate::tcp_transport::TransportChoice::Tcp)
+            }
             Some(s) => crate::tcp_transport::TransportChoice::parse(s),
         }
     }
@@ -245,7 +290,7 @@ impl ShareLink {
         if let Some(cf) = &self.cert_fp {
             url.push_str(&format!("&cf={}", cf));
         }
-        // Team-T：传输选择（仅 tcp 写 tp=tcp；quic 为缺省不写，既有链接零改动）
+        // Team-T：传输选择（tcp 写 tp=tcp；quic 为 legacy 值不生成，缺省语义=tcp）
         if let Some(tp) = &self.transport {
             if tp == "tcp" {
                 url.push_str("&tp=tcp");
@@ -352,7 +397,9 @@ impl ShareLink {
                             HydraError::ProtocolError(format!("Invalid mode: {}", e))
                         })?);
                 }
-                // Team-T：传输选择（tp=tcp|quic；非法值显式报错，不静默回落）
+                // Team-T：传输选择（tp=tcp|quic；非法值显式报错，不静默回落。
+                // quic 为 legacy 值：照原样存入，访问器 transport_choice/transport_is_tcp
+                // 统一告警回退 tcp——QUIC 路径已移除，旧链接不黑洞）
                 "tp" => {
                     crate::tcp_transport::TransportChoice::parse(&value).map_err(|e| {
                         HydraError::ProtocolError(format!("Invalid tp (transport): {}", e))
@@ -547,7 +594,7 @@ hydra://192.168.1.100:8080?bandwidth=80&latency=15&loss_rate=0.02&status=online
 
     // ===================== C4 V3.1 mode 字段 =====================
 
-    /// Team-T：`tp` 传输字段解析/序列化往返；缺省 quic 不写参数（既有链接零改动）
+    /// Team-T：`tp` 传输字段解析/序列化往返；TCP 转型后缺省 = tcp（默认生成写 tp=tcp）
     #[test]
     fn tt_tp_field_roundtrip() {
         let url = "hydra://1.2.3.4:443?bandwidth=100&tp=tcp";
@@ -564,14 +611,23 @@ hydra://192.168.1.100:8080?bandwidth=80&latency=15&loss_rate=0.02&status=online
         let rt2: ShareLink = serde_json::from_str(&json).unwrap();
         assert!(rt2.transport_is_tcp());
 
-        // 显式 quic 与缺省等价：不写 tp 参数
-        let quic = ShareLink::from_share_url("hydra://1.2.3.4:443?tp=quic").unwrap();
-        assert!(!quic.transport_is_tcp());
-        assert!(!quic.to_share_url().contains("tp="));
+        // 缺省（无 tp 参数）= tcp；默认生成写 tp=tcp
         let default = ShareLink::from_share_url("hydra://1.2.3.4:443?bandwidth=100").unwrap();
-        assert!(!default.transport_is_tcp());
+        assert!(default.transport_is_tcp());
+        assert_eq!(
+            default.transport_choice().unwrap(),
+            crate::tcp_transport::TransportChoice::Tcp
+        );
+        let fresh = ShareLink::from_node_info(&sample_node());
+        assert!(fresh.to_share_url().contains("tp=tcp"));
 
-        // 非法值显式报错（不静默回落 quic）
+        // legacy tp=quic：解析不报错，访问器告警回退 tcp；不生成 quic 链接
+        let quic = ShareLink::from_share_url("hydra://1.2.3.4:443?tp=quic").unwrap();
+        assert!(quic.transport_is_tcp(), "legacy quic 回退 tcp");
+        assert_eq!(quic.transport_choice().unwrap(), crate::tcp_transport::TransportChoice::Tcp);
+        assert!(!quic.to_share_url().contains("tp="));
+
+        // 非法值显式报错（不静默回落 tcp）
         assert!(ShareLink::from_share_url("hydra://1.2.3.4:443?tp=obfs").is_err());
     }
 
@@ -728,11 +784,11 @@ hydra://192.168.1.100:8080?bandwidth=80&latency=15&loss_rate=0.02&status=online
         assert_eq!(parsed.obfs_key, None);
         assert_eq!(parsed.mode, TransportMode::Obfs);
 
-        // 旧格式生成输出与旧版逐字节一致（无密钥时）
+        // 旧格式生成输出：默认生成现带 tp=tcp（TCP 转型后唯一传输，缺省语义一致）
         let plain = ShareLink::from_node_info(&sample_node());
         assert_eq!(
             plain.to_share_url(),
-            "hydra://127.0.0.1:8080?bandwidth=100&latency=10&loss_rate=0.01&load=0.5&status=online"
+            "hydra://127.0.0.1:8080?bandwidth=100&latency=10&loss_rate=0.01&load=0.5&status=online&tp=tcp"
         );
     }
 

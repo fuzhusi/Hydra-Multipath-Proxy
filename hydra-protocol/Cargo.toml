@@ -7,14 +7,13 @@ edition = "2021"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
-serde_bytes = "0.11"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
-quinn = "0.10"
-rustls = { version = "0.21", features = ["dangerous_configuration"] }
+# dangerous_configuration feature 已移除（审查 R-10：全仓无 danger:: 使用，
+# pinning 走 RootCertStore 标准校验；缩小供应链审计面）
+rustls = "0.21"
 ring = "0.16"
 # V3.2 Noise-PSK 握手 v2：Noise_NNpsk2_25519_ChaChaPoly_SHA256。
-# 注意：snow 0.9 的 ring-resolver 绑 ring 0.17（任务指定）；在 quinn 0.10 完成向
-# rustls 0.23/ring 0.17 收敛前，工作区暂时并存 ring 0.16（quinn/rustls 栈）与
-# ring 0.17（仅 snow 内部用）——升级阻塞原因见任务书 T3 降级授权与 README。
+# 注意：snow 0.9 的 ring-resolver 绑 ring 0.17（任务指定）；rustls 0.21（已 EOL）
+# → 0.23 + ring 0.17 收敛为已知技术债（审查报告 R-46 / 节点专项审查 P3）。
 snow = { version = "0.9", default-features = false, features = ["default-resolver", "ring-resolver"] }

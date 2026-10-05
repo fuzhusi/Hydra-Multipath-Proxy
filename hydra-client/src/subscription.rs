@@ -116,7 +116,7 @@ fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hydra_obfs::TransportMode;
+    use crate::share_link::TransportMode;
     use hydra_protocol::NodeStatus;
 
     const LINK_A: &str =

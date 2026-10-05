@@ -1,6 +1,6 @@
 # 转型方案：全面 TCP 化 + 开源加密方案选型
 
-- 日期：2026-10-04 ｜ 状态：**待老板批准后执行**
+- 日期：2026-10-04 ｜ 状态：**已执行完成（2026-10-05，见文末执行记录）**
 - 决策背景：老板网络（广东移动→境外 VPS）存在**UDP 回程 QoS 丢包**（tcpdump 实证：上行通/回程丢），QUIC/UDP 路线在该网络环境下不可用。老板拍板：放弃 UDP，全面转 TCP；加密方式从开源项目找成熟方案。
 
 ---
@@ -69,3 +69,21 @@
 
 - Trojan 认证头为明文哈希（TLS 内），无 PSK 前向安全增强——TLS 1.3 已提供前向安全，可接受（如实标注）
 - 广东移动对境外 TCP 443 也可能限速——若出现，后续评估端口/真证书优化（数据说话）
+
+---
+
+## 6. 执行记录（2026-10-05）
+
+**认证方案拍板**：老板确认采用 §1 定版结论——**TLS 1.3（自签 pinning）+ V3.2 Noise-PSK 应用层握手 + 私有帧**（未采用 Trojan 式 SHA224 认证头；§2/Wave 1 中 SHA224 描述作废，帧协议落定为 `[u16 BE 地址长度][目标地址] + [2B 应答码]`）。
+
+**Wave 3 拍板**：QUIC/UDP 死路径与 hydra-obfs 模块本轮直接删除（不经 legacy 保留期；git 历史可回溯）。
+
+交付清单：
+
+- **协议层**：`hydra-protocol/src/tcp_frame.rs`（地址帧/应答码编解码 + 6 项单测）；Noise 握手（handshake.rs）原样平移到 TCP 流，通道绑定 = 证书指纹 + rustls TLS exporter
+- **节点**：`hydra-node/src/tcp_server.rs` 新实现（TLS 无 ALPN + 版本字节判别 + Noise 握手 + 帧 + SSRF/DNS/建连复用 + 半关闭泵）；删除 `server.rs` QUIC endpoint、`tcp.rs`（v1 旧实现）、`stun.rs`；handler 仅保留 resolve_and_connect 与认证访问器
+- **客户端**：`tcp_transport.rs` 重写为新协议（pinning/SNI/禁会话恢复/握手/帧）；proxy 唯一路径 = TCP，保留调度加权分发 + 故障切换；删除 pool/aggregate/aggregate_stream/assembler/nat_traversal/session/crypto/buf_pool/cc 及 transport.rs 的 quinn Endpoint；**修复多节点证书指纹映射缺陷**（Noise confirm 必须用目标节点自己的证书，原实现固定取首证书导致多节点集群静默退化单节点）
+- **GUI**：节点连通性测试改 TCP 探测；obfs/masquerade 模式 UI 与配置字段移除
+- **清理**：hydra-obfs crate 删除并移出 workspace；QUIC 时代集成测试删除；部署套件（env.example/install.sh/systemd/Docker）全部改为 443/tcp；README/部署指南按 TCP 现状重写
+- **验收**：`cargo test --workspace` 125 通过 / 0 失败 / 0 忽略；Wave 1 验收门全绿（64KB/1MB/10MB E2E 逐字节相等——直连与 SOCKS5 代理双路径、错误 PSK 静默关流无可区分错误码、半关闭语义、默认传输 TCP、多节点测速动态调度）
+- **远期评估**（方案原文提及，未在本轮交付）：ACME 真证书（`HYDRA_ACME_DOMAIN`）、非认证 IP 反代静态页、多节点并行下载（HTTP Range 切块）

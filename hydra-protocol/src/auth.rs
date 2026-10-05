@@ -167,13 +167,22 @@ pub fn create_credential(password: &str) -> StoredCredential {
 
 /// Hex 解码（非法输入返回错误而不是 panic）
 pub fn hex_decode(hex: &str) -> std::result::Result<Vec<u8>, String> {
-    if !hex.len().is_multiple_of(2) {
+    // 按字节处理并拒绝非 ASCII：多字节 UTF-8 字符（如 "a中"、emoji）按字节长度
+    // 做偶数检查会通过，但 str 切片落在 char boundary 内会 panic（此前 fail-fast
+    // 链路上 GUI/CLI 输入非法密钥即整个进程 abort）——改为返回 Err。
+    if !hex.is_ascii() {
+        return Err("hex 字符串包含非 ASCII 字符".to_string());
+    }
+    let bytes = hex.as_bytes();
+    if bytes.len() % 2 != 0 {
         return Err("hex 字符串长度必须为偶数".to_string());
     }
-    (0..hex.len())
+    (0..bytes.len())
         .step_by(2)
         .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
+            // 已确认全 ASCII，切片边界安全
+            let pair = std::str::from_utf8(&bytes[i..i + 2]).unwrap_or("");
+            u8::from_str_radix(pair, 16)
                 .map_err(|e| format!("第 {} 个字节不是合法的 hex: {}", i / 2, e))
         })
         .collect()
@@ -182,4 +191,32 @@ pub fn hex_decode(hex: &str) -> std::result::Result<Vec<u8>, String> {
 /// Hex 编码
 pub fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_decode_合法输入() {
+        assert_eq!(hex_decode("").unwrap(), Vec::<u8>::new());
+        assert_eq!(hex_decode("00ff").unwrap(), vec![0x00, 0xff]);
+        assert_eq!(hex_decode("AbCd").unwrap(), vec![0xab, 0xcd]);
+    }
+
+    #[test]
+    fn hex_decode_非法输入返回err不panic() {
+        assert!(hex_decode("abc").is_err()); // 奇数长度
+        assert!(hex_decode("zz").is_err()); // 非 hex 字符
+    }
+
+    #[test]
+    fn hex_decode_多字节utf8输入返回err不panic() {
+        // 此前实现按字节长度切片，"a中"（4 字节）通过偶数检查后切片跨 char
+        // boundary 直接 panic；修复后必须返回 Err。
+        assert!(hex_decode("a中").is_err());
+        assert!(hex_decode("中").is_err());
+        assert!(hex_decode("😀").is_err());
+        assert!(hex_decode("616263中").is_err());
+    }
 }

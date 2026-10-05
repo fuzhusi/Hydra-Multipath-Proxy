@@ -4,8 +4,7 @@
 use eframe::egui;
 use hydra_client::{
     format_bytes, format_duration, format_speed, generate_share_links, hex_encode_lower,
-    parse_share_links, sha256_hex, ProxyServer, Scheduler, ShareLink, TrafficMonitor, Transport,
-    TransportMode,
+    parse_share_links, sha256_hex, ProxyServer, Scheduler, ShareLink, TrafficMonitor,
 };
 use hydra_protocol::{NodeInfo, NodeStatus};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -102,7 +101,6 @@ struct HydraApp {
 
     // 密钥明文显示开关（默认掩码显示）
     show_auth_key: bool,
-    show_obfs_key: bool,
 
     // ── UI 重设计 v2：节点页顶部「全局凭据」折叠区（过渡期全局生效，诚实标注）──
     global_creds_open: bool,
@@ -124,13 +122,9 @@ struct HydraApp {
     edit_auth_key: String,
     edit_show_auth: bool,
     edit_cert_path: String,
-    edit_obfs_key: String,
-    edit_obfs: bool,
-    edit_show_obfs: bool,
 
     // 运行时状态
     scheduler: Option<Arc<Scheduler>>,
-    transport: Option<Arc<Transport>>,
     stop_flag: Option<Arc<AtomicBool>>,
     proxy_thread_handle: Option<std::thread::JoinHandle<()>>,
     proxy_exit_receiver: Option<std::sync::mpsc::Receiver<()>>,
@@ -186,7 +180,6 @@ impl Default for HydraApp {
             import_text: String::new(),
             import_status: None,
             show_auth_key: false,
-            show_obfs_key: false,
             node_edit_open: false,
             edit_orig_addr: String::new(),
             edit_name: String::new(),
@@ -194,16 +187,12 @@ impl Default for HydraApp {
             edit_auth_key: String::new(),
             edit_show_auth: false,
             edit_cert_path: String::new(),
-            edit_obfs_key: String::new(),
-            edit_obfs: false,
-            edit_show_obfs: false,
             global_creds_open: false,
             expanded_sub: None,
             sub_edit_idx: None,
             sub_edit_name: String::new(),
             sub_edit_source: String::new(),
             scheduler: None,
-            transport: None,
             stop_flag: None,
             proxy_thread_handle: None,
             proxy_exit_receiver: None,
@@ -270,7 +259,7 @@ impl HydraApp {
             cfg.proxy_listen_addr = "127.0.0.1:1080".to_string();
         }
 
-        // C2 双模式/obfs 密码/探测间隔：配置非空 → 覆盖 env（hydra-client 内部从 env 读取）。
+        // 探测间隔：配置非空 → 覆盖 env（hydra-client 内部从 env 读取）。
         // 必须在任何工作线程 spawn 之前执行，避免 env 并发读写。
         config::apply_env_overrides(&cfg);
 
@@ -313,7 +302,6 @@ impl HydraApp {
             import_text: String::new(),
             import_status: None,
             show_auth_key: false,
-            show_obfs_key: false,
             node_edit_open: false,
             edit_orig_addr: String::new(),
             edit_name: String::new(),
@@ -321,16 +309,12 @@ impl HydraApp {
             edit_auth_key: String::new(),
             edit_show_auth: false,
             edit_cert_path: String::new(),
-            edit_obfs_key: String::new(),
-            edit_obfs: false,
-            edit_show_obfs: false,
             global_creds_open: false,
             expanded_sub: None,
             sub_edit_idx: None,
             sub_edit_name: String::new(),
             sub_edit_source: String::new(),
             scheduler: None,
-            transport: None,
             stop_flag: None,
             proxy_thread_handle: None,
             proxy_exit_receiver: None,
@@ -424,15 +408,17 @@ impl HydraApp {
             .parse()
             .map_err(|e| format!("地址解析失败: {}", e))?;
 
-        let transport = Transport::new_client(node_certs, hydra_client::DEFAULT_SNI)
-            .await
-            .map_err(|e| format!("创建 QUIC 传输失败: {}", e))?;
-
+        // TCP 连通性探测（TCP 转型后：用 TCP connect 时延作为节点健康近似，3s 超时语义保持）
         let start = std::time::Instant::now();
-        if transport.test_connection(addr, 3000).await {
-            Ok(start.elapsed().as_millis() as u64)
-        } else {
-            Err(format!("QUIC 连接失败或超时（3s）: {}", addr))
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_millis(3000),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await;
+        match probe {
+            Ok(Ok(_)) => Ok(start.elapsed().as_millis() as u64),
+            Ok(Err(e)) => Err(format!("TCP 连接失败: {} ({})", addr, e)),
+            Err(_) => Err(format!("TCP 连接超时（3s）: {}", addr)),
         }
     }
 
@@ -635,7 +621,7 @@ impl HydraApp {
             return;
         }
 
-        // Exec-1：模式/obfs 密码/探测间隔——配置非空 → 覆盖 env（hydra-client 内部从 env 读取）。
+        // Exec-1：探测间隔——配置非空 → 覆盖 env（hydra-client 内部从 env 读取）。
         // 此前已有线程在跑时本函数会被 proxy_running 拦截，故此处写 env 不会与之并发。
         config::apply_env_overrides(&self.config);
 
@@ -1050,7 +1036,9 @@ impl HydraApp {
     // ═══════════════ Team-Q：分享体系 v2（二维码 + 密钥链接）═══════════════
 
     /// 为指定节点构造 v2 分享链接：带认证密钥 + 证书（完整）或证书指纹（紧凑）。
-    /// obfs 模式时附 obfs 第二密码。密钥/证书按当前配置解析，取不到的字段自动省略。
+    /// 密钥/证书按当前配置解析，取不到的字段自动省略。
+    /// TCP/TLS（TLS 1.3 + Noise-PSK）是唯一传输：不再附加 mode=obfs/ok 参数
+    /// （legacy 链接的兼容解析由 hydra-client 的 share_link 层处理）。
     fn build_share_link(&self, addr_str: &str, compact: bool) -> Option<ShareLink> {
         let addr: SocketAddr = addr_str.trim().parse().ok()?;
         let node_info = NodeInfo {
@@ -1061,12 +1049,7 @@ impl HydraApp {
             load: 0.5,
             status: NodeStatus::Online,
         };
-        let mode = if self.config.is_obfs() {
-            TransportMode::Obfs
-        } else {
-            TransportMode::Masquerade
-        };
-        let mut link = ShareLink::new_with_mode(&node_info, mode);
+        let mut link = ShareLink::new(&node_info);
 
         // 认证密钥（完整分享核心字段；解析失败则省略，链接退化为仅地址信息）
         if let Ok(key) = config::resolve_auth_key(&self.config) {
@@ -1079,11 +1062,6 @@ impl HydraApp {
             Some(der) if compact => link = link.with_cert_fp(sha256_hex(&der)),
             Some(der) => link = link.with_cert_der(&der),
             None => {}
-        }
-
-        // obfs 第二密码（仅 obfs 模式且已设置时携带）
-        if self.config.is_obfs() && !self.config.obfs_key.trim().is_empty() {
-            link = link.with_obfs_key(self.config.obfs_key.trim());
         }
         Some(link)
     }
@@ -1129,7 +1107,6 @@ impl HydraApp {
             Some(der) => Some(base64::engine::general_purpose::STANDARD.encode(&der)),
             None => None,
         };
-        let obfs_key = link.obfs_key_string().map_err(|e| e.to_string())?;
 
         // ── 以下为落库（不会再失败）──
         if let Some(hex) = auth_key_hex {
@@ -1156,12 +1133,8 @@ impl HydraApp {
                 }
             }
         }
-        if let Some(ok) = obfs_key {
-            self.config.obfs_key = ok;
-        }
-        if link.mode == TransportMode::Obfs {
-            self.config.hydra_mode = "obfs".to_string();
-        }
+        // legacy 链接中的 mode/ok 参数由 hydra-client 兼容解析层处理；GUI 不再落库
+        // hydra_mode/obfs_key（TCP/TLS 是唯一传输，配置字段已删除）。
 
         let addr_str = format!("{}:{}", link.address, link.port);
         if !self.config.node_addrs.contains(&addr_str) {
@@ -1733,14 +1706,7 @@ impl eframe::App for HydraApp {
                             "未包含（对方需自行导入）"
                         }
                     ));
-                    ui.label(format!(
-                        "传输模式: {}",
-                        if self.config.is_obfs() {
-                            "obfs"
-                        } else {
-                            "masquerade"
-                        }
-                    ));
+                    ui.label(format!("传输模式: TCP/TLS（TLS 1.3 + Noise-PSK）"));
 
                     // 红字安全提示
                     ui.separator();
@@ -2142,11 +2108,7 @@ impl HydraApp {
             .show(ui, |ui| {
                 ui.heading("当前模式");
                 ui.separator();
-                let mode = if self.config.is_obfs() {
-                    "obfs 混淆"
-                } else {
-                    "masquerade 伪装"
-                };
+                let mode = "TCP/TLS（TLS 1.3 + Noise-PSK）";
                 let psk_ok = !self.config.auth_key.trim().is_empty();
                 let cert_ok = !self.config.cert_path.trim().is_empty()
                     || !self.config.cert_der_b64.trim().is_empty();
@@ -2200,7 +2162,7 @@ impl HydraApp {
         ui.heading("节点");
         ui.separator();
 
-        // ── UI 重设计 v2：全局凭据折叠区（PSK/证书/模式/obfs）──
+        // ── UI 重设计 v2：全局凭据折叠区（PSK/证书）──
         // 过渡期这些字段仍为全局单值（GuiConfig），后端节点级凭据（方案 §6 P3）落地前
         // 对所有节点生效——此处诚实标注，不假装是节点级凭据。
         egui::CollapsingHeader::new("🔑 全局凭据（当前对所有节点生效）")
@@ -2278,67 +2240,8 @@ impl HydraApp {
                     );
                 }
 
-                // 传输模式（下拉；对应 HYDRA_MODE；两端须一致）
-                ui.horizontal(|ui| {
-                    ui.label("传输模式:");
-                    let obfs = self.config.is_obfs();
-                    let current = if obfs { "obfs 混淆" } else { "masquerade 伪装" };
-                    egui::ComboBox::from_id_source("global_mode_combo")
-                        .selected_text(current)
-                        .width(160.0)
-                        .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(!obfs, "masquerade 伪装")
-                                .clicked()
-                                && obfs
-                            {
-                                self.config.hydra_mode = "masquerade".to_string();
-                                self.add_log("已切换为 masquerade 模式，下次启动代理生效".to_string());
-                            }
-                            if ui
-                                .selectable_label(obfs, "obfs 混淆")
-                                .clicked()
-                                && !obfs
-                            {
-                                self.config.hydra_mode = "obfs".to_string();
-                                self.add_log(
-                                    "已切换为 obfs 模式（需两端一致），下次启动代理生效".to_string(),
-                                );
-                            }
-                        });
-                });
-
-                // obfs 独立第二密码（仅 obfs 模式显示；对应 HYDRA_OBFS_KEY）
-                if self.config.is_obfs() {
-                    ui.horizontal(|ui| {
-                        ui.label("obfs 密码:");
-                        if self.show_obfs_key {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.config.obfs_key)
-                                    .desired_width(200.0),
-                            );
-                            if ui.small_button("隐藏").clicked() {
-                                self.show_obfs_key = false;
-                            }
-                        } else {
-                            let shown = if self.config.obfs_key.is_empty() {
-                                "（未设置）".to_string()
-                            } else {
-                                config::mask_secret(self.config.obfs_key.trim())
-                            };
-                            ui.monospace(shown);
-                            if ui.small_button("编辑/显示").clicked() {
-                                self.show_obfs_key = true;
-                            }
-                        }
-                    });
-                    if self.config.obfs_key.trim().is_empty() {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(0xFF, 0xD6, 0x66),
-                            "⚠ obfs 模式要求独立第二密码，否则代理无法启动",
-                        );
-                    }
-                }
+                // 传输为固定 TCP/TLS（TLS 1.3 + Noise-PSK）：Wave 3 起无其他模式
+                ui.label("传输模式: TCP/TLS（TLS 1.3 + Noise-PSK）");
             });
 
         ui.separator();
@@ -2861,9 +2764,6 @@ impl HydraApp {
         self.edit_auth_key = self.config.auth_key.clone();
         self.edit_show_auth = false;
         self.edit_cert_path = self.config.cert_path.clone();
-        self.edit_obfs_key = self.config.obfs_key.clone();
-        self.edit_obfs = self.config.is_obfs();
-        self.edit_show_obfs = false;
         self.node_edit_open = true;
     }
 
@@ -2922,8 +2822,6 @@ impl HydraApp {
             ));
             return;
         }
-        let obfs_key = self.edit_obfs_key.trim().to_string();
-        let obfs = self.edit_obfs;
 
         // ── 写回阶段（不会再失败）──
         let orig = self.edit_orig_addr.clone();
@@ -2937,15 +2835,9 @@ impl HydraApp {
         self.config.set_node_name(&new_addr, &self.edit_name.trim());
         self.config.auth_key = key;
         self.config.cert_path = cert_path;
-        self.config.obfs_key = obfs_key;
-        self.config.hydra_mode = if obfs {
-            "obfs".to_string()
-        } else {
-            "masquerade".to_string()
-        };
         self.node_edit_open = false;
         self.add_log(format!("节点 {} 已保存", new_addr));
-        // 全局参数（密钥/证书/模式）只在代理启动时读取，运行中修改必须重启才生效
+        // 全局参数（密钥/证书）只在代理启动时读取，运行中修改必须重启才生效
         if self.proxy_running {
             self.add_log(
                 "⚠ 代理正在运行：本次修改（密钥/证书/模式/地址）需停止并重新启动代理后才生效"
@@ -3057,46 +2949,8 @@ impl HydraApp {
                     }
                 });
 
-                // 传输模式（下拉，方案 §4）+ obfs 密码（仅 obfs 时显示）
-                ui.horizontal(|ui| {
-                    ui.label("传输模式:");
-                    let obfs = self.edit_obfs;
-                    egui::ComboBox::from_id_source("node_edit_mode_combo")
-                        .selected_text(if obfs { "obfs" } else { "masquerade" })
-                        .width(160.0)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.edit_obfs, false, "masquerade");
-                            ui.selectable_value(&mut self.edit_obfs, true, "obfs");
-                        });
-                });
-                ui.horizontal(|ui| {
-                    ui.label("obfs 密码:");
-                    if self.edit_show_obfs {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.edit_obfs_key)
-                                .desired_width(240.0),
-                        );
-                        if ui.small_button("隐藏").clicked() {
-                            self.edit_show_obfs = false;
-                        }
-                    } else {
-                        let shown = if self.edit_obfs_key.is_empty() {
-                            "（未设置）".to_string()
-                        } else {
-                            config::mask_secret(self.edit_obfs_key.trim())
-                        };
-                        ui.monospace(shown);
-                        if ui.small_button("编辑/显示").clicked() {
-                            self.edit_show_obfs = true;
-                        }
-                    }
-                });
-                if self.edit_obfs && self.edit_obfs_key.trim().is_empty() {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0xFF, 0xD6, 0x66),
-                        "⚠ obfs 模式要求独立第二密码，否则代理无法启动",
-                    );
-                }
+                // 传输为固定 TCP/TLS（TLS 1.3 + Noise-PSK）：Wave 3 起无其他模式
+                ui.label("传输模式: TCP/TLS（TLS 1.3 + Noise-PSK）");
 
                 if self.proxy_running {
                     ui.separator();
@@ -3130,7 +2984,7 @@ impl HydraApp {
 
     /// 设置页（v2 方案 §2.5 / 裁决 C）：应用级配置，无任何凭据。
     /// 分区：代理核心 / TUN 模式（预留）/ 系统 / 外观与数据 / 关于。
-    /// 认证密钥、证书、传输模式、obfs 密码已全部迁出到「🌐 节点」页「全局凭据」区。
+    /// 认证密钥、证书已全部迁出到「🌐 节点」页「全局凭据」区。
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("设置");
         ui.separator();

@@ -17,8 +17,8 @@ services:
     # 密钥/配置经 env_file 注入（等价 systemd 的 EnvironmentFile）
     env_file: ./node.env
     ports:
-      # QUIC 数据面。宿主端口:容器端口，容器内固定 443/udp
-      - "443:443/udp"
+      # TCP/TLS 数据面。宿主端口:容器端口，容器内固定 443/tcp
+      - "443:443/tcp"
       # 可选: 若需要从宿主 curl 健康检查，先在 node.env 把
       # HYDRA_HEALTH_ADDR 改为 0.0.0.0:8081（容器内回环无法从宿主访问），
       # 再取消下行注释。注意 0.0.0.0 + 端口映射会把健康端点暴露到宿主

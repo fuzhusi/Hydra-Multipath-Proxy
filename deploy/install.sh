@@ -98,9 +98,7 @@ else
 # 警告: 密钥勿用 export 设置（会进 shell history），请用 vi 编辑本文件
 HYDRA_AUTH_KEY=$AUTH_KEY
 HYDRA_LISTEN=0.0.0.0:443
-HYDRA_MODE=masquerade
-# 启用 obfs 逃生舱时取消注释并填入独立混淆密码（两端一致，勿与认证密钥相同）:
-#HYDRA_OBFS_KEY=
+# 传输 = TCP/TLS（TLS 1.3 + Noise-PSK），唯一传输，无需配置
 # 健康检查端点（可选，只绑回环，供拨测探活）:
 HYDRA_HEALTH_ADDR=127.0.0.1:8081
 EOF
@@ -120,6 +118,19 @@ else
   echo "（--no-enable: 已 enable 但未启动。人工检查 $ENV_FILE 后执行: systemctl start hydra-node）"
 fi
 
+# ── 6. 内核网络加固: BBR + fq（协议优化评估 P0 项，跨境高丢包链路收益显著）──
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/99-hydra-bbr.conf" ]] && sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q .; then
+  echo "==> [附加] 尝试启用内核 BBR + fq"
+  install -m 0644 "$SCRIPT_DIR/99-hydra-bbr.conf" /etc/sysctl.d/99-hydra-bbr.conf
+  sysctl --system >/dev/null 2>&1 || true
+  if sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+    echo "    ✓ BBR + fq 已启用"
+  else
+    echo "    ⚠ BBR 未生效（内核或 VPS 虚拟化不支持，如 OpenVZ）。保持默认 CUBIC，可忽略。"
+  fi
+fi
+
 # ── 收尾提示 ─────────────────────────────────────────────────────
 echo
 echo "════════════════════════════════════════════════════════════"
@@ -133,10 +144,12 @@ else
 fi
 echo
 echo "下一步:"
-echo "  1. 防火墙放行节点端口（UDP）:   sudo ufw allow 443/udp"
+echo "  1. 防火墙放行节点端口（TCP）:   sudo ufw allow 443/tcp"
 echo "     （健康检查只绑 127.0.0.1，无需也【不要】对外放行）"
 echo "  2. 首次启动后把证书复制给客户端（pinning 用）:"
 echo "     sudo scp $NODE_DIR/hydra-node-cert.der <客户端机器>:<路径>"
 echo "  3. 客户端设置 HYDRA_AUTH_KEY（同上密钥）与 HYDRA_NODE_CERT（证书路径）"
+echo "     （真证书部署：HYDRA_CERT_FILE/HYDRA_KEY_FILE 指向 PEM 后，客户端改设"
+echo "      HYDRA_TRUST=ca，无需分发证书）"
 echo "  4. 排障手册: docs/guides/部署指南.md"
 echo "════════════════════════════════════════════════════════════"

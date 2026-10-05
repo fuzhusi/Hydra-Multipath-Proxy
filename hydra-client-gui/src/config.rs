@@ -4,7 +4,7 @@
 //! - Windows：`%APPDATA%\hydra\config.json`
 //! - Linux/macOS：`~/.config/hydra/config.json`（`XDG_CONFIG_HOME` 优先）
 //!
-//! **权限提醒**：配置文件含认证密钥（hex）与 obfs 密码明文。
+//! **权限提醒**：配置文件含认证密钥（hex）明文。
 //! - Windows：`%APPDATA%` 位于用户 profile 目录（`%USERPROFILE%\AppData\Roaming`），
 //!   默认 ACL 仅本机当前用户、Administrators 与 SYSTEM 可读，无需额外处理；
 //! - Linux/macOS：本模块保存时以 `0600` 权限创建/写入文件；
@@ -15,7 +15,7 @@
 //! 仅当配置文件对应字段为空/缺失时，解析函数才回落读取环境变量——
 //! 用户在 GUI 填一次密钥+证书路径后，双击 exe 即可直接使用。
 //!
-//! 实现说明：`HYDRA_MODE`/`HYDRA_OBFS_KEY`/`HYDRA_PROBE_INTERVAL_SECS` 由
+//! 实现说明：`HYDRA_PROBE_INTERVAL_SECS` 由
 //! hydra-client 内部经 `*_from_env()` 读取（该 crate 归 WS-A/WS-B 所有，GUI 不越权改动），
 //! 故本模块以「配置非空 → 覆盖写进程 env」实现同样的优先级，见 [`apply_env_overrides`]。
 
@@ -28,10 +28,8 @@ pub const APP_DIR_NAME: &str = "hydra";
 /// 配置文件名
 pub const CONFIG_FILE_NAME: &str = "config.json";
 
-/// 与 hydra-obfs/src/mode.rs、hydra-client/src/speedtest.rs 中的 env 名保持一致
-/// （GUI 不直接依赖 hydra-obfs，此处为字面量同步，改名需两处同改）
-pub const HYDRA_MODE_ENV: &str = "HYDRA_MODE";
-pub const HYDRA_OBFS_KEY_ENV: &str = "HYDRA_OBFS_KEY";
+/// 与 hydra-client/src/speedtest.rs 中的 env 名保持一致
+/// （GUI 不直接依赖 hydra-client 内部实现，此处为字面量同步，改名需两处同改）
 pub const HYDRA_PROBE_INTERVAL_ENV: &str = "HYDRA_PROBE_INTERVAL_SECS";
 
 /// 手动添加节点的来源标记文案（节点来源：手动 | 订阅名，见 [`SubscriptionConfig`]）
@@ -80,12 +78,8 @@ pub struct GuiConfig {
     /// 导入完整分享（cc 字段）时直接入库，无需证书文件落盘。
     #[serde(default)]
     pub cert_der_b64: String,
-    /// 传输模式：""（默认，等价 masquerade）| "masquerade" | "obfs"（对应 HYDRA_MODE）
-    #[serde(default)]
-    pub hydra_mode: String,
-    /// obfs 模式独立第二混淆密码（对应 HYDRA_OBFS_KEY；masquerade 模式忽略）
-    #[serde(default)]
-    pub obfs_key: String,
+    // TCP/TLS（TLS 1.3 + Noise-PSK）是唯一传输：Wave 3 已删除 hydra_mode/obfs_key 字段
+    // （旧配置文件中的残留值按未知字段忽略，见下方测试）。
     /// Offline 恢复探测间隔（秒，对应 HYDRA_PROBE_INTERVAL_SECS）；None = 用库默认（30）
     #[serde(default)]
     pub probe_interval_secs: Option<u64>,
@@ -118,8 +112,6 @@ impl Default for GuiConfig {
             auth_key: String::new(),
             cert_path: String::new(),
             cert_der_b64: String::new(),
-            hydra_mode: String::new(),
-            obfs_key: String::new(),
             probe_interval_secs: None,
             subscriptions: Vec::new(),
             close_to_tray: true,
@@ -206,11 +198,6 @@ impl GuiConfig {
             }
         }
         false
-    }
-
-    /// 模式是否为 obfs（"" 与 "masquerade" 均视为伪装模式）
-    pub fn is_obfs(&self) -> bool {
-        self.hydra_mode.trim().eq_ignore_ascii_case("obfs")
     }
 }
 
@@ -333,18 +320,10 @@ pub fn resolve_node_certs(cfg: &GuiConfig) -> Result<Vec<Vec<u8>>, String> {
     hydra_client::node_certs_from_env()
 }
 
-/// 将配置中的模式 / obfs 密码 / 探测间隔覆盖写入进程环境变量（仅当配置值非空时覆盖，
+/// 将配置中的探测间隔覆盖写入进程环境变量（仅当配置值非空时覆盖，
 /// 留空则保持 env 原值 = 向后兼容回落）。必须在任何工作线程 spawn 之前调用，
 /// 避免与其他线程的 env 读取并发竞争。
 pub fn apply_env_overrides(cfg: &GuiConfig) {
-    let mode = cfg.hydra_mode.trim();
-    if !mode.is_empty() {
-        std::env::set_var(HYDRA_MODE_ENV, mode);
-    }
-    let obfs_key = cfg.obfs_key.trim();
-    if !obfs_key.is_empty() {
-        std::env::set_var(HYDRA_OBFS_KEY_ENV, obfs_key);
-    }
     if let Some(secs) = cfg.probe_interval_secs {
         std::env::set_var(HYDRA_PROBE_INTERVAL_ENV, secs.to_string());
     }
@@ -362,8 +341,6 @@ mod tests {
             auth_key: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6".into(),
             cert_path: r"C:\certs\hydra-node-cert.der".into(),
             cert_der_b64: String::new(),
-            hydra_mode: "obfs".into(),
-            obfs_key: "second-password".into(),
             probe_interval_secs: Some(15),
             subscriptions: Vec::new(),
             close_to_tray: true,
@@ -389,10 +366,10 @@ mod tests {
         assert_eq!(cfg.proxy_listen_addr, "");
         assert!(cfg.node_addrs.is_empty());
 
-        // 未知字段忽略
+        // 未知字段忽略（含旧版本遗留的 hydra_mode/obfs_key——字段已删除，按未知字段跳过）
         let cfg: GuiConfig =
             serde_json::from_str(r#"{"unknown_field": 1, "hydra_mode": "obfs"}"#).unwrap();
-        assert_eq!(cfg.hydra_mode, "obfs");
+        assert_eq!(cfg, GuiConfig::default());
     }
 
     #[test]
@@ -416,8 +393,6 @@ mod tests {
             auth_key: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6".into(),
             cert_path: "/tmp/node.der".into(),
             cert_der_b64: String::new(),
-            hydra_mode: "masquerade".into(),
-            obfs_key: String::new(),
             probe_interval_secs: Some(30),
             subscriptions: Vec::new(),
             close_to_tray: true,
@@ -463,12 +438,13 @@ mod tests {
     #[test]
     fn test_resolve_auth_key_from_config() {
         // 配置优先：合法 hex 直接解码，不读环境变量
+        // （密钥必须恰好 32 字节——snow NNpsk2 PSK 约束，客户端启动期 fail-fast）
         let cfg = GuiConfig {
-            auth_key: "00112233445566778899aabbccddeeff".into(),
+            auth_key: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".into(),
             ..Default::default()
         };
         let key = resolve_auth_key(&cfg).expect("配置内合法 hex 应解析成功");
-        assert_eq!(key.len(), 16);
+        assert_eq!(key.len(), 32);
         assert_eq!(key[0], 0x00);
 
         // 配置内非法 hex → Err（根因透出，不回落 env）
@@ -478,7 +454,7 @@ mod tests {
         };
         assert!(resolve_auth_key(&bad).is_err());
 
-        // 配置内 hex 太短 → Err
+        // 配置内 hex 长度非法（16 字节，旧文档曾允许）→ Err（审查 R-05）
         let short = GuiConfig {
             auth_key: "aabb".into(),
             ..Default::default()
@@ -555,23 +531,18 @@ mod tests {
     }
 
     #[test]
-    fn test_is_obfs() {
-        assert!(!GuiConfig::default().is_obfs());
-        assert!(GuiConfig {
-            hydra_mode: "obfs".into(),
+    fn test_legacy_obfs_fields_ignored() {
+        // Wave 3：TCP/TLS 是唯一传输。旧配置文件残留的 hydra_mode/obfs_key
+        // 按未知字段忽略（结构体未设 deny_unknown_fields），反序列化不报错。
+        let old: GuiConfig = serde_json::from_str(
+            r#"{"auth_key":"ff","hydra_mode":"obfs","obfs_key":"second-password"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.auth_key, "ff");
+        assert_eq!(old, GuiConfig {
+            auth_key: "ff".into(),
             ..Default::default()
-        }
-        .is_obfs());
-        assert!(!GuiConfig {
-            hydra_mode: "masquerade".into(),
-            ..Default::default()
-        }
-        .is_obfs());
-        assert!(!GuiConfig {
-            hydra_mode: String::new(),
-            ..Default::default()
-        }
-        .is_obfs());
+        });
     }
 
     // ===================== Exec-C：订阅字段持久化 =====================

@@ -1,9 +1,14 @@
 use thiserror::Error;
-
 #[derive(Error, Debug)]
 pub enum HydraError {
     #[error("Connection error: {0}")]
     ConnectionError(String),
+
+    /// 目标不可达（节点存活但目标连不上/SSRF 拒绝/DNS 失败）。
+    /// 与 ConnectionError 的语义区分：故障切换层不得把此类错误计为节点故障
+    /// （目标在任意节点都不可达，换节点无意义，更不能污染节点评分）。
+    #[error("Target unreachable: {0}")]
+    TargetUnreachable(String),
 
     #[error("Protocol error: {0}")]
     ProtocolError(String),
@@ -22,18 +27,6 @@ pub enum HydraError {
 
     #[error("TLS error: {0}")]
     TlsError(#[from] rustls::Error),
-
-    #[error("QUIC connection error: {0}")]
-    QuinnConnectionError(#[from] quinn::ConnectionError),
-
-    #[error("QUIC connect error: {0}")]
-    QuinnConnectError(#[from] quinn::ConnectError),
-
-    #[error("QUIC write error: {0}")]
-    QuinnWriteError(#[from] quinn::WriteError),
-
-    #[error("QUIC read error: {0}")]
-    QuinnReadError(#[from] quinn::ReadToEndError),
 
     #[error("Address parse error: {0}")]
     AddrParseError(#[from] std::net::AddrParseError),

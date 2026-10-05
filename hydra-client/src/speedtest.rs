@@ -2,10 +2,11 @@
 //!
 //! 随 `ProxyServer::start` 常驻的后台任务：每 `HYDRA_PROBE_INTERVAL_SECS`
 //! （默认 30，测试可设 1-2）±随机抖动做一轮探测：
-//! - 非 Online 节点：QUIC connect 探测（`tokio::time::timeout(5s)` 外包，不动 transport.rs）。
+//! - 非 Online 节点：TCP 建连 + TLS 握手探测（`tokio::time::timeout(5s)` 外包）。
 //!   成功 → 恢复 Online+日志；连续 3 次失败保持 Offline。
 //! - Online 节点（`HYDRA_SPEEDTEST=0` 关闭，默认开）：测速评分写回 scheduler——
-//!   延迟 = 探测连接 `Connection::stats().path.rtt`（每周期一次主动 connect，轻量）；
+//!   延迟 = 探测链路 `TCP 建连 + TLS 握手` 总耗时（每周期一次主动探测，轻量；
+//!   QUIC 路径的 path RTT 读数已随 QUIC 移除，TCP 由内核栈测量重传/RTT）；
 //!   吞吐 = 该节点窗口期 relay 字节差分（被动，来自流量统计的按节点计数），
 //!   窗口累计 ≥1KB 才更新否则保持旧值；loss ≈ 最近一次 Offline/探测失败事件的指数衰减。
 //!   评分混合策略：无实测数据的字段沿用静态初始值，`get_best_node` 因此从"静态恒值"
@@ -22,7 +23,6 @@ use hydra_protocol::NodeStatus;
 
 use crate::scheduler::Scheduler;
 use crate::traffic::TrafficMonitor;
-use crate::transport::Transport;
 
 /// 单次探测超时（由 tokio::time::timeout 外包；不影响 transport.rs）
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -122,26 +122,75 @@ fn merge_stats(
     (bandwidth, latency, loss_rate, old.load)
 }
 
+/// TCP 建连 + TLS 握手时延探测（TCP 转型后）。
+///
+/// 信任配置与主链路一致（[`crate::tcp_transport::TlsTrust`]：自签 pinning 或
+/// 真证书公共 CA）；不完成 Noise-PSK 握手与地址帧——探测只关心链路可达性与
+/// 时延，不消耗节点侧认证/转接资源。返回 = TCP connect + TLS 握手总耗时。
+async fn probe_connect(
+    addr: SocketAddr,
+    sni: &str,
+    trust: &crate::tcp_transport::TlsTrust,
+) -> std::result::Result<Duration, String> {
+    let sni = if sni.is_empty() {
+        crate::transport::DEFAULT_SNI
+    } else {
+        sni
+    };
+    let start = Instant::now();
+
+    let mut roots = rustls::RootCertStore::empty();
+    if trust.use_public_ca {
+        // rustls 0.21 的 RootCertStore 收 OwnedTrustAnchor（by value），
+// webpki-roots 0.23 的 TrustAnchor 是借引用，逐条转换
+        roots.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+                ta.subject.to_vec(),
+                ta.spki.to_vec(),
+                None::<Vec<u8>>, // webpki-roots 0.23 的 TrustAnchor 无 name-constraints 字段
+            )
+        }));
+    } else {
+        for der in &trust.pinned_certs {
+            roots
+                .add(&rustls::Certificate(der.clone()))
+                .map_err(|e| format!("无效的节点证书: {:?}", e))?;
+        }
+    }
+    let mut crypto = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    // 与主链路一致：无 ALPN、禁会话恢复（session ticket 不用于跨连接关联追踪）
+    crypto.alpn_protocols = Vec::new();
+    crypto.resumption = rustls::client::Resumption::disabled();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(crypto));
+    let server_name = rustls::ServerName::try_from(sni)
+        .map_err(|e| format!("Invalid SNI '{}': {:?}", sni, e))?;
+
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| format!("TCP connect to {} failed: {}", addr, e))?;
+    let _tls = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| format!("TLS handshake with {} failed: {}", addr, e))?;
+    Ok(start.elapsed())
+}
+
 /// 启动常驻探测任务（随 ProxyServer::start 调用）。
 ///
-/// 探测用独立 Transport（证书 pinning 与主链路一致）；`traffic` 为中继计数同一实例，
-/// 按节点字节计数是吞吐差分的数据源。任务永不返回，随 runtime 关闭而结束。
+/// 探测走 TCP connect + TLS 握手（证书 pinning 与主链路一致）；`traffic` 为
+/// 中继计数同一实例，按节点字节计数是吞吐差分的数据源。任务永不返回，随 runtime 关闭而结束。
 pub fn spawn_recovery_probe(
     scheduler: Arc<Scheduler>,
-    node_certs: Vec<Vec<u8>>,
+    trust: crate::tcp_transport::TlsTrust,
     sni: String,
     traffic: Arc<TrafficMonitor>,
 ) {
     tokio::spawn(async move {
         let interval = probe_interval_from_env();
         let speedtest_enabled = speedtest_enabled_from_env();
-        let transport = match Transport::new_client(node_certs, &sni).await {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("恢复探测器启动失败（无法创建传输）: {}", e);
-                return;
-            }
-        };
         if speedtest_enabled {
             info!(
                 "恢复探测器已启动（间隔 {}s±20% 抖动，单次超时 {}s，测速评分开启）",
@@ -170,8 +219,9 @@ pub fn spawn_recovery_probe(
                     if speedtest_enabled {
                         speedtest_online_node(
                             &scheduler,
-                            &transport,
                             &traffic,
+                            &trust,
+                            &sni,
                             &node,
                             &mut last_offline_event,
                             &mut throughput,
@@ -180,10 +230,11 @@ pub fn spawn_recovery_probe(
                     }
                     continue;
                 }
-                // 非 Online 节点：恢复探测（测速开启时顺带以实测 RTT 更新延迟）
+                // 非 Online 节点：恢复探测（测速开启时顺带以实测时延更新延迟）
                 probe_offline_node(
                     &scheduler,
-                    &transport,
+                    &trust,
+                    &sni,
                     &node,
                     speedtest_enabled,
                     &mut consecutive_failures,
@@ -195,30 +246,32 @@ pub fn spawn_recovery_probe(
     });
 }
 
-/// Online 节点测速：主动 connect 取 RTT，被动差分取吞吐，衰减近似取 loss，写回评分。
+/// Online 节点测速：主动 TCP+TLS 探测取时延，被动差分取吞吐，衰减近似取 loss，写回评分。
 async fn speedtest_online_node(
     scheduler: &Scheduler,
-    transport: &Transport,
     traffic: &TrafficMonitor,
+    trust: &crate::tcp_transport::TlsTrust,
+    sni: &str,
     node: &NodeInfo,
     last_offline_event: &mut HashMap<SocketAddr, Instant>,
     throughput: &mut HashMap<SocketAddr, ThroughputTracker>,
 ) {
     let addr = node.address;
-    // 1. 主动延迟：探测连接的 path RTT（每周期一次，轻量）
-    let rtt = match tokio::time::timeout(PROBE_TIMEOUT, transport.connect(addr)).await {
-        Ok(Ok(conn)) => {
-            let rtt = conn.stats().path.rtt;
-            drop(conn);
-            Some(rtt)
-        }
-        _ => {
+    // 1. 主动延迟：TCP 建连 + TLS 握手总耗时（每周期一次，轻量）
+    let rtt = match tokio::time::timeout(PROBE_TIMEOUT, probe_connect(addr, sni, trust)).await
+    {
+        Ok(Ok(d)) => Some(d),
+        Ok(Err(e)) => {
+            debug!("节点 {} 测速探测失败: {}", addr, e);
             // Online 节点探测失败：不改状态（避免与中继故障切换路径打架），记一次 loss 事件
             last_offline_event.insert(addr, Instant::now());
             None
         }
+        Err(_) => {
+            last_offline_event.insert(addr, Instant::now());
+            None
+        }
     };
-
     // 2. 被动吞吐：该节点窗口期 relay 字节差分（≥1KB 才更新，否则保持旧值）
     let entry = traffic.node_entry(addr);
     let measured_bw =
@@ -253,25 +306,21 @@ async fn speedtest_online_node(
     }
 }
 
-/// 非 Online 节点恢复探测（A2 原逻辑）；测速开启时以实测 RTT 顺带更新延迟。
+/// 非 Online 节点恢复探测（A2 原逻辑）；测速开启时以实测时延顺带更新延迟。
 async fn probe_offline_node(
     scheduler: &Scheduler,
-    transport: &Transport,
+    trust: &crate::tcp_transport::TlsTrust,
+    sni: &str,
     node: &NodeInfo,
     speedtest_enabled: bool,
     consecutive_failures: &mut HashMap<SocketAddr, u32>,
     last_offline_event: &mut HashMap<SocketAddr, Instant>,
 ) {
     let addr = node.address;
-    let attempt = tokio::time::timeout(PROBE_TIMEOUT, transport.connect(addr));
+    let attempt = tokio::time::timeout(PROBE_TIMEOUT, probe_connect(addr, sni, trust));
     match attempt.await {
-        Ok(Ok(conn)) => {
-            let rtt = if speedtest_enabled {
-                Some(conn.stats().path.rtt)
-            } else {
-                None
-            };
-            drop(conn);
+        Ok(Ok(rtt)) => {
+            let rtt = if speedtest_enabled { Some(rtt) } else { None };
             consecutive_failures.remove(&addr);
             scheduler
                 .update_node_status(&addr, NodeStatus::Online)

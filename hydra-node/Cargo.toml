@@ -9,9 +9,8 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-quinn = "0.10"
 rustls = "0.21"
-# Team-T：TCP/TLS 传输模式（与 rustls 0.21 匹配的 tokio 适配层）
+# TCP/TLS 传输（与 rustls 0.21 兼配的 tokio 适配层）
 tokio-rustls = "0.24"
 ring = "0.16"
 serde = { version = "1", features = ["derive"] }
@@ -23,5 +22,11 @@ toml = "0.8"
 anyhow = "1"
 thiserror = "1"
 rcgen = "0.10"
+# 真证书部署（审查协议评估 P0）：解析 ACME 产出的 PEM fullchain/key
+rustls-pemfile = "1"
 hydra-protocol = { path = "../hydra-protocol" }
-hydra-obfs = { path = "../hydra-obfs" }
+
+[dev-dependencies]
+# 信令集成测试复用客户端认证路径（connect_target）；与 hydra-client 对 hydra-node
+# 的 dev 依赖构成允许的 dev 环（无普通依赖环）
+hydra-client = { path = "../hydra-client" }

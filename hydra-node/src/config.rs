@@ -9,7 +9,7 @@
 //!   配置文件 `auth_key_file` 字段。密钥文件化是为了修掉 env 泄漏面
 //!   （shell history / `/proc/<pid>/environ`）；文件权限非 0600 时告警。
 //! - 所有字段 `serde(default)`；未知字段 / 非法值显式报错（静默回落会让
-//!   "以为开了 obfs/健康检查"的用户得到黑洞）。
+//!   "以为开了健康检查"的用户得到黑洞）。
 //!
 //! 解析逻辑全部纯函数化（`resolve` 接收 `BTreeMap` 而非读真实 env），
 //! 便于离线单测优先级与报错；`main.rs` 只做薄 I/O 壳。
@@ -21,8 +21,6 @@ use std::path::{Path, PathBuf};
 
 /// 配置文件路径的环境变量名
 pub const HYDRA_NODE_CONFIG_ENV: &str = "HYDRA_NODE_CONFIG";
-/// STUN 服务器地址环境变量（ip:port 字面量；常量本体归 stun.rs，避免 glob 再导出歧义）
-use crate::stun::HYDRA_STUN_ADDR_ENV;
 /// 认证密钥文件环境变量
 pub const HYDRA_AUTH_KEY_FILE_ENV: &str = "HYDRA_AUTH_KEY_FILE";
 /// 日志级别环境变量（RUST_LOG 仍优先）
@@ -33,14 +31,12 @@ pub const HYDRA_LOG_LEVEL_ENV: &str = "HYDRA_LOG_LEVEL";
 #[serde(default, deny_unknown_fields)]
 pub struct NodeFileConfig {
     pub listen_addr: Option<String>,
-    pub mode: Option<String>,
     pub auth_key_file: Option<String>,
     pub max_connections: Option<u32>,
     pub cert_file: Option<String>,
     pub key_file: Option<String>,
     pub cert_domains: Option<Vec<String>>,
     pub health_addr: Option<String>,
-    pub stun_addr: Option<String>,
     pub log_level: Option<String>,
 }
 
@@ -49,11 +45,10 @@ pub fn parse_toml(text: &str) -> Result<NodeFileConfig, String> {
     toml::from_str(text).map_err(|e| format!("配置文件解析失败: {}", e))
 }
 
-/// CLI 能表达的覆盖项（其余字段 CLI 不暴露，避免密钥进 /proc/<pid>/cmdline）
+/// CLI 能表达的覆盖项（密钥不进 CLI，避免进 /proc/<pid>/cmdline——审查确认并移除 --auth-key）
 #[derive(Debug, Clone, Default)]
 pub struct CliOverrides {
     pub listen: Option<SocketAddr>,
-    pub auth_key: Option<String>,
 }
 
 /// 认证密钥来源（解析成 hex 字符串或文件路径，I/O 延后到 `load_auth_key`）
@@ -69,13 +64,11 @@ pub enum AuthKeySource {
 #[derive(Debug, Clone)]
 pub struct EffectiveConfig {
     pub listen_addr: SocketAddr,
-    pub mode: hydra_obfs::TransportMode,
     pub max_connections: u32,
     pub cert_file: PathBuf,
     pub key_file: PathBuf,
     pub cert_domains: Vec<String>,
     pub health_addr: Option<SocketAddr>,
-    pub stun_addr: Option<SocketAddr>,
     pub log_level: String,
     pub auth_key_source: AuthKeySource,
 }
@@ -194,23 +187,6 @@ pub fn resolve(
         .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 8080)))
     };
 
-    // mode：env（与 hydra-obfs 共用 HYDRA_MODE_ENV）> 文件 > 默认 masquerade
-    let mode_str = env
-        .get(hydra_obfs::HYDRA_MODE_ENV)
-        .or_else(|| env.get("HYDRA_MODE"))
-        .map(|s| s.trim().to_string())
-        .or_else(|| f.mode.clone());
-    let mode = match mode_str {
-        Some(s) => hydra_obfs::TransportMode::parse(&s).map_err(|e| {
-            format!(
-                "传输模式非法（env {} 或配置文件 mode）: {}",
-                hydra_obfs::HYDRA_MODE_ENV,
-                e
-            )
-        })?,
-        None => d.mode,
-    };
-
     let max_connections = parse_u32_field(
         env.get("HYDRA_MAX_CONNECTIONS"),
         f.max_connections,
@@ -255,13 +231,6 @@ pub fn resolve(
         "health_addr",
     )?;
 
-    let stun_addr = parse_addr_opt(
-        env.get(HYDRA_STUN_ADDR_ENV),
-        f.stun_addr.as_ref(),
-        HYDRA_STUN_ADDR_ENV,
-        "stun_addr",
-    )?;
-
     let log_level = env
         .get(HYDRA_LOG_LEVEL_ENV)
         .map(|s| s.as_str())
@@ -270,12 +239,10 @@ pub fn resolve(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "info".to_string());
 
-    // 认证密钥：CLI > HYDRA_AUTH_KEY > HYDRA_AUTH_KEY_FILE > 文件 auth_key_file
-    // （空白值视为未设置该层，防 systemd EnvironmentFile 空值踩坑）
+    // 认证密钥：HYDRA_AUTH_KEY > HYDRA_AUTH_KEY_FILE > 文件 auth_key_file
+    // （CLI 不承接密钥——进 cmdline 全机可读；空白值视为未设置该层，防 systemd EnvironmentFile 空值踩坑）
     let non_blank = |s: &String| !s.trim().is_empty();
-    let auth_key_source = if let Some(h) = cli.auth_key.as_ref().filter(|s| !s.trim().is_empty()) {
-        AuthKeySource::Inline(h.trim().to_string())
-    } else if let Some(h) = env.get("HYDRA_AUTH_KEY").filter(|s| non_blank(s)) {
+    let auth_key_source = if let Some(h) = env.get("HYDRA_AUTH_KEY").filter(|s| non_blank(s)) {
         AuthKeySource::Inline(h.trim().to_string())
     } else if let Some(p) = env.get(HYDRA_AUTH_KEY_FILE_ENV).filter(|s| non_blank(s)) {
         AuthKeySource::File(PathBuf::from(p.trim()))
@@ -291,13 +258,11 @@ pub fn resolve(
 
     Ok(EffectiveConfig {
         listen_addr,
-        mode,
         max_connections,
         cert_file,
         key_file,
         cert_domains,
         health_addr,
-        stun_addr,
         log_level,
         auth_key_source,
     })
@@ -332,11 +297,15 @@ fn check_key_file_permissions(path: &Path) {
 #[cfg(not(unix))]
 fn check_key_file_permissions(_path: &Path) {}
 
-/// hex 解码 + 长度下限校验（与旧 resolve_auth_key 行为一致，改返回 Err 不再直接 exit）
+/// hex 解码 + 长度校验（必须恰好 32 字节：snow NNpsk2 PSK 约束，启动期 fail-fast，
+/// 避免"按旧文档配 16..31 字节密钥 → 每条连接握手期静默失败"的排障陷阱——审查 R-05）
 pub fn decode_auth_key(hex_str: &str) -> Result<Vec<u8>, String> {
     match hydra_protocol::hex_decode(hex_str) {
-        Ok(key) if key.len() >= 16 => Ok(key),
-        Ok(_) => Err("认证密钥太短（解码后至少 16 字节）。".to_string()),
+        Ok(key) if key.len() == 32 => Ok(key),
+        Ok(_) => Err(
+            "认证密钥长度非法：解码后必须恰好 32 字节（64 个 hex 字符；生成：openssl rand -hex 32）。"
+                .to_string(),
+        ),
         Err(e) => Err(format!("认证密钥不是合法的 hex：{}", e)),
     }
 }

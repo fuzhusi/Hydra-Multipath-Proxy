@@ -125,8 +125,14 @@ pub fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
 
 /// snow builder：NNpsk2 + PSK + ring resolver（禁默认 provider 混用，方案 §6-2）
 fn build(psk: &[u8], initiator: bool) -> Result<snow::HandshakeState> {
-    if psk.is_empty() || psk.len() > 32 {
-        return Err(err("PSK 必须为 1..=32 字节（HYDRA_AUTH_KEY hex 解码值）"));
+    // 必须恰好 32 字节：snow NNpsk2 的 ValidatePskLengths 只接受 32B，16..31B 的
+    // 密钥会在握手期才失败且表现为静默关流（审查 R-05：文档曾允许 ≥16B，
+    // 属"合法配置静默不可用"陷阱，故在密钥入口 fail-fast）
+    if psk.len() != 32 {
+        return Err(err(&format!(
+            "PSK 必须恰好 32 字节（HYDRA_AUTH_KEY 为 64 个 hex 字符，openssl rand -hex 32），当前 {} 字节",
+            psk.len()
+        )));
     }
     let params: snow::params::NoiseParams = NOISE_PATTERN.parse().map_err(|e| err(&format!("模式串解析失败: {e}")))?;
     // ring 优先（RNG/Cipher/Hash）；snow 0.9.6 的 RingResolver 不含 X25519 DH，
@@ -410,7 +416,10 @@ mod tests {
     #[test]
     fn psk_length_validated() {
         assert!(build(&[], true).is_err());
+        assert!(build(&[0u8; 31], true).is_err());
         assert!(build(&[0u8; 33], true).is_err());
+        // 16..31 字节：snow NNpsk2 仅接受 32B，入口即拒（审查 R-05 fail-fast）
+        assert!(build(&[0u8; 16], true).is_err());
         assert!(build(&PSK, true).is_ok());
     }
 

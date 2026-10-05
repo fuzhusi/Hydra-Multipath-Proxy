@@ -5,6 +5,8 @@ pub mod log;
 pub mod node;
 pub mod packet;
 pub mod session;
+pub mod stun;
+pub mod tcp_frame;
 
 pub use auth::*;
 pub use error::*;

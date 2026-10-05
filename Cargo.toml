@@ -4,6 +4,5 @@ members = [
     "hydra-node",
     "hydra-protocol",
     "hydra-client-gui",
-    "hydra-obfs",
 ]
 resolver = "2"

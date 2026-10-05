@@ -17,14 +17,11 @@ pub fn test_auth_key() -> Vec<u8> {
 }
 
 pub struct TestNode {
+    /// TCP/TLS 监听实际绑定地址（TCP 转型后唯一传输，恒为 Some）
     pub addr: SocketAddr,
     pub cert: Vec<u8>,
-    /// 保存 endpoint 以便测试中主动关闭节点（模拟故障）
-    pub endpoint: quinn::Endpoint,
     /// 节点配置（证书目录等），供同端口重启（A2 恢复探测测试）
     pub opts: NodeOptions,
-    /// Team-T：TCP/TLS 监听实际绑定地址（None=未启用 HYDRA_TCP_LISTEN）
-    pub tcp_addr: Option<SocketAddr>,
 }
 
 /// 启动一个监听随机端口的节点服务器（带认证；证书持久化到独立临时目录）
@@ -34,6 +31,16 @@ pub async fn spawn_node() -> TestNode {
 
 /// 在指定地址启动节点服务器（指定 127.0.0.1:0 则随机端口）
 pub async fn spawn_node_on(addr: SocketAddr) -> TestNode {
+    spawn_node_with_opts_on(addr, false).await
+}
+
+/// 启动开启 P2P 信令模式（HYDRA_P2P_SIGNAL=1 语义，`@hydra-p2p/<peer_id>`）的节点
+pub async fn spawn_node_with_p2p() -> TestNode {
+    spawn_node_with_opts_on("127.0.0.1:0".parse().unwrap(), true).await
+}
+
+/// spawn_node_on 的内部实现：`p2p` = 是否开启信令模式
+async fn spawn_node_with_opts_on(addr: SocketAddr, p2p: bool) -> TestNode {
     // 测试全部使用 127.0.0.1 回显与回环目标：放宽节点侧 SSRF 过滤
     // （生产默认拒绝私有目标；见 hydra-node/src/handler.rs 与 docs/guides/部署指南.md）
     std::env::set_var("HYDRA_ALLOW_PRIVATE_TARGETS", "1");
@@ -45,54 +52,31 @@ pub async fn spawn_node_on(addr: SocketAddr) -> TestNode {
         max_connections: 100,
         cert_file: dir.join("cert.der"),
         key_file: dir.join("key.der"),
+        p2p_signal: p2p,
         ..NodeOptions::default()
     };
     spawn_node_with_opts(addr, opts).await
 }
 
-/// C2：在指定传输模式下启动节点（mode 显式传入，不依赖进程 env；
-/// obfs 模式的混淆密码仍经 HYDRA_OBFS_KEY env——由 E2E 在进程内统一设置）
-pub async fn spawn_node_in_mode(addr: SocketAddr, mode: hydra_obfs::TransportMode) -> TestNode {
-    // 同 spawn_node_on：测试回环目标需放宽节点侧 SSRF 过滤
-    std::env::set_var("HYDRA_ALLOW_PRIVATE_TARGETS", "1");
-    let seq = SEQ.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("hydra-obfs-test-{}-{}", std::process::id(), seq));
-    std::fs::create_dir_all(&dir).unwrap();
-
-    let opts = NodeOptions {
-        max_connections: 100,
-        cert_file: dir.join("cert.der"),
-        key_file: dir.join("key.der"),
-        mode,
-        ..NodeOptions::default()
-    };
-    spawn_node_with_opts(addr, opts).await
-}
-
-/// 用既有配置（证书目录）启动节点服务器——重启后证书不变，客户端 pinning 仍有效
+/// 用既有配置（证书目录）启动节点服务器——重启后证书不变，客户端 pinning 仍有效。
+/// TCP 接受循环在 HydraServer::new 内部已后台运行，无需再调 start()。
 pub async fn spawn_node_with_opts(addr: SocketAddr, opts: NodeOptions) -> TestNode {
     let server = HydraServer::new(addr, test_auth_key(), opts.clone())
         .await
         .unwrap();
-    let bound = server.endpoint.local_addr().unwrap();
+    let tcp_addr = server.tcp_listen_addr.expect("TCP 监听应已绑定（唯一传输）");
     let cert = server.cert_der().to_vec();
-    let endpoint = server.endpoint.clone();
-    let tcp_addr = server.tcp_listen_addr;
-    tokio::spawn(async move {
-        let _ = server.start().await;
-    });
+    // TCP 接受循环已在 new 时后台运行；无需 spawn start()（start 仅永久挂起保活）
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     TestNode {
-        addr: bound,
+        addr: tcp_addr,
         cert,
-        endpoint,
-        tcp_addr,
         opts,
     }
 }
 
-/// 启动一个 TCP 回显服务器，返回端口
+/// 启动一个 TCP 回显服务器（对端 EOF 后关闭连接，支持半关闭验证），返回端口
 pub async fn spawn_echo_server() -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -114,6 +98,8 @@ pub async fn spawn_echo_server() -> u16 {
                         }
                     }
                 }
+                // 回显完成（读到 EOF/错误）后关闭：EOF 语义可用于半关闭测试
+                let _ = sock.shutdown().await;
             });
         }
     });
@@ -183,23 +169,22 @@ pub async fn spawn_proxy_with_monitor(
     panic!("proxy failed to bind");
 }
 
-/// 等待 UDP 端口释放（节点 endpoint 关闭后 server 任务退出需短暂时间）
-pub async fn wait_udp_port_free(port: u16, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while tokio::time::Instant::now() < deadline {
-        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    false
-}
-
 /// 通过代理发起 SOCKS5 CONNECT（域名类型交给节点解析），返回已就绪的 TCP 流
 pub async fn socks5_connect(
     proxy_addr: SocketAddr,
     target: &str,
 ) -> std::io::Result<tokio::net::TcpStream> {
+    socks5_connect_lenient(proxy_addr, target).await.map(|(s, code)| {
+        assert_eq!(code, 0x00, "SOCKS5 connect failed: status={}", code);
+        s
+    })
+}
+
+/// SOCKS5 CONNECT 的宽松版本：不断言成功，返回应答码（供故障路径测试）
+pub async fn socks5_connect_lenient(
+    proxy_addr: SocketAddr,
+    target: &str,
+) -> std::io::Result<(tokio::net::TcpStream, u8)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut s = tokio::net::TcpStream::connect(proxy_addr).await?;
@@ -221,31 +206,37 @@ pub async fn socks5_connect(
     // reply: VER REP RSV ATYP BND.ADDR(4) BND.PORT(2)
     let mut reply = [0u8; 10];
     s.read_exact(&mut reply).await?;
-    assert_eq!(reply[1], 0x00, "SOCKS5 connect failed: status={}", reply[1]);
-    Ok(s)
+    Ok((s, reply[1]))
 }
 
-/// SOCKS5 CONNECT 的宽松版本：不断言成功，返回应答码（供故障路径测试）
-pub async fn socks5_connect_lenient(
-    proxy_addr: SocketAddr,
-    target: &str,
-) -> std::io::Result<(tokio::net::TcpStream, u8)> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+/// 伪随机 payload 生成器（LCG）：E2E 大数据量校验用，确定性且不引额外依赖
+pub struct Lcg(u64);
 
-    let mut s = tokio::net::TcpStream::connect(proxy_addr).await?;
-    s.write_all(&[0x05, 0x01, 0x00]).await?;
-    let mut resp = [0u8; 2];
-    s.read_exact(&mut resp).await?;
-    assert_eq!(resp, [0x05, 0x00], "greeting reply mismatch");
+impl Lcg {
+    pub fn new(seed: u64) -> Self {
+        Lcg(seed)
+    }
 
-    let (host, port_str) = target.rsplit_once(':').unwrap();
-    let port: u16 = port_str.parse().unwrap();
-    let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
-    req.extend_from_slice(host.as_bytes());
-    req.extend_from_slice(&port.to_be_bytes());
-    s.write_all(&req).await?;
+    pub fn next_byte(&mut self) -> u8 {
+        // 数值取自 Numerical Recipes 常量
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) as u8
+    }
 
-    let mut reply = [0u8; 10];
-    s.read_exact(&mut reply).await?;
-    Ok((s, reply[1]))
+    pub fn fill(&mut self, buf: &mut [u8]) {
+        for b in buf.iter_mut() {
+            *b = self.next_byte();
+        }
+    }
+}
+
+/// 生成 n 字节伪随机 payload（LCG）
+pub fn lcg_payload(seed: u64, n: usize) -> Vec<u8> {
+    let mut g = Lcg::new(seed);
+    let mut v = vec![0u8; n];
+    g.fill(&mut v);
+    v
 }

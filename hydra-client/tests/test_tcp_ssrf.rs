@@ -53,7 +53,6 @@ async fn tcp_ssrf_blocks_loopback_target() {
         max_connections: 16,
         cert_file: dir.join("cert.der"),
         key_file: dir.join("key.der"),
-        tcp_listen: Some("127.0.0.1:0".parse().unwrap()),
         ..NodeOptions::default()
     };
     let server = HydraServer::new("127.0.0.1:0".parse().unwrap(), test_auth_key(), opts)
@@ -66,10 +65,11 @@ async fn tcp_ssrf_blocks_loopback_target() {
     });
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
+    let trust = hydra_client::tcp_transport::TlsTrust::pinned(vec![cert.clone()]);
     let result = connect_target(
         tcp_addr,
         SNI,
-        &[cert],
+        &trust,
         &test_auth_key(),
         &format!("127.0.0.1:{}", echo_port),
     )

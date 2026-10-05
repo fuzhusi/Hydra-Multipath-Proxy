@@ -1,10 +1,8 @@
-use crate::aggregate_stream::{ChannelDownReader, ChannelError, ChannelPair, ChannelUpWriter};
-use crate::pool::{ConnectionPool, PoolConfig};
 use crate::routing;
 use crate::scheduler::Scheduler;
-use crate::tcp_transport::{self, TransportChoice};
+use crate::tcp_transport::{self, TcpReadHalf, TcpWriteHalf};
 use crate::traffic::{ByteCounter, CountingStream, TrafficMonitor};
-use crate::transport::{Transport, DEFAULT_SNI};
+use crate::transport::DEFAULT_SNI;
 use hydra_protocol::{mask_target, HydraError, NodeInfo, NodeStatus, Result};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,39 +23,16 @@ pub fn active_relay_count() -> usize {
     ACTIVE_RELAYS.load(Ordering::Relaxed)
 }
 
-/// Team-T：TCP/TLS 路径凭据快照（start 时注入：节点证书 / SNI / 认证密钥）。
-/// open_target 是无 self 的关联函数，全局传输选择配全局凭据快照（单代理实例场景）；
-/// 未 start 过 = tcp 模式下报错（测试直连路径不经此，显式传参）。
-static TCP_CREDS: std::sync::OnceLock<(Vec<Vec<u8>>, String, Vec<u8>)> =
-    std::sync::OnceLock::new();
-
-// ── 节点侧应用错误码（与 hydra-node/src/handler.rs 保持一致；客户端经 ReadError::Reset 读到）──
-/// 0x11：节点无法连接目标
-pub const NODE_ERR_TARGET_CONNECT: u64 = 0x11;
-/// 0x12：节点侧 DNS 解析失败
-pub const NODE_ERR_DNS_FAIL: u64 = 0x12;
-/// 0x13：转发阶段 IO 错误
-pub const NODE_ERR_FORWARD_IO: u64 = 0x13;
-
-/// open_target 的返回形态：现行单流（行为逐位不变）或 V3.4 多流通道
-pub(crate) enum NodeLink {
-    Single {
-        send: CountingStream<quinn::SendStream>,
-        recv: CountingStream<quinn::RecvStream>,
-    },
-    Channel(ChannelPair),
-    /// Team-T：TCP/TLS 传输（HYDRA_TRANSPORT=tcp；无多流聚合/ACK，TCP 自带可靠有序）
-    Tcp {
-        send: CountingStream<tokio::io::WriteHalf<tcp_transport::TcpNodeStream>>,
-        recv: CountingStream<tokio::io::ReadHalf<tcp_transport::TcpNodeStream>>,
-    },
-}
-
-/// V3.4 通道模式参数：Off = 现行单流路径（逐位不变），On(n) = n 流通道
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ChannelMode {
-    Off,
-    On(usize),
+/// Team-T：TCP/TLS 路径凭据（信任配置 / SNI / 认证密钥）。
+/// start 时随 ProxyServer 实例注入并随任务链传递（测试/多实例场景下
+/// 各代理实例持各自凭据，互不串扰）。
+/// Noise 指纹取 TLS 协商出的对端叶证书（见 tcp_transport::TlsTrust），
+/// 因此这里**不再需要** 节点地址→证书 映射——多节点证书配对类故障从结构上消除。
+#[derive(Clone)]
+struct TcpCreds {
+    trust: Arc<tcp_transport::TlsTrust>,
+    sni: String,
+    auth_key: Arc<Vec<u8>>,
 }
 
 /// HTTP 头部区最大长度（防恶意超大头部无限累积）
@@ -74,9 +49,8 @@ pub struct ProxyServer {
     traffic_monitor: Option<Arc<TrafficMonitor>>,
     auth_key: Vec<u8>,
     node_certs: Vec<Vec<u8>>,
+    trust: Option<tcp_transport::TlsTrust>,
     sni: String,
-    /// 认证版本（V3.2）：None=随 HYDRA_AUTH_MODE env（默认 auto）
-    auth_mode: Option<hydra_protocol::handshake::AuthMode>,
     bound_addr: Arc<std::sync::OnceLock<SocketAddr>>,
 }
 
@@ -89,8 +63,8 @@ impl ProxyServer {
             traffic_monitor: None,
             auth_key: Vec::new(),
             node_certs: Vec::new(),
+            trust: None,
             sni: DEFAULT_SNI.to_string(),
-            auth_mode: None,
             bound_addr: Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -106,25 +80,23 @@ impl ProxyServer {
         self
     }
 
-    /// 节点证书 DER 列表，加入客户端信任根执行标准校验（必填：防中间人）
+    /// 节点证书 DER 列表，加入客户端信任根执行标准校验（必填：防中间人；
+    /// pin 模式默认信任根。真证书部署请改用 [`Self::with_trust`]）
     pub fn with_node_certs(mut self, certs: Vec<Vec<u8>>) -> Self {
         self.node_certs = certs;
+        self
+    }
+
+    /// 覆盖 TLS 信任配置（真证书部署：`TlsTrust::public_ca(..)`；
+    /// 未设置时默认 `TlsTrust::pinned(node_certs)`）
+    pub fn with_trust(mut self, trust: tcp_transport::TlsTrust) -> Self {
+        self.trust = Some(trust);
         self
     }
 
     /// 覆盖 SNI 伪装域名（默认 hydra.node）
     pub fn with_sni(mut self, sni: String) -> Self {
         self.sni = sni;
-        self
-    }
-
-    /// V3.2 认证版本（auto|v2|v3）。不调用则读 HYDRA_AUTH_MODE env（默认 auto：
-    /// 优先 v3 Noise 握手，v2-only 旧节点自动回落 HMAC token）。
-    pub fn with_auth_mode(
-        mut self,
-        mode: hydra_protocol::handshake::AuthMode,
-    ) -> Self {
-        self.auth_mode = Some(mode);
         self
     }
 
@@ -150,58 +122,28 @@ impl ProxyServer {
                     .to_string(),
             ));
         }
-        if self.node_certs.is_empty() {
+        if self.node_certs.is_empty() && self.trust.is_none() {
             return Err(HydraError::ConnectionError(
-                "未提供节点证书：请设置 HYDRA_NODE_CERT 环境变量（或调用 with_node_certs）"
+                "未提供节点证书：请设置 HYDRA_NODE_CERT 环境变量（或调用 with_node_certs / with_trust）"
                     .to_string(),
             ));
         }
 
-        // Add nodes to scheduler（按加入顺序递减初始评分，测速上线后由实测数据取代）
+        // Add nodes to scheduler（按加入顺序递减初始评分，测速上线后由实测数据取代；
+        // register_nodes 幂等，TUN 模式可能已提前注册过）
         info!("Initializing proxy with {} nodes...", self.nodes.len());
-        // Team-T：快照 TCP/TLS 路径凭据（open_target 无 self，全局传输选择配全局快照）
-        let _ = TCP_CREDS.set((
-            self.node_certs.clone(),
-            self.sni.clone(),
-            self.auth_key.clone(),
-        ));
-        for (idx, addr) in self.nodes.iter().enumerate() {
-            let node = NodeInfo {
-                address: *addr,
-                bandwidth: 100.0 - idx as f64 * 10.0,
-                latency: 10.0,
-                loss_rate: 0.01,
-                load: 0.5,
-                status: NodeStatus::Online,
-            };
-            self.scheduler.add_node(node).await;
-            info!("Added node to scheduler: {}", addr);
-        }
-
-        let (endpoint, client_config) =
-            Transport::create_shared_endpoint(self.node_certs.clone(), &self.sni)?;
-        let pool = Arc::new(ConnectionPool::new(
-            endpoint,
-            PoolConfig {
-                max_idle_per_node: 4,
-                idle_timeout: Duration::from_secs(300),
-                cleanup_interval: Duration::from_secs(60),
-                connect_timeout: Duration::from_secs(5),
-                auth_key: self.auth_key.clone(),
-                auth_mode: self.auth_mode.unwrap_or_else(
-                    hydra_protocol::handshake::AuthMode::from_env,
-                ),
-                sni: self.sni.clone(),
-                client_config,
-            },
-        ));
-
-        // 预热连接池
-        info!("Warming up connection pool...");
-        for addr in &self.nodes {
-            pool.warm_up(*addr, 2).await;
-        }
-
+        // Team-T：打包 TCP/TLS 路径凭据。Noise 指纹取对端叶证书（tcp_transport::TlsTrust
+        // 文档），不再需要节点地址→证书映射——多节点各持自签证书也不会配对错。
+        let trust = self
+            .trust
+            .clone()
+            .unwrap_or_else(|| tcp_transport::TlsTrust::pinned(self.node_certs.clone()));
+        let creds = TcpCreds {
+            trust: Arc::new(trust.clone()),
+            sni: self.sni.clone(),
+            auth_key: Arc::new(self.auth_key.clone()),
+        };
+        self.register_nodes().await;
         info!("Binding proxy listener to {}...", self.listen_addr);
         let listener = TcpListener::bind(self.listen_addr).await?;
         if let Ok(local) = listener.local_addr() {
@@ -220,7 +162,7 @@ impl ProxyServer {
         // HYDRA_SPEEDTEST=0 时退回纯恢复探测，评分维持静态初始值。
         crate::speedtest::spawn_recovery_probe(
             self.scheduler.clone(),
-            self.node_certs.clone(),
+            trust,
             self.sni.clone(),
             traffic.clone(),
         );
@@ -230,11 +172,11 @@ impl ProxyServer {
                 Ok((stream, addr)) => {
                     info!("━━━ New SOCKS5 connection from {} ━━━", addr);
                     let scheduler = self.scheduler.clone();
-                    let pool = pool.clone();
                     let traffic = traffic.clone();
+                    let creds = creds.clone();
                     tokio::spawn(async move {
                         // 包装错误处理，确保发送 SOCKS5 错误响应
-                        match Self::handle_connection(stream, scheduler, pool, traffic).await {
+                        match Self::handle_connection(stream, scheduler, traffic, creds).await {
                             Ok(()) => {
                                 info!("━━━ Connection from {} completed successfully ━━━", addr);
                             }
@@ -252,11 +194,80 @@ impl ProxyServer {
         }
     }
 
+    /// 将节点注册进调度器（幂等：重复添加同一地址会更新/去重视实现而定，这里
+    /// 以「仅在不存在时添加」保证幂等）。
+    /// 拆出独立方法：TUN 模式需要在 start() 之前让调度器已有节点
+    /// （通道开启器依赖 get_nodes_by_priority）。
+    pub async fn register_nodes(&self) {
+        for (idx, addr) in self.nodes.iter().enumerate() {
+            if self.scheduler.get_nodes_by_priority().await.iter().any(|n| n.address == *addr) {
+                continue;
+            }
+            let node = NodeInfo {
+                address: *addr,
+                bandwidth: 100.0 - idx as f64 * 10.0,
+                latency: 10.0,
+                loss_rate: 0.01,
+                load: 0.5,
+                status: NodeStatus::Online,
+            };
+            self.scheduler.add_node(node).await;
+            info!("Added node to scheduler: {}", addr);
+        }
+    }
+
+    #[cfg(feature = "tun")]
+    /// TUN 模式通道开启器：把 [`Self::open_target`]（含故障切换 /
+    /// TargetUnreachable 判定 / mark_node_offline / 流量统计语义）包成
+    /// [`crate::tun::ChannelOpener`]。调用前请先 `register_nodes()` 并确保
+    /// 凭据已设置（auth_key/证书）。
+    pub fn tun_channel_opener(&self) -> Result<crate::tun::ChannelOpener> {
+        use crate::tun::{ChannelOpener, OpenFuture, ProxyDuplex};
+
+        if self.auth_key.is_empty() {
+            return Err(HydraError::ConnectionError(
+                "未设置认证密钥：TUN 模式通道开启器无法构建".to_string(),
+            ));
+        }
+        // 与 start() 同构的凭据打包（TcpCreds 为模块私有，此处直接构造）
+        let trust = self
+            .trust
+            .clone()
+            .unwrap_or_else(|| tcp_transport::TlsTrust::pinned(self.node_certs.clone()));
+        let creds = TcpCreds {
+            trust: Arc::new(trust),
+            sni: self.sni.clone(),
+            auth_key: Arc::new(self.auth_key.clone()),
+        };
+        let scheduler = self.scheduler.clone();
+        // 流量统计与 SOCKS 路径同一计数面（monitor 未注入时兜底实例）
+        let traffic = self
+            .traffic_monitor
+            .clone()
+            .unwrap_or_else(|| Arc::new(TrafficMonitor::new()));
+        // TUN 流没有"浏览器对端"，日志 peer 用 0.0.0.0:0 占位（目标本身才是关键信息）
+        let pseudo_peer = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
+        Ok(Arc::new(move |target: String| {
+            let scheduler = scheduler.clone();
+            let traffic = traffic.clone();
+            let creds = creds.clone();
+            Box::pin(async move {
+                let link =
+                    Self::open_target(&scheduler, &traffic, &creds, &target, pseudo_peer).await?;
+                let (recv, send) = link.into_parts();
+                Ok(ProxyDuplex {
+                    reader: Box::new(recv),
+                    writer: Box::new(send),
+                })
+            }) as OpenFuture
+        }) as ChannelOpener)
+    }
+
     async fn handle_connection(
         mut stream: TcpStream,
         scheduler: Arc<Scheduler>,
-        pool: Arc<ConnectionPool>,
         traffic: Arc<TrafficMonitor>,
+        creds: TcpCreds,
     ) -> Result<()> {
         let mut buf = [0u8; 4096];
         let peer_addr = stream
@@ -281,11 +292,11 @@ impl ProxyServer {
         if buf[0] == 0x05 {
             // SOCKS5 协议
             info!("[{}] Detected SOCKS5 protocol", peer_addr);
-            Self::handle_socks5(stream, &buf, n, scheduler, pool, traffic).await
+            Self::handle_socks5(stream, &buf, n, scheduler, traffic, creds).await
         } else if buf[0] >= b'A' && buf[0] <= b'Z' {
             // HTTP 协议 (CONNECT, GET, POST 等)
             info!("[{}] Detected HTTP protocol", peer_addr);
-            Self::handle_http(stream, &buf, n, scheduler, pool, traffic).await
+            Self::handle_http(stream, &buf, n, scheduler, traffic, creds).await
         } else {
             error!(
                 "[{}] Unknown protocol, first byte: 0x{:02x}",
@@ -296,68 +307,18 @@ impl ProxyServer {
         }
     }
 
-    /// 统一的节点连接入口：按优先级尝试候选节点。
-    /// V3.4（裁决 6）：`HYDRA_CHANNELS=2..=16` 时先走多流通道建流；通道整体失败
-    /// （含对旧版节点不认识 0x01 模式标签的版本偏差）→ **显式回退普通单流路径
-    /// 重试一次**（如实降级，不改变既有可用性）。未启用时只走一次单流路径，
-    /// 行为与启用前逐位一致。
-    /// - 传输失败（连接断开/流损坏/响应超时）→ 标记节点 Offline、清空其连接池、切换下一节点
-    /// - 节点存活的显式应用错误码（A3：Reset 0x11 目标不可达 / 0x12 DNS 失败）→ 不切换节点，直接向调用方报错
+    /// 统一的节点连接入口（TCP 转型后唯一路径）：按调度器加权优先级尝试候选节点。
+    /// - 建连失败（TCP/TLS/握手/应答超时）→ 标记节点 Offline、切换下一节点（最多 3 候选）
+    /// - TCP 链路无应用错误码通道：认证失败时节点静默关流，客户端按"节点不可达"
+    ///   处理并故障切换（v1 限制，如实记录；不区分"节点存活但目标不可达"）。
     async fn open_target(
         scheduler: &Scheduler,
-        pool: &ConnectionPool,
         traffic: &Arc<TrafficMonitor>,
+        creds: &TcpCreds,
         target: &str,
         peer_addr: SocketAddr,
-    ) -> Result<NodeLink> {
-        // Team-T：全局 TCP/TLS 传输模式（HYDRA_TRANSPORT=tcp；默认 quic 零改动）。
-        // tcp 模式不做多流聚合/ACK（TCP 自带可靠有序），通道参数被忽略（warn 一次）。
-        if tcp_transport::transport_from_env() == TransportChoice::Tcp {
-            return Self::open_target_tcp(scheduler, traffic, target, peer_addr).await;
-        }
-        if let Some(n) = crate::aggregate_stream::channel_count() {
-            match Self::open_target_once(
-                scheduler,
-                pool,
-                traffic,
-                target,
-                peer_addr,
-                ChannelMode::On(n),
-            )
-            .await
-            {
-                Ok(link) => return Ok(link),
-                Err(e) => {
-                    warn!(
-                        "[{}] HYDRA_CHANNELS={} 通道建流失败（{}），回退普通单流路径重试一次",
-                        peer_addr, n, e
-                    );
-                }
-            }
-        }
-        Self::open_target_once(
-            scheduler,
-            pool,
-            traffic,
-            target,
-            peer_addr,
-            ChannelMode::Off,
-        )
-        .await
-    }
-
-    /// 单轮节点连接（指定通道模式）：返回的流已完成认证并收到节点 0x00 成功应答。
-    async fn open_target_once(
-        scheduler: &Scheduler,
-        pool: &ConnectionPool,
-        traffic: &Arc<TrafficMonitor>,
-        target: &str,
-        peer_addr: SocketAddr,
-        mode: ChannelMode,
     ) -> Result<NodeLink> {
         const MAX_NODE_ATTEMPTS: usize = 3;
-        // 应答等待须大于节点侧目标连接超时（15s），否则慢目标会被误判为节点故障
-        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 
         // 日志脱敏（Exec2）：info 及以上级别目标地址一律短哈希；完整明文仅 debug 级别
         //（排查时开 RUST_LOG=debug 可见）
@@ -366,7 +327,10 @@ impl ProxyServer {
             peer_addr, target
         );
 
-        let mut candidates = scheduler.get_nodes_by_priority().await;
+        let sni = &creds.sni;
+        let auth_key = &creds.auth_key;
+
+        let candidates = scheduler.get_nodes_by_priority().await;
         if candidates.is_empty() {
             error!("[{}] No available nodes in scheduler!", peer_addr);
             return Err(HydraError::ConnectionError(
@@ -374,209 +338,9 @@ impl ProxyServer {
             ));
         }
 
-        // V3.3 方案 B（连接级多路径分发，默认关闭）：HYDRA_AGGREGATE=1 且 Online
-        // 节点 ≥2 时，把评分加权选中的节点换到候选首位，其余候选保持评分降序作为
-        // 故障切换后备；未启用/单节点时本调用是空操作，候选顺序与启用前逐位一致。
-        crate::aggregate::maybe_reorder_candidates(&mut candidates, peer_addr, target);
-
-        // 目标地址带 2 字节大端长度前缀，节点侧 read_exact 读取，杜绝流式截断
-        let addr_bytes = target.as_bytes();
-        if addr_bytes.len() > 256 {
-            return Err(HydraError::ProtocolError(
-                "Target address too long".to_string(),
-            ));
-        }
-        // V3.4：通道模式创建流帧 = [0x01][channel_id 8B][role=0][现行地址帧]；
-        // 现行模式 = 纯现行地址帧（与启用前逐位一致）
-        let cid = match mode {
-            ChannelMode::On(_) => Some(crate::aggregate_stream::new_channel_id()),
-            ChannelMode::Off => None,
-        };
-        let mut request = Vec::with_capacity(16 + addr_bytes.len());
-        if let (ChannelMode::On(_), Some(cid)) = (mode, cid) {
-            request.push(crate::aggregate_stream::MODE_CHANNEL);
-            request.extend_from_slice(&cid.to_be_bytes());
-            request.push(crate::aggregate_stream::ROLE_CREATOR);
-        }
-        request.extend_from_slice(&(addr_bytes.len() as u16).to_be_bytes());
-        request.extend_from_slice(addr_bytes);
-
         let mut last_err: Option<HydraError> = None;
         for node in candidates.iter().take(MAX_NODE_ATTEMPTS) {
-            let (mut send, mut recv) = match pool.get_stream(node.address).await {
-                Ok(streams) => streams,
-                Err(e) => {
-                    warn!(
-                        "[{}] Node {} unreachable ({}), failing over to next node",
-                        peer_addr, node.address, e
-                    );
-                    scheduler.mark_node_offline(&node.address).await;
-                    pool.remove_all(&node.address).await;
-                    last_err = Some(e);
-                    continue;
-                }
-            };
-
-            if let Err(e) = send.write_all(&request).await {
-                warn!(
-                    "[{}] Node {} failed to accept target address ({}), failing over",
-                    peer_addr, node.address, e
-                );
-                scheduler.mark_node_offline(&node.address).await;
-                pool.remove_all(&node.address).await;
-                last_err = Some(HydraError::ProtocolError(format!("Write error: {}", e)));
-                continue;
-            }
-
-            let mut resp = [0u8; 2];
-            match tokio::time::timeout(RESPONSE_TIMEOUT, recv.read_exact(&mut resp)).await {
-                Ok(Ok(())) if resp[0] == 0x00 => {
-                    info!(
-                        "[{}] ✓ Connected to {} via node {}",
-                        peer_addr,
-                        mask_target(target),
-                        node.address
-                    );
-                    // V3.3：按实际承接节点计数（聚合观测/测试断言"两节点都收到流量"）
-                    crate::aggregate::record_node_served(node.address);
-                    // 流量统计：节点路径流包上计数器（up=客户端→节点，down=节点→客户端），
-                    // quinn 错误类型经 CountingStream 固有方法保真转发
-                    let node_entry = traffic.node_entry(node.address);
-                    // V3.4：通道模式 → 在同节点连接上再开 N-1 条数据流建多流通道
-                    if let (ChannelMode::On(n), Some(cid)) = (mode, cid) {
-                        let pair = crate::aggregate_stream::build_channel(
-                            pool,
-                            node.address,
-                            cid,
-                            n,
-                            (send, recv),
-                            traffic,
-                            node_entry,
-                        )
-                        .await;
-                        return Ok(NodeLink::Channel(pair));
-                    }
-                    let send = CountingStream::new(
-                        send,
-                        ByteCounter::up(Some(traffic.clone()), Some(node_entry.clone())),
-                    );
-                    let recv = CountingStream::new(
-                        recv,
-                        ByteCounter::down(Some(traffic.clone()), Some(node_entry)),
-                    );
-                    return Ok(NodeLink::Single { send, recv });
-                }
-                // 节点存活：目标连接失败/DNS 失败属于目标侧问题，不降级节点（兼容旧版节点状态字节路径）
-                Ok(Ok(())) => {
-                    error!(
-                        "[{}] Node {} reported status {} for target {}",
-                        peer_addr,
-                        node.address,
-                        resp[0],
-                        mask_target(target)
-                    );
-                    let msg = if resp[0] == 0x02 {
-                        format!("节点 DNS 解析失败: {}", mask_target(target))
-                    } else {
-                        format!("节点无法连接目标: {}", mask_target(target))
-                    };
-                    return Err(HydraError::ConnectionError(msg));
-                }
-                Ok(Err(e)) => {
-                    // A3：节点存活的显式应用错误码（RESET_STREAM 携带 0x11-0x13）
-                    let app_code = match &e {
-                        quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)) => {
-                            Some(u64::from(*code))
-                        }
-                        _ => None,
-                    };
-                    if app_code == Some(NODE_ERR_TARGET_CONNECT) {
-                        error!(
-                            "[{}] Node {} reported target-unreachable (0x11) for {}",
-                            peer_addr,
-                            node.address,
-                            mask_target(target)
-                        );
-                        return Err(HydraError::ConnectionError(format!(
-                            "节点无法连接目标: {}",
-                            mask_target(target)
-                        )));
-                    }
-                    if app_code == Some(NODE_ERR_DNS_FAIL) {
-                        error!(
-                            "[{}] Node {} reported DNS failure (0x12) for {}",
-                            peer_addr,
-                            node.address,
-                            mask_target(target)
-                        );
-                        return Err(HydraError::ConnectionError(format!(
-                            "节点 DNS 解析失败: {}",
-                            mask_target(target)
-                        )));
-                    }
-                    // 其余应用错误码（含 0x13 转发错误）：节点存活，不降级节点——
-                    // 与 0x11/0x12 的"目标侧问题不切换"原则一致；只有非应用层（传输层）故障才降级
-                    if let Some(code) = app_code {
-                        warn!(
-                            "[{}] Node {} reported app error 0x{:x} for {}, not failing over",
-                            peer_addr,
-                            node.address,
-                            code,
-                            mask_target(target)
-                        );
-                        return Err(HydraError::ConnectionError(format!(
-                            "节点报告转发错误 (0x{:x}): {}",
-                            code,
-                            mask_target(target)
-                        )));
-                    }
-                    warn!(
-                        "[{}] Node {} stream broken ({}), failing over",
-                        peer_addr, node.address, e
-                    );
-                }
-                Err(_) => {
-                    warn!(
-                        "[{}] Node {} response timeout, failing over",
-                        peer_addr, node.address
-                    );
-                }
-            }
-            scheduler.mark_node_offline(&node.address).await;
-            pool.remove_all(&node.address).await;
-            last_err = Some(HydraError::ConnectionError(format!(
-                "Node {} failed",
-                node.address
-            )));
-        }
-
-        Err(last_err.unwrap_or_else(|| HydraError::ConnectionError("All nodes failed".to_string())))
-    }
-
-    /// Team-T：TCP/TLS 传输的单轮建流（结构与 open_target_once 平行：候选节点逐个试，
-    /// 成功返回已认证、已收到 0x00 应答的 TLS 流；失败标记节点离线换下一个）。
-    /// 无通道模式（TCP 自带可靠有序）；无应用错误码通道——节点静默关闭按目标侧故障
-    /// 报错（不降级语义简化为：连接失败一律换下一候选，v1 限制，如实记录）。
-    async fn open_target_tcp(
-        scheduler: &Scheduler,
-        traffic: &Arc<TrafficMonitor>,
-        target: &str,
-        peer_addr: SocketAddr,
-    ) -> Result<NodeLink> {
-        const MAX_NODE_ATTEMPTS: usize = 3;
-        let Some((node_certs, sni, auth_key)) = TCP_CREDS.get() else {
-            return Err(HydraError::ConnectionError(
-                "TCP 传输模式缺少凭据快照（代理未完成初始化）".to_string(),
-            ));
-        };
-
-        let candidates = scheduler.get_nodes_by_priority().await;
-        if candidates.is_empty() {
-            return Err(HydraError::ConnectionError("No available nodes".to_string()));
-        }
-        let mut last_err: Option<HydraError> = None;
-        for node in candidates.iter().take(MAX_NODE_ATTEMPTS) {
-            match tcp_transport::connect_target(node.address, sni, node_certs, auth_key, target)
+            match tcp_transport::connect_target(node.address, sni, &creds.trust, auth_key, target)
                 .await
             {
                 Ok(tls) => {
@@ -586,6 +350,7 @@ impl ProxyServer {
                         mask_target(target),
                         node.address
                     );
+                    // 流量统计：节点路径流包上计数器（up=客户端→节点，down=节点→客户端）
                     let node_entry = traffic.node_entry(node.address);
                     let (r, w) = tokio::io::split(tls);
                     let send = CountingStream::new(
@@ -596,9 +361,20 @@ impl ProxyServer {
                         r,
                         ByteCounter::down(Some(traffic.clone()), Some(node_entry)),
                     );
-                    return Ok(NodeLink::Tcp { send, recv });
+                    return Ok(NodeLink { send, recv });
                 }
                 Err(e) => {
+                    // 目标不可达（节点存活但目标连不上/SSRF/DNS 失败）：换节点无意义
+                    //（目标在任意节点都同样不可达），且绝不污染节点评分——直接报错给
+                    // 客户端（审查 R-01：原实现把健康节点连锁标记 Offline）。
+                    if matches!(e, HydraError::TargetUnreachable(_)) {
+                        warn!(
+                            "[{}] Target unreachable via node {} (node healthy, not failing over)",
+                            peer_addr,
+                            node.address
+                        );
+                        return Err(e);
+                    }
                     warn!(
                         "[{}] Node {} tcp/tls connect failed ({}), failing over to next node",
                         peer_addr,
@@ -620,8 +396,8 @@ impl ProxyServer {
         initial_buf: &[u8],
         initial_len: usize,
         scheduler: Arc<Scheduler>,
-        pool: Arc<ConnectionPool>,
         traffic: Arc<TrafficMonitor>,
+        creds: TcpCreds,
     ) -> Result<()> {
         let peer_addr = stream
             .peer_addr()
@@ -706,10 +482,10 @@ impl ProxyServer {
                 "[{}] >>> HTTP CONNECT request (plaintext): {}",
                 peer_addr, target_str
             );
-            return Self::handle_http_connect(stream, target_str, scheduler, pool, traffic).await;
+            return Self::handle_http_connect(stream, target_str, scheduler, traffic, creds).await;
         }
 
-        // 普通 HTTP 请求 (GET, POST, etc.)
+        // 普通 HTTP 请求 (GET, POST etc.)
         // 对于 HTTP GET/POST，我们需要将请求转发到目标服务器
         // 从 URL 或 Host header 中提取主机名
         let target_host = if let Some(without_protocol) = url.strip_prefix("http://") {
@@ -776,8 +552,8 @@ impl ProxyServer {
                 // 连接到节点（带故障切换）
                 let mut node_link = match Self::open_target(
                     &scheduler,
-                    &pool,
                     &traffic,
+                    &creds,
                     &target_with_port,
                     peer_addr,
                 )
@@ -793,8 +569,8 @@ impl ProxyServer {
 
                 // A6：发送原始 HTTP 请求到节点（原始字节转发，含二进制 body；不再经 lossy 字符串）
                 info!("[{}] Forwarding HTTP request to node...", peer_addr);
-                if let Err(e) = write_node_link(&mut node_link, &raw).await {
-                    error!("[{}] Failed to forward HTTP request: {:?}", peer_addr, e);
+                if let Err(e) = node_link.send.write_all(&raw).await {
+                    error!("[{}] Failed to forward HTTP request: {}", peer_addr, e);
                     let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                     return Err(HydraError::ProtocolError(format!("Write error: {}", e)));
                 }
@@ -817,8 +593,8 @@ impl ProxyServer {
         mut stream: TcpStream,
         target_str: String,
         scheduler: Arc<Scheduler>,
-        pool: Arc<ConnectionPool>,
         traffic: Arc<TrafficMonitor>,
+        creds: TcpCreds,
     ) -> Result<()> {
         let peer_addr = stream
             .peer_addr()
@@ -829,16 +605,16 @@ impl ProxyServer {
             Some(tcp) => RemoteLink::Direct(tcp),
             None => {
                 let node_link =
-                    match Self::open_target(&scheduler, &pool, &traffic, &target_str, peer_addr)
+                    match Self::open_target(&scheduler, &traffic, &creds, &target_str, peer_addr)
                         .await
                     {
-                        Ok(link) => link,
-                        Err(e) => {
-                            error!("[{}] Failed to connect via any node: {}", peer_addr, e);
-                            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                            return Err(e);
-                        }
-                    };
+                    Ok(link) => link,
+                    Err(e) => {
+                        error!("[{}] Failed to connect via any node: {}", peer_addr, e);
+                        let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                        return Err(e);
+                    }
+                };
                 RemoteLink::Node { link: node_link }
             }
         };
@@ -858,8 +634,8 @@ impl ProxyServer {
         initial_buf: &[u8],
         initial_len: usize,
         scheduler: Arc<Scheduler>,
-        pool: Arc<ConnectionPool>,
         traffic: Arc<TrafficMonitor>,
+        creds: TcpCreds,
     ) -> Result<()> {
         let peer_addr = stream
             .peer_addr()
@@ -1042,7 +818,7 @@ impl ProxyServer {
             None => {
                 // 连接到节点（带故障切换）
                 let node_link =
-                    match Self::open_target(&scheduler, &pool, &traffic, &target_str, peer_addr)
+                    match Self::open_target(&scheduler, &traffic, &creds, &target_str, peer_addr)
                         .await
                     {
                         Ok(link) => link,
@@ -1110,12 +886,10 @@ impl ProxyServer {
     }
 
     /// 双向转发（A4 收敛版 + Exec2 直连支持）：
-    /// - 远端既可以是加密节点（QUIC 流对），也可以是国内直连的明文 TCP（CN 分流），
+    /// - 远端既可以是加密节点（TCP/TLS 流），也可以是国内直连的明文 TCP（CN 分流），
     ///   两条路径复用同一套收敛/排水/计数逻辑；
-    /// - 任一方向结束后显式 shutdown/abort 另一方向并 join 收敛，不再留下孤儿任务；
-    /// - 浏览器关写侧（半关闭）时保留 远端→浏览器 方向，在超时窗口内收完剩余响应；
-    /// - 节点侧 A3 应用错误码（Reset 0x11-0x13）映射为对浏览器的显式断开并向上传播错误，
-    ///   不再以干净 EOF 冒充正常结束。
+    /// - 任一方向结束后显式 shutdown 另一方向并 join 收敛，不再留下孤儿任务；
+    /// - 浏览器关写侧（半关闭）时保留 远端→浏览器 方向，在超时窗口内收完剩余响应。
     async fn relay_bidirectional(
         stream: TcpStream,
         link: RemoteLink,
@@ -1135,18 +909,8 @@ impl ProxyServer {
 
         // 节点路径：open_target 已包好计数器；直连路径（CN 分流，无节点归属）：
         // 仅计全局 monitor，不归属任何节点条目。
-        // 通道 TaskGuard 必须提升到函数作用域：match 臂内的模式绑定在 match 结束时
-        // 即析构——若留在臂内，守卫瞬时 drop 会 abort 全部通道任务（0 字节假 EOF）
-        let (mut up_sink, mut down_src, mut channel_guard) = match link {
-            RemoteLink::Node { link } => match link {
-                NodeLink::Channel(ChannelPair { up, down, _guard }) => {
-                    (UpSink::Channel(up), DownSource::Channel(down), Some(_guard))
-                }
-                NodeLink::Single { send, recv } => {
-                    (UpSink::Node(send), DownSource::Node(recv), None)
-                }
-                NodeLink::Tcp { send, recv } => (UpSink::Tcp(send), DownSource::Tcp(recv), None),
-            },
+        let (mut up_sink, mut down_src) = match link {
+            RemoteLink::Node { link } => (UpSink::Node(link.send), DownSource::Node(link.recv)),
             RemoteLink::Direct(tcp) => {
                 let (r, w) = tcp.into_split();
                 (
@@ -1158,39 +922,25 @@ impl ProxyServer {
                         r,
                         ByteCounter::down(Some(traffic), None),
                     )),
-                    None,
                 )
             }
         };
-        // 持有至 relay 收敛（析构时 abort 通道读帧/装配任务）；None=非通道路径
-        let _channel_guard = &mut channel_guard;
         let (mut client_read, mut client_write) = stream.into_split();
 
-        // 浏览器 → 远端（节点 QUIC 流 / 直连 TCP）
+        // 浏览器 → 远端（节点 TCP/TLS 流 / 直连 TCP）
         let mut up = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
             let mut total = 0u64;
             loop {
                 match client_read.read(&mut buf).await {
-                    // 浏览器关写侧：显式优雅结束上行（quinn FIN / TCP 半关闭 shutdown），
-                    // 不依赖 SendStream::drop 的 finish 语义
-                    //（quinn 0.10 drop==finish 已核实，但升级版本时语义可能变化）
+                    // 浏览器关写侧：显式优雅结束上行（TCP 半关闭 shutdown，FIN 传给远端），
+                    // 不依赖写端 drop 的隐式语义
                     Ok(0) => {
                         match up_sink {
-                            UpSink::Node(mut send) => {
-                                let _ = send.finish().await;
-                            }
-                            UpSink::Channel(mut up) => {
-                                // V3.4 半关闭 = 上行写端排空确认（全部 ACK）后 finish
-                                // 全部存活流；Err(Transport) = 排空超时（proxy 层
-                                // 沿用现有忽略语义，通道已由 Err 路径显式报错）
-                                let _ = up.finish().await;
-                            }
-                            UpSink::Direct(mut w) => {
+                            UpSink::Node(mut w) => {
                                 let _ = w.shutdown().await;
                             }
-                            // Team-T：TCP/TLS 链路半关闭 = shutdown 写端（FIN 传给节点）
-                            UpSink::Tcp(mut w) => {
+                            UpSink::Direct(mut w) => {
                                 let _ = w.shutdown().await;
                             }
                         }
@@ -1199,34 +949,17 @@ impl ProxyServer {
                     Ok(n) => {
                         total += n as u64;
                         let write_res = match &mut up_sink {
-                            UpSink::Node(send) => send.write_all(&buf[..n]).await.map_err(|e| {
-                                // 节点 STOP_SENDING（携带 A3 错误码）或连接级故障
-                                match e {
-                                    quinn::WriteError::Stopped(code) => {
-                                        RelayError::NodeAppError(u64::from(code))
-                                    }
-                                    _ => RelayError::Transport,
-                                }
-                            }),
-                            // V3.4 通道上行：多流写入器（轮转 + seq + 接管重发）；
-                            // 通道级失败按 A3 语义映射（节点 reset/stop = NodeAppError）
-                            UpSink::Channel(up) => {
-                                up.write_all(&buf[..n]).await.map_err(|e| match e {
-                                    ChannelError::NodeApp(code) => RelayError::NodeAppError(code),
-                                    ChannelError::Transport => RelayError::Transport,
-                                })
-                            }
+                            // TCP 链路无错误码通道，写失败 = 传输故障
+                            UpSink::Node(w) => w
+                                .write_all(&buf[..n])
+                                .await
+                                .map(|_| ())
+                                .map_err(|_| RelayError::Transport),
                             UpSink::Direct(w) => w
                                 .write_all(&buf[..n])
                                 .await
                                 .map(|_| ())
                                 .map_err(RelayError::LocalIo),
-                            // Team-T：TCP/TLS 链路无错误码通道，写失败 = 传输故障
-                            UpSink::Tcp(w) => w
-                                .write_all(&buf[..n])
-                                .await
-                                .map(|_| ())
-                                .map_err(|_| RelayError::Transport),
                         };
                         if let Err(e) = write_res {
                             return Err(e);
@@ -1243,36 +976,17 @@ impl ProxyServer {
             let mut total = 0u64;
             loop {
                 let n = match &mut down_src {
-                    DownSource::Node(recv) => match recv.read(&mut buf).await {
-                        // 节点 FIN：响应完整结束
-                        Ok(Some(0)) | Ok(None) => return Ok(total),
-                        Ok(Some(n)) => n,
-                        // A3：节点显式 RESET_STREAM(0x11-0x13)——不再冒充正常 EOF
-                        Err(quinn::ReadError::Reset(code)) => {
-                            return Err(RelayError::NodeAppError(u64::from(code)));
-                        }
+                    // TCP/TLS 链路。FIN = 响应完整结束（无应用错误码通道，v1 限制）
+                    DownSource::Node(r) => match r.read(&mut buf).await {
+                        Ok(0) => return Ok(total),
+                        Ok(n) => n,
                         Err(_) => return Err(RelayError::Transport),
-                    },
-                    // V3.4 通道下行：按 seq 重排后交付；通道级失败同 A3 语义映射
-                    DownSource::Channel(down) => match down.read(&mut buf).await {
-                        Ok(Some(n)) => n,
-                        Ok(None) => return Ok(total),
-                        Err(ChannelError::NodeApp(code)) => {
-                            return Err(RelayError::NodeAppError(code));
-                        }
-                        Err(ChannelError::Transport) => return Err(RelayError::Transport),
                     },
                     DownSource::Direct(r) => match r.read(&mut buf).await {
                         // 直连目标 FIN：响应完整结束
                         Ok(0) => return Ok(total),
                         Ok(n) => n,
                         Err(e) => return Err(RelayError::LocalIo(e)),
-                    },
-                    // Team-T：TCP/TLS 链路。FIN = 响应完整结束；无错误码通道（v1 限制）
-                    DownSource::Tcp(r) => match r.read(&mut buf).await {
-                        Ok(0) => return Ok(total),
-                        Ok(n) => n,
-                        Err(_) => return Err(RelayError::Transport),
                     },
                 };
                 total += n as u64;
@@ -1317,20 +1031,20 @@ impl ProxyServer {
                     )))
                 }
             },
-            // 上行故障：中止下行（recv/client_write drop → STOP_SENDING/FIN），收敛后向上报错
+            // 上行故障：中止下行（读写端 drop → FIN/RST），收敛后向上报错
             (true, Some(e)) => {
                 down.abort();
                 let _ = down.await;
                 Err(Self::relay_error(e, peer_addr, target))
             }
-            // 远端响应已完整（FIN）：显式中止上行并收敛（send drop → FIN 传给远端）
+            // 远端响应已完整（FIN）：显式中止上行并收敛（写端 drop → FIN 传给远端）
             (false, None) => {
                 up.abort();
                 let _ = up.await;
                 info!("[{}] Connection to {} closed", peer_addr, masked);
                 Ok(())
             }
-            // 远端侧显式错误码或传输故障：对浏览器明确断开（两个半份直接丢弃，不排水）
+            // 传输故障：对浏览器明确断开（两个半份直接丢弃，不排水）
             (false, Some(e)) => {
                 up.abort();
                 let _ = up.await;
@@ -1339,20 +1053,10 @@ impl ProxyServer {
         }
     }
 
-    /// A3 错误码/传输故障 → 明确的失败（供外层日志与错误传播；浏览器侧为显式断开而非 EOF 冒充）
+    /// 传输/直连故障 → 明确的失败（供外层日志与错误传播；浏览器侧为显式断开而非 EOF 冒充）
     fn relay_error(e: RelayError, peer_addr: SocketAddr, target: &str) -> HydraError {
         let masked = mask_target(target);
         match e {
-            RelayError::NodeAppError(code) => {
-                error!(
-                    "[{}] Node app error 0x{:x} for {} — connection aborted explicitly",
-                    peer_addr, code, masked
-                );
-                HydraError::ConnectionError(format!(
-                    "节点转发故障（错误码 0x{:02x}），连接已显式断开: {}",
-                    code, masked
-                ))
-            }
             RelayError::Transport => {
                 error!(
                     "[{}] Relay transport failure for {} — connection aborted",
@@ -1371,56 +1075,47 @@ impl ProxyServer {
     }
 }
 
-/// Exec2：中继的远端链路——加密节点（QUIC 流对）或国内直连明文 TCP（CN 分流）。
+/// Team-T：已建成的节点转发链路（TCP/TLS，已完成认证并收到节点 0x00 成功应答）。
+/// TCP 自带可靠有序：无多流聚合/ACK/应用错误码通道（QUIC 路径已随 TCP 转型移除）。
+pub(crate) struct NodeLink {
+    send: CountingStream<TcpWriteHalf>,
+    recv: CountingStream<TcpReadHalf>,
+}
+
+impl NodeLink {
+    /// 拆分为（读端, 写端），供 TUN 模式把节点链路透传给用户态 TCP 栈
+    /// （pub(crate)：仅 crate 内 tun 模块经 tun_channel_opener 使用）。
+    pub(crate) fn into_parts(
+        self,
+    ) -> (CountingStream<TcpReadHalf>, CountingStream<TcpWriteHalf>) {
+        (self.recv, self.send)
+    }
+}
+
+/// Exec2：中继的远端链路——加密节点（TCP/TLS 流）或国内直连明文 TCP（CN 分流）。
 /// 两种链路共用 relay_bidirectional 的收敛/排水/计数逻辑与 ACTIVE_RELAYS 计数器。
-/// 节点路径的流为 CountingStream 包装（quinn 错误类型经固有方法保真转发）。
+/// 节点路径的流为 CountingStream 包装。
 enum RemoteLink {
     Node { link: NodeLink },
     Direct(TcpStream),
 }
 
-/// HTTP 明文代理把原始请求字节写向节点链路（单流 write_all / 通道多流写入器）。
-async fn write_node_link(link: &mut NodeLink, raw: &[u8]) -> std::result::Result<(), ChannelError> {
-    match link {
-    NodeLink::Single { send, .. } => send
-        .write_all(raw)
-        .await
-        .map_err(|_| ChannelError::Transport),
-    // V3.4：通道创建流已由 0x00 应答确认，原始请求字节经多流写入器分发
-    NodeLink::Channel(pair) => pair.up.write_all(raw).await,
-    // Team-T：TCP/TLS 链路（无错误码通道）
-    NodeLink::Tcp { send, .. } => send
-        .write_all(raw)
-        .await
-        .map(|_| ())
-        .map_err(|_| ChannelError::Transport),
-}
-}
-
 /// 上行终点（浏览器 → 远端）
 enum UpSink {
-    Node(CountingStream<quinn::SendStream>),
-    /// V3.4 多流通道上行写端
-    Channel(ChannelUpWriter),
-    Direct(CountingStream<tokio::net::tcp::OwnedWriteHalf>),
     /// Team-T：TCP/TLS 链路上行写端
-    Tcp(CountingStream<tokio::io::WriteHalf<tcp_transport::TcpNodeStream>>),
+    Node(CountingStream<TcpWriteHalf>),
+    Direct(CountingStream<tokio::net::tcp::OwnedWriteHalf>),
 }
 
 /// 下行源（远端 → 浏览器）
 enum DownSource {
-    Node(CountingStream<quinn::RecvStream>),
-    /// V3.4 多流通道下行读端（seq 重排后交付）
-    Channel(ChannelDownReader),
-    Direct(CountingStream<tokio::net::tcp::OwnedReadHalf>),
     /// Team-T：TCP/TLS 链路下行读端
-    Tcp(CountingStream<tokio::io::ReadHalf<tcp_transport::TcpNodeStream>>),
+    Node(CountingStream<TcpReadHalf>),
+    Direct(CountingStream<tokio::net::tcp::OwnedReadHalf>),
 }
 
 /// 中继方向错误
 enum RelayError {
-    /// 节点侧显式应用错误码（A3：ReadError::Reset / WriteError::Stopped 携带 0x11-0x13）
-    NodeAppError(u64),
     /// 本地或传输层故障
     Transport,
     /// 直连链路（CN 分流）的 IO 故障

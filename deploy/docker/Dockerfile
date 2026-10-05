@@ -33,6 +33,6 @@ USER hydra
 WORKDIR /etc/hydra
 # 证书/私钥在此目录持久化（容器重建不换证书，客户端 pinning 不受影响）
 VOLUME /etc/hydra
-# QUIC/UDP 数据面
-EXPOSE 443/udp
+# TCP/TLS 数据面
+EXPOSE 443/tcp
 ENTRYPOINT ["/usr/local/bin/hydra-node"]

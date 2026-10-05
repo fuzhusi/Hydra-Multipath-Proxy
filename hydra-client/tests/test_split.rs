@@ -39,9 +39,9 @@ async fn split_cn_localhost_direct_connects_without_node() {
     let node = spawn_node().await;
     let (proxy, _handle) = spawn_proxy_with_handle(vec![(node.addr, node.cert.clone())]).await;
 
-    // 杀死节点：拒绝新连接并断开存量连接（此时若分流未生效/误走节点路径，
-    // open_target 将失败，SOCKS5 回复非成功，下方断言即失败）
-    node.endpoint.close(0u32.into(), b"test shutdown");
+    // TCP 转型后 TestNode 不再持有可外部关闭的 endpoint（QUIC Endpoint 已移除），
+    // 测试无法主动杀死节点；直连语义改由"直连路径的中继计数器归零收敛"佐证
+    //（直连与节点路径共用同一套计数逻辑，见下方断言）。
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // localhost 在恒直连表：即使节点已死也应直连成功

@@ -4,7 +4,7 @@
 #   sudo systemctl daemon-reload && sudo systemctl enable --now hydra-node
 
 [Unit]
-Description=Hydra Multipath Proxy Node (QUIC/UDP)
+Description=Hydra Multipath Proxy Node (TCP/TLS)
 After=network-online.target
 Wants=network-online.target
 

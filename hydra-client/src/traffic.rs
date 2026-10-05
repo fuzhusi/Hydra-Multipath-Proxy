@@ -1,4 +1,3 @@
-use quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -216,9 +215,9 @@ impl ByteCounter {
 /// - 上行包装（up=true）：对 `poll_write` 的字节数计数（客户端→节点方向）；
 /// - 下行包装（up=false）：对 `poll_read` 的字节数计数（节点→客户端方向）。
 ///
-/// 对 quinn 流提供**固有方法** `write_all`/`finish`/`read`，保真转发 quinn 的
-/// `WriteError`/`ReadError`（A3 应用错误码 0x11-0x13 依赖其类型区分，泛型
-/// AsyncRead/AsyncWrite 会把错误折叠成 io::Error，故中继路径必须走固有方法）。
+/// 泛型 AsyncRead/AsyncWrite 实现即可覆盖 TCP/TLS 节点流与直连 TCP
+/// （QUIC 路径固有的错误码通道已随 QUIC 移除；TCP 链路的认证/目标错误
+/// 均在建流阶段由 connect_target 显式报错，转发期无应用错误码）。
 pub struct CountingStream<T> {
     inner: T,
     counter: ByteCounter,
@@ -282,35 +281,6 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for CountingStream<T> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-impl CountingStream<SendStream> {
-    /// quinn 固有 write_all 语义保真转发（错误类型 = `quinn::WriteError`，含 STOP_SENDING 错误码）
-    pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), quinn::WriteError> {
-        let r = self.inner.write_all(buf).await;
-        if r.is_ok() {
-            self.counter.record(buf.len() as u64);
-        }
-        r
-    }
-
-    /// quinn 固有 finish 语义保真转发
-    pub async fn finish(&mut self) -> Result<(), quinn::WriteError> {
-        self.inner.finish().await
-    }
-}
-
-impl CountingStream<RecvStream> {
-    /// quinn 固有 read 语义保真转发（错误类型 = `quinn::ReadError`，含 RESET_STREAM 错误码）
-    pub async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, quinn::ReadError> {
-        let r = self.inner.read(buf).await;
-        if let Ok(Some(n)) = &r {
-            if *n > 0 {
-                self.counter.record(*n as u64);
-            }
-        }
-        r
     }
 }
 

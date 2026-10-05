@@ -7,32 +7,46 @@ edition = "2021"
 name = "hydra-client"
 path = "src/main.rs"
 
+[features]
+# TUN 透明代理模式（docs/design/TUN模式方案.md）：默认开启；
+# `--no-default-features` 可编出无 TUN 的最小客户端（若目标环境无法拉取
+# tun2/smoltcp 依赖，允许此降级）。
+default = ["tun"]
+tun = ["dep:tun2", "dep:smoltcp", "dep:tokio-util"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-quinn = "0.10"
-# 直接依赖 quinn-proto 以实现 congestion::Controller trait（与 quinn 0.10 同一 0.10.x 实例）
-quinn-proto = "0.10"
 rustls = "0.21"
-# Team-T：TCP/TLS 传输模式（与 rustls 0.21 匹配的 tokio 适配层）
+# TCP/TLS 传输（TCP 转型 Wave 1；与 rustls 0.21 匹配的 tokio 适配层）
 tokio-rustls = "0.24"
+# 真证书模式（HYDRA_TRUST=ca）：webpki 公共 CA 根，与 rustls 0.21 配套
+webpki-roots = "0.23"
 ring = "0.16"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-anyhow = "1"
-thiserror = "1"
-rcgen = "0.10"
 url = "2.5"
 base64 = "0.22"
-crossbeam-queue = "0.3"
+# 恢复探测周期的随机抖动（±20%，防整周期被动特征）
 rand = "0.8"
 hydra-protocol = { path = "../hydra-protocol" }
-hydra-obfs = { path = "../hydra-obfs" }
+
+# ── TUN 透明代理模式（feature = "tun"）───────────────────────────────────────
+# tun2 = tun-rs 系维护的 TUN crate（ssrlive/rust-tun 的 tun2 4.x）；
+# Windows 走 Wintun 驱动（运行时需 wintun.dll 与 exe 同架构、同目录或 PATH），
+# Linux 走 /dev/net/tun。
+tun2 = { version = "4", optional = true, features = ["async"] }
+# 用户态 TCP/IP 栈：TUN 收发裸 IP 包（medium-ip），只需 IPv4 + TCP socket。
+smoltcp = { version = "0.11", optional = true, default-features = false, features = [
+    "alloc",
+    "proto-ipv4",
+    "socket-tcp",
+    "medium-ip",
+] }
+# CancellationToken（TUN 任务优雅停机）
+tokio-util = { version = "0.7", optional = true }
 
 [dev-dependencies]
 hydra-node = { path = "../hydra-node" }
-# test_handshake_v3：snow 官方 API 直造 msg1（篡改测试）；rustls 用于 peer cert 下cast
-snow = { version = "0.9", default-features = false, features = ["default-resolver", "ring-resolver"] }
-rustls = "0.21"
