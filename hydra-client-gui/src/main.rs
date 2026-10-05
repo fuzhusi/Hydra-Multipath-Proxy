@@ -155,6 +155,9 @@ struct HydraApp {
     really_quit: bool,
     /// 托盘 tooltip 缓存（变化才 set_tooltip）
     last_tray_tooltip: String,
+    /// TUN 停机令牌（审查修复：从代理线程内部提升到 HydraApp，真退出路径
+    /// 可直接 cancel，确保 RouteGuard 执行路由清理，不再依赖线程内时序）
+    tun_shutdown: Option<hydra_client::ShutdownToken>,
 }
 
 impl Default for HydraApp {
@@ -210,6 +213,7 @@ impl Default for HydraApp {
             tray: None,
             really_quit: false,
             last_tray_tooltip: String::new(),
+            tun_shutdown: None,
         }
     }
 }
@@ -344,6 +348,7 @@ impl HydraApp {
             tray,
             really_quit: false,
             last_tray_tooltip: "Hydra 代理已停止".to_string(),
+            tun_shutdown: None,
         };
 
         // ── 首启向导（轻量版）：无配置文件且关键字段为空 → 日志区中文引导 ──
@@ -551,6 +556,12 @@ impl HydraApp {
 
     /// Test all nodes and update status (non-blocking)
     fn test_all_nodes(&mut self) {
+        // 审查修复：节点列表为空直接记日志返回，不做静默空测
+        //（配合 resolve_trust pin 模式空信任根报错，双保险）
+        if self.config.node_addrs.is_empty() {
+            self.add_log("没有节点可测试（节点列表为空），已跳过".to_string());
+            return;
+        }
         let node_addrs = self.config.node_addrs.clone();
         // 信任根按「配置文件 > 环境变量」构造（支持 ca 模式与逐节点证书）；失败根因直接进日志
         let trust = match config::resolve_trust(&self.config, &node_addrs) {
@@ -828,6 +839,16 @@ impl HydraApp {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = stop_flag.clone();
         let traffic_monitor_clone = traffic_monitor.clone();
+        // 审查修复：TUN 停机令牌提升到 GUI 线程创建并存入 HydraApp 字段——
+        // 真退出路径（托盘退出/关窗退出/on_exit）可直接 cancel，保证
+        // RouteGuard 的路由清理在任何停机时序下都有机会执行
+        let tun_shutdown_token = if tun_cfg.is_some() {
+            Some(hydra_client::new_tun_shutdown_token())
+        } else {
+            None
+        };
+        self.tun_shutdown = tun_shutdown_token.clone();
+        let mut tun_token_for_thread = tun_shutdown_token.clone();
 
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -854,12 +875,14 @@ impl HydraApp {
                         proxy.register_nodes().await;
                         match proxy.tun_channel_opener() {
                             Ok(opener) => {
-                                // 令牌本体留在任务外：停止代理时 cancel → 栈任务退出
-                                // → RouteGuard Drop 清理路由。tx 用独立克隆（任务内发送
-                                // 失败根因，不占用主通道所有权）
+                                // 令牌本体已在 GUI 线程创建并存入 HydraApp（真退出
+                                // 路径可达），此处取传入的令牌 clone 给 TUN 栈任务。
+                                // tx 用独立克隆（任务内发送失败根因，不占用主通道所有权）
                                 let tun_tx = tx.clone();
-                                let shutdown = hydra_client::new_tun_shutdown_token();
-                                let shutdown2 = shutdown.clone();
+                                let tun_token = tun_token_for_thread
+                                    .take()
+                                    .expect("TUN 已启用时停机令牌必须存在");
+                                let shutdown2 = tun_token.clone();
                                 let task = tokio::spawn(async move {
                                     if let Err(e) =
                                         hydra_client::tun::run_tun(tcfg, opener, shutdown2).await
@@ -872,7 +895,7 @@ impl HydraApp {
                                         ))));
                                     }
                                 });
-                                Some((shutdown, task))
+                                Some((tun_token, task))
                             }
                             Err(e) => {
                                 let _ = tx.send(Err(std::io::Error::other(format!(
@@ -956,22 +979,49 @@ impl HydraApp {
         // receiver 下帧再收；Disconnected = 代理线程在就绪信号发出前已退出
         //（如 Runtime::new().unwrap() panic），若吞掉则 proxy_starting 恒为 true，
         // 「启动代理」按钮从此永久命中早退分支，无法再次启动。
-        let (signal, disconnected) = match &self.proxy_start_receiver {
-            Some(rx) => match rx.try_recv() {
-                Ok(sig) => (Some(sig), false),
-                Err(std::sync::mpsc::TryRecvError::Empty) => (None, false),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => (None, true),
-            },
-            None => (None, false),
-        };
-        if disconnected {
-            // 代理线程异常退出：清 receiver、复位启动态，恢复可再次启动
-            self.proxy_start_receiver = None;
-            self.proxy_starting = false;
-            self.add_log("代理启动线程异常退出（未发出就绪信号即终止）".to_string());
-            return Some(());
+        // 审查修复：每轮一次性排空通道——此前只消费一条就丢弃 receiver，
+        // 同帧内随后到达的消息（典型：TUN 启动失败根因紧跟就绪/失败信号）
+        // 会被静默丢弃，故障定位线索丢失。
+        let mut messages: Vec<std::result::Result<std::net::SocketAddr, std::io::Error>> =
+            Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = &self.proxy_start_receiver {
+            loop {
+                match rx.try_recv() {
+                    Ok(sig) => messages.push(sig),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
         }
-        let signal = signal?;
+        // 首条为处理对象，剩余消息全部入日志（不静默丢弃）
+        let first = if messages.is_empty() {
+            None
+        } else {
+            let mut it = messages.into_iter();
+            let head = it.next();
+            for sig in it {
+                match sig {
+                    Ok(addr) => self.add_log(format!("（附加就绪信号）代理监听地址: {addr}")),
+                    Err(e) => self.add_log(format!("⚠ 附加启动消息（勿忽略）: {e}")),
+                }
+            }
+            head
+        };
+        if first.is_none() {
+            if disconnected {
+                // 代理线程异常退出：清 receiver、复位启动态，恢复可再次启动
+                self.proxy_start_receiver = None;
+                self.proxy_starting = false;
+                self.add_log("代理启动线程异常退出（未发出就绪信号即终止）".to_string());
+                return Some(());
+            }
+            return None;
+        }
+        let signal = first.unwrap();
         self.proxy_start_receiver = None;
         self.proxy_starting = false;
         match signal {
@@ -979,9 +1029,15 @@ impl HydraApp {
                 self.proxy_running = true;
                 self.add_log(format!("代理已就绪，监听地址: {addr}"));
                 self.maybe_save_config(true);
-                let proxy_url = format!("socks5://{addr}");
-                self.set_system_proxy(&proxy_url);
-                self.add_log("已设置系统全局代理".to_string());
+                // 审查修复：TUN 模式已全局接管流量，就绪后不再叠加系统代理
+                //（否则制造"系统代理 + TUN"二次进本代理的被警示终态）
+                if self.config.tun_enabled {
+                    self.add_log("TUN 模式运行中：已全局接管流量，跳过系统代理设置".to_string());
+                } else {
+                    let proxy_url = format!("socks5://{addr}");
+                    self.set_system_proxy(&proxy_url);
+                    self.add_log("已设置系统全局代理".to_string());
+                }
             }
             Err(e) => {
                 self.add_log(format!("代理启动失败: {e}"));
@@ -1200,6 +1256,59 @@ impl HydraApp {
         self.add_log("代理停止中，已移除系统代理".to_string());
         // 关键动作立即落盘
         self.maybe_save_config(true);
+    }
+
+    /// 真退出专用：停止代理并同步等待代理线程退出（含 TUN 停机），上限 5s。
+    ///
+    /// 审查修复背景：此前三条真退出路径（托盘退出 / 关窗退出 / on_exit）只调用
+    /// stop_proxy 即放行进程关闭，TUN 的停机令牌锁在代理线程内部，RouteGuard
+    /// 可能来不及 Drop 清理路由 → 退出后路由残留导致断网。
+    /// 现退出时序：置 stop_flag → 直接 cancel TUN 令牌（令牌已提升为 HydraApp
+    /// 字段）→ UI 线程带超时轮询 proxy_exit_receiver（std::thread::sleep，
+    /// 5s 内可接受）；超时也保证 cancel 已发出，路由清理由线程随后完成。
+    /// 注：GUI 退出等待逻辑依赖真实窗口事件循环，无法自动化单测，以人工验证为准。
+    fn shutdown_and_wait_for_exit(&mut self) {
+        let running = self.proxy_running
+            || self.stop_flag.is_some()
+            || self.proxy_exit_receiver.is_some();
+        if !running {
+            return; // 代理未在运行，无需等待
+        }
+        self.stop_proxy();
+        // 确保 TUN 停机令牌已发出（代理线程内也会 cancel，这里双保险且不依赖时序）
+        if let Some(token) = &self.tun_shutdown {
+            token.cancel();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut exited = false;
+        while std::time::Instant::now() < deadline {
+            match &self.proxy_exit_receiver {
+                Some(rx) => match rx.try_recv() {
+                    Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        exited = true;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                },
+                None => {
+                    exited = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if exited {
+            self.proxy_thread_handle = None;
+            self.proxy_exit_receiver = None;
+            self.add_log("代理线程已退出（TUN 路由清理完成）".to_string());
+        } else {
+            self.add_log(
+                "⚠ 等待代理/TUN 停机超时（5s）：停机信号与 TUN 令牌已发出，\
+                 路由清理将由代理线程退出时的 RouteGuard 完成"
+                    .to_string(),
+            );
+        }
+        self.tun_shutdown = None;
     }
 
     fn export_share_links(&mut self) {
@@ -1580,6 +1689,8 @@ impl HydraApp {
         self.config.node_addrs.retain(|a| !removed.contains(a));
         for a in &removed {
             self.node_status.remove(a);
+            // 审查修复：连带清备注名与独立证书路径（remove_node_state 收口）
+            self.config.remove_node_state(a);
         }
         self.add_log(format!(
             "删除订阅「{}」，连带移除其节点 {} 个",
@@ -1729,6 +1840,8 @@ impl HydraApp {
         self.config.node_addrs.retain(|a| !to_remove.contains(a));
         for a in &to_remove {
             self.node_status.remove(a);
+            // 审查修复：订阅更新移除旧节点时同样清残留状态（remove_node_state 收口）
+            self.config.remove_node_state(a);
         }
 
         // 2) 追加：新地址中尚未在列表、且不被其他订阅认领的
@@ -1784,9 +1897,9 @@ impl HydraApp {
 impl eframe::App for HydraApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // 窗口关闭时停止代理并清除系统代理
-        if self.proxy_running {
-            self.stop_proxy();
-        }
+        // 审查修复：改走 shutdown_and_wait_for_exit——带超时等待代理线程退出
+        //（含 TUN 停机令牌 cancel），确保 RouteGuard 清理路由后再放行进程退出
+        self.shutdown_and_wait_for_exit();
         // Exec-1：退出前强制落盘（兜底防抖窗口内尚未写盘的变更）
         self.maybe_save_config(true);
     }
@@ -2251,10 +2364,9 @@ impl HydraApp {
                 TrayCommand::StartProxy => self.start_proxy(),
                 TrayCommand::StopProxy => self.stop_proxy(),
                 TrayCommand::Quit => {
-                    // 真退出：先停代理（含系统代理清理）再关闭窗口；on_exit 兜底落盘
-                    if self.proxy_running {
-                        self.stop_proxy();
-                    }
+                    // 真退出：停代理并带超时等待线程退出（含 TUN 停机 + 路由清理，
+                    // 见 shutdown_and_wait_for_exit）再关闭窗口；on_exit 兜底落盘
+                    self.shutdown_and_wait_for_exit();
                     self.really_quit = true;
                     self.add_log("正在退出 Hydra...".to_string());
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -2656,7 +2768,9 @@ impl HydraApp {
         for &i in indices_to_remove.iter().rev() {
             let removed = self.config.node_addrs.remove(i);
             self.node_status.remove(&removed);
-            self.config.node_names.remove(&removed);
+            // 审查修复：备注名 + 独立证书路径一并清理（remove_node_state 收口），
+            // 防止同地址复用节点时旧证书静默生效
+            self.config.remove_node_state(&removed);
             self.add_log(format!("已删除节点: {}", removed));
         }
         if let Some(addr) = edit_target {
@@ -3466,9 +3580,8 @@ impl HydraApp {
 
         // 退出入口（托盘菜单同样可退出）
         if ui.button("退出程序（停止代理并清理系统代理）").clicked() {
-            if self.proxy_running {
-                self.stop_proxy();
-            }
+            // 真退出：带超时等待代理线程退出（含 TUN 停机 + 路由清理）再关窗
+            self.shutdown_and_wait_for_exit();
             self.really_quit = true;
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }

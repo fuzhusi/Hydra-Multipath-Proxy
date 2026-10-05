@@ -627,8 +627,9 @@ pub fn detect_physical_gateway_v6() -> Option<Ipv6Addr> {
         {
             let text = String::from_utf8_lossy(&out.stdout);
             for tok in text.split_whitespace() {
-                // 形如 `default via  fe80::1 dev eth0`（部分 iproute2 无空格差异）
-                if let Some(ip) = tok.trim_start_matches("via").parse::<Ipv6Addr>() {
+                // 形如 `default via  fe80::1 dev eth0`（部分 iproute2 无空格差异）。
+                // parse 返回 Result（非 Option）——CI Linux 编译错误修复
+                if let Ok(ip) = tok.trim_start_matches("via").parse::<Ipv6Addr>() {
                     if !ip.is_unspecified() {
                         return Some(ip);
                     }

@@ -127,6 +127,9 @@ pub fn tun_config_from_settings(
 
 /// Windows 系统代理是否已启用（HKCU Internet Settings ProxyEnable=0x1）。
 /// TUN 全流量接管与系统代理叠加会形成环路，GUI 据此展示与 CLI 一致的告警。
+/// 审查修复：精确比较 REG_DWORD 数值——此前 `contains("0x1")` 会把
+/// "0x10"、"0x1f" 等值误判为开启（项目 winreg 依赖仅在 GUI crate，
+/// 本 crate 保持 reg 子进程读取，但按行取末列做全等比较）。
 #[cfg(all(windows, feature = "tun"))]
 pub fn windows_system_proxy_enabled() -> bool {
     std::process::Command::new("reg")
@@ -137,7 +140,13 @@ pub fn windows_system_proxy_enabled() -> bool {
             "ProxyEnable",
         ])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("0x1"))
+        .map(|o| {
+            // reg query 输出形如 `    ProxyEnable    REG_DWORD    0x1`，
+            // 取每行最后一个空白分隔字段与 "0x1" 全等比较
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|line| line.split_whitespace().last() == Some("0x1"))
+        })
         .unwrap_or(false)
 }
 

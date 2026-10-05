@@ -209,6 +209,14 @@ impl GuiConfig {
         }
     }
 
+    /// 移除节点的残留状态收口（清备注名 + 独立证书路径）。
+    /// 删除节点 / 订阅移除节点时必须调用：否则 node_cert_paths 残留会导致
+    /// 同一地址日后复用为新节点时，旧证书被静默当作该节点的信任根。
+    pub fn remove_node_state(&mut self, addr: &str) {
+        self.node_names.remove(addr);
+        self.node_cert_paths.remove(addr);
+    }
+
     /// 生效信任模式："ca" → ca；其余（含空串/未知值）→ 默认 pin。
     pub fn trust_mode_effective(&self) -> &str {
         if self.trust_mode.trim() == "ca" {
@@ -437,6 +445,14 @@ pub fn resolve_trust(
         return Ok(hydra_client::tcp_transport::TlsTrust::public_ca(pin));
     }
     let certs = resolve_node_certs_for_nodes(cfg, node_addrs)?;
+    // 审查修复：pin 模式信任根为空（无节点 / 无任何证书）不再返回 Ok——
+    // 空信任根会使 TLS 握手必然失败却无显式根因，test_all_nodes 删光节点后
+    // 变成"静默空测"。此处提前报错，让 GUI 日志区透出原因。
+    if certs.is_empty() {
+        return Err(
+            "pin 模式信任根为空：请先添加节点并配置节点证书（全局证书或逐节点证书）".to_string(),
+        );
+    }
     Ok(hydra_client::tcp_transport::TlsTrust::pinned(certs))
 }
 
@@ -958,6 +974,38 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         assert!(resolve_trust(&cfg, &["1.2.3.4:443".to_string()]).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 审查修复：pin 模式空信任根必须 Err（不再 Ok(pinned([])) 静默空测）
+    #[test]
+    fn test_resolve_trust_pin_empty_root_is_err() {
+        // 无任何证书来源（cert_path / cert_der_b64 / env 均空）+ 空节点列表 → Err
+        let cfg = GuiConfig::default();
+        let err = resolve_trust(&cfg, &[]).unwrap_err();
+        assert!(err.contains("信任根为空"), "错误信息应含根因: {}", err);
+
+        // 有节点地址但无证书可读 → 同样 Err（读文件失败路径）
+        let err = resolve_trust(&cfg, &["1.2.3.4:443".to_string()]).unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    /// 审查修复：remove_node_state 收口清理备注名与独立证书路径
+    #[test]
+    fn test_remove_node_state_clears_names_and_certs() {
+        let mut cfg = GuiConfig::default();
+        cfg.node_addrs.push("10.0.0.1:4433".into());
+        cfg.set_node_name("10.0.0.1:4433", "旧节点");
+        cfg.set_node_cert_path("10.0.0.1:4433", r"C:\certs\old.der");
+
+        cfg.remove_node_state("10.0.0.1:4433");
+        assert!(!cfg.node_names.contains_key("10.0.0.1:4433"));
+        assert!(!cfg.node_cert_paths.contains_key("10.0.0.1:4433"));
+
+        // 幂等：重复调用无副作用
+        cfg.remove_node_state("10.0.0.1:4433");
+        // 不存在的地址：无副作用
+        cfg.remove_node_state("9.9.9.9:1");
+        assert!(cfg.node_names.is_empty() && cfg.node_cert_paths.is_empty());
     }
 
     #[test]
