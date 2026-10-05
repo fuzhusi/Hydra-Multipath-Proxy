@@ -643,7 +643,10 @@ struct HydraApp {
 
     // ── 系统代理检测缓存（修复：移出渲染路径，杜绝每帧 spawn reg 子进程）──
     /// Windows 系统代理状态缓存：(检测完成时刻, 是否开启)。UI 只读缓存；
-    /// 缓存缺失或超过 10s 过期时由后台线程刷新（node_test_receiver 同范式）
+    /// 缓存缺失或超过 10s 过期时由后台线程刷新（node_test_receiver 同范式）。
+    /// 仅 Windows 有意义（reg query 检测 + 告警 UI 均 cfg(windows)），
+    /// 非 Windows 平台不定义该字段（否则 dead_code 阻断 CI）
+    #[cfg(windows)]
     sys_proxy_check_cache: Option<(std::time::Instant, bool)>,
     /// 在途检测结果接收端（Some = 后台检测进行中，防止每帧重复 spawn 线程）
     #[cfg(windows)]
@@ -716,6 +719,7 @@ impl Default for HydraApp {
             really_quit: false,
             last_tray_tooltip: String::new(),
             tun_shutdown: None,
+            #[cfg(windows)]
             sys_proxy_check_cache: None,
             #[cfg(windows)]
             sys_proxy_check_receiver: None,
@@ -971,6 +975,7 @@ impl HydraApp {
             really_quit: false,
             last_tray_tooltip: "Hydra 代理已停止".to_string(),
             tun_shutdown: None,
+            #[cfg(windows)]
             sys_proxy_check_cache: None,
             #[cfg(windows)]
             sys_proxy_check_receiver: None,
@@ -1432,7 +1437,7 @@ impl HydraApp {
         };
         let trust_for_proxy = trust.clone();
 
-        // ── TUN 透明代理（实验性）：GUI 与代理同进程，TUN 需在 ProxyServer::start
+        // ── TUN 透明代理（已交付，需管理员/root）：GUI 与代理同进程，TUN 需在 ProxyServer::start
         // 之外叠加（run_tun 独立任务，共享同一调度器/凭据）。配置在此解析，
         // 权限不足等错误经就绪通道透传到日志区。
         let tun_enabled = self.config.tun_enabled;
@@ -1454,8 +1459,7 @@ impl HydraApp {
                         );
                     }
                     self.add_log(format!(
-                        "TUN 透明代理开启（实验性）：地址 {} 端口 {:?}（需管理员/root；\
-                         Windows 还需 wintun.dll）",
+                        "TUN 透明代理开启：地址 {} 端口 {:?}（需管理员/root；仅 TCP；\n                         Windows 还需 wintun.dll）",
                         self.config.tun_addr_or_default(),
                         c.listen_ports
                     ));
@@ -1534,7 +1538,7 @@ impl HydraApp {
                         .with_trust(trust_for_proxy),
                 );
                 println!("[Proxy Thread] Starting proxy server...");
-                // ── TUN 叠加（实验性）：与 SOCKS 监听并存。register_nodes 需在
+                // ── TUN 叠加（已交付）：与 SOCKS 监听并存。register_nodes 需在
                 // start 之前让调度器已有节点（tun_channel_opener 依赖节点优先级表）
                 // tun_task = (停机令牌, TUN 栈任务句柄)；None = 未开启或启动失败
                 let tun_task: Option<(
@@ -4300,7 +4304,7 @@ impl HydraApp {
     }
 
     /// 设置页（v2 方案 §2.5 / 裁决 C）：应用级配置，无任何凭据。
-    /// 分区：代理核心 / 安全与信任 / TUN 透明代理（实验）/ 系统 / 外观与数据 / 关于。
+    /// 分区：代理核心 / 安全与信任 / TUN 透明代理（需管理员/root；仅 TCP）/ 系统 / 外观与数据 / 关于。
     /// 认证密钥、全局证书在「🌐 节点」页「全局凭据」区；信任模式与 TUN 在本页。
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
         ui.label(
@@ -4484,16 +4488,16 @@ impl HydraApp {
 
         ui.separator();
 
-        // ◈ TUN 透明代理（实验性：需管理员/root；Windows 另需 wintun.dll）
+        // ◈ TUN 透明代理（已交付：需管理员/root；Windows 另需 wintun.dll）
         ui.label(
-            egui::RichText::new("TUN 透明代理（实验）")
+            egui::RichText::new("TUN 透明代理（需管理员/root；仅 TCP）")
                 .size(palette::FONT_TITLE)
                 .strong(),
         );
         if ui
             .checkbox(
                 &mut self.config.tun_enabled,
-                "TUN 透明代理（实验，需管理员/root）",
+                "TUN 透明代理（需管理员/root；仅 TCP）",
             )
             .changed()
         {
@@ -4523,7 +4527,7 @@ impl HydraApp {
                 .hint_text("拦截端口列表（默认 80,443,8080,8443）"),
         )
         .on_disabled_hover_text("先开启 TUN 透明代理");
-        ui.small("TUN 全流量接管，应用无需配置代理；仅 TCP（UDP 含 QUIC 丢弃）、无 DNS 劫持；\n节点 IP 与系统 DNS 自动豁免防环路；退出/崩溃自动清理路由");
+        ui.small("TUN 全流量接管，应用无需配置代理；仅 TCP（UDP 回 ICMP 不可达供应用回落）、无 DNS 劫持；\nIPv6 TCP 经动态 AnyIP 代理（v6 非 TCP 回 ICMPv6 不可达）；\n节点 IP 与系统 DNS 自动豁免防环路；退出/崩溃自动清理路由");
         // 与 CLI（hydra-client main.rs warn_system_proxy_loop）一致的环路告警：
         // Windows 系统代理 + TUN 全流量接管 → 经系统代理的流量二次进本代理。
         // 修复：检测移出渲染路径——此前每帧同步 spawn `reg query`（每秒几十个

@@ -93,7 +93,7 @@ pub struct GuiConfig {
     /// Team-UI：节点备注名（地址 "host:port" → 展示名）。缺项 = 无备注，显示地址本身。
     #[serde(default)]
     pub node_names: HashMap<String, String>,
-    /// TUN 透明代理开关（实验性，需管理员/root；true = 代理启动时叠加 TUN 模式）
+    /// TUN 透明代理开关（已交付，需管理员/root；仅 TCP；true = 代理启动时叠加 TUN 模式）
     #[serde(default)]
     pub tun_enabled: bool,
     /// TUN 虚拟网卡地址（形如 "10.7.0.1/30"）；空串 = 用库默认 10.7.0.1/30

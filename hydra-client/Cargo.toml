@@ -1,6 +1,7 @@
 [package]
 name = "hydra-client"
 version = "0.2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 edition = "2021"
 
 [[bin]]
@@ -44,8 +45,14 @@ tun2 = { version = "4", optional = true, features = ["async"] }
 smoltcp = { version = "0.11", optional = true, default-features = false, features = [
     "alloc",
     "proto-ipv4",
+    # v1 完整版：IPv6 正向路径——v6 TCP 由栈直接代理（动态 AnyIP，见 tun.rs
+    # ensure_v6_dst），UDP/ICMP 等 v6 非 TCP 包回 ICMPv6 不可达快速回落
+    "proto-ipv6",
     "socket-tcp",
     "medium-ip",
+    # 动态 AnyIP 需要地址表容量：默认仅 2 槽（放不下 v4 + 链路本地 + 全局 +
+    # 轮转池），扩到 8 槽 = 3 静态 + 5 动态（见 tun.rs V6_DYNAMIC_SLOTS）
+    "iface-max-addr-count-8",
 ] }
 # CancellationToken（TUN 任务优雅停机）
 tokio-util = { version = "0.7", optional = true }

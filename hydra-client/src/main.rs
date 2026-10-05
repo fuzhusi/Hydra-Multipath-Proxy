@@ -41,11 +41,12 @@ fn tun_config_from_env(nodes: &[SocketAddr]) -> hydra_client::tun::TunConfig {
             cfg.addr = ip;
         }
     }
-    // IPv6 接管开关（07-P1-2 修复）：默认**关**（proto-ipv4 栈下开启接管即 v6 黑洞）；
-    // HYDRA_TUN_IPV6=1 显式开启（开启后有 SYN-RST/ICMPv6 不可达代答快速失败兜底）
+    // IPv6 接管开关（v1 完整版默认**开**：栈已启用 proto-ipv6，v6 TCP 走
+    // 动态 AnyIP 正向代理路径）；HYDRA_TUN_IPV6=0 显式关闭（关闭时 v6 包被
+    // 快速失败代答——SYN 回 RST、其余 ICMPv6 不可达，应用回落 IPv4）
     if let Ok(v) = std::env::var("HYDRA_TUN_IPV6") {
-        if v.trim() == "1" {
-            cfg.ipv6_enabled = true;
+        if v.trim() == "0" {
+            cfg.ipv6_enabled = false;
         }
     }
     // TUN v6 网关占位地址覆盖（形如 fd07::1；接管路由 via 指向它）
@@ -177,7 +178,7 @@ fn parse_args() -> (Option<SocketAddr>, Vec<SocketAddr>, Option<P2pArgs>) {
                     "  --tun                在 SOCKS 监听之外叠加启动 TUN 虚拟网卡接管系统流量\n                       （Windows 需管理员运行且 wintun.dll 可用；Linux 需 root）"
                 );
                 println!(
-                    "  HYDRA_TUN=1          同 --tun；HYDRA_TUN_ADDR 覆盖 TUN 地址（默认 10.7.0.1/30）\n                       HYDRA_TUN_EXCLUDE 额外豁免 IP（逗号分隔，/32 回物理网关）\n                       HYDRA_TUN_PORTS 覆盖拦截端口列表（默认 80,443,8080,8443；\n                       smoltcp 无通配监听，v1 已知限制）\n                       HYDRA_TUN_DNS/HYDRA_TUN_GW 手动指定 DNS/物理网关（默认自动探测）\n                       HYDRA_TUN_IPV6=1 开启 IPv6 接管（默认关；栈不支持 v6 转发，\n                       开启后 v6 连接将收到快速失败回落 IPv4；关闭时 v6 不经代理）\n                       HYDRA_TUN_GW6 手动指定物理网关 IPv6；HYDRA_TUN_IF Windows 下\n                       netsh v6 路由所需的 TUN 适配器名"
+                    "  HYDRA_TUN=1          同 --tun；HYDRA_TUN_ADDR 覆盖 TUN 地址（默认 10.7.0.1/30）\n                       HYDRA_TUN_EXCLUDE 额外豁免 IP（逗号分隔，/32 回物理网关）\n                       HYDRA_TUN_PORTS 覆盖拦截端口列表（默认 80,443,8080,8443；\n                       smoltcp 无通配监听，v1 已知限制）\n                       HYDRA_TUN_DNS/HYDRA_TUN_GW 手动指定 DNS/物理网关（默认自动探测）\n                       HYDRA_TUN_IPV6=0 关闭 IPv6 接管（默认开：v6 TCP 经动态 AnyIP\n                       代理转发，v6 非 TCP 回 ICMPv6 不可达回落 IPv4）\n                       HYDRA_TUN_GW6 手动指定物理网关 IPv6；HYDRA_TUN_IF Windows 下\n                       netsh v6 路由所需的 TUN 适配器名"
                 );
                 println!("P2P 打洞实验（NAT 穿透 §3.3，本轮仅验证输出，不接入代理热路径）:");
                 println!(

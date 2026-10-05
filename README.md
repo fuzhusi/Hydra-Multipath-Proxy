@@ -8,7 +8,7 @@
 
 > **交付状态：v1.0 可交付产品**（2026-10）。三档如实划分：
 > - **已交付**：TCP/TLS + Noise-PSK 隧道、自签 pinning 与 ACME 真证书双路线、多节点加权分发与故障自愈、GUI 全功能（托盘/分享/订阅/配置持久化）、CI。
-> - **实验性**：NAT 穿透（TCP STUN 分类 + 同时打开打洞 + 中继兜底）、TUN 透明代理（仅 TCP、按端口拦截、需管理员）。
+> - **已交付**：NAT 穿透 v1（TCP STUN 分类 + 同时打开打洞 + 中继兜底；真实 NAT 组合环境需人工实网验证）。
 > - **规划中**：UI 重设计实施（方案 v3 已定稿）、ClientHello 指纹模仿、多节点并行下载。
 
 > **项目性质**：个人自用工具，AI 辅助开发。经多轮独立代码审查（[docs/review/](docs/review/)），本 README 与代码逐项核对——未列出的能力即为未实现，不做夸大宣传。
@@ -41,14 +41,20 @@
 - **日志脱敏**：访问目标一律 SHA-256 短哈希，明文仅 `RUST_LOG=debug` 可见
 - **密钥文件化**：节点支持 `HYDRA_AUTH_KEY_FILE`（Unix 0600 校验），替代 env 泄漏面
 
-### TUN 透明代理（实验性，`tun` feature 默认开启）
+### TUN 透明代理（已交付，`tun` feature 默认开启）
 - 全流量接管：应用**无需配置代理**。`0.0.0.0/1 + 128.0.0.0/1 → TUN` → smoltcp 用户态栈 → 既有节点链路（故障切换/流量统计语义零分叉）
-- **防环路**：节点 IP / 系统 DNS / TUN 网段自动豁免路由（/32 回物理网关），物理网关自动探测；退出/崩溃由 drop guard + 下次启动幂等清理恢复
-- **IPv6 防泄漏（尽力而为）**：默认关闭时告警泄漏风险；显式开启后对称接管并拒绝 IPv6-over-TUN（TCP SYN 回 RST 供应用回落 IPv4）
-- **v1 边界（如实）**：仅 TCP——UDP（含 QUIC/HTTP3）直接丢弃；无 DNS 劫持（DNS 走豁免路由直出）；仅拦截 `HYDRA_TUN_PORTS` 列表内端口（默认 80/443/8080/8443），列表外回 RST；TUN 模式下无域名分流
+- **防环路**：节点 IP / 系统 DNS / TUN 网段自动豁免路由（/32 回物理网关），物理网关自动探测；退出/崩溃由 drop guard + 下次启动幂等清理恢复（P3-7：/1 接管路由优先摘除，防 5s 停机宽限不足残留）
+- **IPv6 双栈**：`ipv6_enabled` 默认开启——IPv6 TCP 经用户态栈正向代理（动态 AnyIP：smoltcp 0.11 的 any-ip 仅 IPv4，入站 v6 目的地址临时挂为接口 /128 有界轮转池）；v6 非 TCP 包回 ICMPv6 不可达供应用回落 IPv4；节点 IPv6 豁免照旧（`HYDRA_TUN_IPV6=0` 可关闭，关闭时 v6 全部快速失败代答）
+- **UDP 快速回落**：IPv4 UDP 不代理但代答 **ICMPv4 port unreachable**（type 3/code 3，RFC 792 校验和），应用立即失败回落 TCP 而非漫长超时
+- **已知边界（如实）**：UDP 丢弃回包（无 UDP-over-proxy）、无 DNS 劫持、无域名分流；仅拦截 `HYDRA_TUN_PORTS` 列表内端口（默认 80/443/8080/8443），列表外回 RST；Windows 真机 v6 接管需 netsh + 管理员，未做真机验证（见人工验证清单）
 - 设计与实现记录：[docs/design/TUN模式方案.md](docs/design/TUN模式方案.md)
+- **人工验证清单（无法本地自动化，需管理员真机执行）**：
+  1. Wintun 全链路：管理员运行 `--tun`，浏览器访问 HTTPS 站点经节点出口；退出后 `route print` 无 0.0.0.0/1、128.0.0.0/1 残留
+  2. IPv6 接管：双栈真机 + `HYDRA_TUN_IF=<适配器名>`，`netsh interface ipv6 show route` 出现 ::/1、8000::/1；`curl -6 https://api64.ipify.org` 经节点出口；UDP/QUIC 应用可快速回落
+  3. UDP 回落：TUN 下 QUIC/HTTP3 站点应秒级回落 TCP（收到 ICMPv4 port unreachable）
+  4. 强杀清理：TUN 运行中直接关终端（CTRL_CLOSE_EVENT）后确认 /1 接管路由不残留
 
-### NAT 穿透（实验性）
+### NAT 穿透
 - TCP STUN（RFC 5389）公网地址发现 + NAT 映射行为分类（EIM/对称型）
 - 节点信令（`HYDRA_P2P_SIGNAL=1`）协调下的 **TCP 同时打开打洞**，失败自动回落节点中继
 - CLI：`hydra-client --p2p <我的id> --peer <对方id> --node <节点>`；方案与实现记录见 [docs/design/NAT穿透方案.md](docs/design/NAT穿透方案.md)
@@ -164,7 +170,7 @@ curl -x socks5h://127.0.0.1:1080 https://www.google.com
 | `HYDRA_IDLE_TIMEOUT_SECS` | 转发空闲看门狗（默认 300s，双向无数据即断开） |
 | `HYDRA_NODE_CONFIG` | toml 配置路径（自动探测 `./node.toml` → `/etc/hydra/node.toml`） |
 | `HYDRA_ALLOW_PRIVATE_TARGETS` | `1` 放行私有目标（默认拒绝，仅测试/本地开发） |
-| `HYDRA_P2P_SIGNAL` | `1` 开启 P2P 信令模式（NAT 穿透实验性） |
+| `HYDRA_P2P_SIGNAL` | `1` 开启 P2P 信令模式（NAT 穿透） |
 
 **客户端**
 
@@ -268,8 +274,8 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 ## 已知限制（如实标注）
 
 - **单连接单流**：TCP 下无多流通道聚合（V3.4 已随 QUIC 移除）；连接级加权分发保留
-- TUN v1 边界：仅 TCP、按端口拦截、无 DNS 劫持、TUN 模式下分流失效（详见特性节）
-- NAT 穿透为实验性：对称型 NAT 打洞成功率有限（自动回落节点中继）；未做生产级验证
+- TUN 已交付，已知边界：UDP 丢弃回包、无 DNS 劫持、无域名分流、按端口拦截（详见特性节）；Wintun 全链路 + 真机 v6 接管需管理员人工验证
+- NAT 穿透已交付 v1：对称型 NAT 打洞成功率有限（自动回落节点中继）；真实 NAT 组合环境（hairpin/EIF/端口漂移）需人工实网验证
 - 分流为域名后缀版（无 GeoIP）；订阅为自有格式（不对接机场）
 - 分享链接含完整凭据时等同于交付节点，仅限可信渠道
 - TCP 链路认证失败与目标失败在客户端侧均表现为建连失败（节点侧已认证后的目标失败有 2B 应答码）
@@ -284,8 +290,8 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 - [x] **TCP 转型 Wave 1-3：TLS + Noise-PSK + 私有帧新协议核心 → 默认传输切 TCP → QUIC/UDP 死路径删除（2026-10）**
 - [x] **代码审查 45 项 + P0/P1 修复：故障切换语义、slowloris 防护、idle 看门狗、日志脱敏、PSK fail-fast（docs/review/05）**
 - [x] **交付批次：真证书（PEM/ACME）路线 + 多节点证书配对根治 + BBR 部署加固（2026-10）**
-- [x] **NAT 穿透 v1（实验性）：TCP STUN + 节点信令 + 同时打开打洞 + 中继兜底（docs/design/NAT穿透方案.md）**
-- [x] **TUN 透明代理 v1（实验性）：smoltcp 栈 + 路由豁免 + IPv6 防泄漏（docs/design/TUN模式方案.md）**
+- [x] **NAT 穿透 v1：TCP STUN + 节点信令（属主证明/限速）+ 同时打开打洞 + 中继兜底（docs/design/NAT穿透方案.md）**
+- [x] **TUN 透明代理 v1 完整版：smoltcp 栈 + 路由豁免 + IPv6 双栈正向代理（动态 AnyIP）+ UDP ICMP 快速回落（docs/design/TUN模式方案.md）**
 - [ ] UI 重设计实施（[方案 v3](docs/design/UI重设计方案-v3.md) 已定稿，P0-P2 约 10 人日）
 - [ ] 多节点并行下载（HTTP Range 切块多节点拼装——TCP 下的差异化方向）
 - [ ] ClientHello 指纹模仿（ja-tools 路线，[协议优化评估](docs/design/TCP传输协议优化评估.md) P1）
@@ -295,7 +301,12 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 
 ## 许可证
 
-MIT — 见 [LICENSE](LICENSE)。
+**PolyForm Noncommercial 1.0.0 + 补充条款** — 见 [LICENSE](LICENSE)。
+
+- **禁止商用**：任何商业性使用须事先获得版权所有者书面授权（联系方式见 LICENSE 补充条款与仓库主页）
+- **限制地区**：禁止在法律法规禁止使用加密隧道/代理软件的司法管辖区安装、部署或使用本软件
+- **合规责任**：使用者须自行遵守所在司法管辖区的全部适用法律，违规后果自负
+- 2026-10-05 前版本历史的 MIT 许可不再适用于当前及后续版本
 
 ## 联系方式
 

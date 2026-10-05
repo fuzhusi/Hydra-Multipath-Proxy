@@ -28,6 +28,10 @@ pub const SIGNAL_READ_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_LINE_LEN: usize = 4096;
 /// 每 peer 下行队列深度（跨连接投递用；满即丢弃并警告——信令量极小，满=对端卡死）
 const DOWNLINK_CAP: usize = 32;
+/// 每连接信令速率（条/秒，令牌桶回填速率）与桶容量（突发上限）。
+/// 心跳 60s 一条 + 打洞期数条，10/s 余量充足；超限 = 慢滴滥用，断开。
+pub const SIGNAL_RATE: u32 = 10;
+pub const SIGNAL_BURST: u32 = 20;
 
 // ── 消息定义（serde，tag = "op"）────────────────────────────────────────────
 
@@ -208,6 +212,11 @@ pub async fn serve_signal_stream<R, W>(
 
     let mut line_buf = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
+    // 每连接消息速率限制（安全分报告 P3-2 慢滴防护）：令牌桶——桶容量
+    // SIGNAL_BURST，每秒回填 SIGNAL_RATE 个。超过即断开（信令量极小：
+    // 心跳 60s 一条 + 打洞握手期几条，正常流量远低于此）。
+    let mut tokens: u32 = SIGNAL_BURST;
+    let mut last_refill = Instant::now();
     loop {
         // 逐字节读行（信令量极小；天然解决「行中间跨包」与长度上限）
         // 读超时 = 空闲看门狗：90s 无任何数据（含心跳）即断开
@@ -227,6 +236,15 @@ pub async fn serve_signal_stream<R, W>(
             break;
         }
         if byte[0] == b'\n' {
+            // 速率限制（按完整行计）：回填后无令牌 → 慢滴/滥用，断开
+            let elapsed = last_refill.elapsed().as_secs_f64();
+            last_refill = Instant::now();
+            tokens = refill_tokens(tokens, elapsed);
+            if tokens == 0 {
+                warn!("信令会话 {my_peer_id} 消息速率超限（>{SIGNAL_RATE}/s），断开");
+                break;
+            }
+            tokens -= 1;
             // 一行完整：处理（消息处理顺带 sweep 超时条目，免定时任务）
             let line = std::mem::take(&mut line_buf);
             let expired = registry.sweep(Instant::now(), SIGNAL_READ_TIMEOUT);
@@ -342,6 +360,12 @@ fn mask_peer_id(id: &str) -> String {
     }
 }
 
+/// 令牌桶回填（纯函数）：按流逝秒数回填 `SIGNAL_RATE`，封顶 `SIGNAL_BURST`。
+/// 单测覆盖：满桶不溢出、长时间流逝仍封顶、逐秒消耗后回填。
+fn refill_tokens(tokens: u32, elapsed_secs: f64) -> u32 {
+    ((tokens as f64 + elapsed_secs * SIGNAL_RATE as f64) as u32).min(SIGNAL_BURST)
+}
+
 /// 序列化下行消息为 JSON 行并投递（追加 '\n'）
 async fn forward(down: &mpsc::Sender<Vec<u8>>, msg: &SignalDownMessage) -> Result<(), ()> {
     let mut line = serde_json::to_vec(msg).map_err(|_| ())?;
@@ -383,6 +407,18 @@ mod tests {
     /// 测试用 PSK（Noise-PSK 恰 32 字节）
     fn test_key() -> Vec<u8> {
         vec![7u8; 32]
+    }
+
+    #[test]
+    fn 令牌桶_回填封顶_与逐秒消耗() {
+        // 满桶 + 长时间流逝：封顶不溢出
+        assert_eq!(refill_tokens(SIGNAL_BURST, 3600.0), SIGNAL_BURST);
+        // 满桶 + 极短流逝：仍封顶
+        assert_eq!(refill_tokens(SIGNAL_BURST, 0.1), SIGNAL_BURST);
+        // 消耗到 0 后 1 秒：回填 SIGNAL_RATE
+        assert_eq!(refill_tokens(0, 1.0), SIGNAL_RATE);
+        // 半秒：回填一半（向下取整）
+        assert_eq!(refill_tokens(0, 0.5), SIGNAL_RATE / 2);
     }
 
     fn helper(v: &serde_json::Value) -> String {

@@ -1,21 +1,116 @@
-MIT License
+# Hydra Multipath Proxy 非商业许可证
 
-Copyright (c) 2026 fuzhusi
+- 版权所有 (c) 2026 fuzhusi（Hydra Multipath Proxy 作者）
+- 本项目基于 **PolyForm Noncommercial License 1.0.0** 授权，并附加下方「补充条款」。
+- 两种语言冲突时以中文补充条款为准。
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+---
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+## 补充条款（Addendum，优先适用）
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+1. **禁止商用**：任何商业性使用（包括但不限于销售、SaaS 化提供服务、集成入商业产品、
+   以本软件为核心对外收费）均须事先获得版权所有者的**书面授权**。
+   商用授权申请：通过 https://github.com/fuzhusi/Hydra-Multipath-Proxy/issues 或仓库
+   主页联系方式联系版权所有者。
+2. **限制地区与合规使用**：本软件为加密隧道/代理工具。你承诺：
+   - 不在任何法律法规禁止使用加密隧道或代理软件的司法管辖区安装、部署或使用本软件；
+   - 不将本软件用于任何违法目的，包括但不限于绕过国家/地区法律访问受限内容、
+     网络攻击、侵犯他人权益；
+   - 遵守你所在司法管辖区的全部适用法律。**违规使用的一切法律后果由使用者自行承担。**
+3. **敏感区域**：版权所有者保留对已知的受限、受制裁或高风险地区拒绝授权使用本软件的权利。
+4. 本条为许可证整体的一部分；与上方英文许可证正文冲突时，以本补充条款为准。
+
+---
+
+# PolyForm Noncommercial License 1.0.0
+
+<https://polyformproject.org/licenses/noncommercial/1.0.0>
+
+## Acceptance
+
+In order to get any license under these terms, you must agree to them as
+both strict obligations and conditions on all licenses you receive. You
+must not do anything with the software that triggers a restriction you
+cannot comply with, and you must agree to all terms below. Conditions on
+licenses you receive are also requirements.
+
+## Copyright License
+
+The licensor grants you a copyright license for the software to do
+everything you might do that requires a copyright license, for any purpose
+other than a noncommercial purpose, subject to all other terms in this
+license. (The preceding sentence is a condition on receiving a copyright
+license for the software; a violation ends the license and requires
+deleting all copies of the software.)
+
+**Note (translation, non-binding): the license above grants rights only
+for noncommercial purposes. All commercial use requires the copyright
+holder's prior written permission — see the Addendum above.**
+
+## Notices
+
+You must ensure that anyone who gets a copy of any part of the software
+from you also gets a copy of these terms.
+
+If you modify the software, you must include in any distribution of your
+modified software prominent notices saying you have changed the software,
+and a copy of these terms.
+
+## Patent License
+
+The licensor grants you a patent license for the software that covers
+patent claims the licensor can license, or becomes able to license, that
+you would infringe by using the software, for any purpose other than a
+noncommercial purpose. (The preceding sentence is a condition on receiving
+a patent license; a violation ends the license.)
+
+## Fair Use
+
+You may make "fair use" or other legally allowed uses of the software, as
+these terms do not limit them.
+
+## Free Trial
+
+If you receive the software as a free trial, you may use the software for
+any purpose the license allows, for the length of the free trial period.
+
+## No Other Rights
+
+These terms do not allow you to sublicense or transfer any of your
+licenses to anyone else, and these terms do not grant any rights of
+possession or physical control over the source code. These terms do not
+give you any right to take the software down, remove any of your
+compliance with these terms, or sue the licensor over your use.
+
+## Violations
+
+The first time you are notified in writing that you have violated any of
+these terms, or done anything with the software not covered by your
+licenses, your licenses end nonetheless.
+
+If you violate these terms after receiving that notice, you agree that
+the licensor may charge you for direct damages caused by your violation,
+up to a maximum of twice your past costs of compliance or twice your
+gross revenue from use of the software, whichever is greater, plus legal
+fees. The licensor may also revoke all additional licenses you received
+under these terms, such as patent licenses.
+
+## No Liability
+
+**As far as the law allows, the software comes as is, without any
+warranty or condition, and the licensor will not be liable to you for any
+damages arising out of these terms or the use or nature of the software,
+under any kind of legal claim, however it arises.**
+
+## Definitions
+
+**"noncommercial purpose" means any purpose other than (a) selling the
+software or services related to the software, (b) selling or providing
+services that use the software, or (c) distributing the software as part
+of a product or service whose primary value comes from the software.**
+
+**"the licensor" means the individual or entity offering these terms, and
+"you" means the individual or entity agreeing to them.**
+
+**"the software" means the software these terms apply to, including all
+source code, documentation, and associated files.**
