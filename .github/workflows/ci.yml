@@ -50,9 +50,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # eframe/egui: xkbcommon/wayland/x11；tray-icon（Linux 后端）: gtk3 + ayatana-appindicator
+          # eframe/egui: xkbcommon/wayland/x11；tray-icon（Linux 后端）: gtk3 + ayatana-appindicator + xdo
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
-            libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+            libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
 
       - name: cargo build --workspace
         run: cargo build --workspace
