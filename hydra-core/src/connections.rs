@@ -104,7 +104,7 @@ impl ConnEntry {
             bytes_up: self.bytes_up.load(Ordering::Relaxed),
             bytes_down: self.bytes_down.load(Ordering::Relaxed),
             active: self.active(),
-            closed_at: self.closed_at.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+            closed_at: *self.closed_at.lock().unwrap_or_else(|p| p.into_inner()),
         }
     }
 }
@@ -230,7 +230,7 @@ pub fn connections_registry() -> &'static ConnectionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn node(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
@@ -310,8 +310,8 @@ mod tests {
         let _e = reg.register("e:5".to_string(), node(5));
         let ids2: Vec<u64> = reg.snapshot().iter().map(|i| i.id).collect();
         assert_eq!(ids2.len(), 3);
-        assert!(!ids2.contains(&ids[0]), "全活跃时应淘汰最旧条目");
-        assert!(ids2.contains(&b.id()));
+        assert!(!ids2.contains(&ids[0]), "全活跃时应淘汰最旧条目（b 即 ids[0]）");
+        assert!(ids2.contains(&_c.id()), "未被淘汰的较新条目应保留");
     }
 
     /// 全局单例：多次调用返回同一实例

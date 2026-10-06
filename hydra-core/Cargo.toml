@@ -1,0 +1,32 @@
+[package]
+name = "hydra-core"
+version = "0.2.0"
+license = "PolyForm-Noncommercial-1.0.0"
+edition = "2021"
+description = "Hydra 跨平台核心库：协议/认证/TCP-TLS 传输/代理调度/故障切换/流量统计（桌面 CLI/GUI 与 Android 共用）"
+
+# ClientHello 指纹"最大近似"（路线 C），与 hydra-client 同名 feature 语义一致：
+# 纯 stock rustls 实现、无 fork 依赖，故默认开启；运行时 HYDRA_FINGERPRINT=none
+# 可整体回退 stock rustls 行为。brotli：Chrome ClientHello 携带
+# certCompression(brotli)，rustls 需启用对应 feature 才会声明该解压器。
+[features]
+default = ["fingerprint"]
+fingerprint = ["rustls/brotli"]
+
+[dependencies]
+# 版本统一由根 [workspace.dependencies] 声明（审查 R-31）
+tokio = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+# 真证书模式（TlsTrust::public_ca）：webpki 公共 CA 根，与 rustls 0.23 配套。
+webpki-roots = "0.26"
+ring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+url = "2.5"
+base64 = { workspace = true }
+# 恢复探测周期的随机抖动（±20%，防整周期被动特征）
+rand = "0.8"
+hydra-protocol = { path = "../hydra-protocol" }

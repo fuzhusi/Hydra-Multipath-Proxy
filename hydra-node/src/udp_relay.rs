@@ -41,8 +41,8 @@ use std::time::Duration;
 use hydra_protocol::udp_frame::{
     encode_udp_close, encode_udp_data, read_udp_frame, write_udp_frame, UdpFrame, MAX_DATAGRAM_LEN,
 };
-use hydra_protocol::{mask_target, Result};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use hydra_protocol::mask_target;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -122,10 +122,12 @@ impl UdpSessionTable {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.sessions.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }
@@ -278,13 +280,17 @@ async fn resolve_udp_target(target: &str) -> Option<SocketAddr> {
                 return None;
             }
             Ok(r) => match r {
-                Ok(addrs) => match addrs.find(|a| a.is_ipv4()).or_else(|| addrs.last()) {
-                    Some(a) => a,
-                    None => {
-                        warn!("UDP 目标 DNS 无可用地址: {}", mask_target(target));
-                        return None;
+                Ok(addrs) => {
+                    // 收集后优先取 IPv4，否则首个地址（与 handler::resolve_and_connect 同语义）
+                    let v: Vec<SocketAddr> = addrs.collect();
+                    match v.iter().find(|a| a.is_ipv4()).or_else(|| v.first()).copied() {
+                        Some(a) => a,
+                        None => {
+                            warn!("UDP 目标 DNS 无可用地址: {}", mask_target(target));
+                            return None;
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     warn!("UDP 目标 DNS 解析失败: {} ({e})", mask_target(target));
                     return None;
@@ -310,17 +316,18 @@ async fn resolve_udp_target(target: &str) -> Option<SocketAddr> {
 /// UDP 中继服务入口（tcp_server 分流后调用；默认 60s 空闲回收）。
 pub(crate) async fn serve<R, W>(rd: R, wr: W)
 where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     serve_with_idle(rd, wr, Duration::from_secs(UDP_SESSION_IDLE_SECS)).await;
 }
 
 /// 带显式空闲阈值的版本（测试注入短超时实测回收）。
+/// Send + 'static：会话/回收任务经 tokio::spawn 持有共享的 writer/表。
 pub(crate) async fn serve_with_idle<R, W>(mut rd: R, wr: W, idle: Duration)
 where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     let table = Arc::new(Mutex::new(UdpSessionTable::new()));
     // 下行写端：多个会话任务 + 回收任务并发写，tokio::Mutex 串行化（帧级原子）
@@ -386,7 +393,7 @@ async fn uplink_data<W>(
     target: &str,
     datagram: Vec<u8>,
 ) where
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     // 目标解析 + SSRF 过滤失败：丢弃该数据报；已存在的会话一并回收
     // （目标失效的会话没有继续存在的意义）
@@ -399,27 +406,34 @@ async fn uplink_data<W>(
         return;
     };
 
-    let existing_target;
-    {
+    // 判定是否需要新建/重建绑定（锁内无 await：std MutexGuard 不可跨 .await）
+    let existing_target = {
         let t = table.lock().unwrap();
-        existing_target = t.get(session_id).map(|h| h.target().to_string());
-    }
-
+        t.get(session_id).map(|h| h.target().to_string())
+    };
     if existing_target.as_deref() != Some(target) {
-        // 新会话，或同 session 换目标：回收旧绑定（句柄 drop → 会话任务退出），
-        // 按新目标重建 socket
-        let mut t = table.lock().unwrap();
-        t.remove(session_id);
-        if t.is_full() {
-            t.overlimit_drops += 1;
-            debug!(
-                "UDP 会话数达上限 {UDP_MAX_SESSIONS}，丢弃 {} 的数据报",
-                mask_target(target)
-            );
-            return;
+        {
+            let mut t = table.lock().unwrap();
+            // 同 session 换目标：回收旧绑定（句柄 drop → 会话任务退出）
+            t.remove(session_id);
+            if t.is_full() {
+                t.overlimit_drops += 1;
+                debug!(
+                    "UDP 会话数达上限 {UDP_MAX_SESSIONS}，丢弃 {} 的数据报",
+                    mask_target(target)
+                );
+                return;
+            }
         }
+        // 锁外建 socket + 派生会话任务（await 期间不持有表锁）
         match bind_session_socket(addr).await {
             Ok(socket) => {
+                let mut t = table.lock().unwrap();
+                // 二次查满（锁释放窗口可能有并发新建）
+                if t.is_full() {
+                    t.overlimit_drops += 1;
+                    return;
+                }
                 let (tx, rx) = mpsc::channel(SESSION_QUEUE_DEPTH);
                 let last_active = Arc::new(AtomicU64::new(now_ms()));
                 let handle = SessionHandle::new(tx, last_active.clone(), target.to_string());
@@ -440,7 +454,7 @@ async fn uplink_data<W>(
                 );
             }
             Err(e) => {
-                t.overlimit_drops += 1;
+                table.lock().unwrap().overlimit_drops += 1;
                 debug!("UDP socket 绑定失败（{}）: {e}", mask_target(target));
                 return;
             }
@@ -483,7 +497,7 @@ async fn session_task<W>(
     last_active: Arc<AtomicU64>,
     writer: Arc<tokio::sync::Mutex<W>>,
 ) where
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     let mut buf = vec![0u8; MAX_DATAGRAM_LEN];
     loop {
@@ -523,7 +537,6 @@ async fn session_task<W>(
 
 /// 上行投递的窄接口预留位已并入 [`SessionHandle::clone_handle`]（会话表
 /// 单测直接用真实句柄 + mpsc 接收端，不依赖真实 socket）。
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,13 +631,8 @@ mod tests {
         let addr = sock.local_addr().unwrap().to_string();
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
-            loop {
-                match sock.recv_from(&mut buf).await {
-                    Ok((n, from)) => {
-                        let _ = sock.send_to(&buf[..n], from).await;
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                let _ = sock.send_to(&buf[..n], from).await;
             }
         });
         addr
@@ -635,12 +643,14 @@ mod tests {
         std::env::set_var("HYDRA_ALLOW_PRIVATE_TARGETS", "1");
         let echo = spawn_udp_echo().await;
         let (mut cli, srv) = duplex(65536);
-        tokio::spawn(serve_with_idle(srv, cli.clone(), Duration::from_secs(60)));
+        // DuplexStream 不可 Clone：split 出节点侧读写两半交给 serve
+        let (srv_rd, srv_wr) = tokio::io::split(srv);
+        tokio::spawn(serve_with_idle(srv_rd, srv_wr, Duration::from_secs(60)));
 
         // 两个会话各自隐式建立并回环（数据报按 session_id 分发不串线）
         for sid in [1u16, 2] {
             let payload = format!("ping-{sid}").into_bytes();
-            write_udp_frame(&mut cli, &encode_udp_data(sid, &echo, &payload))
+            write_udp_frame(&mut cli, &encode_udp_data(sid, &echo, &payload).unwrap())
                 .await
                 .unwrap();
             match read_udp_frame(&mut cli).await.unwrap() {
@@ -656,7 +666,7 @@ mod tests {
 
         // close 帧：节点侧回收（后续同 session 数据重新建会话，依然回环）
         write_udp_frame(&mut cli, &encode_udp_close(1)).await.unwrap();
-        write_udp_frame(&mut cli, &encode_udp_data(1, &echo, b"re-usable"))
+        write_udp_frame(&mut cli, &encode_udp_data(1, &echo, b"re-usable").unwrap())
             .await
             .unwrap();
         match read_udp_frame(&mut cli).await.unwrap() {
@@ -670,12 +680,14 @@ mod tests {
         std::env::set_var("HYDRA_ALLOW_PRIVATE_TARGETS", "1");
         let echo = spawn_udp_echo().await;
         let (mut cli, srv) = duplex(65536);
-        tokio::spawn(serve_with_idle(srv, cli.clone(), Duration::from_secs(60)));
+        // DuplexStream 不可 Clone：split 出节点侧读写两半交给 serve
+        let (srv_rd, srv_wr) = tokio::io::split(srv);
+        tokio::spawn(serve_with_idle(srv_rd, srv_wr, Duration::from_secs(60)));
         // 同一 session 先打 A 后打 B：两次都应回环成功（绑定已更新）
-        write_udp_frame(&mut cli, &encode_udp_data(7, &echo, b"first"))
+        write_udp_frame(&mut cli, &encode_udp_data(7, &echo, b"first").unwrap())
             .await
             .unwrap();
-        write_udp_frame(&mut cli, &encode_udp_data(7, &echo, b"second"))
+        write_udp_frame(&mut cli, &encode_udp_data(7, &echo, b"second").unwrap())
             .await
             .unwrap();
         let d1 = match read_udp_frame(&mut cli).await.unwrap() {
@@ -695,8 +707,10 @@ mod tests {
         std::env::set_var("HYDRA_ALLOW_PRIVATE_TARGETS", "1");
         let echo = spawn_udp_echo().await;
         let (mut cli, srv) = duplex(65536);
-        tokio::spawn(serve_with_idle(srv, cli.clone(), Duration::from_millis(300)));
-        write_udp_frame(&mut cli, &encode_udp_data(3, &echo, b"go"))
+        // DuplexStream 不可 Clone：split 出节点侧读写两半交给 serve
+        let (srv_rd, srv_wr) = tokio::io::split(srv);
+        tokio::spawn(serve_with_idle(srv_rd, srv_wr, Duration::from_millis(300)));
+        write_udp_frame(&mut cli, &encode_udp_data(3, &echo, b"go").unwrap())
             .await
             .unwrap();
         assert!(matches!(
@@ -721,9 +735,11 @@ mod tests {
         // 默认拒绝私有目标（OnceLock 进程内固化：本二进制内已有测试设 1，
         // 故该用例改用公网黑名单段的字面地址验证拒绝路径，不依赖 env 状态）
         let (mut cli, srv) = duplex(4096);
-        tokio::spawn(serve_with_idle(srv, cli.clone(), Duration::from_secs(60)));
+        // DuplexStream 不可 Clone：split 出节点侧读写两半交给 serve
+        let (srv_rd, srv_wr) = tokio::io::split(srv);
+        tokio::spawn(serve_with_idle(srv_rd, srv_wr, Duration::from_secs(60)));
         // 240.0.0.0/4 保留段：恒被拒绝（无论 env 放宽与否）
-        write_udp_frame(&mut cli, &encode_udp_data(9, "240.0.0.1:5353", b"x"))
+        write_udp_frame(&mut cli, &encode_udp_data(9, "240.0.0.1:5353", b"x").unwrap())
             .await
             .unwrap();
         // 空闲阈值内不应有任何下行帧（数据报被丢弃、会话未建立）
@@ -750,11 +766,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let auth_key = vec![7u8; 32];
-        let opts = crate::config::NodeOptions {
+        let opts = crate::server::NodeOptions {
             max_connections: 16,
             cert_file: dir.join("cert.der"),
             key_file: dir.join("key.der"),
-            ..crate::config::NodeOptions::default()
+            ..crate::server::NodeOptions::default()
         };
         let server = crate::server::HydraServer::new("127.0.0.1:0".parse().unwrap(), auth_key.clone(), opts)
             .await

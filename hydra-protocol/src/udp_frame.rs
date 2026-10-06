@@ -286,7 +286,7 @@ mod tests {
             v
         };
         assert!(decode_udp_frame(&mk(0, b"")).is_err());
-        assert!(decode_udp_frame(&mk(MAX_TARGET_LEN as u16 + 1, &vec![b'a'; 10])).is_err());
+        assert!(decode_udp_frame(&mk(MAX_TARGET_LEN as u16 + 1, b"aaaaaaaaaa")).is_err());
         assert!(decode_udp_frame(&mk(10, b"short")).is_err());
         // 非 UTF-8 目标地址
         assert!(decode_udp_frame(&mk(2, &[0xFF, 0xFE])).is_err());
@@ -308,7 +308,7 @@ mod tests {
     async fn stream_roundtrip_data_and_close() {
         use tokio::io::duplex;
         let (mut c, mut s) = duplex(4096);
-        write_udp_frame(&mut c, &encode_udp_data(9, "10.0.0.1:5353", b"abc"))
+        write_udp_frame(&mut c, &encode_udp_data(9, "10.0.0.1:5353", b"abc").unwrap())
             .await
             .unwrap();
         write_udp_frame(&mut c, &encode_udp_close(9)).await.unwrap();

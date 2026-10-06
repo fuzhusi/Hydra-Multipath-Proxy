@@ -14,31 +14,18 @@ path = "src/main.rs"
 # tun2/smoltcp 依赖，允许此降级）。
 default = ["tun", "fingerprint"]
 tun = ["dep:tun2", "dep:smoltcp", "dep:tokio-util"]
-# ClientHello 指纹"最大近似"（路线 C：stock rustls 全部可调项，见
-# docs/design/ClientHello指纹模仿方案与实施.md）。纯 stock 实现、无 fork 依赖，
-# 故默认开启；运行时 `HYDRA_FINGERPRINT=none` 可整体回退 stock rustls 行为。
-# brotli：Chrome ClientHello 携带 certCompression(brotli)，rustls 需启用对应
-# feature 才会声明该解压器。
-fingerprint = ["rustls/brotli"]
+# ClientHello 指纹（stock rustls 实现与 brotli 解压器均在 hydra-core，转发开关）
+fingerprint = ["hydra-core/fingerprint"]
 
 [dependencies]
 # 版本统一由根 [workspace.dependencies] 声明（审查 R-31）
 tokio = { workspace = true }
-rustls = { workspace = true }
-# TCP/TLS 传输（TCP 转型 Wave 1；Wave 3 起与 rustls 0.23 匹配的 tokio 适配层）
-tokio-rustls = { workspace = true }
-# 真证书模式（HYDRA_TRUST=ca）：webpki 公共 CA 根，与 rustls 0.23 配套（0.26）。
-# TrustAnchor 与 rustls-pki-types 统一，可直接 extend 进 RootCertStore。
-webpki-roots = "0.26"
-ring = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-bytes = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-url = "2.5"
-base64 = { workspace = true }
-# 恢复探测周期的随机抖动（±20%，防整周期被动特征）
+# 跨平台核心库（v0.3.0 抽取，见 docs/design/移动端Android方案-v2.md §3）：
+# 协议传输/代理/调度/流量统计在 core；本 crate 保留桌面专有封装与 TUN 设备层
+hydra-core = { path = "../hydra-core" }
+# 恢复探测周期的随机抖动（±20%，防整周期被动特征；tun.rs 重连逻辑）
 rand = "0.8"
 hydra-protocol = { path = "../hydra-protocol" }
 
@@ -65,6 +52,9 @@ tokio-util = { version = "0.7", optional = true }
 
 [dev-dependencies]
 hydra-node = { path = "../hydra-node" }
+serde_json = { workspace = true }
+url = "2.5"
+bytes = { workspace = true }
 # R-42 测试缺口专项：真证书 PEM 路径 E2E 用 rcgen 生成 PEM 证书/私钥
 # （0.13 与 hydra-node 主依赖同版本，内部 ring 0.17 与全工作区对齐）
 rcgen = "0.13"

@@ -280,13 +280,14 @@ impl ProxyServer {
         }
     }
 
-    #[cfg(feature = "tun")]
     /// TUN 模式通道开启器：把 [`Self::open_target`]（含故障切换 /
     /// TargetUnreachable 判定 / mark_node_offline / 流量统计语义）包成
-    /// [`crate::tun::ChannelOpener`]。调用前请先 `register_nodes()` 并确保
+    /// [`crate::channel::ChannelOpener`]。调用前请先 `register_nodes()` 并确保
     /// 凭据已设置（auth_key/证书）。
-    pub fn tun_channel_opener(&self) -> Result<crate::tun::ChannelOpener> {
-        use crate::tun::{ChannelOpener, OpenFuture, ProxyDuplex};
+    /// （通道开启器 trait 抽象在 `channel` 模块、平台无关；TUN 设备/栈在
+    /// 桌面 hydra-client::tun，未来 Android tun_core——均反向依赖本实现。）
+    pub fn tun_channel_opener(&self) -> Result<crate::channel::ChannelOpener> {
+        use crate::channel::{ChannelOpener, OpenFuture, ProxyDuplex};
 
         if self.auth_key.is_empty() {
             return Err(HydraError::ConnectionError(

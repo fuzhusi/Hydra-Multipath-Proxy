@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "hydra-client",
+    "hydra-core",
+    "hydra-android",
     "hydra-node",
     "hydra-protocol",
     "hydra-client-gui",

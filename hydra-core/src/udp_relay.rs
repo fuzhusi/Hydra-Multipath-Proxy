@@ -29,9 +29,6 @@ use crate::tcp_transport::{connect_target, TcpNodeStream, TlsTrust};
 /// UDP 中继模式的地址帧目标（节点按保留前缀 `@udp-relay/` 分流）
 pub const UDP_RELAY_TARGET: &str = "@udp-relay/v1";
 
-/// 会话号耗尽前保留的最大值（u16 全空间；按目标地址数配额，远超实际需要）
-const MAX_SESSION_ID: u16 = u16::MAX;
-
 /// 泛型 UDP 通道（对任意 TLS 流半拆分可用；mock 流便于单测）。
 /// 目标地址 → session_id 的映射由通道内部维护。
 pub struct UdpChannel<R, W>
@@ -81,14 +78,12 @@ where
             return Ok(sid);
         }
         // 会话号顺序分配；节点回收的 close 会解除映射，但号本身不回收
-        // （简单优先：u16 空间 65535 个，按目标数远够）
-        if self.next_sid == 0 || self.next_sid > MAX_SESSION_ID {
-            return Err(hydra_protocol::HydraError::ProtocolError(
-                "UDP 会话号耗尽（请重建通道）".to_string(),
-            ));
-        }
+        // （简单优先：u16 空间 65535 个，按目标数远够）；checked_add 防
+        // u16::MAX 回绕为 0（clippy absurd_extreme_comparisons 同源规避）
         let sid = self.next_sid;
-        self.next_sid = self.next_sid.wrapping_add(1);
+        self.next_sid = sid.checked_add(1).ok_or_else(|| {
+            hydra_protocol::HydraError::ProtocolError("UDP 会话号耗尽（请重建通道）".to_string())
+        })?;
         self.sessions.insert(target.to_string(), sid);
         Ok(sid)
     }
@@ -106,7 +101,7 @@ where
         loop {
             match read_udp_frame(&mut self.rd).await? {
                 UdpFrame::Data {
-                    session_id,
+                    session_id: _,
                     target,
                     datagram,
                 } => return Ok((target, datagram)),
@@ -152,7 +147,6 @@ mod tests {
 
     /// mock 节点：读上行帧并回显下行数据帧（同 session 同目标），close 帧仅记录
     async fn mock_node_relay(srv: tokio::io::DuplexStream, closes: std::sync::Arc<std::sync::atomic::AtomicU32>) {
-        use tokio::io::AsyncReadExt;
         let mut srv = srv;
         loop {
             match read_udp_frame(&mut srv).await {
@@ -231,7 +225,6 @@ mod tests {
 
     #[tokio::test]
     async fn 下行close帧被消化并解除映射() {
-        let closes = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let (cli, srv) = duplex(4096);
         // 节点侧：收到一帧后主动回收该会话（模拟空闲回收下行 close），再回一个
         // 新会话数据帧，验证 recv_from 跳过 close 继续收数据
@@ -246,7 +239,7 @@ mod tests {
                 .unwrap();
             write_udp_frame(
                 &mut srv,
-                &encode_udp_data(session_id + 1, &target, b"after-close"),
+                &encode_udp_data(session_id + 1, &target, b"after-close").unwrap(),
             )
             .await
             .unwrap();

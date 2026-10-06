@@ -740,20 +740,10 @@ pub fn detect_dns_servers() -> Vec<Ipv4Addr> {
     out
 }
 
-// ── 代理通道开启器（proxy.rs 提供实现，见 ProxyServer::tun_channel_opener）──
-
-/// 已建成的代理双工链路（既有 NodeLink 的读/写端，含流量统计）
-pub struct ProxyDuplex {
-    pub reader: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-    pub writer: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
-}
-
-/// 通道开启返回 future
-pub type OpenFuture = Pin<Box<dyn Future<Output = Result<ProxyDuplex>> + Send>>;
-
-/// TUN 新流 → 代理通道（target 形如 "ip:port"；复用 open_target 的故障切换 /
-/// TargetUnreachable 判定 / mark_node_offline / 流量统计语义，零分叉）
-pub type ChannelOpener = Arc<dyn Fn(String) -> OpenFuture + Send + Sync>;
+// ── 代理通道开启器（实现见 hydra_core::proxy::ProxyServer::tun_channel_opener）──
+// trait 抽象平台无关，已下沉 hydra-core::channel（Android tun_core 复用同一接口）；
+// 此处 re-export 维持本模块既有引用路径 `tun::ChannelOpener` 等不变。
+pub use hydra_core::channel::{ChannelOpener, OpenFuture, ProxyDuplex};
 
 // ── TUN 包传输抽象（设备与栈解耦；测试用通道对接两个 smoltcp Interface）──────
 

@@ -1,35 +1,32 @@
-pub mod connections;
-pub mod nat;
-pub mod proxy;
-pub mod routing;
-pub mod scheduler;
-pub mod share_link;
-pub mod speedtest;
-pub mod subscription;
-pub mod tcp_transport;
-pub mod traffic;
-pub mod transport;
-// UDP-over-proxy 客户端通道（同一条 TCP/TLS 流上的 UDP 多路复用）
-pub mod udp_relay;
-// TUN 透明代理模式（feature = "tun"，见 tun.rs 模块文档）
+//! Hydra 桌面客户端库（Windows/Linux/macOS CLI + GUI 共用入口）。
+//!
+//! v0.3.0 起，平台无关的核心逻辑抽取至 [`hydra-core`]（docs/design/
+//! 移动端Android方案-v2.md §3，Android uniffi 共用同一核心）。本 crate 保留：
+//! - 全量 re-export（GUI/CLI 既有 `hydra_client::…` 引用路径不变）
+//! - 桌面专有封装：env 凭据读取、TUN 设备/系统路由（tun.rs）、Windows 系统代理
+//!   检测、CREATE_NO_WINDOW 等
+//! - `tun_config_from_settings` 等 TUN 配置构造（依赖 tun.rs 类型，故留桌面）
+
+pub use hydra_core::{
+    auth_key_from_hex, node_certs_from_paths,
+    // 内容级 re-export（各模块 pub use 于 core::lib 已展开为平铺项）
+    channel::*, connections::*, nat::*, proxy::*, routing::*, scheduler::*, share_link::*,
+    speedtest::*, subscription::*, tcp_transport::*, traffic::*, udp_relay::*,
+};
+// 模块路径同样保留（`hydra_client::proxy::ProxyServer` 等既有引用）
+pub use hydra_core::{channel, connections, nat, proxy, routing, scheduler, share_link, speedtest,
+    subscription, tcp_transport, traffic, transport, udp_relay};
+
+// TUN 透明代理模式（feature = "tun"，见 tun.rs 模块文档；Android 不复用本模块，
+// 其 tun_core 为按评审 R1-R4 增强的独立实现）
 #[cfg(feature = "tun")]
 pub mod tun;
 
-pub use connections::*;
-pub use nat::*;
-pub use proxy::*;
-pub use routing::*;
-pub use scheduler::*;
-pub use share_link::*;
-pub use speedtest::*;
-pub use subscription::*;
-pub use tcp_transport::*;
-pub use traffic::*;
 #[cfg(feature = "tun")]
 pub use tun::*;
 
 /// 默认 SNI（伪装域名，同时是节点证书的默认 SAN）
-pub const DEFAULT_SNI: &str = "hydra.node";
+pub use hydra_core::transport::DEFAULT_SNI;
 
 /// 从 HYDRA_AUTH_KEY 环境变量解析节点预共享认证密钥
 pub fn auth_key_from_env() -> Result<Vec<u8>, String> {
@@ -37,19 +34,6 @@ pub fn auth_key_from_env() -> Result<Vec<u8>, String> {
         "未设置 HYDRA_AUTH_KEY 环境变量（节点预共享密钥，hex 编码，解码后恰好 32 字节）".to_string()
     })?;
     auth_key_from_hex(&hex_str)
-}
-
-/// 从 hex 字符串解析认证密钥（必须恰好 32 字节——snow NNpsk2 的 PSK 长度约束，
-/// 提前 fail-fast 而非让每条连接在握手期静默失败）
-pub fn auth_key_from_hex(hex_str: &str) -> Result<Vec<u8>, String> {
-    let key = hydra_protocol::hex_decode(hex_str)?;
-    if key.len() != 32 {
-        return Err(format!(
-            "认证密钥长度非法：解码后 {} 字节（必须恰好 32 字节，即 64 个 hex 字符；生成：openssl rand -hex 32）",
-            key.len()
-        ));
-    }
-    Ok(key)
 }
 
 /// 从 HYDRA_NODE_CERT 环境变量读取节点证书文件
@@ -178,18 +162,6 @@ pub type ShutdownToken = tokio_util::sync::CancellationToken;
 #[cfg(feature = "tun")]
 pub fn new_tun_shutdown_token() -> tokio_util::sync::CancellationToken {
     tokio_util::sync::CancellationToken::new()
-}
-
-/// 从逗号分隔的证书文件路径列表读取多节点证书（`HYDRA_NODE_CERTS`）。
-/// 顺序必须与节点地址顺序一一对应（仅用于 pin 模式信任根；Noise 指纹取对端
-/// 叶证书，配对错误不再导致握手失败——审查 R-02 的根治补全）。
-pub fn node_certs_from_paths(paths: &str) -> Result<Vec<Vec<u8>>, String> {
-    paths
-        .split(',')
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
-        .map(|p| std::fs::read(p).map_err(|e| format!("读取节点证书 {} 失败: {}", p, e)))
-        .collect()
 }
 
 #[cfg(test)]
