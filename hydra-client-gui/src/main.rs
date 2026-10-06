@@ -3250,12 +3250,13 @@ impl HydraApp {
         let median_latency = median_online_latency(&self.node_status);
         let best_node = best_online_node(&self.config, &self.node_status);
 
-    // ── 顶部四张统计卡（列数按可用宽度自适应 1..=4：窄窗口不再整行溢出）──
+    // ── 顶部四张统计卡：固定 2×2 网格（确定性布局——任何窗口宽度下四张卡
+    //    都完整可见；卡宽 = 可用宽度均分，钳制 130..=320，极窄窗口整行收缩）──
         ui.add_space(palette::SPACING_LG);
         let avail_w = ui.available_width();
-        let stat_cols = ((avail_w / 165.0).floor() as usize).clamp(1, 4);
-        // 卡宽按可用宽度均分（含列间距），任何窗口宽度下都不产生横向溢出
-        let card_w = ((avail_w - palette::SPACING_SM as f32 * (stat_cols as f32 - 1.0)) / stat_cols as f32).max(120.0);
+        let stat_cols = 2usize;
+        let card_w = (((avail_w - palette::SPACING_SM as f32) / stat_cols as f32)
+            .clamp(130.0, 320.0)) as f32;
         egui::Grid::new("dashboard_stat_cards")
             .num_columns(stat_cols)
             .spacing([palette::SPACING_SM, palette::SPACING_SM])
