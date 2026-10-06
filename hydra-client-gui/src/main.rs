@@ -3259,8 +3259,10 @@ impl HydraApp {
         let card_w = card_w.clamp(130.0, 320.0);
         // card_w 是含 Frame 边距的整卡宽度；内容区需再扣除 内边距MD×2 + 外边距XS×2 = 32px，
         // 否则两张卡的 Frame 总宽超出可用宽度，第二列被窗口右缘裁掉（卡内文字被截断）
+        // 卡内长文本均已 truncate(true)，内容可随窗口收缩——不设可读性下限，
+        // 否则极窄窗口下 120px 下限会重新引入二列水平溢出（审查批次 C-1）
         let card_inner_w =
-            (card_w - (palette::SPACING_MD + palette::SPACING_XS) * 2.0).max(120.0);
+            (card_w - (palette::SPACING_MD + palette::SPACING_XS) * 2.0).max(1.0);
         egui::Grid::new("dashboard_stat_cards")
             .num_columns(stat_cols)
             .spacing([palette::SPACING_SM, palette::SPACING_SM])
@@ -3426,8 +3428,10 @@ impl HydraApp {
                     ui.small("最近 120 个采样点（500ms/点）");
                 });
             });
-            // 固定高度的大号曲线区（约 12 行正文高）
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 180.0), egui::Sense::hover());
+            // 固定高度的大号曲线区（180px）：审查批次 C-2——allocate_exact_size
+            // 只会留 180px 空白带且 Plot 高度失控（吃掉剩余可用高度）；改用
+            // allocate_ui 给 Plot 一个确定大小的 rect
+            ui.allocate_ui(egui::vec2(ui.available_width(), 180.0), |ui| {
             egui_plot::Plot::new("dashboard_speed_plot")
                 // 图例与坐标轴/网格配置在 Plot 构造器上（egui_plot 0.27 API）
                 .legend(egui_plot::Legend::default())
@@ -3452,6 +3456,7 @@ impl HydraApp {
                             .width(2.0_f32),
                     );
                 });
+            });
             if !self.proxy_running {
                 ui.colored_label(
                     palette::TEXT_FAINT,
