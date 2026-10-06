@@ -3255,16 +3255,20 @@ impl HydraApp {
         ui.add_space(palette::SPACING_LG);
         let avail_w = ui.available_width();
         let stat_cols = 2usize;
-        let card_w = (((avail_w - palette::SPACING_SM as f32 * (stat_cols as f32 + 1.0)) / stat_cols as f32)
-            .clamp(130.0, 320.0)) as f32;
+        let card_w = (avail_w - palette::SPACING_SM * (stat_cols + 1) as f32) / stat_cols as f32;
+        let card_w = card_w.clamp(130.0, 320.0);
+        // card_w 是含 Frame 边距的整卡宽度；内容区需再扣除 内边距MD×2 + 外边距XS×2 = 32px，
+        // 否则两张卡的 Frame 总宽超出可用宽度，第二列被窗口右缘裁掉（卡内文字被截断）
+        let card_inner_w =
+            (card_w - (palette::SPACING_MD + palette::SPACING_XS) * 2.0).max(120.0);
         egui::Grid::new("dashboard_stat_cards")
             .num_columns(stat_cols)
             .spacing([palette::SPACING_SM, palette::SPACING_SM])
             .show(ui, |ui| {
                 // ① 运行状态卡：状态色点三态 + 启停大按钮
                 card_frame(ui).show(ui, |ui| {
-                    ui.set_min_width(card_w);
-                    ui.set_max_width(card_w);
+                    ui.set_min_width(card_inner_w);
+                    ui.set_max_width(card_inner_w);
                     ui.label(
                         egui::RichText::new("运行状态")
                             .size(palette::FONT_SECONDARY)
@@ -3308,8 +3312,8 @@ impl HydraApp {
                 });
                 // ② 当前节点卡：在线节点中延迟最低者（调度参考语义，诚实标注）
                 card_frame(ui).show(ui, |ui| {
-                    ui.set_min_width(card_w);
-                    ui.set_max_width(card_w);
+                    ui.set_min_width(card_inner_w);
+                    ui.set_max_width(card_inner_w);
                     ui.label(
                         egui::RichText::new("当前节点（调度参考）")
                             .size(palette::FONT_SECONDARY)
@@ -3349,8 +3353,8 @@ impl HydraApp {
                 ui.end_row();
                 // ③ 今日流量卡：上下行当日累计（差分自采样序列；重启不跨日不清零）
                 card_frame(ui).show(ui, |ui| {
-                    ui.set_min_width(card_w);
-                    ui.set_max_width(card_w);
+                    ui.set_min_width(card_inner_w);
+                    ui.set_max_width(card_inner_w);
                     ui.label(
                         egui::RichText::new("今日流量")
                             .size(palette::FONT_SECONDARY)
@@ -3374,8 +3378,8 @@ impl HydraApp {
                 });
                 // ④ 活跃节点卡：在线数/总数 + 在线节点延迟中位数
                 card_frame(ui).show(ui, |ui| {
-                    ui.set_min_width(card_w);
-                    ui.set_max_width(card_w);
+                    ui.set_min_width(card_inner_w);
+                    ui.set_max_width(card_inner_w);
                     ui.label(
                         egui::RichText::new("活跃节点")
                             .size(palette::FONT_SECONDARY)
