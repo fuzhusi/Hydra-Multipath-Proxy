@@ -1,5 +1,6 @@
-// Windows 下隐藏随 GUI 弹出的终端窗口（仅 release；debug 保留控制台便于看日志）
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Windows 下隐藏随 GUI 弹出的终端窗口（无条件：GUI 有应用内日志页，控制台
+// 只在拖累体验——用户反馈 debug 运行时背后常驻黑色命令行窗口）
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use eframe::egui;
 use hydra_client::{
@@ -3433,6 +3434,17 @@ impl HydraApp {
             // allocate_ui 给 Plot 一个确定大小的 rect
             ui.allocate_ui(egui::vec2(ui.available_width(), 180.0), |ui| {
             egui_plot::Plot::new("dashboard_speed_plot")
+                // 仪表盘装饰性图表：禁用全部交互（拖动/缩放/平移/双击重置）——
+                // 此前可被拖得找不到图；悬停坐标读数也一并关闭
+                .allow_zoom(false)
+                .allow_drag(false)
+                .allow_scroll(false)
+                .allow_boxed_zoom(false)
+                .allow_double_click_reset(false)
+                .coordinates_formatter(
+                    egui_plot::Corner::RightBottom,
+                    egui_plot::CoordinatesFormatter::new(|_pt, _bounds| String::new()),
+                )
                 // 图例与坐标轴/网格配置在 Plot 构造器上（egui_plot 0.27 API）
                 .legend(egui_plot::Legend::default())
                 .show_axes(false)
