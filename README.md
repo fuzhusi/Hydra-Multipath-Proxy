@@ -69,7 +69,15 @@
 
 ## 快速开始
 
-### 1. 编译
+### Windows 安装包（推荐普通用户）
+
+到 [Releases](https://github.com/fuzhusi/Hydra-Multipath-Proxy/releases) 下载 `Hydra-Setup-<版本>-x64.exe`：
+
+- **双击安装**：自动复制程序与官方签名 `wintun.dll` 到 Program Files，创建开始菜单/桌面快捷方式，自带卸载器
+- **TUN 模式开箱即用**：安装版 GUI 快捷方式默认请求管理员权限（UAC），无需手动处理 wintun.dll
+- 配置保存在 `%APPDATA%\hydra`，卸载重装不丢失
+
+### 1. 编译（便携方式 / 从源码）
 
 ```bash
 cargo build --release

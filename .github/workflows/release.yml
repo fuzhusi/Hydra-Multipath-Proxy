@@ -1,24 +1,28 @@
-# Hydra 发布：push tag v* 触发，构建 release 二进制并上传 GitHub Release。
+# Hydra 发布：push tag v* 触发（也可在 Actions 页手动 workflow_dispatch 触发以测试安装包）。
 # 产物：
-# - Windows: hydra-client.exe + hydra-client-gui.exe 打 zip（附 wintun.dll 说明 + README）
+# - Windows 安装包: Hydra-Setup-<版本>-x64.exe（NSIS，自动包含官方签名 wintun.dll）
+# - Windows 便携包: hydra-windows-x64.zip（已内置 wintun.dll，解压即用）
 # - Linux:   hydra-node 打 tar.gz
-# 注意：wintun.dll 本体不进仓库（授权与体积），zip 内附说明文件，用户按架构自行下载。
+# 注意：wintun.dll 从官方 https://www.wintun.net/ 下载（0.14.1，WireGuard LLC 签名），
+#       不进仓库（体积）；amd64 架构随包分发。
 name: Release
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write # 创建 Release 与上传产物所需
 
 env:
   CARGO_TERM_COLOR: always
+  WINTUN_VERSION: 0.14.1
 
 jobs:
   build-windows:
-    name: Windows 产物（客户端 + GUI）
+    name: Windows 产物（安装包 + 便携包）
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,29 +43,54 @@ jobs:
       - name: cargo build --release
         run: cargo build --release --workspace
 
-      # 打包：两个客户端 exe + README + wintun.dll 部署说明（节点二进制不打进 Windows 包）
-      - name: 打包 zip
+      # 官方签名 wintun.dll（WireGuard LLC），TUN 模式必需
+      - name: 下载 wintun.dll（官方 0.14.1 amd64）
         shell: pwsh
         run: |
+          curl.exe -L --connect-timeout 30 --max-time 300 `
+            -o wintun.zip https://www.wintun.net/builds/wintun-$($env:WINTUN_VERSION).zip
+          Expand-Archive -Path wintun.zip -DestinationPath wintun-extracted -Force
           New-Item -ItemType Directory -Path dist | Out-Null
-          Copy-Item target/release/hydra-client.exe dist/
-          Copy-Item target/release/hydra-client-gui.exe dist/
-          Copy-Item README.md dist/
+          Copy-Item "wintun-extracted/wintun/bin/amd64/wintun.dll" dist/wintun.dll
+          Get-AuthenticodeSignature dist/wintun.dll | Select-Object Status, SignerCertificate
+
+      # 便携 zip：exe + wintun.dll + README（解压即用）
+      - name: 打包便携 zip
+        shell: pwsh
+        run: |
           @'
-          wintun.dll 部署说明（TUN 模式需要）:
-          1. 从 https://www.wintun.net/ 下载 wintun-*.zip
-          2. 解压后取与 exe 同架构的 bin/<arch>/wintun.dll
-             （64 位系统用 bin/amd64/wintun.dll）
-          3. 放到 hydra-client.exe 同目录（或 PATH 可见处）
-          4. TUN 模式需以管理员身份运行
+          TUN 模式说明:
+          - wintun.dll 已内置（官方 0.14.1 amd64 签名版），无需自行下载
+          - TUN 需以管理员身份运行 GUI
+          - 反代静态页/TUN 开关见 README
           '@ | Set-Content -Path dist/WINTUN-README.txt -Encoding utf8
           Compress-Archive -Path dist/* -DestinationPath hydra-windows-x64.zip
 
-      - name: 上传到 GitHub Release
+      # NSIS 安装包：双击安装到 Program Files，自动创建快捷方式 + 卸载器
+      - name: 安装 NSIS
+        run: choco install nsis -y --no-progress
+
+      - name: 生成 NSIS 安装包
+        run: makensis /DAPPVERSION=${{ github.ref_name }} packaging\hydra.nsi
+
+      - name: 上传到 GitHub Release（tag 触发时）
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: hydra-windows-x64.zip
+          files: |
+            dist/Hydra-Setup-*.exe
+            hydra-windows-x64.zip
           generate_release_notes: true
+
+      - name: 上传构建产物（手动触发时，供下载测试）
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hydra-windows-dist
+          path: |
+            dist/Hydra-Setup-*.exe
+            hydra-windows-x64.zip
+          if-no-files-found: error
 
   build-linux:
     name: Linux 产物（hydra-node）
@@ -96,8 +125,16 @@ jobs:
           cp deploy/env.example dist/
           tar -czf hydra-linux-x64.tar.gz -C dist .
 
-      - name: 上传到 GitHub Release
+      - name: 上传到 GitHub Release（tag 触发时）
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: hydra-linux-x64.tar.gz
           generate_release_notes: true
+
+      - name: 上传构建产物（手动触发时）
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hydra-linux-dist
+          path: hydra-linux-x64.tar.gz
