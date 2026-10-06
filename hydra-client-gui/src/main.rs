@@ -3255,7 +3255,7 @@ impl HydraApp {
         ui.add_space(palette::SPACING_LG);
         let avail_w = ui.available_width();
         let stat_cols = 2usize;
-        let card_w = (((avail_w - palette::SPACING_SM as f32) / stat_cols as f32)
+        let card_w = (((avail_w - palette::SPACING_SM as f32 * (stat_cols as f32 + 1.0)) / stat_cols as f32)
             .clamp(130.0, 320.0)) as f32;
         egui::Grid::new("dashboard_stat_cards")
             .num_columns(stat_cols)
@@ -3339,11 +3339,14 @@ impl HydraApp {
                                     .size(palette::FONT_TITLE + 3.0)
                                     .color(palette::TEXT_FAINT),
                             );
-                            ui.small(if total == 0 { "暂无节点" } else { "无在线节点" });
+                            ui.add(egui::Label::new(egui::RichText::new(if total == 0 { "暂无节点" } else { "无在线节点" }).size(palette::FONT_SECONDARY)).truncate(true));
                         }
                     }
-                    ui.small("自动按最低延迟调度");
+                    ui.add(egui::Label::new(egui::RichText::new("自动按最低延迟调度").size(palette::FONT_SECONDARY).color(palette::TEXT_WEAK)).truncate(true));
                 });
+                // egui Grid 不会自动换行：2 列布局下每 2 张卡必须显式 end_row，
+                // 否则 ③④ 两张卡排到屏幕外（本轮「今日流量看不到」的根因）
+                ui.end_row();
                 // ③ 今日流量卡：上下行当日累计（差分自采样序列；重启不跨日不清零）
                 card_frame(ui).show(ui, |ui| {
                     ui.set_min_width(card_w);
