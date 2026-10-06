@@ -433,7 +433,11 @@ impl ProxyServer {
                         r,
                         ByteCounter::down(Some(traffic.clone()), Some(node_entry)),
                     );
-                    return Ok(NodeLink { send, recv });
+                    return Ok(NodeLink {
+                        send,
+                        recv,
+                        node: node.address,
+                    });
                 }
                 Err(e) => {
                     // 目标不可达（节点存活但目标连不上/SSRF 失败）：默认换节点无意义
@@ -1027,6 +1031,20 @@ impl ProxyServer {
             peer_addr, target
         );
 
+        // ── 连接注册表钩子（GUI「连接」页数据源，与 TrafficMonitor 同范式）──
+        // 注册点 = 中继起点；字节计数条目交由上下行任务原子累加，热路径零锁。
+        // 目标入库即脱敏（mask_target 短哈希），明文不进注册表。
+        let conn = crate::connections::connections_registry().register(
+            masked.clone(),
+            match &link {
+                RemoteLink::Node { link } => link.node,
+                // 直连（CN 分流）无节点归属：0.0.0.0:0 占位（UI 显示「直连」）
+                RemoteLink::Direct(_) => {
+                    SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0)
+                }
+            },
+        );
+
         // 节点路径：open_target 已包好计数器；直连路径（CN 分流，无节点归属）：
         // 仅计全局 monitor，不归属任何节点条目。
         let (mut up_sink, mut down_src) = match link {
@@ -1048,6 +1066,7 @@ impl ProxyServer {
         let (mut client_read, mut client_write) = stream.into_split();
 
         // 浏览器 → 远端（节点 TCP/TLS 流 / 直连 TCP）
+        let up_conn = conn.clone();
         let mut up = tokio::spawn(async move {
             let mut buf = vec![0u8; RELAY_BUF];
             let mut total = 0u64;
@@ -1068,6 +1087,8 @@ impl ProxyServer {
                     }
                     Ok(n) => {
                         total += n as u64;
+                        // 连接注册表：上行字节回调（原子累加，热路径零锁）
+                        up_conn.add_up(n as u64);
                         let write_res = match &mut up_sink {
                             // TCP 链路无错误码通道，写失败 = 传输故障
                             UpSink::Node(w) => w
@@ -1089,6 +1110,7 @@ impl ProxyServer {
         });
 
         // 远端 → 浏览器
+        let down_conn = conn.clone();
         let mut down = tokio::spawn(async move {
             let mut buf = vec![0u8; RELAY_BUF];
             let mut total = 0u64;
@@ -1108,6 +1130,8 @@ impl ProxyServer {
                     },
                 };
                 total += n as u64;
+                // 连接注册表：下行字节回调（原子累加，热路径零锁）
+                down_conn.add_down(n as u64);
                 if client_write.write_all(&buf[..n]).await.is_err() {
                     return Err(RelayError::Transport);
                 }
@@ -1120,7 +1144,9 @@ impl ProxyServer {
             r = &mut down => (false, join_relay_result(r)),
         };
 
-        match (up_done, first_err) {
+        // 结果先绑定再收尾：中继终点（任意结束路径）统一标记连接关闭，
+        // 注册表条目保留 60s 供 GUI「最近关闭」展示
+        let relay_result = match (up_done, first_err) {
             // 浏览器已关写侧且上行干净：保留下行，在超时窗口内收完剩余响应（半关闭）
             (true, None) => match tokio::time::timeout(RELAY_DRAIN_TIMEOUT, &mut down).await {
                 Ok(Ok(Ok(_))) => {
@@ -1182,7 +1208,10 @@ impl ProxyServer {
                 let _ = up.await;
                 Err(Self::relay_error(e, peer_addr, target))
             }
-        }
+        };
+        // 连接注册表钩子（中继终点）：幂等标记关闭（连接页转「最近关闭」）
+        conn.finish();
+        relay_result
     }
 
     /// 传输/直连故障 → 明确的失败（供外层日志与错误传播；浏览器侧为显式断开而非 EOF 冒充）
@@ -1212,6 +1241,8 @@ impl ProxyServer {
 pub(crate) struct NodeLink {
     send: CountingStream<TcpWriteHalf>,
     recv: CountingStream<TcpReadHalf>,
+    /// 出口节点地址（连接注册表展示「节点」列用；中继起点随链路携带，零额外查询）
+    node: SocketAddr,
 }
 
 impl NodeLink {

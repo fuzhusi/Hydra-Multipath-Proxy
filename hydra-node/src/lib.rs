@@ -6,6 +6,8 @@ pub mod health;
 pub mod server;
 pub mod signal;
 pub mod tcp_server;
+// UDP-over-proxy 中继（协议层能力，TUN 模式 UDP 转发的地基）
+pub mod udp_relay;
 
 pub use config::*;
 pub use fallback::*;

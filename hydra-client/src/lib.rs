@@ -1,3 +1,4 @@
+pub mod connections;
 pub mod nat;
 pub mod proxy;
 pub mod routing;
@@ -8,10 +9,13 @@ pub mod subscription;
 pub mod tcp_transport;
 pub mod traffic;
 pub mod transport;
+// UDP-over-proxy 客户端通道（同一条 TCP/TLS 流上的 UDP 多路复用）
+pub mod udp_relay;
 // TUN 透明代理模式（feature = "tun"，见 tun.rs 模块文档）
 #[cfg(feature = "tun")]
 pub mod tun;
 
+pub use connections::*;
 pub use nat::*;
 pub use proxy::*;
 pub use routing::*;

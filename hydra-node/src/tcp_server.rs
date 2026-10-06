@@ -289,6 +289,18 @@ async fn handle_tls_stream(
         }
     }
 
+    // ── 第 5.5 步（分流）：UDP 中继保留前缀 → UDP 会话多路复用（同款模式见
+    // `@hydra-p2p/` 信令分流）。回 2B OK 后该流不再走 TCP 目标转发，改承载
+    // hydra_protocol::udp_frame 定义的变长 UDP 会话帧；空闲/资源/SSRF 语义见
+    // udp_relay 模块文档。普通 TCP 目标路径零改动。
+    if target.strip_prefix(crate::udp_relay::UDP_RELAY_PREFIX).is_some() {
+        if write_reply(&mut wr, REPLY_OK).await.is_err() {
+            return;
+        }
+        crate::udp_relay::serve(rd, wr).await;
+        return;
+    }
+
     // ── 第 6 步：SSRF 过滤 + DNS + 建目标（复用 handler 逻辑）
     let target_stream = match ConnectionHandler::resolve_and_connect(&target).await {
         Ok(s) => s,
