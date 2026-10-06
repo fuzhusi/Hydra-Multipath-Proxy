@@ -5,6 +5,37 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased] - Android M0（hydra-core 抽取 + 工程骨架）
+
+### 新增
+
+- **hydra-core crate**：从 hydra-client 抽取 12 个平台无关模块（tcp_transport/
+  proxy/nat/udp_relay/scheduler/speedtest/connections/routing/subscription/
+  share_link/traffic/transport + 新增 `channel` 通道开启器抽象）为跨平台核心库，
+  桌面与 Android 共用；零 env 读取、零平台专有代码，凭据一律显式参数传入。
+- **hydra-android crate**：cdylib + uniffi 0.29 导出 `HydraEngine`
+  （new/start/stop/boundAddr/stats，显式 NodeSpec/TrustMode/PSK hex 参数）与
+  `SocketProtect` 回调接口（v2.1 R4 防环回钩子，Kotlin 调 `VpnService.protect`；
+  运行时接线随 M2 tun_core）。附 Rust 冒烟测试。
+- **android/ Gradle 工程**：Kotlin 2.2 + Compose（BOM）最小骨架；版本集中
+  libs.versions.toml；abiFilters arm64-v8a + x86_64；R8 keep 规则（uniffi/JNI）；
+  cargo-ndk 交叉编译脚本（scripts/build-rust.*）；JVM 单测注入 java.library.path，
+  桌面直接加载 host 动态库跑 uniffi 启停冒烟（EngineSmokeTest）。
+- uniffi Kotlin 绑定生成器（hydra-android 的 uniffi-bindgen bin）与再生成脚本。
+
+### 变更
+
+- hydra-client 瘦身为桌面壳：全量 re-export hydra-core（GUI/CLI 引用路径不变），
+  保留 tun.rs、env 凭据函数、TUN 配置构造、Windows 系统代理检测等桌面专有封装。
+- workspace 新增成员 hydra-core、hydra-android；hydra-client 依赖收敛（rustls 等
+  随模块移入 hydra-core）。
+
+### 修复
+
+- 存量测试笔误三处：udp_frame.rs / udp_relay.rs 测试漏 `.unwrap()`；
+  connections.rs 测试缺 `IpAddr` import；`test_eviction_cap` 自相矛盾断言
+  （既断言淘汰最旧又断言最旧保留）修正为断言次新条目保留。
+
 ## [0.2.0] - 2026-10
 
 > 0.2.0 是一次**路线级变更**：传输层从 QUIC/UDP 全面转向 TCP/TLS（因部署网络

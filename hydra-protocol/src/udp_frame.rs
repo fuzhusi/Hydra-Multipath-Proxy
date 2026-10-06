@@ -149,10 +149,19 @@ pub fn decode_udp_frame(buf: &[u8]) -> Result<UdpFrame> {
             let target = String::from_utf8(rest[2..total].to_vec()).map_err(|e| {
                 HydraError::ProtocolError(format!("UDP 目标地址非 UTF-8: {e}"))
             })?;
+            // 数据报上限校验（审查 P3）：编码侧保证 ≤65507，解码侧同样把关——
+            // 超限帧若放行，节点 socket.send 必然 EMSGSIZE 导致整条会话被拆
+            let datagram = &rest[total..];
+            if datagram.len() > MAX_DATAGRAM_LEN {
+                return Err(HydraError::ProtocolError(format!(
+                    "UDP 数据报超限: {} 字节（≤{MAX_DATAGRAM_LEN}）",
+                    datagram.len()
+                )));
+            }
             Ok(UdpFrame::Data {
                 session_id,
                 target,
-                datagram: rest[total..].to_vec(),
+                datagram: datagram.to_vec(),
             })
         }
         UDP_KIND_CLOSE => {

@@ -239,6 +239,11 @@ fn ssrf_blocked_reason(ip: IpAddr) -> Option<&'static str> {
                 Some("IPv6 ULA private")
             } else if v6.is_unspecified() {
                 Some("unspecified ::")
+            } else if (seg[0] & 0xff00) == 0xff00 {
+                // IPv6 组播 ff00::/8（审查 P2-2：与 IPv4 组播拦截对称）
+                Some("IPv6 multicast ff00::/8")
+            } else if (seg[0] & 0xff00) == 0x2000 && seg[1] == 0x01db {
+                Some("documentation 2001:db8::/32")
             } else {
                 None
             }
@@ -395,26 +400,30 @@ async fn uplink_data<W>(
 ) where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    // 目标解析 + SSRF 过滤失败：丢弃该数据报；已存在的会话一并回收
-    // （目标失效的会话没有继续存在的意义）
-    let Some(addr) = resolve_udp_target(target).await else {
-        let mut t = table.lock().unwrap();
-        t.overlimit_drops += 1;
-        if t.remove(session_id).is_some() {
-            debug!("UDP 会话 {session_id} 因目标失效而回收");
-        }
-        return;
-    };
-
-    // 判定是否需要新建/重建绑定（锁内无 await：std MutexGuard 不可跨 .await）
+    // 审查 P2-1 修复：先查表——已存在会话且目标未变时**跳过 DNS 解析**直接
+    // 投递（此前每帧 resolve：域名目标每包一次 DNS 查询放大上游、5s 解析
+    // 超时会停摆该连接全部会话的上行）。
     let existing_target = {
         let t = table.lock().unwrap();
         t.get(session_id).map(|h| h.target().to_string())
     };
     if existing_target.as_deref() != Some(target) {
+        // 目标解析 + SSRF 过滤失败：丢弃该数据报；已存在的会话一并回收
+        // （目标失效的会话没有继续存在的意义）
+        let Some(addr) = resolve_udp_target(target).await else {
+            let mut t = table.lock().unwrap();
+            t.overlimit_drops += 1;
+            if t.remove(session_id).is_some() {
+                debug!("UDP 会话 {session_id} 因目标失效而回收");
+            }
+            return;
+        };
+
+        // 新会话，或同 session 换目标：回收旧绑定（句柄 drop → 会话任务退出），
+        // 按新目标重建 socket。锁内只做「摘旧 + 判满」，bind().await 在锁外
+        // （MutexGuard 非 Send，不能跨 await）
         {
             let mut t = table.lock().unwrap();
-            // 同 session 换目标：回收旧绑定（句柄 drop → 会话任务退出）
             t.remove(session_id);
             if t.is_full() {
                 t.overlimit_drops += 1;
@@ -428,15 +437,16 @@ async fn uplink_data<W>(
         // 锁外建 socket + 派生会话任务（await 期间不持有表锁）
         match bind_session_socket(addr).await {
             Ok(socket) => {
-                let mut t = table.lock().unwrap();
-                // 二次查满（锁释放窗口可能有并发新建）
-                if t.is_full() {
-                    t.overlimit_drops += 1;
-                    return;
-                }
                 let (tx, rx) = mpsc::channel(SESSION_QUEUE_DEPTH);
                 let last_active = Arc::new(AtomicU64::new(now_ms()));
                 let handle = SessionHandle::new(tx, last_active.clone(), target.to_string());
+                // 锁外 await 完成后重新上锁回填；二次查满（锁释放窗口可能有
+                // 并发新建）
+                let mut t = table.lock().unwrap();
+                if t.is_full() {
+                    t.overlimit_drops += 1;
+                    return; // socket 由 Ok(socket) 分支的 drop 关闭
+                }
                 if t.insert(session_id, handle).is_none() {
                     return; // 理论不可达（is_full 已查）；保守不投递
                 }
@@ -501,8 +511,8 @@ async fn session_task<W>(
 {
     let mut buf = vec![0u8; MAX_DATAGRAM_LEN];
     loop {
+        // 不用 biased：持续高速上行不应饥饿下行回包（审查批次 P3）
         tokio::select! {
-            biased;
             cmd = rx.recv() => match cmd {
                 Some(datagram) => {
                     if socket.send(&datagram).await.is_err() {

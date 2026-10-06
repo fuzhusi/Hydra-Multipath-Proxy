@@ -1179,6 +1179,15 @@ fn is_unproxyable_udp_v4(pkt: &[u8]) -> bool {
     if frag & 0x1fff != 0 {
         return false; // 非首片：静默丢弃（不答）
     }
+    // RFC 1122 §3.2.2：广播/组播目的、未指定源不回 ICMP 差错
+    // （DHCP Discover 255.255.255.255、mDNS 224.0.0.251 等场景回包是协议违规）
+    let dst = &pkt[16..20];
+    if dst == [255, 255, 255, 255] || dst[0] & 0xf0 == 0xe0 {
+        return false;
+    }
+    if pkt[12..16] == [0, 0, 0, 0] {
+        return false;
+    }
     pkt[9] == 17 // protocol = UDP
 }
 
@@ -1285,12 +1294,19 @@ fn ensure_v6_dst(
         }
     }
     iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::new(
+        // 审查批次 P3-9：push 失败（静态地址挤占）时不入池——池认为已挂载而
+        // 接口实际没有会造成「每包重试 + 误淘汰他人」的失同步抖动
+        if addrs.push(IpCidr::new(
             IpAddress::Ipv6(smoltcp::wire::Ipv6Address(addr.octets())),
             128,
-        ));
+        ))
+        .is_err()
+        {
+            debug!("v6 动态地址挂载失败（地址表满），{addr} 不入池");
+            return;
+        }
+        pool.push_back(addr);
     });
-    pool.push_back(addr);
 }
 
 /// 栈主循环（与真实 TUN 设备解耦：任何 [`PacketTransport`] 都可驱动，
@@ -1394,6 +1410,13 @@ pub async fn run_stack<T: PacketTransport>(
                                 // 差错（防差错风暴/反射），静默丢弃；ping 不通属设
                                 // 计内（无 v6 转发能力，回不可达反而让 ping 失真）
                                 debug!("TUN 丢弃入站 IPv6 ICMPv6 包（无 v6 转发能力）");
+                            } else if pkt.len() > 6
+                                && matches!(pkt[6], 0 | 43 | 44 | 51 | 60)
+                            {
+                                // IPv6 扩展头承载的 TCP（HBH/路由/分片/IPsec）：
+                                // 无法安全解析端口——静默丢弃而非回不可达（让应用
+                                // 快速失败即可，审查批次 C P3-8 同源场景）
+                                debug!("TUN 丢弃带扩展头的 IPv6 包（无 v6 转发能力）");
                             } else {
                                 let icmp = build_icmpv6_unreachable_v6(pkt);
                                 if let Err(e) = transport.send(&icmp).await {
