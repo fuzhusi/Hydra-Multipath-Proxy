@@ -3252,14 +3252,18 @@ impl HydraApp {
 
     // ── 顶部四张统计卡（列数按可用宽度自适应 1..=4：窄窗口不再整行溢出）──
         ui.add_space(palette::SPACING_LG);
-        let stat_cols = ((ui.available_width() / 170.0).floor() as usize).clamp(1, 4);
+        let avail_w = ui.available_width();
+        let stat_cols = ((avail_w / 165.0).floor() as usize).clamp(1, 4);
+        // 卡宽按可用宽度均分（含列间距），任何窗口宽度下都不产生横向溢出
+        let card_w = ((avail_w - palette::SPACING_SM as f32 * (stat_cols as f32 - 1.0)) / stat_cols as f32).max(120.0);
         egui::Grid::new("dashboard_stat_cards")
             .num_columns(stat_cols)
             .spacing([palette::SPACING_SM, palette::SPACING_SM])
             .show(ui, |ui| {
                 // ① 运行状态卡：状态色点三态 + 启停大按钮
                 card_frame(ui).show(ui, |ui| {
-                    ui.set_min_width(150.0);
+                    ui.set_min_width(card_w);
+                    ui.set_max_width(card_w);
                     ui.label(
                         egui::RichText::new("运行状态")
                             .size(palette::FONT_SECONDARY)
@@ -3303,7 +3307,8 @@ impl HydraApp {
                 });
                 // ② 当前节点卡：在线节点中延迟最低者（调度参考语义，诚实标注）
                 card_frame(ui).show(ui, |ui| {
-                    ui.set_min_width(150.0);
+                    ui.set_min_width(card_w);
+                    ui.set_max_width(card_w);
                     ui.label(
                         egui::RichText::new("当前节点（调度参考）")
                             .size(palette::FONT_SECONDARY)
@@ -3340,7 +3345,8 @@ impl HydraApp {
                 });
                 // ③ 今日流量卡：上下行当日累计（差分自采样序列；重启不跨日不清零）
                 card_frame(ui).show(ui, |ui| {
-                    ui.set_min_width(150.0);
+                    ui.set_min_width(card_w);
+                    ui.set_max_width(card_w);
                     ui.label(
                         egui::RichText::new("今日流量")
                             .size(palette::FONT_SECONDARY)
@@ -3364,7 +3370,8 @@ impl HydraApp {
                 });
                 // ④ 活跃节点卡：在线数/总数 + 在线节点延迟中位数
                 card_frame(ui).show(ui, |ui| {
-                    ui.set_min_width(150.0);
+                    ui.set_min_width(card_w);
+                    ui.set_max_width(card_w);
                     ui.label(
                         egui::RichText::new("活跃节点")
                             .size(palette::FONT_SECONDARY)
