@@ -2965,12 +2965,19 @@ impl eframe::App for HydraApp {
             });
 
         // ── T2：中央面板（按导航页签切换）──
-        egui::CentralPanel::default().show(ctx, |ui| match self.current_tab {
-            Tab::Overview => self.ui_overview(ui),
-            Tab::Nodes => self.ui_nodes(ui),
-            Tab::Subscriptions => self.ui_subscriptions(ui),
-            Tab::Settings => self.ui_settings(ui),
-            Tab::Logs => self.ui_logs(ui),
+        // 页面主体统一包垂直 ScrollArea（auto_shrink=false 占满宽度）：
+        // 内容高过窗口时在页内滚动，而非溢出屏幕产生 egui「组件超出」告警
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let tab = self.current_tab;
+            egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(ui, |ui| match tab {
+                    Tab::Overview => self.ui_overview(ui),
+                    Tab::Nodes => self.ui_nodes(ui),
+                    Tab::Subscriptions => self.ui_subscriptions(ui),
+                    Tab::Settings => self.ui_settings(ui),
+                    Tab::Logs => self.ui_logs(ui),
+                });
         });
 
         // ── Team-UI：节点编辑对话框 ──
@@ -3243,10 +3250,11 @@ impl HydraApp {
         let median_latency = median_online_latency(&self.node_status);
         let best_node = best_online_node(&self.config, &self.node_status);
 
-    // ── 顶部四张统计卡（4 列网格，窄窗口自动换行由 Grid 列数固定保持简单）──
+    // ── 顶部四张统计卡（列数按可用宽度自适应 1..=4：窄窗口不再整行溢出）──
         ui.add_space(palette::SPACING_LG);
+        let stat_cols = ((ui.available_width() / 170.0).floor() as usize).clamp(1, 4);
         egui::Grid::new("dashboard_stat_cards")
-            .num_columns(4)
+            .num_columns(stat_cols)
             .spacing([palette::SPACING_SM, palette::SPACING_SM])
             .show(ui, |ui| {
                 // ① 运行状态卡：状态色点三态 + 启停大按钮
@@ -3284,7 +3292,14 @@ impl HydraApp {
                             self.start_proxy();
                         }
                     }
-                    ui.small(format!("监听 {}", self.config.proxy_listen_addr));
+                    // 长地址超卡宽会触发「组件超出」告警：截断 + hover 显示全量
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("监听 {}", self.config.proxy_listen_addr))
+                                .size(palette::FONT_SECONDARY),
+                        )
+                        .truncate(true),
+                    );
                 });
                 // ② 当前节点卡：在线节点中延迟最低者（调度参考语义，诚实标注）
                 card_frame(ui).show(ui, |ui| {
@@ -3296,10 +3311,14 @@ impl HydraApp {
                     );
                     match &best_node {
                         Some((addr, ms)) => {
-                            ui.label(
-                                egui::RichText::new(self.config.node_display_name(addr))
-                                    .size(palette::FONT_TITLE + 3.0)
-                                    .strong(),
+                            // 节点备注/地址超卡宽：截断 + hover 全量
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(self.config.node_display_name(addr))
+                                        .size(palette::FONT_TITLE + 3.0)
+                                        .strong(),
+                                )
+                                .truncate(true),
                             )
                             .on_hover_text(addr);
                             ui.label(
