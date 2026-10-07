@@ -25,8 +25,8 @@ InstallDirRegKey HKLM "Software\Hydra" "InstallDir"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
 ; Installer icon (repo file; also embeds into uninstaller)
-Icon "hydra-client-gui\assets\app.ico"
-UninstallIcon "hydra-client-gui\assets\app.ico"
+Icon "..\hydra-client-gui\assets\app.ico"
+UninstallIcon "..\hydra-client-gui\assets\app.ico"
 
 Page directory
 Page instfiles
