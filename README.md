@@ -7,9 +7,8 @@
 > **关于 "Multipath" 命名**：指**连接级多节点加权分发与故障自愈**——每条连接走单一节点，多节点按评分分流新连接、故障自动切换。QUIC 时代的字节级多路径聚合（V3.4）已随 UDP 路径移除，如实声明避免名实脱钩。
 
 > **交付状态：v1.0 可交付产品**（2026-10）。三档如实划分：
-> - **已交付**：TCP/TLS + Noise-PSK 隧道、自签 pinning 与 ACME 真证书双路线、多节点加权分发与故障自愈、GUI 全功能（托盘/分享/订阅/配置持久化）、CI。
-> - **已交付**：NAT 穿透 v1（TCP STUN 分类 + 同时打开打洞 + 中继兜底；真实 NAT 组合环境需人工实网验证）。
-> - **规划中**：UI 重设计实施（方案 v3 已定稿）、多节点并行下载。（ClientHello 指纹模仿已交付：最大近似方案，见 docs/design/ClientHello指纹模仿方案与实施.md）
+> - **已交付**：TCP/TLS + Noise-PSK 隧道、自签 pinning 与 ACME 真证书双路线、多节点加权分发与故障自愈、测速动态调度、TUN 透明代理 v1 完整版（IPv6 双栈）、NAT 穿透 v1（TCP STUN 分类 + 同时打开打洞 + 中继兜底；真实 NAT 组合环境需人工实网验证）、UDP-over-proxy 协议/节点/客户端三层（桌面 TUN 接线未做，TUN 下 UDP 仍快速回落 TCP）、反代静态页回退、ClientHello 指纹模仿（最大近似方案，见 docs/design/ClientHello指纹模仿方案与实施.md）、UI 重设计 v3 全部批次（含连接页）、GUI 全功能（托盘/分享/订阅/连接页/配置持久化/CA 信任模式）、CI 与 Release 安装包、Android M0 骨架（hydra-core 抽取 + FFI 引擎 + R4 protect 钩子接线）。
+> - **规划中**：Android M1/M2（全局 VPN：VpnService + TUN + DNS 劫持 + 任意端口）、桌面 TUN 的 UDP-over-proxy 接线与 DNS 劫持、多节点并行下载（HTTP Range）、rekey 密钥轮换、main.rs 模块化拆分（内部工程项）。
 
 > **项目性质**：个人自用工具，AI 辅助开发。经多轮独立代码审查（[docs/review/](docs/review/)），本 README 与代码逐项核对——未列出的能力即为未实现，不做夸大宣传。
 >
@@ -28,7 +27,7 @@
 - **DNS 隐私**：客户端不解析目标域名，域名只经加密通道交节点解析，明文域名永不离开本机
 
 ### 可靠性与性能
-- **节点故障切换 + 自愈**：传输失败自动标记 Offline、切换下一节点（最多 3 候选）；后台探测器周期探测（TCP connect + TLS 握手时延），节点恢复自动重新上线
+- **节点故障切换 + 自愈**：传输失败自动标记 Offline、切换下一节点（最多 3 候选）；后台探测器周期**完整握手探测**（TCP + TLS + Noise-PSK，认证面故障可在探测复现），Offline 节点恢复自动重新上线、Online 节点连续失败自动降级 Degraded——死节点不再"恒被选中靠每连接失败兜底"
 - **连接级多节点加权分发**：多节点按评分承接新连接，杀节点不中断
 - **测速动态调度**：主动探测 RTT + 被动吞吐差分（按节点字节计数）+ 故障衰减，实测写回节点评分
 - **拥塞与转发调优**：节点侧一键启用内核 **BBR + fq**（[deploy/99-hydra-bbr.conf](deploy/99-hydra-bbr.conf)）；转发空闲看门狗（`HYDRA_IDLE_TIMEOUT_SECS`）防连接额度耗尽
@@ -61,7 +60,7 @@
 - CLI：`hydra-client --p2p <我的id> --peer <对方id> --node <节点>`；方案与实现记录见 [docs/design/NAT穿透方案.md](docs/design/NAT穿透方案.md)
 
 ### 便捷性
-- **桌面 GUI**（egui，中文）：五页导航（状态总览/节点/订阅/日志/设置）、状态卡实时速率、**系统托盘**（关窗到托盘、托盘菜单启停/退出）、配置持久化 + 首启向导、Windows 系统代理一键设置（注册表+WinINet，崩溃自动恢复）
+- **桌面 GUI**（egui，中文）：六页导航（状态总览/节点/订阅/**连接**/日志/设置）、状态卡实时速率、**连接页**（活跃连接实时表格：目标脱敏/节点归属/上下行计数/最近关闭）、**系统托盘**（关窗到托盘、托盘菜单启停/退出）、配置持久化 + 首启向导、Windows 系统代理一键设置（注册表+WinINet，崩溃自动恢复）、真证书 CA 信任模式（设置页可配 + 可选叶证书硬 pin）
 - **分享体系**：`hydra://` 链接可携带完整凭据（认证密钥**强制恰好 32 字节**，生成/导入双层校验），**二维码生成 + 图片识别导入 + 粘贴/文件导入**；带"完整链接=持有节点"安全提示
 - **订阅**：自有格式（多行/逐行 base64/整体 base64），URL 或本地文件，自动合并节点
 - **国内直连分流**（`HYDRA_SPLIT=cn`）：内置 CN 域名后缀表 + 用户扩展文件，默认关闭（隐私优先）
@@ -266,11 +265,13 @@ Hydra-Multipath-Proxy/
 ├── hydra-protocol/     # 协议：Noise-PSK 握手、TCP 帧编解码、认证 token、日志脱敏
 ├── hydra-node/         # 节点：TCP/TLS 服务、握手认证、SSRF 过滤、健康检查、信号停机、toml 配置
 ├── hydra-client/       # 客户端：SOCKS5/HTTP、TCP 传输、故障切换、测速调度、分流、TUN、NAT/STUN、订阅
-├── hydra-client-gui/   # GUI：五页导航、系统托盘、二维码分享、节点编辑、配置持久化
+├── hydra-client-gui/   # GUI：六页导航（含连接页）、系统托盘、二维码分享、节点编辑、配置持久化
 │   └── assets/app.ico  # 应用图标（窗口/托盘/exe 资源三处共用；源文件为根目录 favicon.ico 副本）
+├── hydra-android/      # Android FFI 库（uniffi）：HydraEngine 启停/统计 + R4 protect 钩子
+├── android/            # Android Gradle 工程（Kotlin/Compose 骨架 + cargo-ndk 脚本 + 单测）
 ├── config/             # 节点 toml 样例
 ├── deploy/             # systemd unit / Docker / install.sh / env.example / 99-hydra-bbr.conf（BBR+fq）
-└── docs/               # review（6 份审查报告）/ design / improvement / assessment / guides
+└── docs/               # review（00-09 共 10 份审查报告）/ design / improvement / assessment / guides
 ```
 
 ## 测试与质量
@@ -279,7 +280,7 @@ Hydra-Multipath-Proxy/
 cargo test --workspace
 ```
 
-**268 通过 / 0 失败**（v0.2.0；rustls 0.23 + ring 0.17 单版本收敛，clippy `--all-targets` 零告警；CI 为 Windows + Ubuntu 双矩阵，badge 见顶部）。
+**304 通过 / 0 失败**（审查 09 修复后实测；rustls 0.23 + ring 0.17 单版本收敛，clippy `--all-targets` 零告警；CI 为 Windows + Ubuntu 双矩阵，badge 见顶部）。
 
 **Linux 构建系统依赖**（tray-icon/egui 的 GTK 后端需要，CI 已内置）：
 
@@ -313,7 +314,7 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 - 分流为域名后缀版（无 GeoIP）；订阅为自有格式（不对接机场）
 - 分享链接含完整凭据时等同于交付节点，仅限可信渠道
 - TCP 链路认证失败与目标失败在客户端侧均表现为建连失败（节点侧已认证后的目标失败有 2B 应答码）
-- ~~GUI 暂仅支持自签 pin 模式~~（已支持真证书 CA 模式：设置页 trust=ca + 可选叶证书 SHA-256 硬 pin，`config.rs resolve_trust`）
+- GUI 信任双路线均已支持：自签 pin 模式（默认）+ 真证书 CA 模式（设置页 trust=ca + 可选叶证书 SHA-256 硬 pin）
 
 
 ## 开发路线
