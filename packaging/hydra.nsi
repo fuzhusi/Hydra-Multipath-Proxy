@@ -1,8 +1,10 @@
 ; Hydra Multipath Proxy — Windows installer (NSIS 3)
-; Built by CI:  makensis /DAPPVERSION=v0.2.0 packaging\hydra.nsi   (run from repo root)
+; Built by CI:  makensis /DAPPVERSION=vX.Y.Z packaging\hydra.nsi   (run from repo root)
 ; Installs: GUI + CLI + official signed wintun.dll, Start Menu & Desktop shortcuts,
 ;           uninstaller + Add/Remove Programs entry.
 ; GUI shortcut requests admin elevation (UAC) on launch — required for TUN mode.
+; 路径约定：makensis 编译期 CWD = 本脚本所在目录（packaging\），因此输入取
+; ..\dist\（仓库根 dist，CI 预先汇集 exe/wintun.dll/README），输出写 ..\dist\。
 
 Unicode true
 ManifestDPIAware true
@@ -17,7 +19,7 @@ ManifestDPIAware true
 !endif
 
 Name "${APPNAME} ${APPVERSION}"
-OutFile "dist\Hydra-Setup-${APPVERSION}-x64.exe"
+OutFile "..\dist\Hydra-Setup-${APPVERSION}-x64.exe"
 InstallDir "$PROGRAMFILES64\Hydra"
 InstallDirRegKey HKLM "Software\Hydra" "InstallDir"
 RequestExecutionLevel admin

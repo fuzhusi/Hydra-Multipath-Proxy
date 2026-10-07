@@ -43,6 +43,16 @@ jobs:
       - name: cargo build --release
         run: cargo build --release --workspace
 
+      # 汇集分发文件：主程序 + README 进 dist（便携 zip 与 NSIS 安装包共用此目录）
+      - name: 汇集构建产物到 dist
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/release/hydra-client-gui.exe dist/
+          Copy-Item target/release/hydra-client.exe dist/
+          Copy-Item README.md dist/
+          Get-ChildItem dist
+
       # 官方签名 wintun.dll（WireGuard LLC），TUN 模式必需
       - name: 下载 wintun.dll（官方 0.14.1 amd64）
         shell: pwsh
@@ -50,7 +60,6 @@ jobs:
           curl.exe -L --connect-timeout 30 --max-time 300 `
             -o wintun.zip https://www.wintun.net/builds/wintun-$($env:WINTUN_VERSION).zip
           Expand-Archive -Path wintun.zip -DestinationPath wintun-extracted -Force
-          New-Item -ItemType Directory -Path dist | Out-Null
           Copy-Item "wintun-extracted/wintun/bin/amd64/wintun.dll" dist/wintun.dll
           Get-AuthenticodeSignature dist/wintun.dll | Select-Object Status, SignerCertificate
 
@@ -66,12 +75,22 @@ jobs:
           '@ | Set-Content -Path dist/WINTUN-README.txt -Encoding utf8
           Compress-Archive -Path dist/* -DestinationPath hydra-windows-x64.zip
 
-      # NSIS 安装包：双击安装到 Program Files，自动创建快捷方式 + 卸载器
+      # NSIS 安装包：双击安装到 Program Files，自动创建快捷方式 + 卸载器。
+      # 注意：choco 装的 NSIS 在 C:\Program Files (x86)\NSIS，runner 的 PATH 在
+      # job 启动时已固定（安装期新增的 PATH 后续步骤不可见）——必须显式全路径
+      # 调用 makensis（此前 v0.2.1 tag 构建即因 makensis 不在 PATH 失败）。
       - name: 安装 NSIS
         run: choco install nsis -y --no-progress
 
       - name: 生成 NSIS 安装包
-        run: makensis /DAPPVERSION=${{ github.ref_name }} packaging\hydra.nsi
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\NSIS\makensis.exe" /DAPPVERSION=${{ github.ref_name }} packaging\hydra.nsi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path "dist/Hydra-Setup-*.exe")) {
+            Write-Error "NSIS 产物未生成到 dist/（检查 .nsi OutFile 路径）"; exit 1
+          }
+          Get-ChildItem dist
 
       - name: 上传到 GitHub Release（tag 触发时）
         if: startsWith(github.ref, 'refs/tags/')
