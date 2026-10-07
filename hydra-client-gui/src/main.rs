@@ -600,7 +600,10 @@ fn build_form_share_url(
         .with_transport(TransportChoice::Tcp);
     link.address = link_address;
     if let Some(key) = &key_bytes {
-        link = link.with_auth_key_bytes(key);
+        // 09-P3-6：非法长度显式报错（builder 不再 panic）
+        link = link
+            .with_auth_key_bytes(key)
+            .map_err(|e| e.to_string())?;
     }
     if let Some(der) = &cert_der {
         link = link.with_cert_der(der);
@@ -2237,9 +2240,12 @@ impl HydraApp {
         };
         let mut link = ShareLink::new(&node_info);
 
-        // 认证密钥（完整分享核心字段；解析失败则省略，链接退化为仅地址信息）
+        // 认证密钥（完整分享核心字段；解析失败或非法长度则省略，链接退化为仅地址信息）
         if let Ok(key) = config::resolve_auth_key(&self.config) {
-            link = link.with_auth_key_bytes(&key);
+            if key.len() == 32 {
+                // 32 字节已预检，Err 分支不可能；clone 兜底保守回退
+                link = link.clone().with_auth_key_bytes(&key).unwrap_or(link);
+            }
         }
 
         // 证书：完整模式带 DER 本体，紧凑模式只带 SHA-256 指纹
@@ -5481,6 +5487,18 @@ fn apply_dark_theme(ctx: &egui::Context) {
 async fn main() -> eframe::Result<()> {
     // 初始化日志
     tracing_subscriber::fmt::init();
+
+    // 09-P3-5：双实例互斥——双 GUI 实例会并发写配置、互相抢系统代理开关状态。
+    // 守卫存到 main 作用域直至退出。async main 里用阻塞 bind 可接受（一次性、
+    // 内核立即返回、无 await 竞争）。
+    let _instance_guard = match hydra_client::acquire_instance_guard(hydra_client::INSTANCE_PORT_GUI)
+    {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("Hydra GUI 无法启动：{e}");
+            std::process::exit(1);
+        }
+    };
 
     // 设置 panic hook，确保代理异常时清除系统代理
     let main_thread_id = std::thread::current().id();

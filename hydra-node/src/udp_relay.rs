@@ -437,7 +437,14 @@ where
         }
     }
 
-    // 连接结束：整表 drop → 各会话任务发送队列关闭而退出；回收任务显式 abort
+    // 连接结束：整表 drop → 各会话任务发送队列关闭而退出；回收任务显式 abort。
+    // overlimit_drops 连接级汇总日志（09-P3：协议层丢弃计数此前完全不可观测）
+    {
+        let drops = table.lock().unwrap().overlimit_drops;
+        if drops > 0 {
+            info!("UDP 中继连接关闭：累计协议层丢弃 {drops} 个数据报（会话满/解析超限/速率预算）");
+        }
+    }
     reaper.abort();
     drop(table);
     info!("UDP 中继连接关闭");

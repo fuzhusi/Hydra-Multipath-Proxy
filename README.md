@@ -315,6 +315,7 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 - 分享链接含完整凭据时等同于交付节点，仅限可信渠道
 - TCP 链路认证失败与目标失败在客户端侧均表现为建连失败（节点侧已认证后的目标失败有 2B 应答码）
 - GUI 信任双路线均已支持：自签 pin 模式（默认）+ 真证书 CA 模式（设置页 trust=ca + 可选叶证书 SHA-256 硬 pin）
+- **密钥落盘威胁模型（如实）**：Windows GUI 的认证密钥**明文**存于 `%APPDATA%\hydra\config.json`（依赖用户目录 ACL 保护，仅本机当前用户可读；DPAPI 加密待做）；Linux CLI 0600 文件权限；Android EncryptedSharedPreferences（Keystore 硬件级主密钥）。本机管理员/root 可读取——本工具不防本机高权限攻击者
 
 
 ## 开发路线

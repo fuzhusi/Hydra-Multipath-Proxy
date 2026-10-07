@@ -117,6 +117,15 @@ impl HydraServer {
             hydra_protocol::handshake::cert_fingerprint(leaf_der.as_ref()),
             hydra_protocol::handshake::AuthMode::from_env(), // 启动时读一次，不在每流热路径读 env
         ));
+        // 09-P3-5（协议层报告）：TCP 是唯一传输且仅实现 v3 握手——auth_mode 显式
+        // 配置为非 v3 时 TCP 监听会静默拒绝一切连接。启动期告警把配置陷阱显性化。
+        if !handler.auth_mode().accepts_v3() {
+            tracing::warn!(
+                "HYDRA_AUTH_MODE 非 v3（auth_mode={:?}）：TCP 仅支持 v3 握手，\
+                 所有 TCP 连接将被静默拒绝！如需正常服务请改为 auto/v3",
+                handler.auth_mode()
+            );
+        }
 
         // TCP/TLS 监听（唯一传输）：接受循环在 spawn_tcp_listener 内部后台运行；
         // 绑定失败显式报错（静默回落会让用户得到黑洞）。

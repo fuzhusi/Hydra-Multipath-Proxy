@@ -369,6 +369,20 @@ async fn main() -> Result<()> {
 
     let (listen_arg, nodes, p2p) = parse_args();
 
+    // 09-P3-5：TUN 模式双实例互斥——两个 TUN 实例会争抢同一 TUN 网卡与 /1
+    // 接管路由。守卫存到 main 作用域直至退出（进程死自动释放端口）。
+    let _instance_guard = if tun_enabled(&std::env::args().collect::<Vec<String>>()) {
+        match hydra_client::acquire_instance_guard(hydra_client::INSTANCE_PORT_CLI_TUN) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                error!("{e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
     let auth_key = match hydra_client::auth_key_from_env() {
         Ok(k) => k,
         Err(e) => {

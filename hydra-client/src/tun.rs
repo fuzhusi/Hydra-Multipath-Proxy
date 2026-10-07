@@ -1225,8 +1225,23 @@ fn build_icmpv6_unreachable_v6(pkt: &[u8]) -> Vec<u8> {
 /// 判断包是否为「应代答的 IPv4 UDP 包」：完整 IPv4 头（IHL≥5）、协议号 17（UDP）、
 /// 非分片（分片偏移 0 且不分片才答首个分片；后续分片一律静默丢弃——对分片代答
 /// 会让应用收到重复/错序 ICMP）。返回 None 表示包应正常投喂栈。
-fn is_unproxyable_udp_v4(pkt: &[u8]) -> bool {
-    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+/// IPv4 UDP 包的目的地址是否为私网（RFC1918/CGNAT/回环/链路本地/保留段）。
+/// 09-P3-7：此类目的不代答 ICMP 差错（详见 run_stack 分发处注释）。
+fn is_private_udp_v4_dst(pkt: &[u8]) -> bool {
+    if pkt.len() < 20 {
+        return false;
+    }
+    let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+    dst.is_loopback()
+        || dst.is_link_local()
+        || dst.is_private()
+        || dst.octets()[0] == 0
+        || (dst.octets()[0] == 100 && (64..=127).contains(&dst.octets()[1]))
+        || dst.octets()[0] & 0xf0 == 0xe0
+        || dst.octets()[0] & 0xf0 == 0xf0
+}
+
+fn is_unproxyable_udp_v4(pkt: &[u8]) -> bool {    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
         return false;
     }
     let ihl = (pkt[0] & 0x0f) as usize * 4;
@@ -1519,9 +1534,16 @@ pub async fn run_stack<T: PacketTransport>(
                             }
                         }
                     } else if is_unproxyable_udp_v4(pkt) {
-                        // IPv4 UDP：项目无 UDP-over-proxy 能力——代答 ICMPv4 port
-                        // unreachable（type 3/code 3），应用立即失败回落 TCP
-                        if let Some(icmp) = build_icmpv4_port_unreachable(pkt) {
+                        // IPv4 UDP：项目无 UDP-over-proxy 能力——公网目标代答
+                        // ICMPv4 port unreachable（type 3/code 3，RFC 792 校验
+                        // 和），应用立即失败回落 TCP。
+                        // 09-P3-7：私网目标的 UDP（正常已被私网豁免路由引回物理
+                        // 网关；到达此处 = 物理网关未知豁免未生成）**静默丢弃**——
+                        // 对内网目的回差错违反 RFC 1122/4443 对内网/受限目的的
+                        // 约束精神，且 mDNS/NBNS 等内网服务发现会持续触发噪声
+                        if is_private_udp_v4_dst(pkt) {
+                            debug!("TUN 丢弃发往私网目标的 UDP 包（无豁免路由，不代答差错）");
+                        } else if let Some(icmp) = build_icmpv4_port_unreachable(pkt) {
                             if let Err(e) = transport.send(&icmp).await {
                                 error!("TUN 写 ICMPv4 不可达失败: {}", e);
                             }

@@ -5,6 +5,45 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased] - Android M1 + 审查 09 收尾（上批遗留技术项清账）
+
+### 新增（Android M1）
+
+- **真机可跑的本地代理应用**：Compose UI（节点多行/SNI/认证密钥掩码/自签 pin 与
+  CA 双模式/证书 DER 导入/本地端口）→ 前台服务持有 HydraEngine（防 Android 11+
+  Cached App Freezer 冻结后台进程，通知栏实时流量/连接数）→ EncryptedSharedPreferences
+  密钥存储（R8 必须项：Keystore 主密钥 AES256-GCM，allowBackup=false）。
+  cargo-ndk 交叉编译 arm64-v8a + x86_64 release so；桌面 JVM 冒烟回归通过。
+
+### 修复（审查 09 上批遗留，P3 清账）
+
+- **speedtest 并发探测**（限流 4）：串行探测 N 个离线节点最坏 5N 秒/轮、恢复延迟
+  随节点数线性增长——拆分"并发探测/串行应用"后单轮 ≈ ⌈N/4⌉×5s。
+- **NAT STUN 容错**：并发探测前 3 个服务器收集成功结果（此前只取前 2 个且
+  `try_join!` 任一失败整体失败）；多服务器映射两两交叉比对防漏判。
+- **STUN 事务 ID 换 `ring::rand`**（此前时间戳+计数器 xorshift 有效熵远低于 96 位）。
+- **`proxy.rs` 远端 FIN 排水分支不再丢弃上行任务真实错误**（与对称分支一致）。
+- **share_link**：`with_auth_key_bytes` assert→Result（builder 链上非法输入显式
+  报错而非崩溃，GUI 调用点同步更新）；`with_cert_fp` 与解析侧同规则校验 64 hex；
+  域名节点 `to_node_info` 报清晰错误；`parse_base64_share_links` 失败行告警 +
+  支持 URL_SAFE_NO_PAD 变体（此前静默丢行）；`hex_encode_lower` 查表替换逐字节
+  format!（叶证书 pin 热路径）。
+- **节点**：`HYDRA_AUTH_MODE` 非 v3 启动期显式告警（TCP 仅实现 v3，此前静默拒绝
+  一切连接无迹可查）；UDP 中继连接关闭时汇总 `overlimit_drops` 日志（此前完全
+  不可观测）；fallback 伪装页补 `Date` 头（缺失即可被动统计的指纹）。
+- **TUN**：私网目标 UDP 到达栈侧（豁免路由未生成的降级场景）静默丢弃，不再对
+  内网目的回 ICMP 差错。
+- **GUI/CLI**：配置临时文件名加 pid 唯一化（修双实例并发保存交错覆写坏配置）；
+  **双实例互斥**（CLI-TUN 端口 52810 / GUI 端口 52811，内核级进程锁，崩溃自动
+  释放——防两个 TUN 实例争抢路由/两 GUI 争抢系统代理状态）。
+- **cert.rs 补测试**（此前零覆盖）：rcgen 生成真 PEM 对 → parse_pem_pair 往返
+  + 坏输入显式报错。
+
+### 文档
+
+- README 已知限制补密钥落盘威胁模型（Windows 明文/ACL、Linux 0600、Android
+  Keystore；不防本机高权限攻击者）。
+
 ## [0.2.1] - 2026-10-07
 
 > 本版本包含两批交付：**全量代码审查 09 修复**（P1 全部 7 项 + P2 主体 + 文档清账）

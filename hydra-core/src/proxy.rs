@@ -1423,10 +1423,10 @@ impl ProxyServer {
             // 现给上行一个有限排水窗口：上行自然结束（客户端 EOF → shutdown 远端
             // 写端）或超时后再中止，超时告警保留。
             (false, None) => {
-                match tokio::time::timeout(RELAY_DOWN_FIN_DRAIN, &mut up).await {
-                    Ok(r) => {
-                        let _ = join_relay_result(r);
-                    }
+                // 09-P3-4：排水结束后上行任务的真实错误不再丢弃（与 (true, None)
+                // 分支对 down 的处理对称）——客户端侧 IO 故障可见于日志与错误路径
+                let up_result = match tokio::time::timeout(RELAY_DOWN_FIN_DRAIN, &mut up).await {
+                    Ok(r) => join_relay_result(r),
                     Err(_) => {
                         up.abort();
                         let _ = up.await;
@@ -1434,10 +1434,16 @@ impl ProxyServer {
                             "[{}] Upstream drain timeout after remote FIN for {}, aborted",
                             peer_addr, masked
                         );
+                        None
+                    }
+                };
+                match up_result {
+                    Some(e) => Err(Self::relay_error(e, peer_addr, target)),
+                    None => {
+                        info!("[{}] Connection to {} closed", peer_addr, masked);
+                        Ok(())
                     }
                 }
-                info!("[{}] Connection to {} closed", peer_addr, masked);
-                Ok(())
             }
             // 传输故障：对浏览器明确断开（两个半份直接丢弃，不排水）
             (false, Some(e)) => {

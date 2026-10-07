@@ -132,6 +132,7 @@ async fn 分享链接_生成解析_凭据建链回显() {
     };
     let link = ShareLink::new(&info)
         .with_auth_key_bytes(&test_auth_key())
+        .expect("32 字节密钥合法")
         .with_cert_der(&node.cert);
     let url = link.to_share_url();
     assert!(url.starts_with("hydra://"), "分享链接 scheme: {url}");

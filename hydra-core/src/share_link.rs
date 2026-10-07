@@ -121,18 +121,18 @@ impl ShareLink {
     // ═══════════ v2 密钥字段 builder（Team-Q）═══════════
 
     /// 携带认证密钥原始字节（生成完整分享）。
-    /// 长度必须恰好 32 字节（NNpsk2 PSK 约束）；非法长度静默丢弃会让
-    /// "链接生成成功但不可用"，故直接 panic 级 assert——调用方（GUI/CLI）
-    /// 均在密钥入口做过 `auth_key_from_hex` 的 32B 校验，此处为防御性兜底。
-    pub fn with_auth_key_bytes(mut self, key: &[u8]) -> Self {
-        assert_eq!(
-            key.len(),
-            32,
-            "分享链接认证密钥必须恰好 32 字节（当前 {} 字节）；请走 auth_key_from_hex 入口完成校验",
-            key.len()
-        );
+    /// 长度必须恰好 32 字节（NNpsk2 PSK 约束）。09-P3-6：返回 `Result` 而非
+    /// panic——builder 链上的非法输入应让调用方（GUI 新增调用点）显式处理，
+    /// 而非进程崩溃。现有调用点（GUI 两处）已带 32B 校验，正常路径不变。
+    pub fn with_auth_key_bytes(mut self, key: &[u8]) -> Result<Self> {
+        if key.len() != 32 {
+            return Err(HydraError::ProtocolError(format!(
+                "分享链接认证密钥必须恰好 32 字节（当前 {} 字节）；请走 auth_key_from_hex 入口完成校验",
+                key.len()
+            )));
+        }
         self.auth_key = Some(BASE64URL.encode(key));
-        self
+        Ok(self)
     }
 
     /// 携带节点证书 DER（完整模式），同时自动写入证书指纹
@@ -142,8 +142,17 @@ impl ShareLink {
         self
     }
 
-    /// 仅携带证书指纹（紧凑模式：对方需另行导入证书并核对指纹）
+    /// 仅携带证书指纹（紧凑模式：对方需另行导入证书并核对指纹）。
+    /// 输入归一化为小写；与解析侧同规则校验 64 hex（09-P3-3）——builder 误用
+    /// 会在生成期立即报错而非产出对端无法导入的坏链接。
     pub fn with_cert_fp(mut self, fp: String) -> Self {
+        let fp = fp.trim().to_ascii_lowercase();
+        if fp.len() != 64 || !fp.bytes().all(|b| b.is_ascii_hexdigit()) {
+            panic!(
+                "with_cert_fp: 证书指纹必须为 64 位 hex（当前 {} 字符）；请传 sha256_hex 的输出",
+                fp.len()
+            );
+        }
         self.cert_fp = Some(fp);
         self
     }
@@ -263,7 +272,14 @@ impl ShareLink {
     pub fn to_node_info(&self) -> Result<NodeInfo> {
         let address: SocketAddr = format!("{}:{}", self.address, self.port)
             .parse()
-            .map_err(HydraError::AddrParseError)?;
+            .map_err(|_| {
+                // 09-P3-5：域名节点此前报裸 AddrParseError，用户无从判断原因
+                HydraError::ProtocolError(format!(
+                    "节点地址 \"{}:{}\" 不是合法的 IP:端口（域名节点暂不支持，请先解析为 IP；\
+                     IPv6 用 [::1]:443 字面量形式）",
+                    self.address, self.port
+                ))
+            })?;
 
         Ok(NodeInfo {
             address,
@@ -497,6 +513,18 @@ impl ShareLink {
             .map_err(|e| HydraError::ProtocolError(format!("Invalid UTF-8: {}", e)))?;
         Self::from_share_url(&url)
     }
+
+    /// URL_SAFE_NO_PAD 变体解码（09-P3-4：第三方生成器常用的无填充 base64url，
+    /// STANDARD 解码会因填充缺失失败）。
+    pub fn from_base64_nopad(encoded: &str) -> Result<Self> {
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|e| HydraError::ProtocolError(format!("Invalid base64url: {}", e)))?;
+        let url = String::from_utf8(decoded)
+            .map_err(|e| HydraError::ProtocolError(format!("Invalid UTF-8: {}", e)))?;
+        Self::from_share_url(&url)
+    }
 }
 
 /// 解析带范围校验的 f64 链接参数（09-P1-4）：NaN/inf/越界一律显式报错。
@@ -523,13 +551,18 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex_encode_lower(digest(&SHA256, data).as_ref())
 }
 
-/// 字节 → 小写 hex 字符串（GUI 导入 v2 链接时密钥入库用）
+/// 字节 → 小写 hex 字符串（GUI 导入 v2 链接时密钥入库用）。
+/// 09-P3-11：查表替换逐字节 `format!`——本函数位于叶证书 pin/密钥入库热路径
+/// （每连接/每探测 32 次调用），format! 的每次堆分配纯属浪费。
 pub fn hex_encode_lower(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push_str(&format!("{:02x}", b));
+        out.push(HEX[usize::from(b >> 4)]);
+        out.push(HEX[usize::from(b & 0x0f)]);
     }
-    s
+    // 查表产物必为合法 ASCII：unwrap 安全
+    String::from_utf8(out).expect("hex 查表输出恒为 UTF-8")
 }
 
 /// 解析多个分享链接（每行一个）
@@ -580,6 +613,7 @@ pub fn generate_base64_share_links(nodes: &[NodeInfo]) -> String {
 /// 解析多个Base64编码的分享链接
 pub fn parse_base64_share_links(text: &str) -> Result<Vec<ShareLink>> {
     let mut links = Vec::new();
+    let mut bad_lines = 0usize;
 
     for line in text.lines() {
         let line = line.trim();
@@ -587,14 +621,36 @@ pub fn parse_base64_share_links(text: &str) -> Result<Vec<ShareLink>> {
             continue;
         }
 
-        // 尝试解析为Base64
-        if let Ok(link) = ShareLink::from_base64(line) {
-            links.push(link);
-        }
-        // 尝试解析为URL
-        else if line.starts_with("hydra://") {
-            let link = ShareLink::from_share_url(line)?;
-            links.push(link);
+        // 尝试解析为Base64：先 STANDARD（带填充），失败再试 URL_SAFE_NO_PAD
+        //（第三方生成器常用变体）——09-P3-4：此前仅 STANDARD，变体行与坏行
+        // 一律静默消失，批量导入丢行无迹可查
+        match ShareLink::from_base64(line) {
+            Ok(link) => {
+                links.push(link);
+                continue;
+            }
+            Err(first_err) => {
+                if line.starts_with("hydra://") {
+                    let link = ShareLink::from_share_url(line)?;
+                    links.push(link);
+                    continue;
+                }
+                match ShareLink::from_base64_nopad(line) {
+                    Ok(link) => {
+                        links.push(link);
+                        continue;
+                    }
+                    Err(_) => {
+                        bad_lines += 1;
+                        // 截断防日志注入/超长刷屏；不含密钥明文（解码失败的行）
+                        tracing::warn!(
+                            "分享链接第 {} 行解析失败（base64 STANDARD: {}；URL_SAFE_NO_PAD 也失败），已跳过",
+                            bad_lines,
+                            first_err
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -796,6 +852,7 @@ hydra://192.168.1.100:8080?bandwidth=80&latency=15&loss_rate=0.02&status=online
         let cert_der: Vec<u8> = vec![0x30, 0x82, 0x01, 0xAB, 0xCD, 0xEF];
         let link = ShareLink::new_with_mode(&sample_node(), TransportMode::Obfs)
             .with_auth_key_bytes(&auth_key)
+            .expect("32 字节密钥合法")
             .with_cert_der(&cert_der)
             .with_obfs_key("second-password-密");
 
@@ -895,6 +952,7 @@ hydra://192.168.1.100:8080?bandwidth=80&latency=15&loss_rate=0.02&status=online
         // 密钥必须恰好 32 字节（NNpsk2 PSK 约束，与 auth_key_from_hex/节点侧一致）
         let url = ShareLink::new_with_mode(&sample_node(), TransportMode::Masquerade)
             .with_auth_key_bytes(&[9u8; 32])
+            .expect("32 字节密钥合法")
             .to_share_url();
         let links = parse_share_links(&format!("# 注释\n{}\n", url)).unwrap();
         assert_eq!(links.len(), 1);
@@ -903,12 +961,11 @@ hydra://192.168.1.100:8080?bandwidth=80&latency=15&loss_rate=0.02&status=online
 
     #[test]
     fn tq_v2_auth_key_length_enforced() {
-        // 生成侧：非 32 字节密钥防御性拒绝（调用方应先过 auth_key_from_hex）
-        let result = std::panic::catch_unwind(|| {
-            ShareLink::new_with_mode(&sample_node(), TransportMode::Masquerade)
-                .with_auth_key_bytes(&[9u8; 16])
-        });
-        assert!(result.is_err(), "16 字节密钥必须被拒绝");
+        // 生成侧：非 32 字节密钥显式报错（09-P3-6：assert → Result，调用方可处理）
+        let err = ShareLink::new_with_mode(&sample_node(), TransportMode::Masquerade)
+            .with_auth_key_bytes(&[9u8; 16])
+            .expect_err("16 字节密钥必须被拒绝");
+        assert!(err.to_string().contains("32 字节"), "错误应指明长度要求: {err}");
 
         // 解析侧：携带非法长度密钥的链接 → auth_key_bytes 显式报错（导入即拦截，
         // 不等对端启动/握手才发现）

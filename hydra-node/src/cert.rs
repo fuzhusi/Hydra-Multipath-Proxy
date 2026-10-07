@@ -207,3 +207,38 @@ fn warn_if_key_permissions_too_open(key_file: &Path) {
 
 #[cfg(not(unix))]
 fn warn_if_key_permissions_too_open(_key_file: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 09 审查补测（此前 cert.rs 零测试）：rcgen 生成真自签 PEM 对 →
+    /// parse_pem_pair 应产出可被 rustls 消费的证书链与私钥；
+    /// 坏输入有清晰错误而非 panic。
+    #[test]
+    fn pem_对解析_rcgen自签往返() {
+        let certified = rcgen::generate_simple_self_signed(vec!["hydra.node".into()])
+            .expect("rcgen 生成自签证书失败");
+        let cert_pem = certified.cert.pem();
+        let key_pem = certified.key_pair.serialize_pem();
+
+        let (chain, key_der) =
+            parse_pem_pair(cert_pem.as_bytes(), key_pem.as_bytes()).expect("合法 PEM 对应解析成功");
+        assert!(!chain.is_empty(), "证书链至少含叶证书");
+        // 叶证书 DER 与 PEM 内容一致（指纹可复算）
+        assert_eq!(fingerprint_hex(chain[0].as_ref()).len(), 64);
+        assert!(!key_der.secret_der().is_empty(), "私钥 DER 非空");
+    }
+
+    #[test]
+    fn pem_空证书与坏输入_显式报错不panic() {
+        // 空证书文件
+        let err = parse_pem_pair(b"", b"").expect_err("空输入必须报错");
+        assert!(err.to_string().contains("未找到任何证书"), "错误信息应指明原因: {err}");
+        // 有证书无合法私钥
+        let certified = rcgen::generate_simple_self_signed(vec!["hydra.node".into()]).unwrap();
+        let err = parse_pem_pair(certified.cert.pem().as_bytes(), b"not a key")
+            .expect_err("坏私钥必须报错");
+        assert!(!err.to_string().is_empty());
+    }
+}

@@ -331,7 +331,10 @@ pub fn save_to_file(path: &Path, cfg: &GuiConfig) -> Result<(), String> {
     // 全部节点、订阅一次性丢失。现先写同目录临时文件并 sync_all 落盘，再
     // rename 原子替换（同文件系统内 rename 原子；Windows 下 std::fs::rename
     // 以 MOVEFILE_REPLACE_EXISTING 语义覆盖旧文件）。
-    let tmp = path.with_extension("json.tmp");
+    // 临时文件名带进程号（09-P3-2）：固定名 `config.json.tmp` 在双实例并发保存
+    // 时互相交错覆写，后到的 rename 会用坏文件替换好配置。pid 唯一化后各写各的
+    // tmp，rename 原子性由文件系统保证。
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     #[cfg(unix)]
     {
         use std::io::Write;

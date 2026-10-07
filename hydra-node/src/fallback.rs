@@ -100,21 +100,64 @@ footer { text-align:center; padding:32px 24px 48px; color:#a49e8f;
 </html>
 "#;
 
+/// 当前 UTC 时间的 RFC 7231 IMF-fixdate（`Tue, 15 Nov 1994 08:12:31 GMT`）。
+/// std 无 httpdate 格式化；手写 civil-from-days（Howard Hinnant 算法）避免引
+/// chrono。09-P3-10：真实 HTTP 服务 SHOULD 携带 Date——缺它本身就是可被动
+/// 统计的指纹。
+fn http_date_now() -> String {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // civil-from-days：z 为自 1970-03-01 起的天数偏移技巧
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mth <= 2 { y + 1 } else { y };
+    let weekday = ((days % 7) + 4) % 7; // 1970-01-01 是周四
+    format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+        DAYS[weekday as usize],
+        d,
+        MONTHS[(mth - 1) as usize],
+        y,
+        h,
+        m,
+        s
+    )
+}
+
 /// 写出完整的 HTTP/1.1 200 静态页响应（状态行 + 头 + body 后正常关闭由
 /// 调用方负责）。泛型 `W` 使 TLS 流（含 split 后的写半）均可直接使用。
 ///
-/// 头部固定：`Content-Type: text/html; charset=utf-8`、`Content-Length`（与
-/// body 字节数严格一致）、`Connection: close`——探测者无论发什么（哪怕不足
-/// 以构成 HTTP 请求），都得到同一响应，这是标准反代行为。
+/// 头部固定：`Date`（RFC 7231，09-P3-10 补齐——真实 HTTP 服务 SHOULD 有，缺失
+/// 即可被动统计的指纹）、`Content-Type: text/html; charset=utf-8`、
+/// `Content-Length`（与 body 字节数严格一致）、`Connection: close`——探测者
+/// 无论发什么（哪怕不足以构成 HTTP 请求），都得到同一响应，这是标准反代行为。
 pub async fn http_serve_fallback<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {
     use tokio::io::AsyncWriteExt;
     let response = format!(
         "HTTP/1.1 200 OK\r\n\
+         Date: {}\r\n\
          Content-Type: text/html; charset=utf-8\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
+        http_date_now(),
         FALLBACK_HTML.len(),
         FALLBACK_HTML
     );

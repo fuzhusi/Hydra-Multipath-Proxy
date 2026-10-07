@@ -150,10 +150,37 @@ async fn probe_connect(
     Ok(start.elapsed())
 }
 
+/// 单轮探测的最大并发数（09-P3-7）：串行探测 N 个离线节点最坏 5N 秒/轮，
+/// 超过探测间隔时背靠背不间断、恢复延迟随节点数线性增长。限流并发后单轮
+/// 耗时 ≈ ⌈N/并发⌉ × 5s；评分/状态写回仍在单线程收敛（无共享可变状态）。
+pub const MAX_CONCURRENT_PROBES: usize = 4;
+
+/// 单次探测的网络部分（并发任务内执行；不带任何共享可变状态）。
+#[derive(Debug)]
+enum ProbeOutcome {
+    Reachable(Duration),
+    Failed(String),
+    TimedOut,
+}
+
+async fn probe_node(
+    addr: SocketAddr,
+    sni: &str,
+    trust: &crate::tcp_transport::TlsTrust,
+    auth_key: &[u8],
+) -> ProbeOutcome {
+    match tokio::time::timeout(PROBE_TIMEOUT, probe_connect(addr, sni, trust, auth_key)).await {
+        Ok(Ok(d)) => ProbeOutcome::Reachable(d),
+        Ok(Err(e)) => ProbeOutcome::Failed(e),
+        Err(_) => ProbeOutcome::TimedOut,
+    }
+}
+
 /// 启动常驻探测任务（随 ProxyServer::start 调用）。
 ///
 /// 探测走完整链路（TCP+TLS+Noise-PSK，证书 pinning 与主链路一致）；`traffic`
 /// 为中继计数同一实例，按节点字节计数是吞吐差分的数据源。任务永不返回，随 runtime 关闭而结束。
+/// 每轮：并发探测（限流 [`MAX_CONCURRENT_PROBES`]）→ 单线程按序应用状态/评分。
 pub fn spawn_recovery_probe(
     scheduler: Arc<Scheduler>,
     trust: crate::tcp_transport::TlsTrust,
@@ -166,15 +193,17 @@ pub fn spawn_recovery_probe(
         let speedtest_enabled = speedtest_enabled_from_env();
         if speedtest_enabled {
             info!(
-                "恢复探测器已启动（间隔 {}s±20% 抖动，单次超时 {}s，完整握手探测，测速评分开启）",
+                "恢复探测器已启动（间隔 {}s±20% 抖动，单次超时 {}s，完整握手探测，并发 {}，测速评分开启）",
                 interval.as_secs(),
-                PROBE_TIMEOUT.as_secs()
+                PROBE_TIMEOUT.as_secs(),
+                MAX_CONCURRENT_PROBES
             );
         } else {
             info!(
-                "恢复探测器已启动（间隔 {}s±20% 抖动，单次超时 {}s，完整握手探测，测速评分关闭）",
+                "恢复探测器已启动（间隔 {}s±20% 抖动，单次超时 {}s，完整握手探测，并发 {}，测速评分关闭）",
                 interval.as_secs(),
-                PROBE_TIMEOUT.as_secs()
+                PROBE_TIMEOUT.as_secs(),
+                MAX_CONCURRENT_PROBES
             );
         }
         let mut consecutive_failures: HashMap<SocketAddr, u32> = HashMap::new();
@@ -188,76 +217,86 @@ pub fn spawn_recovery_probe(
             let sleep_ms = ((interval.as_millis() as i64) + offset).max(500) as u64;
             tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
 
-            for node in scheduler.get_all_nodes().await {
+            // ── 并发探测阶段：全部节点一起发探测，信号量限流 ──
+            let nodes = scheduler.get_all_nodes().await;
+            let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROBES));
+            let mut set = tokio::task::JoinSet::new();
+            for node in nodes {
+                let sem = sem.clone();
+                let trust = trust.clone();
+                let sni = sni.clone();
+                let auth_key = auth_key.clone();
+                set.spawn(async move {
+                    // permit 在探测全程持有（离开作用域自动释放）
+                    let _permit = sem.acquire().await;
+                    let outcome = probe_node(node.address, &sni, &trust, &auth_key).await;
+                    (node, outcome)
+                });
+            }
+            // ── 应用阶段：单线程按完成顺序收敛状态/评分（网络等待已全部并行）──
+            while let Some(joined) = set.join_next().await {
+                let (node, outcome) = match joined {
+                    Ok(r) => r,
+                    Err(e) => {
+                        debug!("探测任务 join 失败（忽略本轮该节点）: {e}");
+                        continue;
+                    }
+                };
                 if matches!(node.status, NodeStatus::Online) {
-                    // 09-P2-3：Online 节点同样纳入活性探测（测速关闭时此前
-                    // 零活性探测，死节点恒被选中）；连续失败达阈值转 Degraded
-                    probe_online_node(
+                    apply_online_probe(
                         &scheduler,
                         &traffic,
-                        &trust,
-                        &sni,
-                        &auth_key,
                         &node,
+                        outcome,
                         speedtest_enabled,
                         &mut online_failures,
                         &mut last_offline_event,
                         &mut throughput,
                     )
                     .await;
-                    continue;
+                } else {
+                    apply_offline_probe(
+                        &scheduler,
+                        &node,
+                        outcome,
+                        speedtest_enabled,
+                        &mut consecutive_failures,
+                        &mut last_offline_event,
+                    )
+                    .await;
                 }
-                // 非 Online 节点：恢复探测（测速开启时顺带以实测时延更新延迟）
-                probe_offline_node(
-                    &scheduler,
-                    &trust,
-                    &sni,
-                    &auth_key,
-                    &node,
-                    speedtest_enabled,
-                    &mut consecutive_failures,
-                    &mut last_offline_event,
-                )
-                .await;
             }
         }
     });
 }
 
-/// Online 节点活性探测 + 测速：完整握手探测；连续失败达阈值转 Degraded。
+/// Online 节点探测结果应用：连续失败达阈值转 Degraded；成功清除计数。
 /// 测速开启时写回评分（主动完整握手时延 + 被动吞吐差分 + 衰减 loss）。
 #[allow(clippy::too_many_arguments)]
-async fn probe_online_node(
+async fn apply_online_probe(
     scheduler: &Scheduler,
     traffic: &TrafficMonitor,
-    trust: &crate::tcp_transport::TlsTrust,
-    sni: &str,
-    auth_key: &[u8],
     node: &NodeInfo,
+    outcome: ProbeOutcome,
     speedtest_enabled: bool,
     online_failures: &mut HashMap<SocketAddr, u32>,
     last_offline_event: &mut HashMap<SocketAddr, Instant>,
     throughput: &mut HashMap<SocketAddr, ThroughputTracker>,
 ) {
     let addr = node.address;
-    let rtt = match tokio::time::timeout(PROBE_TIMEOUT, probe_connect(addr, sni, trust, auth_key))
-        .await
-    {
-        Ok(Ok(d)) => {
+    let rtt = match outcome {
+        ProbeOutcome::Reachable(d) => {
             online_failures.remove(&addr);
             Some(d)
         }
-        Ok(Err(e)) => {
+        ProbeOutcome::Failed(e) => {
             let fails = online_failures.entry(addr).or_insert(0);
             *fails += 1;
-            debug!(
-                "节点 {} 活性探测失败（第 {} 次）: {}",
-                addr, *fails, e
-            );
+            debug!("节点 {addr} 活性探测失败（第 {} 次）: {e}", *fails);
             if *fails >= MAX_CONSECUTIVE_FAILURES {
                 warn!(
-                    "节点 {} 连续 {} 次活性探测失败，转 Degraded（继续探测，成功即恢复）",
-                    addr, *fails
+                    "节点 {addr} 连续 {} 次活性探测失败，转 Degraded（继续探测，成功即恢复）",
+                    *fails
                 );
                 scheduler.update_node_status(&addr, NodeStatus::Degraded).await;
                 online_failures.remove(&addr);
@@ -267,18 +306,17 @@ async fn probe_online_node(
                 return;
             }
             if speedtest_enabled {
-                // 探测失败记一次 loss 事件（不改状态，未达阈值）
                 last_offline_event.insert(addr, Instant::now());
             }
             None
         }
-        Err(_) => {
+        ProbeOutcome::TimedOut => {
             let fails = online_failures.entry(addr).or_insert(0);
             *fails += 1;
             if *fails >= MAX_CONSECUTIVE_FAILURES {
                 warn!(
-                    "节点 {} 连续 {} 次活性探测超时，转 Degraded（继续探测，成功即恢复）",
-                    addr, *fails
+                    "节点 {addr} 连续 {} 次活性探测超时，转 Degraded（继续探测，成功即恢复）",
+                    *fails
                 );
                 scheduler.update_node_status(&addr, NodeStatus::Degraded).await;
                 online_failures.remove(&addr);
@@ -317,8 +355,7 @@ async fn probe_online_node(
     if rtt.is_some() || measured_bw.is_some() {
         let score = bandwidth * 0.5 - latency * 0.3 - loss_rate * 0.2;
         info!(
-            "节点 {} 测速写回：rtt {}ms，吞吐 {:.1}Mbps，loss {:.3}，评分 {:.1}",
-            addr,
+            "节点 {addr} 测速写回：rtt {}ms，吞吐 {:.1}Mbps，loss {:.3}，评分 {:.1}",
             rtt.map_or(-1.0, |d| d.as_secs_f64() * 1000.0),
             measured_bw.unwrap_or(-1.0),
             loss_rate,
@@ -326,34 +363,27 @@ async fn probe_online_node(
         );
     } else {
         debug!(
-            "节点 {} 本窗口无实测数据，仅 loss 衰减写回（{:.3}）",
-            addr, loss
+            "节点 {addr} 本窗口无实测数据，仅 loss 衰减写回（{loss:.3}）"
         );
     }
 }
 
-/// 非 Online 节点恢复探测（A2 原逻辑）；测速开启时以实测时延顺带更新延迟。
-#[allow(clippy::too_many_arguments)]
-async fn probe_offline_node(
+/// 非 Online 节点探测结果应用（A2 恢复语义）；测速开启时以实测时延更新延迟。
+async fn apply_offline_probe(
     scheduler: &Scheduler,
-    trust: &crate::tcp_transport::TlsTrust,
-    sni: &str,
-    auth_key: &[u8],
     node: &NodeInfo,
+    outcome: ProbeOutcome,
     speedtest_enabled: bool,
     consecutive_failures: &mut HashMap<SocketAddr, u32>,
     last_offline_event: &mut HashMap<SocketAddr, Instant>,
 ) {
     let addr = node.address;
-    let attempt = tokio::time::timeout(PROBE_TIMEOUT, probe_connect(addr, sni, trust, auth_key));
-    match attempt.await {
-        Ok(Ok(rtt)) => {
+    match outcome {
+        ProbeOutcome::Reachable(rtt) => {
             let rtt = if speedtest_enabled { Some(rtt) } else { None };
             consecutive_failures.remove(&addr);
-            scheduler
-                .update_node_status(&addr, NodeStatus::Online)
-                .await;
-            info!("节点 {} 探测成功，恢复 Online", addr);
+            scheduler.update_node_status(&addr, NodeStatus::Online).await;
+            info!("节点 {addr} 探测成功，恢复 Online");
             if let Some(rtt) = rtt {
                 // 刚恢复的节点先以实测 RTT 修正延迟，其余字段沿用静态值
                 let (_, latency, loss_rate, load) =
@@ -363,13 +393,13 @@ async fn probe_offline_node(
                     .await;
             }
         }
-        Ok(Err(e)) => {
+        ProbeOutcome::Failed(e) => {
             if speedtest_enabled {
                 last_offline_event.insert(addr, Instant::now());
             }
-            record_failure(scheduler, consecutive_failures, addr, &e.to_string()).await;
+            record_failure(scheduler, consecutive_failures, addr, &e).await;
         }
-        Err(_) => {
+        ProbeOutcome::TimedOut => {
             if speedtest_enabled {
                 last_offline_event.insert(addr, Instant::now());
             }

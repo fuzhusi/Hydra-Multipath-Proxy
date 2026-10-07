@@ -40,24 +40,16 @@ pub enum NatType {
     Symmetric,
 }
 
-/// 简易熵源（不引 rand 依赖）：时间纳秒 + 栈地址 + 进程级计数器，xorshift 混合。
-/// 事务 ID 只需「本次探测内唯一」，不承担密码学职责（响应按 tx_id 匹配防串扰）。
+/// 事务 ID：`ring::rand::SystemRandom` 密码学随机（09-P3-1：此前为时间戳+栈
+/// 地址+计数器的 xorshift——熵源相关性使有效熵远低于 96 位；事务 ID 虽"只承担
+/// 防串扰"，但打洞凭据语义在演进，直接给足熵免得未来升级踩坑。ring 已在依赖
+/// 树内，零新增成本）。
 fn random_tx_id() -> [u8; TX_ID_LEN] {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let mut state = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0xDEAD_BEEF)
-        ^ (&COUNTER as *const _ as u64)
-        ^ (COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    use ring::rand::{SecureRandom, SystemRandom};
     let mut id = [0u8; TX_ID_LEN];
-    for chunk in id.chunks_mut(8) {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
-    }
+    SystemRandom::new()
+        .fill(&mut id)
+        .expect("SystemRandom 不可用（OS 熵源故障）——进程级致命，panic 合理");
     id
 }
 

@@ -227,23 +227,65 @@ pub async fn discover_public_address(stun_addrs: &[SocketAddr]) -> Result<(Socke
 
 /// 同 [`discover_public_address`]，额外返回探测所用本地 socket 地址
 /// （打洞时 listener 须绑定同一端口以复用 NAT 映射）。
+/// 公网地址发现 + NAT 行为分类。
+///
+/// 09-P3-3：并发探测**前 3 个**服务器（此前只取前 2 个且 `try_join!` 任一失败
+/// 整体失败——第 1 个服务器宕机会把打洞功能整体打入中继回落）。收集全部成功
+/// 结果后两两比对：任何一对映射不一致即判 Symmetric；全部一致才判 EIM。
+/// 单服务器成功 → 保守 Symmetric（无法比较映射行为）。
 pub async fn discover_full(stun_addrs: &[SocketAddr]) -> Result<Discovery> {
     if stun_addrs.is_empty() {
         return Err(HydraError::ConnectionError(
             "无可用 STUN 服务器，公网地址发现失败（检查 HYDRA_STUN_ADDRS）".into(),
         ));
     }
-    if stun_addrs.len() == 1 {
-        let mut d = probe_one(stun_addrs[0]).await?;
-        d.nat = NatType::Symmetric; // 单服务器无法比较映射行为：保守回落中继
-        return Ok(d);
+    let mut set = tokio::task::JoinSet::new();
+    for &s in stun_addrs.iter().take(3) {
+        set.spawn(probe_one(s));
     }
-    let (a, b) = tokio::try_join!(probe_one(stun_addrs[0]), probe_one(stun_addrs[1]))?;
-    Ok(Discovery {
-        mapped: a.mapped,
-        local: a.local,
-        nat: stun::classify(a.mapped, b.mapped),
-    })
+    let mut ok: Vec<Discovery> = Vec::new();
+    let mut first_err: Option<String> = None;
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok(d)) => ok.push(d),
+            Ok(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(e.to_string());
+                }
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(format!("探测任务失败: {e}"));
+                }
+            }
+        }
+    }
+    match ok.len() {
+        0 => Err(HydraError::ConnectionError(format!(
+            "全部 STUN 服务器探测失败（{} 个；首个错误: {}）",
+            stun_addrs.len().min(3),
+            first_err.unwrap_or_else(|| "未知".into())
+        ))),
+        1 => {
+            let mut d = ok.remove(0);
+            d.nat = NatType::Symmetric; // 单服务器无法比较映射行为：保守回落中继
+            Ok(d)
+        }
+        _ => {
+            let mut d = ok.remove(0);
+            let mut nat = stun::classify(d.mapped, ok[0].mapped);
+            for other in &ok[1..] {
+                // 任一服务器对映射不一致 → 对称型（多服务器交叉验证，防
+                // "恰好抽到两个一致的服务器"漏判）
+                if matches!(stun::classify(d.mapped, other.mapped), NatType::Symmetric) {
+                    nat = NatType::Symmetric;
+                    break;
+                }
+            }
+            d.nat = nat;
+            Ok(d)
+        }
+    }
 }
 
 // ── 节点信令（客户端侧最小实现，与 hydra_node::signal 线格式一致）──────────

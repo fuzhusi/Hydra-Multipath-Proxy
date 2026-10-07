@@ -131,6 +131,37 @@ pub fn hide_console_window(cmd: &mut std::process::Command) -> &mut std::process
     cmd
 }
 
+// ── 双实例互斥（09-P3-5）────────────────────────────────────────────────────
+
+/// 双实例互斥守卫：持有即代表本进程是唯一实例（守卫 drop / 进程退出自动释放）。
+/// 实现为**绑定固定回环端口**的进程锁——内核保证端口独占，比锁文件可靠
+/// （崩溃残留的锁文件会永久阻塞下次启动，端口随进程死自动归还）。
+pub struct InstanceGuard {
+    _listener: std::net::TcpListener,
+}
+
+/// CLI TUN 模式互斥端口：两个 TUN 实例会争抢同一 TUN 网卡与 /1 接管路由
+/// （第二实例路由失败半途退出虽安全，但期间路由可能指向错误适配器）。
+pub const INSTANCE_PORT_CLI_TUN: u16 = 52810;
+/// GUI 互斥端口：双 GUI 实例会并发写配置（虽已 pid 唯一化）且互相抢系统代理
+/// 开关状态，单实例语义更安全。
+pub const INSTANCE_PORT_GUI: u16 = 52811;
+
+/// 尝试取得实例互斥。已有一实例在运行 → Err（携带用户可读信息）；
+/// 其余绑定错误原样透传。守卫须由调用方保存到 main 作用域直至退出。
+pub fn acquire_instance_guard(port: u16) -> Result<InstanceGuard, String> {
+    std::net::TcpListener::bind(("127.0.0.1", port))
+        .map(|listener| InstanceGuard { _listener: listener })
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                format!("已有 Hydra 实例在运行（互斥端口 {port} 被占用）——请先退出已有实例；\
+                         若确认没有，可能是其他程序占用了该端口")
+            } else {
+                format!("实例互斥端口 {port} 绑定失败: {e}")
+            }
+        })
+}
+
 /// Windows 系统代理是否已启用（HKCU Internet Settings ProxyEnable=0x1）。
 /// TUN 全流量接管与系统代理叠加会形成环路，GUI 据此展示与 CLI 一致的告警。
 /// 审查修复：精确比较 REG_DWORD 数值——此前 `contains("0x1")` 会把
