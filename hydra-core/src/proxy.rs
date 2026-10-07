@@ -39,8 +39,12 @@ struct TcpCreds {
 /// 与节点侧 pump 一致；1000 并发常驻缓冲从 128MB 降到 32MB，64KB 无收益
 const RELAY_BUF: usize = 16 * 1024;
 
-/// HTTP 头部区最大长度（防恶意超大头部无限累积）
+    /// HTTP 头部区最大长度（防恶意超大头部无限累积）
 const MAX_HTTP_HEAD: usize = 64 * 1024;
+/// HTTP 头阶段**总时限**（09-P2-1 slowloris 修复）：此前每段读各自重置 30s
+/// 超时且无总时长约束，攻击者每 29s 发 1 字节可让单连接合法存续约 22 天
+/// （64KB × 29s），task+FD+缓冲常驻。总时限 30s 内头必须读完。
+const HTTP_HEAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// 半关闭排水阶段等待另一方向的超时（浏览器已关写侧后，剩余响应应在此窗口内到齐）
 const RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// 初始读超时（审查 R-39，Wave 3 修复）：协议探测 / HTTP 头循环 / SOCKS5 请求
@@ -55,20 +59,42 @@ const RELAY_DOWN_FIN_DRAIN: Duration = Duration::from_secs(5);
 const TARGET_UNREACH_FAILOVER_THRESHOLD: u32 = 3;
 
 /// 同一目标"连续不可达"计数表（审查 06-P2-1）。进程级共享：key 为目标字符串。
-fn target_unreach_counts() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
-    static COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> =
-        std::sync::OnceLock::new();
+/// 09-P1-3：value 带 (计数, 最近写入时刻)——**容量上限 + TTL 惰性过期**。
+/// 此前 key 空间无界（客户端提交的任意目标串）且只增不减：`--listen 0.0.0.0`
+/// 时任意 LAN 主机每连接提交一个唯一且必然被拒的目标（随机子域/私网 IP），
+/// 每条约 350B 永久驻留，分钟级即可注入数百 MB 内存。
+const TARGET_UNREACH_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const TARGET_UNREACH_MAX_ENTRIES: usize = 100_000;
+
+fn target_unreach_counts()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>> {
+    static COUNTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>,
+    > = std::sync::OnceLock::new();
     COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// 记录一次目标不可达，返回该目标当前连续不可达次数。
+/// 记录一次目标不可达，返回该目标当前连续不可达次数（TTL 内）。
+/// 超过 TTL 未再失败的计数视为过期归零；容量达上限时先清过期项，仍满则
+/// 整表清空（仅攻击流量可触达，语义损失可接受）。
 fn record_target_unreachable(target: &str) -> u32 {
     let mut map = target_unreach_counts()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let c = map.entry(target.to_string()).or_insert(0);
-    *c = c.saturating_add(1);
-    *c
+    let now = std::time::Instant::now();
+    if map.len() >= TARGET_UNREACH_MAX_ENTRIES {
+        map.retain(|_, (_, t)| now.duration_since(*t) < TARGET_UNREACH_TTL);
+        if map.len() >= TARGET_UNREACH_MAX_ENTRIES {
+            map.clear();
+        }
+    }
+    let entry = map.entry(target.to_string()).or_insert((0, now));
+    if now.duration_since(entry.1) >= TARGET_UNREACH_TTL {
+        entry.0 = 0; // 过期：重新计数
+    }
+    entry.0 = entry.0.saturating_add(1);
+    entry.1 = now;
+    entry.0
 }
 
 /// 目标在某节点连接成功：清除其连续不可达计数。
@@ -83,10 +109,9 @@ fn clear_target_unreachable(target: &str) {
 /// 一次性跨节点重试。达阈值时**立即重置计数**（"命中即重置"语义，06-P2-1
 /// 承诺此前未实现——计数只增不减导致偶发目标失败被永久放大为每请求 3 节点
 /// 全握手）。返回 true = 本次允许继续尝试下一节点；false = 直接报错给客户端。
-/// 时间窗说明：并发突发下多个请求可能各自命中一次阈值（最多放大 MAX_NODE_
-/// ATTEMPTS × 在途请求数），实现 60s 时间窗需将计数表改为 `(u32, Instant)`
-/// 并在所有读写路径加时钟比较——收益有限、侵入面大，故以注释说明取舍，
-/// 保持一次性重置语义即可。
+/// 时间窗：09-P1-3 起计数表带 60s TTL——过期目标的计数自动归零，并发突发
+/// 下"命中即重置"仍可能短暂放大 MAX_NODE_ATTEMPTS × 在途请求数（原注释
+/// 取舍保留，侵入面与收益不变）。
 fn record_and_should_failover(target: &str) -> bool {
     let consecutive = record_target_unreachable(target);
     if consecutive >= TARGET_UNREACH_FAILOVER_THRESHOLD {
@@ -216,12 +241,14 @@ impl ProxyServer {
             .clone()
             .unwrap_or_else(|| Arc::new(TrafficMonitor::new()));
 
-        // A2：Offline 节点自动恢复探测 + 测速评分（常驻后台任务；start 是 &self，故用 Arc clone）。
-        // HYDRA_SPEEDTEST=0 时退回纯恢复探测，评分维持静态初始值。
+        // A2：Offline 节点自动恢复探测 + Online 节点活性探测 + 测速评分（常驻后台任务；
+        // start 是 &self，故用 Arc clone）。HYDRA_SPEEDTEST=0 时仍做活性探测，
+        // 评分维持静态初始值。
         crate::speedtest::spawn_recovery_probe(
             self.scheduler.clone(),
             trust,
             self.sni.clone(),
+            creds.auth_key.clone(),
             traffic.clone(),
         );
 
@@ -269,7 +296,9 @@ impl ProxyServer {
             }
             let node = NodeInfo {
                 address: *addr,
-                bandwidth: 100.0 - idx as f64 * 10.0,
+                // 09-P3-6：第 11+ 个节点此前会得到 ≤0 的负初始带宽（评分面观感
+                // 异常，测速关闭时永久负分）；下限 10.0
+                bandwidth: (100.0 - idx as f64 * 10.0).max(10.0),
                 latency: 10.0,
                 loss_rate: 0.01,
                 load: 0.5,
@@ -464,6 +493,17 @@ impl ProxyServer {
                         );
                         return Err(e);
                     }
+                    // 09-P3-3：本地请求侧错误（如目标串超长 MAX_TARGET_LEN 的
+                    // 协议编码失败）与节点传输故障区分——此前一律
+                    // mark_node_offline，畸形 Host 头即可把健康候选连锁误标
+                    // Offline；协议错误换节点同样无意义，直接报错。
+                    if matches!(e, HydraError::ProtocolError(_)) {
+                        warn!(
+                            "[{}] Local protocol error (node {} healthy, no failover): {}",
+                            peer_addr, node.address, e
+                        );
+                        return Err(e);
+                    }
                     warn!(
                         "[{}] Node {} tcp/tls connect failed ({}), failing over to next node",
                         peer_addr, node.address, e
@@ -493,6 +533,9 @@ impl ProxyServer {
         // 与头部同批到达的二进制 body 会被 U+FFFD 替换而损坏；现仅解析用 lossy 视图，转发发原始字节。
         let mut raw: Vec<u8> = initial_buf[..initial_len].to_vec();
         let mut header_end = find_header_end(&raw);
+        // 09-P2-1：头阶段总 deadline——逐段读超时只防单段挂起，防不了
+        // "每段都在 29s 时到达 1 字节"的慢滴；整个头循环共用一个 deadline。
+        let head_deadline = tokio::time::Instant::now() + HTTP_HEAD_TOTAL_TIMEOUT;
         while header_end.is_none() {
             if raw.len() > MAX_HTTP_HEAD {
                 error!("[{}] HTTP head too large ({} bytes)", peer_addr, raw.len());
@@ -500,8 +543,12 @@ impl ProxyServer {
                 return Err(HydraError::ProtocolError("HTTP head too large".to_string()));
             }
             let mut buf = [0u8; 4096];
-            // R-39：头循环每段读同样包超时（头部可分多段到达，逐段计时）
-            let n = match tokio::time::timeout(INITIAL_READ_TIMEOUT, stream.read(&mut buf)).await {
+            // R-39：头循环每段读同样包超时；同时受总 deadline 约束（取更早者）
+            let segment = head_deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or_default();
+            let read_timeout = segment.min(INITIAL_READ_TIMEOUT);
+            let n = match tokio::time::timeout(read_timeout, stream.read(&mut buf)).await {
                 Ok(Ok(n)) => n,
                 Ok(Err(e)) => {
                     error!("[{}] Failed to read HTTP request: {}", peer_addr, e);
@@ -510,7 +557,7 @@ impl ProxyServer {
                 Err(_) => {
                     return Err(HydraError::ConnectionError(format!(
                         "[{}] HTTP header read timeout ({:?})",
-                        peer_addr, INITIAL_READ_TIMEOUT
+                        peer_addr, HTTP_HEAD_TOTAL_TIMEOUT
                     )));
                 }
             };
@@ -586,8 +633,8 @@ impl ProxyServer {
         // 普通 HTTP 请求 (GET, POST etc.)
         // 对于 HTTP GET/POST，我们需要将请求转发到目标服务器
         // 从 URL 或 Host header 中提取主机名
-        let target_host = if let Some(without_protocol) = url.strip_prefix("http://") {
-            // 从 http://host/path 中提取 host
+        let mut authority = if let Some(without_protocol) = url.strip_prefix("http://") {
+            // 从 http://host/path 中提取 authority
             match without_protocol.find('/') {
                 Some(pos) => without_protocol[..pos].to_string(),
                 None => without_protocol.to_string(),
@@ -603,6 +650,66 @@ impl ProxyServer {
                 .map(|line| line[5..].trim().to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         };
+        // 09-P3-2：剥 userinfo（http://user:pass@host/ 的 authority 含凭据段；
+        // userinfo 不允许未编码 '@'，rsplit_once 取末段即 host）。此前不剥，
+        // host:port 解析会把 "user:pass@host" 误拆为 (user, pass@host)。
+        if let Some((_, host_part)) = authority.rsplit_once('@') {
+            authority = host_part.to_string();
+        }
+
+        // 解析主机名和端口（09-P3-2 重写）：
+        // - SocketAddr 形态（含 [v6]:port）直接解析；
+        // - "[v6]" / "[v6]:port"：取 ']' 前为 host；
+        // - "host:port"：rsplit_once 取**末个**冒号（裸 v6 无括号属非法 Host，
+        //   rsplit 得空 host → 拒绝），端口必须完全为数字，非法显式 400——
+        //   此前 splitn(2)+unwrap_or(80) 会把 "evil.com:443x" 静默改连 80 端口、
+        //   把裸 "::1" 拆出空 host。
+        let parse_failure = |peer_addr: SocketAddr, authority: &str| {
+            error!(
+                "[{}] Invalid HTTP authority (bad port form): {}",
+                peer_addr,
+                mask_target(authority)
+            );
+        };
+        let (target_addr_str, default_port) = if let Ok(addr) = authority.parse::<SocketAddr>() {
+            (addr.ip().to_string(), addr.port())
+        } else if authority.starts_with('[') {
+            match authority.rsplit_once(']') {
+                Some((inner, rest)) => {
+                    let host = inner.strip_prefix('[').unwrap_or(inner).to_string();
+                    match rest.strip_prefix(':') {
+                        Some(p) => match p.parse::<u16>() {
+                            Ok(port) => (host, port),
+                            Err(_) => {
+                                parse_failure(peer_addr, &authority);
+                                let _ = stream
+                                    .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                                    .await;
+                                return Err(HydraError::ProtocolError(
+                                    "Invalid authority port".to_string(),
+                                ));
+                            }
+                        },
+                        None => (host, 80u16),
+                    }
+                }
+                None => (authority.clone(), 80u16),
+            }
+        } else if let Some((h, p)) = authority.rsplit_once(':') {
+            match (h.is_empty(), p.parse::<u16>()) {
+                (false, Ok(port)) => (h.to_string(), port),
+                _ => {
+                    parse_failure(peer_addr, &authority);
+                    let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+                    return Err(HydraError::ProtocolError(
+                        "Invalid authority host/port".to_string(),
+                    ));
+                }
+            }
+        } else {
+            (authority.clone(), 80u16)
+        };
+        let target_host = authority;
 
         info!(
             "[{}] >>> HTTP {} request to {}",
@@ -614,17 +721,6 @@ impl ProxyServer {
             "[{}] >>> HTTP {} request (plaintext): {}",
             peer_addr, method, target_host
         );
-
-        // 解析主机名和端口（兼容 IPv6 字面量 "[::1]:8080"）
-        let (target_addr_str, default_port) =
-            if let Ok(addr) = target_host.parse::<std::net::SocketAddr>() {
-                (addr.ip().to_string(), addr.port())
-            } else if target_host.contains(':') {
-                let parts: Vec<&str> = target_host.splitn(2, ':').collect();
-                (parts[0].to_string(), parts[1].parse::<u16>().unwrap_or(80))
-            } else {
-                (target_host.clone(), 80u16)
-            };
 
         // 发送目标地址到服务器（包含端口）
         let target_with_port = format!("{}:{}", target_addr_str, default_port);
@@ -686,7 +782,7 @@ impl ProxyServer {
             mask_target(&target_host)
         );
 
-        Self::relay_bidirectional(stream, link, peer_addr, &target_host, traffic).await
+        Self::relay_bidirectional(stream, link, peer_addr, &target_host, &[], traffic).await
     }
 
     /// 处理 HTTP CONNECT 请求（用于 HTTPS）
@@ -726,7 +822,38 @@ impl ProxyServer {
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
 
-        Self::relay_bidirectional(stream, link, peer_addr, &target_str, traffic).await
+        Self::relay_bidirectional(stream, link, peer_addr, &target_str, &[], traffic).await
+    }
+
+    /// 分片安全 read_exact（09-P2-4）：先消化 handle_connection 预读缓冲的
+    /// 剩余字节，不足部分再从流上 `read_exact` 补齐（每段读包
+    /// INITIAL_READ_TIMEOUT，R-39 语义保持）。TCP 是字节流，SOCKS5 greeting/
+    /// request 完全允许分段到达——此前按"单次 read 到齐"解析，经多级代理链
+    /// /MTU 边缘设备分片交付的合法请求会被误判拒绝。
+    async fn read_exact_socks(
+        stream: &mut TcpStream,
+        pending: &mut &[u8],
+        out: &mut [u8],
+    ) -> std::result::Result<(), std::io::Error> {
+        let from_buf = pending.len().min(out.len());
+        out[..from_buf].copy_from_slice(&pending[..from_buf]);
+        *pending = &pending[from_buf..];
+        if from_buf < out.len() {
+            match tokio::time::timeout(
+                INITIAL_READ_TIMEOUT,
+                stream.read_exact(&mut out[from_buf..]),
+            )
+            .await
+            {
+                Ok(r) => r.map(|_| ()),
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "SOCKS5 request read timeout",
+                )),
+            }
+        } else {
+            Ok(())
+        }
     }
 
     /// 处理 SOCKS5 代理请求
@@ -741,17 +868,21 @@ impl ProxyServer {
         let peer_addr = stream
             .peer_addr()
             .unwrap_or_else(|_| SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0));
-        let mut buf = [0u8; 320];
+        // 预读字节游标：greeting/request 优先从这里消化，剩余部分（客户端在
+        // 请求后同段捎带的早发数据）最后交给中继上行，不再丢弃
+        let mut pending: &[u8] = &initial_buf[..initial_len];
 
-        // 初始数据应该是 SOCKS5 greeting
-        if initial_len < 2 || initial_buf[0] != 0x05 {
+        // 初始数据应该是 SOCKS5 greeting：[ver, nmethods] + nmethods 字节方法列表
+        let mut greeting = [0u8; 2];
+        if let Err(e) = Self::read_exact_socks(&mut stream, &mut pending, &mut greeting).await {
             // 审查 R-23：error 级不再 dump 原始字节（含潜在目标明文/可被恶意方
             // 注入任意内容落日志）；只记长度与结构信息，字节 dump 降为 debug 级
             error!(
-                "[{}] Invalid SOCKS5 greeting ({} bytes, ver=0x{:02x})",
+                "[{}] Invalid SOCKS5 greeting ({} bytes, ver=0x{:02x}, err={})",
                 peer_addr,
                 initial_len,
-                initial_buf.first().copied().unwrap_or(0)
+                initial_buf.first().copied().unwrap_or(0),
+                e
             );
             debug!(
                 "[{}] Invalid SOCKS5 greeting (plaintext bytes): {:?}",
@@ -763,42 +894,68 @@ impl ProxyServer {
                 "Invalid SOCKS5 greeting".to_string(),
             ));
         }
+        if greeting[0] != 0x05 {
+            error!(
+                "[{}] Invalid SOCKS5 greeting version 0x{:02x}",
+                peer_addr, greeting[0]
+            );
+            let _ = stream.write_all(&[0x05, 0xFF]).await;
+            return Err(HydraError::ProtocolError(
+                "Invalid SOCKS5 greeting".to_string(),
+            ));
+        }
+        let nmethods = greeting[1] as usize;
+        if nmethods == 0 {
+            error!("[{}] SOCKS5 greeting with empty method list", peer_addr);
+            let _ = stream.write_all(&[0x05, 0xFF]).await;
+            return Err(HydraError::ProtocolError(
+                "Invalid SOCKS5 greeting".to_string(),
+            ));
+        }
+        let mut methods = vec![0u8; nmethods];
+        if let Err(e) = Self::read_exact_socks(&mut stream, &mut pending, &mut methods).await {
+            error!("[{}] Failed to read SOCKS5 methods: {}", peer_addr, e);
+            let _ = stream.write_all(&[0x05, 0xFF]).await;
+            return Err(HydraError::ProtocolError(
+                "Invalid SOCKS5 greeting".to_string(),
+            ));
+        }
 
         info!(
-            "[{}] SOCKS5 greeting received ({} bytes)",
-            peer_addr, initial_len
+            "[{}] SOCKS5 greeting received ({} bytes, {} methods)",
+            peer_addr, initial_len, nmethods
         );
 
+        // 方法协商（09-P2-4 顺修）：本代理仅支持无认证（0x00）。客户端未提供
+        // 0x00 时必须回 0xFF（无可接受方法）——此前恒回 0x00，只提供 user/pass
+        // (0x02) 的客户端会随即开始子协商，与我们的请求解析必然失步。
+        if !methods.contains(&0x00) {
+            info!("[{}] SOCKS5 client offers no no-auth method, rejecting", peer_addr);
+            let _ = stream.write_all(&[0x05, 0xFF]).await;
+            return Err(HydraError::ProtocolError(
+                "No acceptable SOCKS5 auth method".to_string(),
+            ));
+        }
         // 发送无需认证响应
         stream.write_all(&[0x05, 0x00]).await?;
         info!("[{}] Sent no-auth response", peer_addr);
 
-        // 读取 SOCKS5 请求（R-39：30s 超时防慢连接挂起）
+        // 读取 SOCKS5 请求（R-39：分段读各自包 30s 超时防慢连接挂起）
         info!("[{}] Reading SOCKS5 request...", peer_addr);
-        let n = match tokio::time::timeout(INITIAL_READ_TIMEOUT, stream.read(&mut buf)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => {
-                error!("[{}] Failed to read request: {}", peer_addr, e);
-                return Err(e.into());
-            }
-            Err(_) => {
-                return Err(HydraError::ConnectionError(format!(
-                    "[{}] SOCKS5 request read timeout ({:?})",
-                    peer_addr, INITIAL_READ_TIMEOUT
-                )));
-            }
-        };
-        if n < 7 || buf[0] != 0x05 {
-            // 审查 R-23：error 级不 dump 原始请求字节（SOCKS 请求含目标域名/IP 明文，
-            // 恶意方可借畸形请求把任意"明文目标"写进日志）；只记 ver/cmd/长度结构信息
+        let mut req_head = [0u8; 4]; // [ver, cmd, rsv, atyp]
+        if let Err(e) = Self::read_exact_socks(&mut stream, &mut pending, &mut req_head).await {
+            error!("[{}] Failed to read SOCKS5 request head: {}", peer_addr, e);
+            let _ = stream
+                .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+            return Err(HydraError::ProtocolError(
+                "Invalid SOCKS5 request".to_string(),
+            ));
+        }
+        if req_head[0] != 0x05 {
             error!(
-                "[{}] Invalid SOCKS5 request ({} bytes, ver=0x{:02x}, cmd=0x{:02x})",
-                peer_addr, n, buf[0], buf[1]
-            );
-            debug!(
-                "[{}] Invalid SOCKS5 request (plaintext bytes): {:?}",
-                peer_addr,
-                &buf[..n]
+                "[{}] Invalid SOCKS5 request (ver=0x{:02x}, cmd=0x{:02x})",
+                peer_addr, req_head[0], req_head[1]
             );
             let _ = stream
                 .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
@@ -808,12 +965,12 @@ impl ProxyServer {
             ));
         }
         info!(
-            "[{}] SOCKS5 request received ({} bytes), cmd={}",
-            peer_addr, n, buf[1]
+            "[{}] SOCKS5 request received, cmd={}",
+            peer_addr, req_head[1]
         );
 
         // Parse command
-        let cmd = buf[1];
+        let cmd = req_head[1];
         if cmd != 0x01 {
             // Only CONNECT supported
             stream
@@ -825,14 +982,18 @@ impl ProxyServer {
         }
 
         // Parse address type
-        let atyp = buf[3];
+        let atyp = req_head[3];
         info!("[{}] Address type: 0x{:02x}", peer_addr, atyp);
+        // 最大地址体：1(len) + 255(域名) + 2(port) = 258，取 262 整备
+        let mut body = [0u8; 262];
 
         let target_str = match atyp {
             0x01 => {
-                // IPv4
-                if n < 10 {
-                    error!("[{}] Invalid IPv4 address length: {}", peer_addr, n);
+                // IPv4：4B 地址 + 2B 端口
+                if let Err(e) = Self::read_exact_socks(&mut stream, &mut pending, &mut body[..6])
+                    .await
+                {
+                    error!("[{}] Invalid IPv4 address length: {}", peer_addr, e);
                     let _ = stream
                         .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                         .await;
@@ -840,8 +1001,8 @@ impl ProxyServer {
                         "Invalid IPv4 address".to_string(),
                     ));
                 }
-                let ip = std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
-                let port = u16::from_be_bytes([buf[8], buf[9]]);
+                let ip = std::net::Ipv4Addr::new(body[0], body[1], body[2], body[3]);
+                let port = u16::from_be_bytes([body[4], body[5]]);
                 let v4_target = format!("{}:{}", ip, port);
                 info!("[{}] Target IPv4: {}", peer_addr, mask_target(&v4_target));
                 debug!("[{}] Target IPv4 (plaintext): {}", peer_addr, v4_target);
@@ -849,20 +1010,36 @@ impl ProxyServer {
             }
             0x03 => {
                 // Domain name - 发送域名到节点，由节点解析 DNS（域名不明文离开加密通道）
-                if n < 7 {
-                    error!("[{}] Invalid domain name length: {}", peer_addr, n);
+                if let Err(e) = Self::read_exact_socks(&mut stream, &mut pending, &mut body[..1])
+                    .await
+                {
+                    error!("[{}] Invalid domain name length byte: {}", peer_addr, e);
                     let _ = stream
                         .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                         .await;
-                    return Err(HydraError::ProtocolError("Invalid domain name".to_string()));
+                    return Err(HydraError::ProtocolError(
+                        "Invalid domain name".to_string(),
+                    ));
                 }
-                let domain_len = buf[4] as usize;
-                if n < 5 + domain_len + 2 {
+                let domain_len = body[0] as usize;
+                if domain_len == 0 {
+                    error!("[{}] Empty domain name", peer_addr);
+                    let _ = stream
+                        .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await;
+                    return Err(HydraError::ProtocolError(
+                        "Invalid domain name length".to_string(),
+                    ));
+                }
+                if let Err(e) =
+                    Self::read_exact_socks(&mut stream, &mut pending, &mut body[..domain_len + 2])
+                        .await
+                {
                     error!(
-                        "[{}] Invalid domain name data length: need {}, got {}",
+                        "[{}] Invalid domain name data length (need {}, err={})",
                         peer_addr,
-                        5 + domain_len + 2,
-                        n
+                        domain_len + 2,
+                        e
                     );
                     let _ = stream
                         .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
@@ -871,8 +1048,8 @@ impl ProxyServer {
                         "Invalid domain name length".to_string(),
                     ));
                 }
-                let domain = String::from_utf8_lossy(&buf[5..5 + domain_len]);
-                let port = u16::from_be_bytes([buf[5 + domain_len], buf[5 + domain_len + 1]]);
+                let domain = String::from_utf8_lossy(&body[..domain_len]);
+                let port = u16::from_be_bytes([body[domain_len], body[domain_len + 1]]);
                 let domain_target = format!("{}:{}", domain, port);
 
                 info!(
@@ -887,9 +1064,11 @@ impl ProxyServer {
                 domain_target
             }
             0x04 => {
-                // IPv6
-                if n < 22 {
-                    error!("[{}] Invalid IPv6 address length: {}", peer_addr, n);
+                // IPv6：16B 地址 + 2B 端口
+                if let Err(e) = Self::read_exact_socks(&mut stream, &mut pending, &mut body[..18])
+                    .await
+                {
+                    error!("[{}] Invalid IPv6 address length: {}", peer_addr, e);
                     let _ = stream
                         .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                         .await;
@@ -898,16 +1077,16 @@ impl ProxyServer {
                     ));
                 }
                 let ip = std::net::Ipv6Addr::new(
-                    u16::from_be_bytes([buf[4], buf[5]]),
-                    u16::from_be_bytes([buf[6], buf[7]]),
-                    u16::from_be_bytes([buf[8], buf[9]]),
-                    u16::from_be_bytes([buf[10], buf[11]]),
-                    u16::from_be_bytes([buf[12], buf[13]]),
-                    u16::from_be_bytes([buf[14], buf[15]]),
-                    u16::from_be_bytes([buf[16], buf[17]]),
-                    u16::from_be_bytes([buf[18], buf[19]]),
+                    u16::from_be_bytes([body[0], body[1]]),
+                    u16::from_be_bytes([body[2], body[3]]),
+                    u16::from_be_bytes([body[4], body[5]]),
+                    u16::from_be_bytes([body[6], body[7]]),
+                    u16::from_be_bytes([body[8], body[9]]),
+                    u16::from_be_bytes([body[10], body[11]]),
+                    u16::from_be_bytes([body[12], body[13]]),
+                    u16::from_be_bytes([body[14], body[15]]),
                 );
-                let port = u16::from_be_bytes([buf[20], buf[21]]);
+                let port = u16::from_be_bytes([body[16], body[17]]);
                 let v6_target = format!("[{}]:{}", ip, port);
                 info!("[{}] Target IPv6: {}", peer_addr, mask_target(&v6_target));
                 debug!("[{}] Target IPv6 (plaintext): {}", peer_addr, v6_target);
@@ -923,6 +1102,10 @@ impl ProxyServer {
                 ));
             }
         };
+
+        // 客户端在请求后同段捎带的早发数据（pipelining）：交给中继上行，
+        // 不再静默丢弃（09-P2-4）
+        let pending_up = pending.to_vec();
 
         info!(
             "[{}] >>> SOCKS5 CONNECT request to {}",
@@ -968,7 +1151,7 @@ impl ProxyServer {
             .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
             .await?;
 
-        Self::relay_bidirectional(stream, link, peer_addr, &target_str, traffic).await
+        Self::relay_bidirectional(stream, link, peer_addr, &target_str, &pending_up, traffic).await
     }
 
     /// Exec2：国内直连分流建连。命中 CN 域名表（且 HYDRA_SPLIT=cn）时客户端本机
@@ -981,8 +1164,15 @@ impl ProxyServer {
             "[{}] Direct (CN split) connect (plaintext): {}",
             peer_addr, target
         );
-        match tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, TcpStream::connect(target)).await {
+        match tokio::time::timeout(
+            DIRECT_CONNECT_TIMEOUT,
+            Self::direct_connect_resolved(target),
+        )
+        .await
+        {
             Ok(Ok(tcp)) => {
+                // 09-P1-2：直连链路同样启用 keepalive（与节点路径同一静默死亡检测）
+                crate::tcp_transport::enable_tcp_keepalive(&tcp);
                 info!(
                     "[{}] ✓ Direct (CN split) connected to {} locally (bypasses node)",
                     peer_addr,
@@ -1010,16 +1200,43 @@ impl ProxyServer {
         }
     }
 
+    /// 直连目标的解析 + 逐地址受保护建连（09-P1-7）：字面 IP 直接建连；域名经
+    /// 系统解析后逐个候选尝试——每个新 socket 都过 protect 钩子（Android VPN
+    /// 场景必须，未安装钩子时零开销）。
+    async fn direct_connect_resolved(target: &str) -> std::io::Result<TcpStream> {
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(target)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?
+            .collect();
+        if addrs.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "DNS resolved no addresses",
+            ));
+        }
+        let mut last_err = None;
+        for addr in addrs {
+            match crate::socket_protect::connect_tcp_protected(addr).await {
+                Ok(s) => return Ok(s),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| std::io::Error::other("connect failed")))
+    }
+
     /// 双向转发（A4 收敛版 + Exec2 直连支持）：
     /// - 远端既可以是加密节点（TCP/TLS 流），也可以是国内直连的明文 TCP（CN 分流），
     ///   两条路径复用同一套收敛/排水/计数逻辑；
     /// - 任一方向结束后显式 shutdown 另一方向并 join 收敛，不再留下孤儿任务；
-    /// - 浏览器关写侧（半关闭）时保留 远端→浏览器 方向，在超时窗口内收完剩余响应。
+    /// - 浏览器关写侧（半关闭）时保留 远端→浏览器 方向，在超时窗口内收完剩余响应；
+    /// - `pending_up`：协议解析阶段消化预读缓冲后剩余的早发数据（SOCKS5 请求后
+    ///   同段捎带），先行写入远端再进入稳态循环，不丢弃（09-P2-4）。
     async fn relay_bidirectional(
         stream: TcpStream,
         link: RemoteLink,
         peer_addr: SocketAddr,
         target: &str,
+        pending_up: &[u8],
         traffic: Arc<TrafficMonitor>,
     ) -> Result<()> {
         ACTIVE_RELAYS.fetch_add(1, Ordering::Relaxed);
@@ -1068,9 +1285,28 @@ impl ProxyServer {
 
         // 浏览器 → 远端（节点 TCP/TLS 流 / 直连 TCP）
         let up_conn = conn.clone();
+        let pre_up = pending_up.to_vec();
         let mut up = tokio::spawn(async move {
             let mut buf = vec![0u8; RELAY_BUF];
             let mut total = 0u64;
+            // 协议头同段捎带的早发数据先行写入（09-P2-4）
+            if !pre_up.is_empty() {
+                let write_res = match &mut up_sink {
+                    UpSink::Node(w) => w
+                        .write_all(&pre_up)
+                        .await
+                        .map(|_| ())
+                        .map_err(|_| RelayError::Transport),
+                    UpSink::Direct(w) => w
+                        .write_all(&pre_up)
+                        .await
+                        .map(|_| ())
+                        .map_err(RelayError::LocalIo),
+                };
+                write_res?;
+                total += pre_up.len() as u64;
+                up_conn.add_up(pre_up.len() as u64);
+            }
             loop {
                 match client_read.read(&mut buf).await {
                     // 浏览器关写侧：显式优雅结束上行（TCP 半关闭 shutdown，FIN 传给远端），

@@ -1,4 +1,4 @@
-# 交叉编译 libhydra_android.so → android/app/src/main/jniLibs/{abi}/（Windows 版）
+﻿# 交叉编译 libhydra_android.so → android/app/src/main/jniLibs/{abi}/（Windows 版）
 # 依赖：cargo-ndk（cargo install cargo-ndk）+ NDK。缺 cargo-ndk 时打印提示并以 0 退出。
 $ErrorActionPreference = "Stop"
 $root = Join-Path $PSScriptRoot "..\.."
@@ -14,6 +14,16 @@ rustup target add aarch64-linux-android x86_64-linux-android
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = $null
+# NDK 缺失同样跳过（JVM 单测不需要交叉编译产物）
+$sdk = $env:ANDROID_HOME
+if (-not $sdk) { $sdk = "$env:LOCALAPPDATA\Android\Sdk" }
+$ndkDirs = Get-ChildItem -Directory -Path (Join-Path $sdk "ndk") -ErrorAction SilentlyContinue
+if (-not $ndkDirs) {
+    Write-Host "[build-rust] 未检测到 NDK（$sdk\ndk 为空），跳过交叉编译"
+    Write-Host "[build-rust] 安装：Android Studio SDK Manager 或 sdkmanager ndk;28.2.13676358"
+    exit 0
+}
+
 $out = "android/app/src/main/jniLibs"
 New-Item -ItemType Directory -Force -Path "$out/arm64-v8a", "$out/x86_64" | Out-Null
 

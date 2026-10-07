@@ -389,24 +389,16 @@ impl ShareLink {
                 // v=3：版本标记，当前仅识别不校验（未来版本升级入口）
                 "v" => {}
                 "bandwidth" => {
-                    bandwidth = value.parse::<f64>().map_err(|e| {
-                        HydraError::ProtocolError(format!("Invalid bandwidth: {}", e))
-                    })?;
+                    bandwidth = parse_bounded_f64(value.as_ref(), "bandwidth", 0.0, 1_000_000.0)?;
                 }
                 "latency" => {
-                    latency = value.parse::<f64>().map_err(|e| {
-                        HydraError::ProtocolError(format!("Invalid latency: {}", e))
-                    })?;
+                    latency = parse_bounded_f64(value.as_ref(), "latency", 0.0, 1_000_000.0)?;
                 }
                 "loss_rate" => {
-                    loss_rate = value.parse::<f64>().map_err(|e| {
-                        HydraError::ProtocolError(format!("Invalid loss_rate: {}", e))
-                    })?;
+                    loss_rate = parse_bounded_f64(value.as_ref(), "loss_rate", 0.0, 1.0)?;
                 }
                 "load" => {
-                    load = value
-                        .parse::<f64>()
-                        .map_err(|e| HydraError::ProtocolError(format!("Invalid load: {}", e)))?;
+                    load = parse_bounded_f64(value.as_ref(), "load", 0.0, 1.0)?;
                 }
                 "status" => {
                     status = match value.as_ref() {
@@ -433,6 +425,43 @@ impl ShareLink {
                     transport = Some(value.to_string());
                 }
                 _ => {}
+            }
+        }
+
+        // 09-P2-1：IP 字面量形态的私网/回环/链路本地/组播节点地址告警（不拒绝）。
+        // 恶意订阅可借此让客户端对内网任意 IP:port 周期发起 TCP+TLS 探测
+        // （成功/耗时进入评分与日志 = 内网存活/端口扫描侧信道）。自建内网节点
+        // 是本产品的合法场景（LAN 部署/NAT 穿透），拒绝导入会破坏分享链接的
+        // 正常分发，故以 warn 留痕、由用户自行判断。域名形态无法本地判定，
+        // 交由连接期行为（节点不可达即故障切换）兜底。
+        if let Ok(ip) = address.parse::<std::net::IpAddr>() {
+            let private_reason = match ip {
+                std::net::IpAddr::V4(v4) => {
+                    if v4.is_loopback() || v4.is_link_local() || v4.is_private() {
+                        Some("IPv4 私网/回环/链路本地")
+                    } else if v4.is_broadcast() || v4.is_multicast() || v4.octets()[0] == 0 {
+                        Some("IPv4 广播/组播/保留")
+                    } else {
+                        None
+                    }
+                }
+                std::net::IpAddr::V6(v6) => {
+                    let loopback_or_local =
+                        v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80;
+                    let ula_or_multicast = (v6.segments()[0] & 0xfe00) == 0xfc00 || v6.is_multicast();
+                    if loopback_or_local || ula_or_multicast {
+                        Some("IPv6 回环/链路本地/ULA/组播")
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(reason) = private_reason {
+                warn!(
+                    "导入的分享链接节点地址为{}（{}:{}）：确认这是你自建的节点再启用；\
+                     来源不可信的订阅可能借此对内网地址发起探测",
+                    reason, address, port
+                );
             }
         }
 
@@ -468,6 +497,24 @@ impl ShareLink {
             .map_err(|e| HydraError::ProtocolError(format!("Invalid UTF-8: {}", e)))?;
         Self::from_share_url(&url)
     }
+}
+
+/// 解析带范围校验的 f64 链接参数（09-P1-4）：NaN/inf/越界一律显式报错。
+/// 此前仅 `parse::<f64>()`——`bandwidth=NaN` 在 max_by 中与任何节点比较恒
+/// Equal（HashMap 随机序约 50% 胜出健康节点）、`loss_rate=-1e300` 评分
+/// +2e299 确定性恒排第一，且该节点无法完成 Noise 握手 → 无中继字节 →
+/// 测速差分永不覆盖，构成持久的调度劫持（恶意订阅一行即可全量降速）。
+fn parse_bounded_f64(value: &str, name: &str, min: f64, max: f64) -> Result<f64> {
+    let v: f64 = value
+        .parse()
+        .map_err(|e| HydraError::ProtocolError(format!("Invalid {}: {}", name, e)))?;
+    if !v.is_finite() || v < min || v > max {
+        return Err(HydraError::ProtocolError(format!(
+            "Invalid {} value: must be finite and within [{}, {}]",
+            name, min, max
+        )));
+    }
+    Ok(v)
 }
 
 /// SHA-256 摘要的小写 hex 编码（v2 证书指纹 `cf` 用）

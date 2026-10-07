@@ -21,6 +21,7 @@ tokio-rustls = { workspace = true }
 # 真证书模式（TlsTrust::public_ca）：webpki 公共 CA 根，与 rustls 0.23 配套。
 webpki-roots = "0.26"
 ring = { workspace = true }
+socket2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }

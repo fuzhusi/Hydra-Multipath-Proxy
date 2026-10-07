@@ -262,9 +262,15 @@ fn normalize_domain(d: &str) -> String {
 /// 完整标签边界的后缀匹配：自右向左逐级检查。
 /// `www.baidu.com` → 检查 `www.baidu.com` / `baidu.com` / `com`；
 /// `evil-baidu.com` 的各级后缀均不在表中 → 不误命中。
+/// 空标签防御（09-P3-1）：`".baidu.com"` / `"a..baidu.com"` 的拆分产物含空
+/// 首段——DNS 规范不容许空标签，但部分系统解析器会容忍/规整，命中 CN 表
+/// 即被误判直连，故遇空段直接不匹配。
 fn suffix_match(table: &HashSet<String>, domain: &str) -> bool {
     let mut rest = domain;
     loop {
+        if rest.is_empty() || rest.starts_with('.') {
+            return false;
+        }
         if table.contains(rest) {
             return true;
         }

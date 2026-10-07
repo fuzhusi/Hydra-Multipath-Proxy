@@ -3,6 +3,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// 指标兜底：非法（非有限/越界）→ 旧值，合法 → 新值（09-P1-4 防御纵深）
+fn sanitize(new: f64, min: f64, max: f64, old: f64) -> f64 {
+    if new.is_finite() && new >= min && new <= max {
+        new
+    } else {
+        old
+    }
+}
+
 pub struct Scheduler {
     nodes: Arc<RwLock<HashMap<std::net::SocketAddr, NodeInfo>>>,
 }
@@ -38,9 +47,13 @@ impl Scheduler {
             .max_by(|a, b| {
                 let score_a = a.calculate_score();
                 let score_b = b.calculate_score();
+                // 平分时按地址升序取最小者（09-P3-7：与 get_nodes_by_priority
+                // 的 tie-break 统一——此前 max_by 平分取向"取后者"、HashMap
+                // 随机序导致观测层与调度层对同一批节点给出不同最优）
                 score_a
                     .partial_cmp(&score_b)
                     .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.address.cmp(&a.address))
             })
             .cloned()
     }
@@ -57,9 +70,11 @@ impl Scheduler {
         let mut list: Vec<NodeInfo> = nodes.values().cloned().collect();
         list.sort_by(|a, b| {
             rank(a).cmp(&rank(b)).then_with(|| {
+                // 平分时按地址升序（09-P3-7：确定序，与 get_best_node 一致）
                 b.calculate_score()
                     .partial_cmp(&a.calculate_score())
                     .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.address.cmp(&b.address))
             })
         });
         list
@@ -75,10 +90,12 @@ impl Scheduler {
     ) {
         let mut nodes = self.nodes.write().await;
         if let Some(node) = nodes.get_mut(addr) {
-            node.bandwidth = bandwidth;
-            node.latency = latency;
-            node.loss_rate = loss_rate;
-            node.load = load;
+            // 防御性 clamp（09-P1-4）：所有写进入口统一兜底——NaN/inf/越界值
+            // 保持旧值（NaN 比较恒 false 时会以旧值落下；显式判断更清晰）
+            node.bandwidth = sanitize(bandwidth, 0.0, 1_000_000.0, node.bandwidth);
+            node.latency = sanitize(latency, 0.0, 1_000_000.0, node.latency);
+            node.loss_rate = sanitize(loss_rate, 0.0, 1.0, node.loss_rate);
+            node.load = sanitize(load, 0.0, 1.0, node.load);
         }
     }
 

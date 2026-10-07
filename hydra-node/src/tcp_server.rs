@@ -27,7 +27,8 @@ use hydra_protocol::tcp_frame::{
 use hydra_protocol::{mask_target, Result};
 // rustls 0.23（Wave 3）：pki-types 的 DER 新类型取代旧的 Certificate/PrivateKey 元组结构体
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Semaphore;
@@ -44,6 +45,57 @@ const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// 双向均无数据达此时长才静默双向关闭）。env `HYDRA_IDLE_TIMEOUT_SECS` 可调。
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 const IDLE_TIMEOUT_ENV: &str = "HYDRA_IDLE_TIMEOUT_SECS";
+
+/// 单源 IP 并发连接上限（09-P2-6）：防单主机以 ~25 conn/s 轮换（每条拖满认证
+/// 阶段最长约 40s）持续钉满全部连接槽。默认 256——远高于单客户端 TUN 模式的
+/// 合理并发流数，又足以把单主机钉槽面从 1000 压到 1/4；env
+/// `HYDRA_PER_IP_CONNECTIONS` 可调（0 = 关闭该限制）。
+const DEFAULT_PER_IP_CONNECTIONS: usize = 256;
+const PER_IP_LIMIT_ENV: &str = "HYDRA_PER_IP_CONNECTIONS";
+
+fn per_ip_limit() -> usize {
+    std::env::var(PER_IP_LIMIT_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_PER_IP_CONNECTIONS)
+}
+
+/// per-IP 并发计数守卫：连接任务结束时自动递减（含 panic 展开路径）。
+struct PerIpGuard {
+    map: Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl PerIpGuard {
+    fn acquire(
+        map: &Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>,
+        ip: IpAddr,
+        limit: usize,
+    ) -> Option<Self> {
+        let mut m = map.lock().unwrap_or_else(|p| p.into_inner());
+        let cnt = m.entry(ip).or_insert(0);
+        if limit > 0 && *cnt >= limit {
+            return None;
+        }
+        *cnt += 1;
+        Some(Self {
+            map: map.clone(),
+            ip,
+        })
+    }
+}
+
+impl Drop for PerIpGuard {
+    fn drop(&mut self) {
+        let mut m = self.map.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(c) = m.get_mut(&self.ip) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                m.remove(&self.ip);
+            }
+        }
+    }
+}
 
 fn idle_timeout() -> std::time::Duration {
     let secs = std::env::var(IDLE_TIMEOUT_ENV)
@@ -123,16 +175,30 @@ pub async fn spawn_tcp_listener(
     let local = listener.local_addr()?;
     info!("Hydra TCP/TLS transport (Noise-PSK) listening on {}", local);
 
+    // per-IP 并发计数（09-P2-6）：进程启动时解析一次（env 固化，测试可经
+    // NodeOptions 注入前的 env 设置控制）
+    let per_ip_map: Arc<std::sync::Mutex<HashMap<IpAddr, usize>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let per_ip_limit = per_ip_limit();
+
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
                     // 禁 Nagle：握手与交互式流量的小包延迟敏感
                     let _ = stream.set_nodelay(true);
+                    // per-IP 限额（09-P2-6）：单源并发超限立即丢弃（与额度满
+                    // shedding 同语义；permit 未占用）
+                    let Some(ip_guard) = PerIpGuard::acquire(&per_ip_map, peer.ip(), per_ip_limit)
+                    else {
+                        debug!("per-IP connection limit reached for {}, dropping", peer);
+                        continue;
+                    };
                     // 快速失败（sheding）：额度满时立即丢弃新连接而非让其在内核
                     // backlog 里无限排队（客户端有自己的故障切换/超时语义）
                     let Ok(permit) = sem.clone().try_acquire_owned() else {
                         debug!("Connection limit reached, dropping incoming {}", peer);
+                        drop(ip_guard);
                         continue;
                     };
                     let acceptor = acceptor.clone();
@@ -141,6 +207,7 @@ pub async fn spawn_tcp_listener(
                     let idle = idle.clone();
                     let fallback = fallback_page;
                     tokio::spawn(async move {
+                        let _ip_guard = ip_guard; // 连接结束自动递减 per-IP 计数
                         let _permit = permit; // 连接结束自动归还
                                               // TLS 握手超时：认证前 slowloris 防护（超时静默 drop，语义不变）
                         match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
@@ -158,7 +225,12 @@ pub async fn spawn_tcp_listener(
                         }
                     });
                 }
-                Err(e) => error!("TCP accept error: {}", e),
+                Err(e) => {
+                    // 09-P3：accept 持久性错误（如 fd 耗尽）立即重试 = 热循环刷
+                    // 日志；短暂退避再重试（与 health.rs 同款模式）
+                    error!("TCP accept error: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
             }
         }
     });

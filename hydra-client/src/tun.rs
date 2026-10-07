@@ -227,6 +227,14 @@ pub fn compute_routes_for(
                 gateway: gw,
             });
         }
+        // 09-P2-1：私网段豁免——TUN /1 接管覆盖 RFC1918/CGNAT，而这些目标的
+        // 流量进 TUN 后会被节点的 SSRF 过滤 fail-closed 拒绝（对应用表现为
+        // "能上外网但访问不了路由器/NAS 等内网设备"且无日志解释）。按
+        // "与无 VPN 时一致"的语义豁免回物理网关（TUN 自身网段 /30 更精确，
+        // 不受影响）。节点本就不接受私网目标，豁免无功能损失。
+        for (dest, prefix) in PRIVATE_EXCLUDE_V4 {
+            add.push(RouteCmd { dest, prefix, gateway: gw });
+        }
     } else if !tun.exclude_routes.is_empty() {
         warn!(
             "物理网关未知，{} 条豁免路由未能生成——代理到节点的流量可能形成环路！\
@@ -237,6 +245,14 @@ pub fn compute_routes_for(
     let remove = add.to_vec();
     RoutePlan { add, remove }
 }
+
+/// 私网段豁免路由（09-P2-1）：RFC1918 全部三段 + CGNAT 100.64/10
+const PRIVATE_EXCLUDE_V4: [(Ipv4Addr, u8); 4] = [
+    (Ipv4Addr::new(10, 0, 0, 0), 8),
+    (Ipv4Addr::new(172, 16, 0, 0), 12),
+    (Ipv4Addr::new(192, 168, 0, 0), 16),
+    (Ipv4Addr::new(100, 64, 0, 0), 10),
+];
 
 // ── IPv6 路由方案（0-4 防泄漏：与 v4 对称的接管/豁免清单）────────────────────
 
@@ -293,7 +309,9 @@ pub struct RoutePlanV6 {
 
 /// 计算 IPv6 路由方案（纯函数，与 [`compute_routes`] 对称）。
 ///
-/// - `ipv6_enabled == false`（默认；`HYDRA_TUN_IPV6` 未设或非 "1"）→ 返回空方案（不生成任何命令）；
+/// - `ipv6_enabled == false` → 返回空方案（不生成任何命令）。默认 **true**
+///   （09 补正：`TunConfig::default` 为 true，`HYDRA_TUN_IPV6=0` 显式关闭；
+///   本注释此前误写"默认 false"，与实现相反）；
 /// - 接管：`::/1` + `8000::/1` → TUN（比 v6 默认路由 /0 更精确即接管全 v6 空间）；
 /// - 豁免：每个 exclude v6 IP /128 → 物理网关 v6（None 时跳过豁免项并告警——
 ///   与 v4 同语义：没有网关就无法生成豁免命令）；
@@ -321,6 +339,13 @@ pub fn compute_routes_v6(tun: &TunConfig, physical_gw6: Option<Ipv6Addr>) -> Rou
                     gateway: gw,
                 });
             }
+            // 09-P2-1：ULA fc00::/7 豁免（与 v4 RFC1918 对称；fe80::/10 链路
+            // 本地由内核直连处理，无需显式路由）
+            add.push(RouteCmdV6 {
+                dest: Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0),
+                prefix: 7,
+                gateway: gw,
+            });
         } else if !tun.exclude_routes_v6.is_empty() {
             warn!(
                 "物理网关（IPv6）未知，{} 条 v6 豁免路由未能生成——代理到 v6 节点的流量可能环路",
@@ -684,23 +709,60 @@ pub fn detect_physical_gateway_v6() -> Option<Ipv6Addr> {
 }
 
 /// best-effort 探测系统 DNS 服务器（豁免路由用：DNS 明文直出物理网卡，方案 §1 非目标）。
-/// `HYDRA_TUN_DNS`（逗号分隔）优先；Windows 解析注册表 NameServer/DhcpNameServer，
-/// Linux 解析 /etc/resolv.conf。
+/// `HYDRA_TUN_DNS`（逗号分隔，v4/v6 均可）优先；Windows 解析注册表
+/// NameServer/DhcpNameServer 行，Linux 解析 /etc/resolv.conf。
+///
+/// 09-P3-7 修复：只取 **NameServer 行**并按 v4/v6 分桶——此前对 reg query 全量
+/// 输出"凡能解析成 IPv4 的 token 都收"，DhcpIPAddress/第三方虚拟适配器地址等
+/// 非 DNS 值也被收进豁免清单（各生成一条 /32 豁免路由，可能覆盖同网段
+/// on-link 路由）；v6 DNS（如 2001:4860:4860::8888）此前完全缺失——v6 DNS
+/// over UDP 被 TUN 代答回不可达（纯 v6 网络断网观感），over TCP 却被代理。
 pub fn detect_dns_servers() -> Vec<Ipv4Addr> {
+    detect_dns_all().0
+}
+
+/// 系统 IPv6 DNS 服务器（09-P2-4：与 v4 对称进入 v6 豁免清单）
+pub fn detect_dns_servers_v6() -> Vec<Ipv6Addr> {
+    detect_dns_all().1
+}
+
+/// v4/v6 DNS 探测合一（`HYDRA_TUN_DNS` > Windows 注册表 > /etc/resolv.conf）
+fn detect_dns_all() -> (Vec<Ipv4Addr>, Vec<Ipv6Addr>) {
+    let mut v4_out = Vec::new();
+    let mut v6_out = Vec::new();
+    let push = |tok: &str, v4: &mut Vec<Ipv4Addr>, v6: &mut Vec<Ipv6Addr>| {
+        match tok.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => {
+                if !v4.contains(&ip) {
+                    v4.push(ip);
+                }
+            }
+            Ok(std::net::IpAddr::V6(ip)) => {
+                if !v6.contains(&ip) {
+                    v6.push(ip);
+                }
+            }
+            Err(_) => {}
+        }
+    };
     if let Ok(s) = std::env::var("HYDRA_TUN_DNS") {
-        let v = s
-            .split(',')
-            .filter_map(|p| p.trim().parse::<Ipv4Addr>().ok())
-            .collect::<Vec<_>>();
-        if !v.is_empty() {
-            return v;
+        let mut any = false;
+        for p in s.split(',') {
+            let before_v4 = v4_out.len();
+            let before_v6 = v6_out.len();
+            push(p.trim(), &mut v4_out, &mut v6_out);
+            if v4_out.len() != before_v4 || v6_out.len() != before_v6 {
+                any = true;
+            }
+        }
+        if any {
+            return (v4_out, v6_out);
         }
     }
-    let mut out = Vec::new();
     #[cfg(windows)]
     {
-        // reg query 递归导出各接口的静态/动态 DNS（输出含 REG_SZ 等噪声 token，
-        // 统一按「能解析成 IPv4 就收」过滤，best-effort）
+        // reg query 递归导出各接口 DNS；仅取含 "NameServer" 的行（静态 NameServer
+        // 与 DhcpNameServer），行内按空白/逗号切分 token 后逐个尝试解析
         // CREATE_NO_WINDOW：DNS 探测不弹控制台窗口
         let mut c = std::process::Command::new("reg");
         c.args([
@@ -708,14 +770,14 @@ pub fn detect_dns_servers() -> Vec<Ipv4Addr> {
             r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces",
             "/s",
         ]);
-        if let Ok(outp) = crate::hide_console_window(&mut c).output()
-        {
+        if let Ok(outp) = crate::hide_console_window(&mut c).output() {
             let text = String::from_utf8_lossy(&outp.stdout);
-            for tok in text.split_whitespace() {
-                if let Ok(ip) = tok.parse::<Ipv4Addr>() {
-                    if !out.contains(&ip) {
-                        out.push(ip);
-                    }
+            for line in text.lines() {
+                if !line.contains("NameServer") {
+                    continue;
+                }
+                for tok in line.split([' ', '\t', ',']) {
+                    push(tok.trim(), &mut v4_out, &mut v6_out);
                 }
             }
         }
@@ -727,17 +789,13 @@ pub fn detect_dns_servers() -> Vec<Ipv4Addr> {
                 let mut it = line.split_whitespace();
                 if it.next() == Some("nameserver") {
                     if let Some(tok) = it.next() {
-                        if let Ok(ip) = tok.parse::<Ipv4Addr>() {
-                            if !out.contains(&ip) {
-                                out.push(ip);
-                            }
-                        }
+                        push(tok, &mut v4_out, &mut v6_out);
                     }
                 }
             }
         }
     }
-    out
+    (v4_out, v6_out)
 }
 
 // ── 代理通道开启器（实现见 hydra_core::proxy::ProxyServer::tun_channel_opener）──
@@ -1335,8 +1393,14 @@ pub async fn run_stack<T: PacketTransport>(
     let mut buf = vec![0u8; cfg.mtu as usize + 4];
     // 07-P1-2：IPv6 快速失败首见告警只发一次（避免每包刷日志）
     let mut warned_v6 = false;
+    // 09-P2-1 栈侧兜底：私网 TCP 目标告警只发一次
+    let mut warned_private = false;
     // v6 动态 AnyIP 地址池（静态 3 槽之外轮转，见 ensure_v6_dst）
     let mut v6_pool: VecDeque<std::net::Ipv6Addr> = VecDeque::new();
+    // 栈中转缓冲：一次分配、整个主循环复用（06-P3-8：此前 step() 每 tick
+    // 分配 16KB 再丢弃，持续产生无效内存带宽；09-P3-8 复核发现分配仍在
+    // 循环内，本次真正提到循环外）
+    let mut stack_buf = vec![0u8; 16 * 1024];
 
     loop {
         tokio::select! {
@@ -1352,10 +1416,40 @@ pub async fn run_stack<T: PacketTransport>(
                 Ok(n) => {
                     let pkt = &buf[..n];
                     if is_ipv6_packet(pkt) {
+                        // 09-P2-3：组播目的/未指定源豁免（上轮 v4 修复的同源遗漏
+                        // 在 v6 侧补齐）——对 ff02::fb（mDNS）等回差错违反
+                        // RFC 4443 §2.4(e)，组播目的的 SYN 走正向路径还会白占
+                        // AnyIP 池与流槽，一律静默丢弃
+                        let v6_drop = pkt.len() >= 40 && {
+                            let src = std::net::Ipv6Addr::new(
+                                u16::from_be_bytes([pkt[8], pkt[9]]),
+                                u16::from_be_bytes([pkt[10], pkt[11]]),
+                                u16::from_be_bytes([pkt[12], pkt[13]]),
+                                u16::from_be_bytes([pkt[14], pkt[15]]),
+                                u16::from_be_bytes([pkt[16], pkt[17]]),
+                                u16::from_be_bytes([pkt[18], pkt[19]]),
+                                u16::from_be_bytes([pkt[20], pkt[21]]),
+                                u16::from_be_bytes([pkt[22], pkt[23]]),
+                            );
+                            let dst = std::net::Ipv6Addr::new(
+                                u16::from_be_bytes([pkt[24], pkt[25]]),
+                                u16::from_be_bytes([pkt[26], pkt[27]]),
+                                u16::from_be_bytes([pkt[28], pkt[29]]),
+                                u16::from_be_bytes([pkt[30], pkt[31]]),
+                                u16::from_be_bytes([pkt[32], pkt[33]]),
+                                u16::from_be_bytes([pkt[34], pkt[35]]),
+                                u16::from_be_bytes([pkt[36], pkt[37]]),
+                                u16::from_be_bytes([pkt[38], pkt[39]]),
+                            );
+                            src.is_unspecified() || src.is_multicast() || dst.is_multicast()
+                        };
+                        if v6_drop {
+                            debug!("TUN 丢弃组播/未指定源 IPv6 包");
+                        }
                         // v6 分发：TCP 且已启用接管 → 正向路径投喂栈（动态 AnyIP）；
                         // 否则快速失败代答（SYN→RST / 其余→ICMPv6 不可达），应用回落 IPv4
                         let v6_tcp = pkt.len() >= 41 && pkt[6] == 6; // 无扩展头直载 TCP
-                        if cfg.ipv6_enabled && v6_tcp {
+                        if !v6_drop && cfg.ipv6_enabled && v6_tcp {
                             if !warned_v6 {
                                 info!(
                                     "TUN IPv6 正向路径就绪：v6 TCP 经动态 AnyIP 代理，\
@@ -1392,8 +1486,8 @@ pub async fn run_stack<T: PacketTransport>(
                                 &protected,
                             );
                             device.push_inbound(pkt);
-                        } else {
-                            if !warned_v6 {
+                            } else if !v6_drop {
+                                if !warned_v6 {
                                 warn!(
                                     "TUN 收到 IPv6 包：{}，代答快速失败\
                                      （SYN→RST，其余→ICMPv6 不可达）供应用回落 IPv4",
@@ -1435,7 +1529,8 @@ pub async fn run_stack<T: PacketTransport>(
                             device.push_inbound(pkt); // 判定与构造不一致的防御兜底
                         }
                     } else {
-                        device.push_inbound(pkt);
+                        // IPv4 其余协议：逐项过滤后投喂 smoltcp（09 审查）
+                        handle_v4_else(pkt, &cfg, &mut device, &mut warned_private);
                     }
                 }
                 Err(e) => {
@@ -1447,9 +1542,7 @@ pub async fn run_stack<T: PacketTransport>(
             _ = tokio::time::sleep(Duration::from_millis(10)) => {}
         }
 
-        // 栈中转缓冲：一次分配、整个主循环复用（06-P3-8：此前 step() 每 tick
-        // 分配 16KB 再丢弃，持续产生无效内存带宽）
-        let mut stack_buf = vec![0u8; 16 * 1024];
+        // 栈中转缓冲已提升到循环外复用（06-P3-8 / 09-P3-8）
         step(
             &cfg,
             &mut iface,
@@ -1480,6 +1573,80 @@ pub async fn run_stack<T: PacketTransport>(
         }
     }
     Ok(())
+}
+
+/// IPv4 非 UDP（非代答路径）包的过滤与投喂（09 审查 T-2/分片/私网兜底）。
+///
+/// - **ICMP 全部静默丢弃**（09-P2-2）：smoltcp（未启用 socket-icmp）对
+///   EchoRequest 无条件自动回 EchoReply，且 any-ip 放行一切单播目的——
+///   此前任意 IPv4 地址的 ping 都被本地栈以被 ping 的 IP 为源伪造应答，
+///   连通性探测/故障切换/captive-portal 判定全部失真。丢弃后与 v6
+///   "ping 不通属设计内"语义对称。
+/// - **分片包全部静默丢弃**（09-P3-1）：未启用 proto-ipv4-fragmentation 时
+///   smoltcp 不检查分片，非首片载荷会被按传输层头解析（仅靠校验和兜底，
+///   理论可伪造）；MF 位此前也未判。MTU 1500 + MSS 钳制下分片本就罕见。
+/// - **私网 TCP 目标告警兜底**（09-P2-1）：正常路径下私网段已被豁免路由
+///   引回物理网关；仅当物理网关未知、豁免未生成时包才会到达此处——
+///   丢弃并一次性告警（节点会 SSRF 拒绝私网目标，盲转发注定失败且无诊断）。
+/// - 其余（TCP 到公网目标等）原样投喂栈。
+fn handle_v4_else(
+    pkt: &[u8],
+    cfg: &TunConfig,
+    device: &mut ChanDevice,
+    warned_private: &mut bool,
+) {
+    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+        // 非 IPv4（ARP 等非 IP 帧）：原样投喂由栈自行处理
+        device.push_inbound(pkt);
+        return;
+    }
+    let ihl = usize::from(pkt[0] & 0x0f) * 4;
+    if pkt[0] & 0x0f < 5 || pkt.len() < ihl {
+        device.push_inbound(pkt); // 畸形头交由 smoltcp checked parse 丢弃
+        return;
+    }
+    let proto = pkt[9];
+    let (flags_frag_lo, frag_hi) = (pkt[6], pkt[7]);
+    let frag_offset = (u16::from(flags_frag_lo & 0x1f) << 8) | u16::from(frag_hi);
+    let has_more = flags_frag_lo & 0x20 != 0;
+    if proto == 1 {
+        // ICMP：不再投喂（防 any-ip 伪造 Echo Reply，见函数文档）
+        debug!("TUN 丢弃入站 ICMPv4 包（防本地栈伪造回显）");
+        return;
+    }
+    if frag_offset != 0 || has_more {
+        debug!("TUN 丢弃 IPv4 分片包（无重组能力，防非首片被误解析）");
+        return;
+    }
+    if proto == 6 && pkt.len() >= 24 {
+        // 私网 TCP 目标兜底（排除 TUN 自身网段：发往 TUN 地址的流量合法）
+        let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+        let mask = match cfg.prefix {
+            0 => 0u32,
+            p => u32::MAX << (32 - p.min(32)),
+        };
+        let dst_u32 = u32::from(dst);
+        let net_u32 = u32::from(cfg.network());
+        let private = dst.is_loopback()
+            || dst.is_link_local()
+            || dst.is_private()
+            || dst.octets()[0] == 0
+            || (dst.octets()[0] == 100 && (64..=127).contains(&dst.octets()[1]));
+        let tun_subnet_hit = cfg.prefix > 0 && (dst_u32 & mask) == (net_u32 & mask);
+        if private && !tun_subnet_hit {
+            if !*warned_private {
+                *warned_private = true;
+                warn!(
+                    "TUN 收到发往私网目标的 TCP 包（如 {}）但未生成豁免路由\
+                     （物理网关未知？）：私网目标不经代理（节点会拒绝），已丢弃。\
+                     请设置 HYDRA_TUN_GW 或确认默认网关可解析，私网访问即可直连",
+                    dst
+                );
+            }
+            return;
+        }
+    }
+    device.push_inbound(pkt);
 }
 
 /// 添加一个监听 socket
@@ -2163,8 +2330,8 @@ mod tests {
         let gw = Some(Ipv4Addr::new(192, 168, 1, 1));
         // 显式含网段直连版（平台无关；生产入口按 cfg!(windows) 决定，见 compute_routes）
         let plan = compute_routes_for(&tun(), gw, true);
-        // 添加清单：/1 x2 + TUN 网段 + 2 豁免
-        assert_eq!(plan.add.len(), 5);
+        // 添加清单：/1 x2 + TUN 网段 + 2 豁免 + 4 私网段豁免（09-P2-1）
+        assert_eq!(plan.add.len(), 9);
         assert!(plan.add.contains(&RouteCmd {
             dest: Ipv4Addr::new(0, 0, 0, 0),
             prefix: 1,
@@ -2218,13 +2385,18 @@ mod tests {
     #[test]
     fn compute_routes_linux不含网段直连() {
         let plan = compute_routes_for(&tun(), Some(Ipv4Addr::new(192, 168, 1, 1)), false);
-        // /1 x2 + 2 豁免 = 4；无 10.7.0.0/30
-        assert_eq!(plan.add.len(), 4);
+        // /1 x2 + 2 豁免 + 4 私网段豁免（09-P2-1）= 8；无 10.7.0.0/30
+        assert_eq!(plan.add.len(), 8);
         assert!(!plan
             .add
             .iter()
             .any(|c| c.prefix == 30 && c.dest == Ipv4Addr::new(10, 7, 0, 0)));
-        assert_eq!(plan.remove.len(), 4);
+        assert_eq!(plan.remove.len(), 8);
+        // 私网豁免段在场
+        assert!(plan
+            .add
+            .iter()
+            .any(|c| c.prefix == 8 && c.dest == Ipv4Addr::new(10, 0, 0, 0)));
     }
 
     /// 审查 06-P2-9：prefix>32 不再下溢（钳制到 32 的掩码）
@@ -2259,8 +2431,13 @@ mod tests {
     fn compute_routes_v6_接管与豁免完备() {
         let gw6 = Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
         let plan = compute_routes_v6(&tun_v6(), gw6);
-        // ::/1 + 8000::/1 接管 + 1 条节点 v6 豁免 /128
-        assert_eq!(plan.add.len(), 3);
+        // ::/1 + 8000::/1 接管 + 1 条节点 v6 豁免 /128 + ULA fc00::/7 豁免（09-P2-1）
+        assert_eq!(plan.add.len(), 4);
+        assert!(plan.add.contains(&RouteCmdV6 {
+            dest: Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0),
+            prefix: 7,
+            gateway: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+        }));
         assert!(plan.add.contains(&RouteCmdV6 {
             dest: Ipv6Addr::UNSPECIFIED,
             prefix: 1,
@@ -2336,8 +2513,8 @@ mod tests {
         let failed = apply_routes_v6_try(&exec, &plan);
         assert_eq!(
             failed,
-            2,
-            "::/1 之后的 2 条应失败: {calls:?}",
+            3,
+            "::/1 之后的 3 条（8000::/1、节点 /128、ULA /7）应失败: {calls:?}",
             calls = exec.calls.lock().unwrap()
         );
         // try-and-warn：失败条目不产生任何 Delete（不回滚），已成功的保留
@@ -2354,7 +2531,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         };
         assert_eq!(apply_routes_v6_try(&exec, &plan), 0);
-        assert_eq!(exec.calls.lock().unwrap().len(), 3);
+        assert_eq!(exec.calls.lock().unwrap().len(), 4);
     }
 
     #[test]
@@ -2364,8 +2541,8 @@ mod tests {
         assert_eq!(apply_routes_v6_try(&exec, &plan), 0);
         cleanup_routes_v6(&exec, &plan);
         let cmds = exec.commands.lock().unwrap();
-        assert_eq!(cmds.len(), 6);
-        assert!(cmds[3].starts_with("v6 Delete ::/1"));
+        assert_eq!(cmds.len(), 8);
+        assert!(cmds[4].starts_with("v6 Delete ::/1"));
     }
 
     #[test]
@@ -2402,11 +2579,11 @@ mod tests {
         let exec = DryRunExecutor::default();
         let plan = compute_routes_for(&tun(), Some(Ipv4Addr::new(192, 168, 1, 1)), true);
         apply_routes(&exec, &plan).unwrap();
-        assert_eq!(exec.commands.lock().unwrap().len(), 5);
+        assert_eq!(exec.commands.lock().unwrap().len(), 9);
         cleanup_routes(&exec, &plan);
-        assert_eq!(exec.commands.lock().unwrap().len(), 10);
+        assert_eq!(exec.commands.lock().unwrap().len(), 18);
         assert!(exec.commands.lock().unwrap()[0].starts_with("Add 0.0.0.0/1"));
-        assert!(exec.commands.lock().unwrap()[5].starts_with("Delete 0.0.0.0/1"));
+        assert!(exec.commands.lock().unwrap()[9].starts_with("Delete 0.0.0.0/1"));
     }
 
     /// 注入式执行器：前 `ok` 条 Add 成功，之后全部失败；记录所有命令
@@ -2475,7 +2652,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         };
         assert!(apply_routes(&exec, &plan).is_ok());
-        assert_eq!(exec.calls.lock().unwrap().len(), 5);
+        assert_eq!(exec.calls.lock().unwrap().len(), 9);
         assert!(exec
             .calls
             .lock()

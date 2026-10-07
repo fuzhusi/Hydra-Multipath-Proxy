@@ -5,6 +5,107 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased] - 全量代码审查 09 修复（P1/P2 全部 + 高价值 P3 + 文档清账）
+
+> 审查报告：[docs/review/09-全量代码审查报告.md](docs/review/09-全量代码审查报告.md)。
+> 7 路并行深审（协议/数据面/服务/服务端/TUN/GUI+Android/框架符合度），P0 为零；
+> 本批次修复 P1 全部 7 项、P2 绝大多数、以及文档/构建阻断项。clippy 零警告、
+> 全工作区测试通过。
+
+### 安全与资源（P1）
+
+- **节点 UDP 中继连接级空闲看门狗**（300s 无上行帧即主动关闭）——半开/静默
+  连接此前可永久钉满连接额度（1000 条即全节点拒绝服务）；TCP/信令路径已有
+  同款防护，UDP 新路径补齐。
+- **客户端出站连接 TCP keepalive**（idle 60s/interval 10s，socket2）+ 全部
+  出站建连收口 `connect_tcp_protected`——对端静默死亡（掉电/断网/NAT 回收）
+  时中继双向 read 永久挂起、任务与缓冲泄漏。
+- **不可达目标计数表加 60s TTL + 10 万条容量上限**——此前 key 空间无界，
+  `--listen 0.0.0.0` 时任意 LAN 主机可分钟级注入数百 MB 内存。
+- **分享链接数值参数范围校验**（`is_finite` + 上下界）+ 调度器写回入口防御
+  clamp——恶意订阅 `bandwidth=NaN`（约 50% 概率胜出全部健康节点）/
+  `loss_rate=-1e300`（评分恒第一且测速永不覆盖）的持久调度劫持封死。
+- **客户端 UDP 会话号回收**：映射表 4096 容量上限 + LRU 淘汰复用 sid（淘汰
+  先发下行 close，节点按换绑定语义重建）——此前单调分配永不回收，一次性
+  目标高频出现约 1 小时耗尽 u16 空间，整条 UDP 通道永久报废。
+- **GUI TUN 失败降级**：就绪信号与 TUN 失败信号竞态时（此前失败只进一行日志）
+  自动回退设置系统代理并显著告警——不再出现"显示 TUN 已全局接管、实际流量
+  明文直连且无系统代理"的错误安全态势。
+- **Android R4 protect 全链路接线**：`hydra-core` 新增进程级出站 socket 保护
+  钩子（`socket_protect` 模块），节点连接/直连建连均经 `TcpSocket` 阶段回调；
+  `SocketProtect` 接口改为返回 `bool`，protect 失败即中止该连接（放行 = 回环）。
+  uniffi Kotlin 绑定已再生成。
+
+### 服务端（P2）
+
+- UDP 中继：连接内 DNS 结果缓存（TTL 60s/128 条）+ 真实解析速率预算（1s
+  窗口 ≤10 次）——封堵"同 session 换目标逐帧 getaddrinfo 打满 tokio blocking
+  池、跨连接拖垮全节点 DNS"的放大路径；会话任务异常退出经通道上报、主循环
+  删表项并下行 close（修僵尸会话黑洞）；会话满下行 close 通知客户端；上行
+  `try_send` 失败区分队列满与会话已死。
+- **SSRF 判定收敛单源**：`handler::classify_blocked_ip` 为唯一实现，UDP 路径
+  复用（此前镜像已分叉）；补齐 TEST-NET-1/2/3、192.0.0.0/24——并修正上轮
+  引入的 2001:db8::/32 段值笔误（`0x01db`→`0x0db8`，该段从未真正命中）。
+- 信令：跨连接下行投递限时 5s（防黑洞客户端楔死他人信令连接）；写任务超时
+  无条件 abort（修 fd/TLS 写半泄漏）；invite 日志脱敏 + `mask_peer_id` 多字节
+  安全。
+- **per-IP 并发连接上限**（默认 256，`HYDRA_PER_IP_CONNECTIONS` 可调，0=关闭）
+  ——防单主机 ~25 conn/s 轮换钉满全部连接额度；accept 错误循环加 100ms 退避。
+- `main.rs` 未知 CLI 参数/无法解析的位置参数显式报错退出（此前 `--confg`
+  typo 会以默认 0.0.0.0:8080 静默启动）。
+
+### 客户端 core（P2）
+
+- HTTP 头阶段总 deadline（30s）——修 slowloris（逐段读重置 30s 超时、单连接
+  可存续约 22 天）。
+- Online 节点活性探测（连续 3 次失败转 Degraded，恢复探测成功即回 Online）；
+  探测升级为**完整握手**（TCP+TLS+Noise-PSK+地址帧，目标用 UDP 中继保留前缀）
+  ——修"Online 永不下线"与"PSK 错配时节点永久振荡"两个叠加缺陷。
+- SOCKS5 greeting/request 改为分片安全的增量 `read_exact` 解析 + 方法协商
+  修正（客户端未提供 no-auth 时回 0xFF 而非违约回 0x00）+ 请求后捎带早发
+  数据不再丢弃。
+- HTTP authority 解析重写：剥 userinfo、`rsplit_once(':')`、非法端口显式 400
+  （此前 `evil.com:443x` 静默改连 80、裸 `::1` 产出空 host）。
+- 本地协议错误不再误标健康节点 Offline（畸形 Host 头此前可连锁误标 3 个候选）；
+  调度器平分取向统一（地址升序）；节点初始带宽下限 10.0（>10 节点时不再为负）。
+- `connection_closed` 饱和递减（修 reset 竞态回绕 u64::MAX）；连接注册表
+  prune 去除 O(n) 深拷贝。
+- NAT：信令下行行读带 4096 上限（防无换行长行耗内存）；打洞候选截断 ≤32 条。
+- `tcp_transport` 写地址帧补 5s 超时（建链序列最后一个无超时 I/O）。
+
+### TUN（P2/P3）
+
+- **私网段豁免路由**：RFC1918 + CGNAT（v4）、ULA fc00::/7（v6）回物理网关
+  ——修"能上外网但访问不了路由器/NAS"（私网目标此前进 TUN 被节点 SSRF
+  fail-closed 拒绝且无日志）；栈侧对私网 TCP 兜底丢弃 + 一次性告警。
+- ICMPv4 全部静默丢弃（此前 smoltcp any-ip 对任意 IPv4 地址伪造 ping 应答）；
+  IPv4 分片包（MF/offset）不再投喂栈；IPv6 组播目的/未指定源包静默丢弃
+  （上轮 v4 修复的同源 v6 遗漏）。
+- 系统 **IPv6 DNS 探测**（`detect_dns_servers_v6`）并入 v6 豁免——修纯 v6
+  网络 DNS 失效与"v6 DNS over UDP 被拒 / over TCP 被代理"的分叉；Windows
+  注册表只取 NameServer 行（不再把 DhcpIPAddress 等误收进豁免）。
+- `stack_buf` 分配真正提到主循环外（06-P3-8 修复意图复核未达成，本次落地）。
+
+### GUI / Android（P2）
+
+- GUI：代理线程就绪前 panic 的 Disconnected 分支补清 stop_flag/handle/
+  exit_receiver（修"启动代理"永久被拒，仅托盘可恢复）；导入分享链接覆盖
+  全局密钥前显式告警（掩码前后值）；节点页"全部测速"按钮加进行中守卫。
+- Android：节点地址解析失败显式报 `InvalidConfig`（此前域名节点被静默过滤、
+  引擎以 0 节点"成功启动"）；JNA 依赖改用 **aar 变体**（此前桌面 jar，
+  真机必 UnsatisfiedLinkError）；`build-rust.ps1` 断行字符串修复。
+
+### 文档清账
+
+- README：删除已实现的"无 UDP-over-proxy"与"GUI 仅 pin 模式"表述、残留死
+  变量 `HYDRA_AGGREGATE`；补 `HYDRA_PER_IP_CONNECTIONS`/私网直连说明；
+  roadmap 勾选已完成的门③ TCP 形态重放测试与连接页。
+- 修正 TUN IPv6 默认值三处矛盾（CHANGELOG 0.2.0 历史条目保留原文，现状以
+  README 为准：默认**开**）。
+- 审查 08 遗留 4 条 P3（send_to 先登记后编码 / touch 锁外竞态 / is_full
+  保留 / 测试 set_var）随本批次处理或在代码注释中如实标注。
+- 审查报告与修复记录：[docs/review/09-全量代码审查报告.md](docs/review/09-全量代码审查报告.md)。
+
 ## [Unreleased] - Android M0（hydra-core 抽取 + 工程骨架）
 
 ### 新增

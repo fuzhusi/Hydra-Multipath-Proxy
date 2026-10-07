@@ -655,7 +655,7 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
     fun callback(`callbackData`: Long,`result`: UniffiForeignFutureStructVoid.UniffiByValue,)
 }
 internal interface UniffiCallbackInterfaceSocketProtectMethod0 : com.sun.jna.Callback {
-    fun callback(`uniffiHandle`: Long,`fd`: Long,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+    fun callback(`uniffiHandle`: Long,`fd`: Long,`uniffiOutReturn`: ByteByReference,uniffiCallStatus: UniffiRustCallStatus,)
 }
 @Structure.FieldOrder("protect", "uniffiFree")
 internal open class UniffiVTableCallbackInterfaceSocketProtect(
@@ -979,7 +979,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_hydra_android_checksum_constructor_hydraengine_new() != 57904.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_hydra_android_checksum_method_socketprotect_protect() != 2709.toShort()) {
+    if (lib.uniffi_hydra_android_checksum_method_socketprotect_protect() != 63365.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1245,6 +1245,29 @@ public object FfiConverterDouble: FfiConverter<Double, Double> {
 
     override fun write(value: Double, buf: ByteBuffer) {
         buf.putDouble(value)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
+    override fun lift(value: Byte): Boolean {
+        return value.toInt() != 0
+    }
+
+    override fun read(buf: ByteBuffer): Boolean {
+        return lift(buf.get())
+    }
+
+    override fun lower(value: Boolean): Byte {
+        return if (value) 1.toByte() else 0.toByte()
+    }
+
+    override fun allocationSize(value: Boolean) = 1UL
+
+    override fun write(value: Boolean, buf: ByteBuffer) {
+        buf.put(lower(value))
     }
 }
 
@@ -1909,11 +1932,14 @@ public object FfiConverterTypeTrustMode : FfiConverterRustBuffer<TrustMode>{
 
 /**
  * R4 防环回：出站 socket 保护回调（Kotlin 实现 → `VpnService.protect(fd)`）。
- * fd 为引擎新建出站 socket 的文件描述符；必须在任何 connect 之前调用 protect。
+ * fd 为引擎新建出站 socket 的文件描述符；在任何 connect 之前调用。
+ * **返回 protect 是否成功**：false 时引擎中止该连接（放行 = 流量进自身
+ * TUN 回环，宁失败不放行）。Kotlin 实现示例：
+ * `override fun protect(fd: Long): Boolean = vpnService.protect(fd.toInt())`
  */
 public interface SocketProtect {
     
-    fun `protect`(`fd`: kotlin.Long)
+    fun `protect`(`fd`: kotlin.Long): kotlin.Boolean
     
     companion object
 }
@@ -1923,14 +1949,14 @@ public interface SocketProtect {
 // Put the implementation in an object so we don't pollute the top-level namespace
 internal object uniffiCallbackInterfaceSocketProtect {
     internal object `protect`: UniffiCallbackInterfaceSocketProtectMethod0 {
-        override fun callback(`uniffiHandle`: Long,`fd`: Long,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+        override fun callback(`uniffiHandle`: Long,`fd`: Long,`uniffiOutReturn`: ByteByReference,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeSocketProtect.handleMap.get(uniffiHandle)
             val makeCall = { ->
                 uniffiObj.`protect`(
                     FfiConverterLong.lift(`fd`),
                 )
             }
-            val writeReturn = { _: Unit -> Unit }
+            val writeReturn = { value: kotlin.Boolean -> uniffiOutReturn.setValue(FfiConverterBoolean.lower(value)) }
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }

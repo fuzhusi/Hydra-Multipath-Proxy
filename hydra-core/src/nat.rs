@@ -34,7 +34,7 @@ use hydra_protocol::stun::{self, NatType};
 use hydra_protocol::{HydraError, Result};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -55,6 +55,11 @@ const SIGNAL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(8);
 const ROLE_WAIT: Duration = Duration::from_millis(1500);
 /// peer_offline 重试间隔
 const INVITE_RETRY: Duration = Duration::from_millis(300);
+/// 信令下行单行长度上限（09-P2-3：防无换行长行无限耗内存；与节点侧
+/// signal.rs 的 4096 上限对齐）
+const SIGNAL_MAX_LINE_LEN: usize = 4096;
+/// 打洞候选数量上限（09-P2-3：防被入侵节点下发海量候选逐条 spawn 任务）
+const MAX_PEER_CANDIDATES: usize = 32;
 
 /// 从 `HYDRA_STUN_ADDRS` 读取 STUN 服务器列表。
 /// 未设置/为空/解析失败均为特定错误（调用方据此提示「功能关闭」或配置问题）。
@@ -321,13 +326,30 @@ impl SignalSession {
         Ok(())
     }
 
-    /// 读一条下行 JSON 行（无数据到达返回 Err/超时由调用方包裹）
+    /// 读一条下行 JSON 行（无数据到达返回 Err/超时由调用方包裹）。
+    /// 09-P2-3：带行长上限的逐字节读——此前 `read_line` 无上限累积 String，
+    /// 被入侵节点/链路劫持者以无换行长行可无限耗内存。
     async fn recv(&mut self) -> Result<SignalDown> {
-        let mut line = String::new();
-        let n = self.rd.read_line(&mut line).await?;
-        if n == 0 {
-            return Err(HydraError::ConnectionError("信令连接被节点关闭".into()));
+        let mut line = Vec::with_capacity(256);
+        let mut byte = [0u8; 1];
+        loop {
+            let n = self.rd.read(&mut byte).await?;
+            if n == 0 {
+                return Err(HydraError::ConnectionError("信令连接被节点关闭".into()));
+            }
+            if byte[0] == b'\n' {
+                break;
+            }
+            line.push(byte[0]);
+            if line.len() > SIGNAL_MAX_LINE_LEN {
+                return Err(HydraError::ProtocolError(format!(
+                    "信令下行行超长（>{}B）",
+                    SIGNAL_MAX_LINE_LEN
+                )));
+            }
         }
+        let line = String::from_utf8(line)
+            .map_err(|_| HydraError::ProtocolError("信令下行非 UTF-8".into()))?;
         serde_json::from_str(&line)
             .map_err(|e| HydraError::ProtocolError(format!("信令下行解析失败: {e}")))
     }
@@ -755,9 +777,16 @@ async fn signal_exchange(
     }
 }
 
-/// 候选字符串 → SocketAddr（解析失败的条目丢弃）
+/// 候选字符串 → SocketAddr（解析失败的条目丢弃）。
+/// 09-P2-3：上限 [`MAX_PEER_CANDIDATES`] 条——共享 PSK 信任模型下被入侵节点
+/// 可下发海量候选，此前逐条 spawn connect 任务（10 万条候选 → 10 万 socket/任务）。
+/// 打洞只需少数候选，截断即可。
 fn parse_cands(cand: Vec<String>) -> Vec<SocketAddr> {
-    cand.iter().filter_map(|s| s.parse().ok()).collect()
+    cand.iter()
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .take(MAX_PEER_CANDIDATES)
+        .collect()
 }
 
 #[cfg(test)]

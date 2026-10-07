@@ -39,16 +39,20 @@ fn private_targets_allowed() -> bool {
     })
 }
 
-/// SSRF 黑名单判定：命中返回原因（供脱敏日志），未命中返回 None。
+/// SSRF 黑名单判定（审查 09-P2-5 起为本仓库唯一实现源：UDP 中继路径复用本
+/// 函数，不再镜像维护）：命中返回原因（供脱敏日志），未命中返回 None。
 /// 覆盖：loopback（127.0.0.0/8、::1）、链路本地（169.254.0.0/16、fe80::/10）、
 /// RFC1918 私网（10/8、172.16/12、192.168/16）、0.0.0.0/8、IPv6 未指定地址（::）
 /// 与 IPv6 ULA（fc00::/7，RFC1918 的 IPv6 对应物）；
 /// 运营商级 NAT（CGNAT 100.64.0.0/10，RFC6598）、基准测试网段（198.18.0.0/15，
 /// RFC2544）、组播（224.0.0.0/4）与保留段（240.0.0.0/4，含 255.255.255.255 广播）
 /// ——审查 N-06 补段（纵深防御）；
+/// 文档/特殊用途段（192.0.0.0/24 RFC6890、TEST-NET-1/2/3 RFC5737）——09-P3 补齐；
+/// IPv6 组播（ff00::/8）与文档段（2001:db8::/32）——09-P2-5 补齐（此前仅 UDP
+/// 镜像侧有，两侧已收敛为单源）；
 /// 全部内嵌 IPv4 形态（IPv4 映射 ::ffff:a.b.c.d、NAT64 64:ff9b::/96、IPv4 兼容
 /// ::/96、::ffff:0:0/96——07-P2-1 补齐后两段）的尾 4 字节均按 IPv4 规则复查，防绕过。
-fn classify_blocked_ip(ip: IpAddr) -> Option<&'static str> {
+pub(crate) fn classify_blocked_ip(ip: IpAddr) -> Option<&'static str> {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
@@ -66,6 +70,18 @@ fn classify_blocked_ip(ip: IpAddr) -> Option<&'static str> {
             } else if o[0] == 198 && (18..=19).contains(&o[1]) {
                 // 基准测试网段 198.18.0.0/15（RFC2544）
                 Some("benchmarking 198.18.0.0/15")
+            } else if o[0] == 192 && o[1] == 0 && o[2] == 0 {
+                // 192.0.0.0/24（IETF 协议分配，RFC 6890）
+                Some("special 192.0.0.0/24")
+            } else if o[0] == 192 && o[1] == 0 && o[2] == 2 {
+                // TEST-NET-1（RFC 5737）
+                Some("documentation TEST-NET-1 192.0.2.0/24")
+            } else if o[0] == 198 && o[1] == 51 && o[2] == 100 {
+                // TEST-NET-2（RFC 5737）
+                Some("documentation TEST-NET-2 198.51.100.0/24")
+            } else if o[0] == 203 && o[1] == 0 && o[2] == 113 {
+                // TEST-NET-3（RFC 5737）
+                Some("documentation TEST-NET-3 203.0.113.0/24")
             } else if o[0] & 0xf0 == 0xe0 {
                 // 组播 224.0.0.0/4（is_multicast，显式写出便于审阅）
                 Some("multicast 224.0.0.0/4")
@@ -96,6 +112,13 @@ fn classify_blocked_ip(ip: IpAddr) -> Option<&'static str> {
                 Some("IPv6 ULA private")
             } else if v6.is_unspecified() {
                 Some("unspecified ::")
+            } else if (seg[0] & 0xff00) == 0xff00 {
+                // IPv6 组播 ff00::/8（审查 09-P2-5：与 IPv4 组播拦截对称）
+                Some("IPv6 multicast ff00::/8")
+            } else if (seg[0] & 0xff00) == 0x2000 && seg[1] == 0x0db8 {
+                // 文档段 2001:db8::/32（RFC 3849）。注意段值是 0x0db8——此前
+                // 镜像实现误写 0x01db，该分支从未命中（09 审查测试暴露）
+                Some("documentation 2001:db8::/32")
             } else {
                 None
             }
@@ -110,7 +133,7 @@ fn classify_blocked_ip(ip: IpAddr) -> Option<&'static str> {
 /// - `64:ff9b::/96`（NAT64）。
 ///
 /// 命中返回重组的 `Ipv4Addr`，由调用方递归按 IPv4 规则复查。
-fn embedded_ipv4_of_v6(seg: [u16; 8]) -> Option<Ipv4Addr> {
+pub(crate) fn embedded_ipv4_of_v6(seg: [u16; 8]) -> Option<Ipv4Addr> {
     let v4 = Ipv4Addr::new(
         (seg[6] >> 8) as u8,
         (seg[6] & 0xff) as u8,
@@ -506,6 +529,39 @@ mod ssrf_tests {
         assert_eq!(
             classify_blocked_ip("223.255.255.254".parse().unwrap()),
             None
+        );
+    }
+
+    #[test]
+    fn documentation_segments_blocked() {
+        // 09-P3 补段：TEST-NET-1/2/3 + 192.0.0.0/24
+        assert_eq!(
+            classify_blocked_ip("192.0.2.1".parse().unwrap()),
+            Some("documentation TEST-NET-1 192.0.2.0/24")
+        );
+        assert_eq!(
+            classify_blocked_ip("198.51.100.7".parse().unwrap()),
+            Some("documentation TEST-NET-2 198.51.100.0/24")
+        );
+        assert_eq!(
+            classify_blocked_ip("203.0.113.9".parse().unwrap()),
+            Some("documentation TEST-NET-3 203.0.113.0/24")
+        );
+        assert_eq!(
+            classify_blocked_ip("192.0.0.1".parse().unwrap()),
+            Some("special 192.0.0.0/24")
+        );
+        // 段外不误伤（198.51.101.x 与 203.0.114.x 属公网）
+        assert_eq!(classify_blocked_ip("198.51.101.1".parse().unwrap()), None);
+        assert_eq!(classify_blocked_ip("203.0.114.1".parse().unwrap()), None);
+        // 09-P2-5 补段：IPv6 组播与 2001:db8（此前仅 UDP 镜像侧有）
+        assert_eq!(
+            classify_blocked_ip("ff02::1".parse().unwrap()),
+            Some("IPv6 multicast ff00::/8")
+        );
+        assert_eq!(
+            classify_blocked_ip("2001:db8::1".parse().unwrap()),
+            Some("documentation 2001:db8::/32")
         );
     }
 

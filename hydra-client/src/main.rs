@@ -36,9 +36,21 @@ fn tun_config_from_env(nodes: &[SocketAddr]) -> hydra_client::tun::TunConfig {
                         cfg.addr
                     );
                 }
+            } else {
+                // 09-P3-6：设置了解析失败 → 显式告警（此前静默使用默认地址，
+                // 路由豁免全部错位还无痕可查）
+                error!(
+                    "HYDRA_TUN_ADDR \"{s}\" 无法解析（应为形如 10.7.0.1/30），使用默认 {}/30",
+                    cfg.addr
+                );
             }
         } else if let Ok(ip) = s.trim().parse::<std::net::Ipv4Addr>() {
             cfg.addr = ip;
+        } else {
+            error!(
+                "HYDRA_TUN_ADDR \"{s}\" 无法解析（应为形如 10.7.0.1/30），使用默认 {}/30",
+                cfg.addr
+            );
         }
     }
     // IPv6 接管开关（v1 完整版默认**开**：栈已启用 proto-ipv6，v6 TCP 走
@@ -62,9 +74,13 @@ fn tun_config_from_env(nodes: &[SocketAddr]) -> hydra_client::tun::TunConfig {
             std::net::IpAddr::V6(ip) => cfg.exclude_routes_v6.push(ip),
         }
     }
-    // 系统 DNS 豁免（best-effort；DNS 明文直出物理网卡——v1 无 DNS 劫持，如实边界）
+    // 系统 DNS 豁免（best-effort；DNS 明文直出物理网卡——v1 无 DNS 劫持，如实边界）。
+    // 09-P2-4：v6 DNS 同样豁免（详见 tun::detect_dns_servers_v6 文档）
     for dns in hydra_client::tun::detect_dns_servers() {
         cfg.exclude_routes.push(dns);
+    }
+    for dns in hydra_client::tun::detect_dns_servers_v6() {
+        cfg.exclude_routes_v6.push(dns);
     }
     if let Ok(s) = std::env::var("HYDRA_TUN_EXCLUDE") {
         for ip in s
@@ -78,7 +94,19 @@ fn tun_config_from_env(nodes: &[SocketAddr]) -> hydra_client::tun::TunConfig {
         }
     }
     if let Ok(s) = std::env::var("HYDRA_TUN_PORTS") {
-        let ports: Vec<u16> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+        let mut ports = Vec::new();
+        let mut bad = Vec::new();
+        for p in s.split(',') {
+            match p.trim().parse::<u16>() {
+                Ok(port) => ports.push(port),
+                Err(_) => bad.push(p.trim().to_string()),
+            }
+        }
+        // 09-P3-6：非法端口显式告警（此前 filter_map 静默丢弃——"443,84434"
+        // 只剩 443，用户以为 84434 也被拦截）
+        if !bad.is_empty() {
+            error!("HYDRA_TUN_PORTS 含非法端口项: {:?}（已忽略）", bad);
+        }
         if !ports.is_empty() {
             cfg.listen_ports = ports;
         }
@@ -86,22 +114,12 @@ fn tun_config_from_env(nodes: &[SocketAddr]) -> hydra_client::tun::TunConfig {
     cfg
 }
 
-/// Windows 系统代理开启时 TUN 流量会二次进代理形成环路（方案 §5）：检测并告警（不自动关闭）
+/// Windows 系统代理开启时 TUN 流量会二次进代理形成环路（方案 §5）：检测并告警（不自动关闭）。
+/// 09-P3-3：复用 lib.rs 的共享实现（`contains("0x1")` 会把 `0x10`/`0x1f` 等
+/// 误判为开启——同逻辑副本此前只在 lib.rs 修复，此处为漏改副本）。
 #[cfg(all(windows, feature = "tun"))]
 fn warn_system_proxy_loop() {
-    // CREATE_NO_WINDOW：后台检测不弹控制台窗口
-    let mut cmd = std::process::Command::new("reg");
-    cmd.args([
-        "query",
-        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-        "/v",
-        "ProxyEnable",
-    ]);
-    let ok = hydra_client::hide_console_window(&mut cmd)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("0x1"))
-        .unwrap_or(false);
-    if ok {
+    if hydra_client::windows_system_proxy_enabled() {
         eprintln!(
             "⚠ 检测到 Windows 系统代理已开启：TUN 模式下经系统代理的流量会二次进入本代理形成环路，\
              建议关闭系统代理后使用 TUN 模式"
@@ -118,7 +136,19 @@ fn parse_args() -> (Option<SocketAddr>, Vec<SocketAddr>, Option<P2pArgs>) {
     while i < args.len() {
         match args[i].as_str() {
             "--listen" => {
-                listen = args.get(i + 1).and_then(|s| s.parse().ok());
+                match args.get(i + 1).map(|s| s.parse::<SocketAddr>()) {
+                    Some(Ok(a)) => listen = Some(a),
+                    // 09-P3-6：解析失败显式退出（此前静默回退默认且吞掉该参数位）
+                    Some(Err(_)) => {
+                        let raw = args.get(i + 1).cloned().unwrap_or_default();
+                        error!("--listen 参数 \"{raw}\" 无法解析（应为 地址:端口，如 127.0.0.1:1080）");
+                        std::process::exit(1);
+                    }
+                    None => {
+                        error!("--listen 需要参数 <监听地址:端口>");
+                        std::process::exit(1);
+                    }
+                }
                 i += 2;
             }
             "--tun" => {
@@ -434,15 +464,33 @@ async fn main() -> Result<()> {
                 #[cfg(windows)]
                 {
                     use tokio::signal::windows::{ctrl_close, ctrl_logoff, ctrl_shutdown};
-                    // ctrl_close/shutdown/logoff 返回事件流（recv 取首个事件）
-                    let mut close = ctrl_close().expect("注册 ctrl_close 监听失败");
-                    let mut shutdown_ev = ctrl_shutdown().expect("注册 ctrl_shutdown 监听失败");
-                    let mut logoff = ctrl_logoff().expect("注册 ctrl_logoff 监听失败");
+                    // 09-P3-4：注册失败不再 expect——panic 发生在 spawn 的任务内
+                    // 无人收尸，此后 Ctrl+C/关机事件无任何处理器，进程被系统强杀，
+                    // RouteGuard 不执行 → /1 接管路由残留整机断网。降级为 error 日志
+                    // + None 流（select 对 None future 直接跳过该分支）。
+                    let close = ctrl_close();
+                    let shutdown_ev = ctrl_shutdown();
+                    let logoff = ctrl_logoff();
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => {}
-                        _ = close.recv() => {}
-                        _ = shutdown_ev.recv() => {}
-                        _ = logoff.recv() => {}
+                        _ = async {
+                            match close {
+                                Ok(mut s) => { let _ = s.recv().await; }
+                                Err(e) => error!("注册 ctrl_close 监听失败（降级忽略）: {e}"),
+                            }
+                        } => {}
+                        _ = async {
+                            match shutdown_ev {
+                                Ok(mut s) => { let _ = s.recv().await; }
+                                Err(e) => error!("注册 ctrl_shutdown 监听失败（降级忽略）: {e}"),
+                            }
+                        } => {}
+                        _ = async {
+                            match logoff {
+                                Ok(mut s) => { let _ = s.recv().await; }
+                                Err(e) => error!("注册 ctrl_logoff 监听失败（降级忽略）: {e}"),
+                            }
+                        } => {}
                     }
                 }
                 #[cfg(not(windows))]

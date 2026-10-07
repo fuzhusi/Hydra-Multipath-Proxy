@@ -46,7 +46,8 @@
 - **防环路**：节点 IP / 系统 DNS / TUN 网段自动豁免路由（/32 回物理网关），物理网关自动探测；退出/崩溃由 drop guard + 下次启动幂等清理恢复（P3-7：/1 接管路由优先摘除，防 5s 停机宽限不足残留）
 - **IPv6 双栈**：`ipv6_enabled` 默认开启——IPv6 TCP 经用户态栈正向代理（动态 AnyIP：smoltcp 0.11 的 any-ip 仅 IPv4，入站 v6 目的地址临时挂为接口 /128 有界轮转池）；v6 非 TCP 包回 ICMPv6 不可达供应用回落 IPv4；节点 IPv6 豁免照旧（`HYDRA_TUN_IPV6=0` 可关闭，关闭时 v6 全部快速失败代答）
 - **UDP 快速回落**：IPv4 UDP 不代理但代答 **ICMPv4 port unreachable**（type 3/code 3，RFC 792 校验和），应用立即失败回落 TCP 而非漫长超时
-- **已知边界（如实）**：UDP 丢弃回包（无 UDP-over-proxy）、无 DNS 劫持、无域名分流；仅拦截 `HYDRA_TUN_PORTS` 列表内端口（默认 80/443/8080/8443），列表外回 RST；Windows 真机 v6 接管需 netsh + 管理员，未做真机验证（见人工验证清单）
+- **已知边界（如实）**：UDP 丢弃回包（UDP-over-proxy 协议/节点/客户端封装三层已交付，桌面 TUN 接线未做——UDP 仍快速回落 TCP）、无 DNS 劫持、无域名分流；仅拦截 `HYDRA_TUN_PORTS` 列表内端口（默认 80/443/8080/8443），列表外回 RST；Windows 真机 v6 接管需 netsh + 管理员，未做真机验证（见人工验证清单）
+- **私网直连**：RFC1918 + CGNAT（IPv4）与 ULA fc00::/7（IPv6）默认豁免回物理网关（09-P2-1）——路由器/NAS 等内网设备访问不进代理（节点本就 SSRF 拒绝私网目标）；物理网关未知时私网 TCP 丢弃并告警
 - 设计与实现记录：[docs/design/TUN模式方案.md](docs/design/TUN模式方案.md)
 - **人工验证清单（无法本地自动化，需管理员真机执行）**：
   1. Wintun 全链路：管理员运行 `--tun`，浏览器访问 HTTPS 站点经节点出口；退出后 `route print` 无 0.0.0.0/1、128.0.0.0/1 残留
@@ -213,16 +214,16 @@ curl -x socks5h://127.0.0.1:1080 https://www.google.com
 | `HYDRA_TRUST` | 信任模式：`pin`（默认，自签固定）\| `ca`（真证书/公共 CA） |
 | `HYDRA_CERT_SHA256` | ca 模式可选：叶证书 SHA-256 硬 pin（64 hex，防 CA 误签发） |
 | `HYDRA_SNI` | SNI 域名（默认 `hydra.node`；真证书部署填证书 SAN 域名） |
-| `HYDRA_AGGREGATE` | `1` 启用连接级多节点加权分发（默认关闭） |
-| `HYDRA_PROBE_INTERVAL_SECS` | Offline 节点恢复探测周期（默认 30s） |
+| `HYDRA_PROBE_INTERVAL_SECS` | 节点探测周期（Offline 恢复 + Online 活性探测，默认 30s） |
 | `HYDRA_SPLIT` | `cn` 启用国内域名直连分流（默认关闭） |
 | `HYDRA_DIRECT_DOMAIN_FILE` | 自定义直连域名列表（一行一域名） |
-| `HYDRA_SPEEDTEST` | `0` 关闭测速评分（恢复探测保留） |
+| `HYDRA_SPEEDTEST` | `0` 关闭测速评分（Online 节点活性探测与 Offline 恢复探测保留） |
 | `HYDRA_STUN_ADDRS` | STUN 服务器（逗号分隔 ip:port 或域名；未设=NAT 穿透关闭） |
 | `HYDRA_TUN` | `1` 启用 TUN 透明代理（需管理员） |
-| `HYDRA_TUN_IF` / `HYDRA_TUN_ADDR` / `HYDRA_TUN_GW` / `HYDRA_TUN_DNS` | TUN 网卡名/地址/网关/DNS |
+| `HYDRA_TUN_IF` / `HYDRA_TUN_ADDR` / `HYDRA_TUN_GW` / `HYDRA_TUN_DNS` | TUN 网卡名/地址/网关/DNS（`HYDRA_TUN_DNS` 支持 v4/v6 混合列表） |
 | `HYDRA_TUN_PORTS` | TUN 拦截的 TCP 端口列表（默认 `80,443,8080,8443`） |
-| `HYDRA_TUN_EXCLUDE` / `HYDRA_TUN_IPV6` | 额外路由豁免 / IPv6 接管开关（默认关） |
+| `HYDRA_TUN_EXCLUDE` / `HYDRA_TUN_IPV6` | 额外路由豁免 / IPv6 接管开关 |
+| `HYDRA_PER_IP_CONNECTIONS` | **节点**单源 IP 并发连接上限（默认 256，0=关闭；防单主机钉满连接额度） |
 | `HYDRA_TRANSPORT` | legacy 兼容：`quic` 值告警回落 tcp（QUIC 已移除）；缺省即 TCP |
 
 优先级统一为：**命令行参数 > 环境变量 > 配置文件 > 默认值**。GUI 场景下配置文件 > 环境变量。
@@ -312,7 +313,7 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 - 分流为域名后缀版（无 GeoIP）；订阅为自有格式（不对接机场）
 - 分享链接含完整凭据时等同于交付节点，仅限可信渠道
 - TCP 链路认证失败与目标失败在客户端侧均表现为建连失败（节点侧已认证后的目标失败有 2B 应答码）
-- GUI 暂仅支持自签 pin 模式（真证书部署走 CLI；GUI 支持按 [UI 方案 v3](docs/design/UI重设计方案-v3.md) P1 补齐）
+- ~~GUI 暂仅支持自签 pin 模式~~（已支持真证书 CA 模式：设置页 trust=ca + 可选叶证书 SHA-256 硬 pin，`config.rs resolve_trust`）
 
 
 ## 开发路线
@@ -325,10 +326,12 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 - [x] **交付批次：真证书（PEM/ACME）路线 + 多节点证书配对根治 + BBR 部署加固（2026-10）**
 - [x] **NAT 穿透 v1：TCP STUN + 节点信令（属主证明/限速）+ 同时打开打洞 + 中继兜底（docs/design/NAT穿透方案.md）**
 - [x] **TUN 透明代理 v1 完整版：smoltcp 栈 + 路由豁免 + IPv6 双栈正向代理（动态 AnyIP）+ UDP ICMP 快速回落（docs/design/TUN模式方案.md）**
-- [x] UI 重设计 P0-P2 第一至三批：节点页组视图/卡片化、订阅「＋ 新建」聚合入口、首页卡片式仪表盘（egui_plot 速率曲线）、设置页七分区折叠、palette 视觉规范全量应用（[方案 v3](docs/design/UI重设计方案-v3.md)；剩余：main.rs 模块化拆分、连接页）
+- [x] UI 重设计 P0-P2 第一至三批：节点页组视图/卡片化、订阅「＋ 新建」聚合入口、首页卡片式仪表盘（egui_plot 速率曲线）、设置页七分区折叠、palette 视觉规范全量应用（[方案 v3](docs/design/UI重设计方案-v3.md)；连接页已交付，剩余：main.rs 模块化拆分）
+- [x] **全量代码审查 09 + P1/P2 修复：资源生命周期（连接看门狗/keepalive/计数表上限/sid 回收）、调度劫持（f64 校验/Online 下线探测）、GUI TUN 竞态降级、SSRF 单源、UDP 中继连接超时/DNS 缓存（docs/review/09）**
 - [ ] 多节点并行下载（HTTP Range 切块多节点拼装——TCP 下的差异化方向）
 - [x] ClientHello 指纹模仿（调研结论：ja-tools fork 供应链风险高，落地为 stock rustls 最大近似 + `HYDRA_FINGERPRINT=chrome|none`，[方案与实施](docs/design/ClientHello指纹模仿方案与实施.md)）
-- [ ] rekey 密钥轮换；门③重放测试以 TCP 形态重写
+- [x] 门③重放测试以 TCP 形态重写（`hydra-protocol/src/handshake.rs` 真重放单测在库，roadmap 此前未勾——09 审查补正）
+- [ ] rekey 密钥轮换
 
 完整依据：[docs/design/TCP转型与加密选型方案.md](docs/design/TCP转型与加密选型方案.md) · [docs/review/00-审查总览与改进目标.md](docs/review/00-审查总览与改进目标.md)
 

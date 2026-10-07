@@ -56,7 +56,19 @@ fn parse_args() -> CliArgs {
                 if listen.is_none() {
                     if let Ok(a) = other.parse() {
                         listen = Some(a);
+                        i += 1;
+                        continue;
                     }
+                }
+                // 09-P3-4：未知参数/无法解析的位置参数显式报错退出——此前
+                // 静默跳过，`--confg x.toml`（typo）会以默认监听 0.0.0.0 启动
+                if other.starts_with("--") {
+                    eprintln!("错误：未知参数 {other}（--help 查看用法）");
+                    std::process::exit(1);
+                }
+                if !other.starts_with('-') {
+                    eprintln!("错误：无法解析位置参数 {other}（应为监听地址，如 0.0.0.0:443）");
+                    std::process::exit(1);
                 }
                 i += 1;
             }

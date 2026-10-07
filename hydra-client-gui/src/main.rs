@@ -647,6 +647,8 @@ struct HydraApp {
         std::sync::mpsc::Receiver<std::result::Result<std::net::SocketAddr, std::io::Error>>,
     >,
     proxy_starting: bool,
+    /// 代理监听地址（09-P1-6：TUN 失败降级回退系统代理时需要；就绪信号携带）
+    proxy_bound_addr: Option<std::net::SocketAddr>,
     logs: Vec<String>,
     /// 持久化配置（配置文件 > 环境变量，见 config.rs）
     config: GuiConfig,
@@ -797,6 +799,7 @@ impl Default for HydraApp {
         Self {
             proxy_running: false,
             proxy_start_receiver: None,
+            proxy_bound_addr: None,
             proxy_starting: false,
             logs: Vec::new(),
             config: GuiConfig::default(),
@@ -1068,6 +1071,7 @@ impl HydraApp {
         let mut app = Self {
             proxy_running: false,
             proxy_start_receiver: None,
+            proxy_bound_addr: None,
             proxy_starting: false,
             logs: Vec::new(),
             saved_snapshot: cfg.clone(),
@@ -1816,58 +1820,91 @@ impl HydraApp {
                 }
             }
         }
-        // 首条为处理对象，剩余消息全部入日志（不静默丢弃）
-        let first = if messages.is_empty() {
-            None
-        } else {
-            let mut it = messages.into_iter();
-            let head = it.next();
-            for sig in it {
-                match sig {
-                    Ok(addr) => self.add_log(format!("（附加就绪信号）代理监听地址: {addr}")),
-                    Err(e) => self.add_log(format!("⚠ 附加启动消息（勿忽略）: {e}")),
-                }
-            }
-            head
-        };
-        if first.is_none() {
+        if messages.is_empty() {
             if disconnected {
-                // 代理线程异常退出：清 receiver、复位启动态，恢复可再次启动
+                // 代理线程异常退出：清 receiver、复位启动态，恢复可再次启动。
+                // 09-G-1：同时清 stop_flag / handle / exit_receiver——此前只清
+                // 前两者，残留的 stop_flag 使 update 收敛分支
+                //（!proxy_running && stop_flag.is_none()）永不接管，残留的
+                // exit_receiver 使 start_proxy 永久命中"上一实例正在退出"。
                 self.proxy_start_receiver = None;
                 self.proxy_starting = false;
-                self.add_log("代理启动线程异常退出（未发出就绪信号即终止）".to_string());
+                self.stop_flag = None;
+                self.proxy_thread_handle = None;
+                self.proxy_exit_receiver = None;
+                if self.proxy_running {
+                    // 运行中代理线程死亡：exit_receiver 分支已清系统代理，此处补日志
+                    self.add_log("代理线程异常退出（已移除系统代理，可重新启动）".to_string());
+                } else {
+                    self.add_log("代理启动线程异常退出（未发出就绪信号即终止）".to_string());
+                }
                 return Some(());
             }
             return None;
         }
-        let signal = first.unwrap();
-        self.proxy_start_receiver = None;
-        self.proxy_starting = false;
-        match signal {
-            Ok(addr) => {
-                self.proxy_running = true;
-                // 阶段性日志收尾（问题 1/2 附加）：明确告知用户代理可用
-                self.add_log(format!("✓ 代理已就绪，监听地址: {addr}"));
-                self.maybe_save_config(true);
-                // 审查修复：TUN 模式已全局接管流量，就绪后不再叠加系统代理
-                //（否则制造"系统代理 + TUN"二次进本代理的被警示终态）
-                if self.config.tun_enabled {
-                    self.add_log("TUN 模式运行中：已全局接管流量，跳过系统代理设置".to_string());
-                } else {
-                    let proxy_url = format!("socks5://{addr}");
-                    self.set_system_proxy(&proxy_url);
-                    self.add_log("已设置系统全局代理".to_string());
+        // 09-P1-6（TUN 竞态修复）：按序处理**全部**消息，且运行态保持 receiver
+        // 存活（TUN 任务失败可在就绪信号之后数秒才发出）。已置运行态后到达的
+        // Err（典型：SOCKS 就绪信号先于 TUN 失败信号经同一通道到达）触发降级
+        // 处理——回退设置系统代理。此前该 Err 只进一行日志：UI 显示“TUN 已全
+        // 局接管”而 TUN 已死、系统代理又被跳过，流量明文直连且无系统代理兜底。
+        let mut degraded: Vec<std::io::Error> = Vec::new();
+        let mut failure = None;
+        for sig in messages {
+            match sig {
+                Ok(addr) if !self.proxy_running => {
+                    self.proxy_running = true;
+                    self.proxy_starting = false;
+                    self.proxy_bound_addr = Some(addr);
+                    self.add_log(format!("✓ 代理已就绪，监听地址: {addr}"));
+                    self.maybe_save_config(true);
+                    // 审查修复：TUN 模式已全局接管流量，就绪后不再叠加系统代理
+                    //（否则制造"系统代理 + TUN"二次进本代理的被警示终态）
+                    if self.config.tun_enabled {
+                        self.add_log("TUN 模式运行中：已全局接管流量，跳过系统代理设置".to_string());
+                    } else {
+                        let proxy_url = format!("socks5://{addr}");
+                        self.set_system_proxy(&proxy_url);
+                        self.add_log("已设置系统全局代理".to_string());
+                    }
+                }
+                Ok(addr) => {
+                    self.add_log(format!("（附加就绪信号）代理监听地址: {addr}"));
+                }
+                Err(e) if !self.proxy_running => {
+                    // 启动失败（就绪信号之前的失败）：停掉代理线程，交收敛分支清理
+                    failure = Some(e);
+                    break;
+                }
+                Err(e) => {
+                    degraded.push(e);
                 }
             }
-            Err(e) => {
-                self.add_log(format!("代理启动失败: {e}"));
-                if let Some(flag) = &self.stop_flag {
-                    flag.store(true, Ordering::Relaxed);
-                }
-                // 07-P3-10 零成本顺修：置位 stop_flag 后立即清空，让 update 的
-                // 收敛分支（!proxy_running && stop_flag.is_none()）正常接管
-                // JoinHandle / exit_receiver 清理
-                self.stop_flag = None;
+        }
+        if let Some(e) = failure {
+            self.add_log(format!("代理启动失败: {e}"));
+            if let Some(flag) = &self.stop_flag {
+                flag.store(true, Ordering::Relaxed);
+            }
+            // 07-P3-10 零成本顺修：置位 stop_flag 后立即清空，让 update 的
+            // 收敛分支（!proxy_running && stop_flag.is_none()）正常接管
+            // JoinHandle / exit_receiver 清理
+            self.stop_flag = None;
+            // 失败态 receiver 使命完成（后续可能有附加消息，但失败已定）
+            self.proxy_start_receiver = None;
+            self.proxy_starting = false;
+            return Some(());
+        }
+        if !degraded.is_empty() && self.proxy_running {
+            for e in &degraded {
+                self.add_log(format!("⚠ TUN 模式启动失败: {e}"));
+            }
+            self.add_log(
+                "⚠ TUN 全局接管未生效：已自动回退为系统代理模式（若回退失败请手动开启系统代理）"
+                    .to_string(),
+            );
+            if let Some(addr) = self.proxy_bound_addr {
+                let proxy_url = format!("socks5://{addr}");
+                self.set_system_proxy(&proxy_url);
             }
         }
         Some(())
@@ -2259,6 +2296,18 @@ impl HydraApp {
 
         // ── 以下为落库（不会再失败）──
         if let Some(hex) = auth_key_hex {
+            // 09-G-2：覆盖全局认证密钥前显式留痕——此前静默替换，旧密钥对应
+            // 节点全部静默失联且不可回滚
+            if self.config.auth_key.trim().is_empty() {
+                self.add_log("已导入链接携带的认证密钥".to_string());
+            } else if self.config.auth_key.trim() != hex {
+                self.add_log(format!(
+                    "⚠ 导入链接覆盖了原有认证密钥（旧 {} → 新 {}）；\
+                     原密钥对应的节点将无法连接，如非预期请撤销导入",
+                    config::mask_secret(self.config.auth_key.trim()),
+                    config::mask_secret(&hex),
+                ));
+            }
             self.config.auth_key = hex;
         }
         if let Some(b64) = cert_b64 {
@@ -3844,7 +3893,16 @@ impl HydraApp {
                     ui.add(egui::Spinner::new().size(14.0));
                     ui.label("全部测速中…");
                 }
-                if ui.button("⚡ 全部测速").clicked() {
+                // 09-G-3：测速进行中禁用按钮（防重入覆盖 health_check_receiver，
+                // 上一批结果通道被弃、重复探测）
+                let speedtest_busy = self.health_check_receiver.is_some();
+                let speedtest_btn = egui::Button::new("⚡ 全部测速");
+                let speedtest_resp = if speedtest_busy {
+                    ui.add_enabled(false, speedtest_btn)
+                } else {
+                    ui.add(speedtest_btn)
+                };
+                if speedtest_resp.clicked() {
                     self.test_all_nodes();
                 }
                 if ui

@@ -199,12 +199,17 @@ impl ConnectionRegistry {
     /// 2. 仍超上限时，优先移除最旧的已完成条目，不足再移除最旧条目。
     fn prune_locked(&self, list: &mut Vec<Arc<ConnEntry>>) {
         let now = Instant::now();
-        list.retain(|e| match e.snapshot().closed_at {
+        // 直读 closed_at（09-P2-9：此前每条目 snapshot() 深拷贝 target String，
+        // register 与 GUI 500ms 快照两条路径都是 O(n) 克隆）
+        list.retain(|e| match *e.closed_at.lock().unwrap_or_else(|p| p.into_inner()) {
             Some(closed) => now.duration_since(closed) < RETAIN_AFTER_CLOSE,
             None => true,
         });
         while list.len() > self.max_entries {
-            // 已完成条目优先淘汰；都活跃时移除最旧（表本身按注册序排列）
+            // 已完成条目优先淘汰；都活跃时移除最旧（表本身按注册序排列）。
+            // 活跃条目被淘汰后其 Arc 成孤儿，字节计数写入不可见对象（统计
+            // 黑洞）——1024 上限下仅端口扫描/瞬时高并发可触发，GUI 显示
+            // 短暂缺失可接受，暂不引入"溢出截断"标记。
             let victim = list
                 .iter()
                 .position(|e| !e.active())

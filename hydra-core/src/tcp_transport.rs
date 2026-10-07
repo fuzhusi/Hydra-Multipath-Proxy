@@ -346,6 +346,24 @@ fn peer_leaf_cert(tls: &tokio_rustls::client::TlsStream<tokio::net::TcpStream>) 
         })
 }
 
+/// 为出站 TCP 流启用参数化 keepalive（09-P1-2）。
+///
+/// 客户端中继循环（proxy.rs）无空闲超时——对端**静默死亡**（掉电/拔线/NAT
+/// 空闲回收映射且不回 RST）时双向 read 永久挂起，任务+缓冲+注册表条目泄漏；
+/// keepalive 让内核在约 idle + interval×系统重试次数（Windows 固定 10 次，
+/// Linux 取默认）内检出死链并以错误唤醒 read。语义上优于应用层空闲超时：
+/// 合法的长空闲但健康连接（SSH/长轮询）不会被误杀。设置失败仅记录（非致命，
+/// 防御纵深不受单点影响）。
+pub(crate) fn enable_tcp_keepalive(stream: &tokio::net::TcpStream) {
+    use socket2::{SockRef, TcpKeepalive};
+    let ka = TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(10));
+    if let Err(e) = SockRef::from(stream).set_tcp_keepalive(&ka) {
+        tracing::debug!("TCP keepalive 设置失败（忽略）: {}", e);
+    }
+}
+
 /// 经 TCP+TLS 连接节点并打开目标转发。
 ///
 /// 步骤：TCP 建连（5s）→ TLS 握手（[`TlsTrust`]：pinning 或公共 CA + SNI，5s）
@@ -386,10 +404,17 @@ pub async fn connect_target(
         "Attempting TCP/TLS connection to {} (sni={})...",
         node_addr, sni
     );
-    let tcp = match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(node_addr))
-        .await
+    let tcp = match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        crate::socket_protect::connect_tcp_protected(node_addr),
+    )
+    .await
     {
-        Ok(Ok(s)) => s,
+        Ok(Ok(s)) => {
+            // 09-P1-2：出站节点连接启用 keepalive（静默死亡连接检测）
+            enable_tcp_keepalive(&s);
+            s
+        }
         Ok(Err(e)) => {
             return Err(HydraError::ConnectionError(format!(
                 "TCP connect to {} failed: {}",
@@ -456,10 +481,16 @@ pub async fn connect_target(
     .await
     .map_err(|_| HydraError::ConnectionError(format!("Noise 握手超时: {}", node_addr)))?
     .map_err(|e| HydraError::ConnectionError(format!("Noise 握手失败: {}", e)))?;
-    // 地址帧 + 2B 应答
-    write_target(&mut wr, target).await.map_err(|e| {
-        HydraError::ConnectionError(format!("write request to {} failed: {}", node_addr, e))
-    })?;
+    // 地址帧 + 2B 应答（09-P3-1：write_target 是建链序列中唯一无超时 I/O，
+    // 恶意节点完成 Noise 后停读可挂住写端——补 CONNECT_TIMEOUT 与同序列对齐）
+    tokio::time::timeout(CONNECT_TIMEOUT, write_target(&mut wr, target))
+        .await
+        .map_err(|_| {
+            HydraError::ConnectionError(format!("write request to {} timed out", node_addr))
+        })?
+        .map_err(|e| {
+            HydraError::ConnectionError(format!("write request to {} failed: {}", node_addr, e))
+        })?;
     match tokio::time::timeout(RESPONSE_TIMEOUT, read_reply(&mut rd)).await {
         // 保留错误类型：TargetUnreachable 供故障切换层区分「节点故障」与「目标不可达」
         Ok(r) => r?,

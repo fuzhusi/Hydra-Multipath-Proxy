@@ -14,6 +14,14 @@ fi
 
 rustup target add aarch64-linux-android x86_64-linux-android
 
+# NDK 缺失同样跳过（JVM 单测不需要交叉编译产物）
+SDK="${ANDROID_HOME:-$HOME/AppData/Local/Android/Sdk}"
+if ! ls "$SDK"/ndk/ndk-build >/dev/null 2>&1 && ! ls -d "$SDK"/ndk/* >/dev/null 2>&1; then
+    echo "[build-rust] 未检测到 NDK（$SDK/ndk 为空），跳过交叉编译"
+    echo '[build-rust] 安装：Android Studio SDK Manager 或 sdkmanager "ndk;28.2.13676358"'
+    exit 0
+fi
+
 OUT=android/app/src/main/jniLibs
 mkdir -p "$OUT/arm64-v8a" "$OUT/x86_64"
 

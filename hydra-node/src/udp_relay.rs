@@ -14,30 +14,37 @@
 //!   客户端也可发 close 帧主动关闭。
 //!
 //! # 资源与安全
-//! - 每连接会话上限 [`UDP_MAX_SESSIONS`]：满时新会话的数据报丢弃并计数；
+//! - 连接级空闲看门狗 [`UDP_CONN_IDLE_SECS`]（09-P1-1）：整条连接无任何上行帧
+//!   达此时长即主动关闭——防半开/静默连接永久占用连接额度（TCP/信令路径同款
+//!   防护见 tcp_server pump 与 signal 读超时，UDP 路径此前三无）；
+//! - 每连接会话上限 [`UDP_MAX_SESSIONS`]：满时新会话的数据报丢弃并计数，
+//!   同时下行 close 帧让客户端解除映射（09-P3-6）；
 //! - 数据报超限（帧编码期拒绝）丢弃并计数；
 //! - 目标地址过 SSRF 过滤：字面 IP 直接复查，域名节点侧 DNS 解析（5s 超时）
-//!   后复查。判定逻辑为本模块 [`ssrf_blocked_reason`]（与
-//!   `handler::classify_blocked_ip` 同源同语义——该函数为 handler 模块私有，
-//!   按文件所有权约束不改动 handler.rs，此处镜像实现并以镜像单测对齐；
-//!   默认拒绝私有目标，`HYDRA_ALLOW_PRIVATE_TARGETS=1` 放开，语义与 TCP
-//!   路径一致）。
+//!   后复查。判定逻辑单源复用 `handler::classify_blocked_ip`（09-P2-5 起两侧
+//!   收敛为同一实现，防镜像分叉）；默认拒绝私有目标，
+//!   `HYDRA_ALLOW_PRIVATE_TARGETS=1` 放开，语义与 TCP 路径一致；
+//! - 连接内 DNS 结果缓存（TTL 60s，≤128 条）+ 解析速率预算（1s 窗口 ≤10 次，
+//!   超限丢帧）：换目标/新会话不再逐帧 getaddrinfo，防单连接打满 tokio
+//!   blocking 池拖垮全节点 DNS（09-P2-3）。
 //!
 //! # 任务结构
 //! ```text
-//! serve（上行读循环：TLS 帧 → 会话表 → 数据报）
-//!   ├─ 每会话任务（select: 上行队列 / socket 回包 → 下行帧）
+//! serve（上行读循环：TLS 帧 → 会话表 → 数据报；select 会话死亡通知）
+//!   ├─ 每会话任务（select: 上行队列 / socket 回包 → 下行帧；异常退出经
+//!   │   dead 通道上报 → 主循环删表项 + 下行 close，防僵尸会话 09-P2-2）
 //!   └─ 回收任务（周期扫描 last_active，超时移除 + 下行 close）
 //! ```
-//! 上行读循环退出（EOF/坏帧）即整表 drop：各会话任务的发送队列被关闭而
-//! 退出，回收任务被显式 abort——连接结束不留悬挂任务。
+//! 上行读循环退出（EOF/坏帧/空闲超时）即整表 drop：各会话任务的发送队列被
+//! 关闭而退出，回收任务被显式 abort——连接结束不留悬挂任务。
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::handler::classify_blocked_ip;
 use hydra_protocol::udp_frame::{
     encode_udp_close, encode_udp_data, read_udp_frame, write_udp_frame, UdpFrame, MAX_DATAGRAM_LEN,
 };
@@ -55,6 +62,11 @@ pub const UDP_MAX_SESSIONS: usize = 64;
 
 /// 会话空闲回收阈值（双向均无活动达此时长即移除会话并下行 close）
 pub const UDP_SESSION_IDLE_SECS: u64 = 60;
+
+/// 连接级空闲看门狗（09-P1-1）：整条连接无任何**上行帧**达此时长即主动关闭。
+/// 与 TCP 转发路径的 pump idle（300s）对齐；会话回收（60s）先行，本阈值兜底
+/// 回收"会话表已空但客户端不发帧不关流"的半开/静默连接。取 max(idle, 本值)。
+const UDP_CONN_IDLE_SECS: u64 = 300;
 
 /// 目标 DNS 解析超时（与 TCP 路径 resolve 的 5s 层次一致）
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -178,7 +190,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-// ── SSRF 过滤（与 handler::classify_blocked_ip 镜像，见模块头注释）──────
+// ── SSRF 过滤（单源复用 handler::classify_blocked_ip，09-P2-5）──────────
 
 /// `HYDRA_ALLOW_PRIVATE_TARGETS=1` 放开私有目标（进程内首次调用时固化，
 /// 与 handler.rs 同款 OnceLock 语义，防运行期改动安全边界）。
@@ -192,85 +204,73 @@ fn private_targets_allowed() -> bool {
     })
 }
 
-/// SSRF 黑名单判定（镜像 `handler::classify_blocked_ip`，段位一一对应）：
-/// loopback / 链路本地 / RFC1918 / 0.0.0.0/8 / CGNAT 100.64.0.0/10 /
-/// 基准测试 198.18.0.0/15 / 组播 224.0.0.0/4 / 保留 240.0.0.0/4；
-/// IPv6：::1、fe80::/10、fc00::/7（ULA）、::，以及全部内嵌 IPv4 形态
-/// （::ffff: 映射、NAT64 64:ff9b::/96、::/96 兼容、::ffff:0:0/96）尾 4 字节
-/// 按 IPv4 规则复查。命中返回原因（供脱敏日志）。
-fn ssrf_blocked_reason(ip: IpAddr) -> Option<&'static str> {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            if o[0] == 0 {
-                Some("this-network 0.0.0.0/8")
-            } else if v4.is_loopback() {
-                Some("loopback")
-            } else if v4.is_link_local() {
-                Some("link-local")
-            } else if v4.is_private() {
-                Some("RFC1918 private")
-            } else if o[0] == 100 && (64..=127).contains(&o[1]) {
-                Some("CGNAT 100.64.0.0/10")
-            } else if o[0] == 198 && (18..=19).contains(&o[1]) {
-                Some("benchmarking 198.18.0.0/15")
-            } else if o[0] & 0xf0 == 0xe0 {
-                Some("multicast 224.0.0.0/4")
-            } else if o[0] & 0xf0 == 0xf0 {
-                Some("reserved 240.0.0.0/4")
-            } else {
-                None
-            }
+/// 连接内 DNS 解析缓存（09-P2-3）：目标串 → (地址, 解析时刻)。
+/// 换目标/新会话的每帧解析被 TTL 内的缓存吸收，不再逐帧 getaddrinfo——
+/// 此前同 session 交替两目标即可每帧一次解析，单连接线速小帧可打满
+/// tokio blocking 池（512 线程），拖垮全节点 DNS。缓存条目在解析时已过
+/// SSRF 过滤，命中即跳过复查。
+struct DnsCache {
+    entries: HashMap<String, (SocketAddr, std::time::Instant)>,
+}
+
+impl DnsCache {
+    const TTL: Duration = Duration::from_secs(60);
+    const MAX_ENTRIES: usize = 128;
+
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
         }
-        IpAddr::V6(v6) => {
-            // ::ffff:a.b.c.d 映射形态等价对应 IPv4，按 v4 规则复查
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return ssrf_blocked_reason(IpAddr::V4(v4));
-            }
-            let seg = v6.segments();
-            if let Some(v4) = embedded_ipv4_of_v6(seg) {
-                return ssrf_blocked_reason(IpAddr::V4(v4));
-            }
-            if v6.is_loopback() {
-                Some("loopback")
-            } else if (seg[0] & 0xffc0) == 0xfe80 {
-                Some("link-local")
-            } else if (seg[0] & 0xfe00) == 0xfc00 {
-                Some("IPv6 ULA private")
-            } else if v6.is_unspecified() {
-                Some("unspecified ::")
-            } else if (seg[0] & 0xff00) == 0xff00 {
-                // IPv6 组播 ff00::/8（审查 P2-2：与 IPv4 组播拦截对称）
-                Some("IPv6 multicast ff00::/8")
-            } else if (seg[0] & 0xff00) == 0x2000 && seg[1] == 0x01db {
-                Some("documentation 2001:db8::/32")
-            } else {
-                None
-            }
+    }
+
+    fn get(&mut self, target: &str) -> Option<SocketAddr> {
+        let now = std::time::Instant::now();
+        self.entries.retain(|_, (_, t)| now.duration_since(*t) < Self::TTL);
+        self.entries.get(target).map(|(a, _)| *a)
+    }
+
+    fn put(&mut self, target: &str, addr: SocketAddr) {
+        if self.entries.len() >= Self::MAX_ENTRIES {
+            // 上限兜底（真实客户端换目标数有限；打满即攻击流量，整体清空
+            // 由解析速率预算限流，不会放大解析压力）
+            self.entries.clear();
         }
+        self.entries
+            .insert(target.to_string(), (addr, std::time::Instant::now()));
     }
 }
 
-/// 内嵌 IPv4 提取（镜像 handler::embedded_ipv4_of_v6）：覆盖 ::/96（IPv4
-/// 兼容）、::ffff:0:0/96（RFC 2765）、64:ff9b::/96（NAT64）三类前缀；
-/// :: 与 ::1 是 IPv6 特殊地址，不按内嵌 IPv4 解释。
-fn embedded_ipv4_of_v6(seg: [u16; 8]) -> Option<Ipv4Addr> {
-    let v4 = Ipv4Addr::new(
-        (seg[6] >> 8) as u8,
-        (seg[6] & 0xff) as u8,
-        (seg[7] >> 8) as u8,
-        (seg[7] & 0xff) as u8,
-    );
-    if seg[0..6].iter().all(|&s| s == 0) && !(seg[6] == 0 && seg[7] <= 1) {
-        return Some(v4);
+/// 每连接真实解析速率预算（09-P2-3）：滑动 1s 窗口内最多
+/// [`ResolveBudget::MAX_PER_SEC`] 次真实 DNS 解析，超限直接丢弃该帧
+/// （UDP 语义允许丢包）——缓存未命中的高频换目标不再无限消耗 blocking 池。
+struct ResolveBudget {
+    window_start: std::time::Instant,
+    used: u32,
+}
+
+impl ResolveBudget {
+    const MAX_PER_SEC: u32 = 10;
+
+    fn new() -> Self {
+        Self {
+            window_start: std::time::Instant::now(),
+            used: 0,
+        }
     }
-    if seg[0..4].iter().all(|&s| s == 0) && seg[4] == 0xffff && seg[5] == 0 {
-        return Some(v4);
+
+    fn try_take(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
+            self.window_start = now;
+            self.used = 0;
+        }
+        if self.used >= Self::MAX_PER_SEC {
+            false
+        } else {
+            self.used += 1;
+            true
+        }
     }
-    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6].iter().all(|&s| s == 0) {
-        return Some(v4);
-    }
-    None
 }
 
 /// 解析目标地址（字面 IP 优先，否则节点侧 DNS，5s 超时）并过 SSRF 过滤。
@@ -304,7 +304,7 @@ async fn resolve_udp_target(target: &str) -> Option<SocketAddr> {
         }
     };
     if !private_targets_allowed() {
-        if let Some(reason) = ssrf_blocked_reason(addr.ip()) {
+        if let Some(reason) = classify_blocked_ip(addr.ip()) {
             warn!(
                 "UDP 目标被 SSRF 过滤拒绝（{}）: {}",
                 reason,
@@ -338,6 +338,10 @@ where
     // 下行写端：多个会话任务 + 回收任务并发写，tokio::Mutex 串行化（帧级原子）
     let writer: Arc<tokio::sync::Mutex<W>> = Arc::new(tokio::sync::Mutex::new(wr));
 
+    // 连接级空闲看门狗（09-P1-1）：max(idle, UDP_CONN_IDLE_SECS)。测试注入的
+    // 短 idle 只影响会话回收，不影响连接级阈值（测试不必等 300s）。
+    let conn_idle = idle.max(Duration::from_secs(UDP_CONN_IDLE_SECS));
+
     // 回收任务：周期扫描空闲会话，移除并下行 close 帧（间隔 = idle/4，下限 100ms）
     let reaper = {
         let table = table.clone();
@@ -358,28 +362,77 @@ where
         })
     };
 
+    // 会话异常死亡通知通道（09-P2-2 僵尸会话修复）：session_task 因 socket/
+    // 下行写错误退出时上报 sid，主循环删表项并下行 close——否则表项残留且
+    // 每帧上行 touch 使回收任务永不判定过期，会话永久黑洞。
+    let (dead_tx, mut dead_rx) = mpsc::unbounded_channel::<u16>();
+    // serve 自持一份发送端：避免"全部会话任务已退出"时 recv() 返回 None 被
+    // 误判为连接结束（空会话表是常态）。
+    let _dead_tx_keepalive = dead_tx.clone();
+
+    // 连接内解析缓存与速率预算（09-P2-3）
+    let mut dns_cache = DnsCache::new();
+    let mut resolve_budget = ResolveBudget::new();
+
     // ── 上行读循环：TLS 流帧 → 会话表 → 数据报 ──
     loop {
-        let frame = match read_udp_frame(&mut rd).await {
-            Ok(f) => f,
-            Err(e) => {
-                debug!("UDP 中继上行读结束: {e}");
-                break;
-            }
-        };
-        match frame {
-            UdpFrame::Close { session_id } => {
-                if table.lock().unwrap().remove(session_id).is_some() {
-                    debug!("UDP 会话 {session_id} 客户端请求关闭");
+        tokio::select! {
+            // 会话任务异常死亡：删表项 + 下行 close（客户端解除映射后可重建）
+            dead = dead_rx.recv() => {
+                match dead {
+                    Some(sid) => {
+                        let removed = table.lock().unwrap().remove(sid).is_some();
+                        if removed {
+                            debug!("UDP 会话 {sid} 任务异常退出，回收并下行 close");
+                            let mut w = writer.lock().await;
+                            let _ = write_udp_frame(&mut *w, &encode_udp_close(sid)).await;
+                        }
+                    }
+                    // 仅在 _dead_tx_keepalive 也被丢弃后到达（连接收尾路径），退出
+                    None => break,
                 }
-                // 未知 session 的 close 视为 no-op（幂等）
             }
-            UdpFrame::Data {
-                session_id,
-                target,
-                datagram,
-            } => {
-                uplink_data(&table, &writer, session_id, &target, datagram).await;
+            frame = tokio::time::timeout(conn_idle, read_udp_frame(&mut rd)) => {
+                match frame {
+                    // 连接级空闲超时：会话表可能为空（回收先行），客户端静默不关流
+                    // ——主动关闭，释放 permit/fd/reaper（09-P1-1）
+                    Err(_) => {
+                        info!(
+                            "UDP 中继连接空闲超时（{}s 无上行帧），主动关闭",
+                            conn_idle.as_secs()
+                        );
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        debug!("UDP 中继上行读结束: {e}");
+                        break;
+                    }
+                    Ok(Ok(f)) => match f {
+                        UdpFrame::Close { session_id } => {
+                            if table.lock().unwrap().remove(session_id).is_some() {
+                                debug!("UDP 会话 {session_id} 客户端请求关闭");
+                            }
+                            // 未知 session 的 close 视为 no-op（幂等）
+                        }
+                        UdpFrame::Data {
+                            session_id,
+                            target,
+                            datagram,
+                        } => {
+                            uplink_data(
+                                &table,
+                                &writer,
+                                session_id,
+                                &target,
+                                datagram,
+                                &mut dns_cache,
+                                &mut resolve_budget,
+                                &dead_tx,
+                            )
+                            .await;
+                        }
+                    },
+                }
             }
         }
     }
@@ -391,48 +444,77 @@ where
 }
 
 /// 处理一帧上行数据：建会话 / 更新绑定 / 投递数据报。
+#[allow(clippy::too_many_arguments)]
 async fn uplink_data<W>(
     table: &Arc<Mutex<UdpSessionTable>>,
     writer: &Arc<tokio::sync::Mutex<W>>,
     session_id: u16,
     target: &str,
     datagram: Vec<u8>,
+    dns_cache: &mut DnsCache,
+    resolve_budget: &mut ResolveBudget,
+    dead_tx: &mpsc::UnboundedSender<u16>,
 ) where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    // 审查 P2-1 修复：先查表——已存在会话且目标未变时**跳过 DNS 解析**直接
-    // 投递（此前每帧 resolve：域名目标每包一次 DNS 查询放大上游、5s 解析
+    // 09-P2-3（原审查 P2-1）：先查表——已存在会话且目标未变时**跳过 DNS 解析**
+    // 直接投递（此前每帧 resolve：域名目标每包一次 DNS 查询放大上游、5s 解析
     // 超时会停摆该连接全部会话的上行）。
     let existing_target = {
         let t = table.lock().unwrap();
         t.get(session_id).map(|h| h.target().to_string())
     };
     if existing_target.as_deref() != Some(target) {
-        // 目标解析 + SSRF 过滤失败：丢弃该数据报；已存在的会话一并回收
-        // （目标失效的会话没有继续存在的意义）
-        let Some(addr) = resolve_udp_target(target).await else {
-            let mut t = table.lock().unwrap();
-            t.overlimit_drops += 1;
-            if t.remove(session_id).is_some() {
-                debug!("UDP 会话 {session_id} 因目标失效而回收");
+        // 缓存命中（TTL 内、解析时已过 SSRF）：跳过解析直接建连
+        let addr = match dns_cache.get(target) {
+            Some(a) => a,
+            None => {
+                // 解析速率预算（09-P2-3）：1s 窗口内真实解析超限直接丢帧，
+                // 防单连接打满 tokio blocking 池（不回收会话——突发换目标
+                // 不应抹掉既有绑定）
+                if !resolve_budget.try_take() {
+                    table.lock().unwrap().overlimit_drops += 1;
+                    debug!("UDP 目标解析速率超限（1s ≤10 次），丢弃: {}", mask_target(target));
+                    return;
+                }
+                // 目标解析 + SSRF 过滤失败：丢弃该数据报；已存在的会话一并回收
+                // （目标失效的会话没有继续存在的意义）
+                let Some(addr) = resolve_udp_target(target).await else {
+                    let mut t = table.lock().unwrap();
+                    t.overlimit_drops += 1;
+                    if t.remove(session_id).is_some() {
+                        debug!("UDP 会话 {session_id} 因目标失效而回收");
+                    }
+                    return;
+                };
+                dns_cache.put(target, addr);
+                addr
             }
-            return;
         };
 
         // 新会话，或同 session 换目标：回收旧绑定（句柄 drop → 会话任务退出），
         // 按新目标重建 socket。锁内只做「摘旧 + 判满」，bind().await 在锁外
         // （MutexGuard 非 Send，不能跨 await）
-        {
+        let full = {
             let mut t = table.lock().unwrap();
             t.remove(session_id);
             if t.is_full() {
                 t.overlimit_drops += 1;
-                debug!(
-                    "UDP 会话数达上限 {UDP_MAX_SESSIONS}，丢弃 {} 的数据报",
-                    mask_target(target)
-                );
-                return;
+                true
+            } else {
+                false
             }
+        };
+        if full {
+            // 09-P3-6：会话满对新建会话下行 close，让客户端解除映射
+            // （此前静默丢弃，客户端对第 65 个目标起完全无感知）
+            let mut w = writer.lock().await;
+            let _ = write_udp_frame(&mut *w, &encode_udp_close(session_id)).await;
+            debug!(
+                "UDP 会话数达上限 {UDP_MAX_SESSIONS}，丢弃 {} 的数据报并下行 close",
+                mask_target(target)
+            );
+            return;
         }
         // 锁外建 socket + 派生会话任务（await 期间不持有表锁）
         match bind_session_socket(addr).await {
@@ -457,6 +539,7 @@ async fn uplink_data<W>(
                     rx,
                     last_active,
                     writer.clone(),
+                    dead_tx.clone(),
                 ));
                 debug!(
                     "UDP 会话 {session_id} 建立 → {}",
@@ -477,9 +560,21 @@ async fn uplink_data<W>(
     match handle {
         Some(h) => {
             h.touch();
-            if h.tx.try_send(datagram).is_err() {
-                // 队列满 = 对端 socket 短时过载：UDP 语义直接丢包
-                debug!("UDP 会话 {session_id} 上行队列满，丢弃数据报");
+            if let Err(e) = h.tx.try_send(datagram) {
+                if matches!(e, tokio::sync::mpsc::error::TrySendError::Closed(_)) {
+                    // 队列发送端已关闭 = 会话任务已死（socket/下行写错误退出）。
+                    // 09-P2-2：删表项 + 下行 close，防「每帧 touch 使回收任务
+                    // 永不判定过期」的僵尸会话黑洞。
+                    let removed = table.lock().unwrap().remove(session_id).is_some();
+                    if removed {
+                        debug!("UDP 会话 {session_id} 上行队列已关闭（任务已死），回收并下行 close");
+                        let mut w = writer.lock().await;
+                        let _ = write_udp_frame(&mut *w, &encode_udp_close(session_id)).await;
+                    }
+                } else {
+                    // 队列满 = 对端 socket 短时过载：UDP 语义直接丢包
+                    debug!("UDP 会话 {session_id} 上行队列满，丢弃数据报");
+                }
             }
         }
         None => {
@@ -498,7 +593,10 @@ async fn bind_session_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
 }
 
 /// 单会话任务：select 上行队列（数据报 → socket）与 UDP 回包（→ 下行帧）。
-/// 上行队列关闭（表移除/连接结束）或 socket 出错即退出。
+/// 上行队列关闭（表移除/连接结束）或 socket 出错即退出；任何**异常**退出
+/// （socket 收发错误/下行写错误）经 `dead_tx` 上报 sid——主循环据此删表项
+/// 并下行 close（09-P2-2 僵尸会话修复；表移除/连接结束的正常退出无需上报，
+/// 表项已不在）。
 async fn session_task<W>(
     session_id: u16,
     socket: UdpSocket,
@@ -506,6 +604,7 @@ async fn session_task<W>(
     mut rx: mpsc::Receiver<Vec<u8>>,
     last_active: Arc<AtomicU64>,
     writer: Arc<tokio::sync::Mutex<W>>,
+    dead_tx: mpsc::UnboundedSender<u16>,
 ) where
     W: AsyncWrite + Unpin + Send + 'static,
 {
@@ -517,6 +616,7 @@ async fn session_task<W>(
                 Some(datagram) => {
                     if socket.send(&datagram).await.is_err() {
                         debug!("UDP 会话 {session_id} socket 发送失败，会话结束");
+                        let _ = dead_tx.send(session_id);
                         break;
                     }
                 }
@@ -533,11 +633,13 @@ async fn session_task<W>(
                     let mut w = writer.lock().await;
                     if write_udp_frame(&mut *w, &frame).await.is_err() {
                         debug!("UDP 会话 {session_id} 下行写失败，会话结束");
+                        let _ = dead_tx.send(session_id);
                         break;
                     }
                 }
                 Err(e) => {
                     debug!("UDP 会话 {session_id} socket 接收错误: {e}");
+                    let _ = dead_tx.send(session_id);
                     break;
                 }
             },
@@ -607,30 +709,46 @@ mod tests {
         assert!(t.reap_expired(Duration::from_secs(60)).is_empty());
     }
 
-    // ── SSRF 镜像判定 ──
+    // ── SSRF 单源判定（复用 handler::classify_blocked_ip）──
 
     #[test]
-    fn ssrf_镜像判定_与handler对齐() {
+    fn ssrf_判定_与tcp路径同源对齐() {
         use std::net::IpAddr;
         let p = |s: &str| s.parse::<IpAddr>().unwrap();
-        assert_eq!(ssrf_blocked_reason(p("127.0.0.1")), Some("loopback"));
-        assert_eq!(ssrf_blocked_reason(p("10.1.2.3")), Some("RFC1918 private"));
-        assert_eq!(ssrf_blocked_reason(p("192.168.1.1")), Some("RFC1918 private"));
-        assert_eq!(ssrf_blocked_reason(p("169.254.169.254")), Some("link-local"));
+        assert_eq!(classify_blocked_ip(p("127.0.0.1")), Some("loopback"));
+        assert_eq!(classify_blocked_ip(p("10.1.2.3")), Some("RFC1918 private"));
+        assert_eq!(classify_blocked_ip(p("192.168.1.1")), Some("RFC1918 private"));
+        assert_eq!(classify_blocked_ip(p("169.254.169.254")), Some("link-local"));
         assert_eq!(
-            ssrf_blocked_reason(p("::ffff:127.0.0.1")),
+            classify_blocked_ip(p("::ffff:127.0.0.1")),
             Some("loopback"),
             "IPv4 映射形态须按 v4 规则复查"
         );
         assert_eq!(
-            ssrf_blocked_reason(p("64:ff9b::a00:1")),
+            classify_blocked_ip(p("64:ff9b::a00:1")),
             Some("RFC1918 private"),
             "NAT64 内嵌 v4 须复查"
         );
-        assert_eq!(ssrf_blocked_reason(p("fd00::1")), Some("IPv6 ULA private"));
-        assert_eq!(ssrf_blocked_reason(p("224.0.0.1")), Some("multicast 224.0.0.0/4"));
-        assert_eq!(ssrf_blocked_reason(p("8.8.8.8")), None);
-        assert_eq!(ssrf_blocked_reason(p("2606:4700::1111")), None);
+        assert_eq!(classify_blocked_ip(p("fd00::1")), Some("IPv6 ULA private"));
+        assert_eq!(
+            classify_blocked_ip(p("224.0.0.1")),
+            Some("multicast 224.0.0.0/4")
+        );
+        // 09-P2-5 收敛单源后 UDP 路径同样拦 v6 组播/2001:db8 与 TEST-NET
+        assert_eq!(
+            classify_blocked_ip(p("ff02::fb")),
+            Some("IPv6 multicast ff00::/8")
+        );
+        assert_eq!(
+            classify_blocked_ip(p("2001:db8::1")),
+            Some("documentation 2001:db8::/32")
+        );
+        assert_eq!(
+            classify_blocked_ip(p("192.0.2.1")),
+            Some("documentation TEST-NET-1 192.0.2.0/24")
+        );
+        assert_eq!(classify_blocked_ip(p("8.8.8.8")), None);
+        assert_eq!(classify_blocked_ip(p("2606:4700::1111")), None);
     }
 
     // ── 全链路回环（无 TLS：serve 直挂 duplex 流，验证帧封装/分发/回收）──

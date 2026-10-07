@@ -4,10 +4,11 @@
 //! - **显式参数化**：节点/PSK/证书全部由 Kotlin 传入（R8：PSK 存
 //!   EncryptedSharedPreferences，Kotlin 侧解密后以 hex/bytes 交付），本层
 //!   零 env 读取、零文件路径依赖。
-//! - **R4 防环回**：[`SocketProtect`] 回调接口——引擎建连后回调 Kotlin 层调
-//!   `VpnService.protect(fd)`；iOS 等无 VPN 环回问题的平台传 None 或空实现。
-//!   M0 阶段回调先由引擎持有（存储/透传），运行时全链路接线随 M2 tun_core
-//!   （fd 化出站 socket）落地。
+//! - **R4 防环回**：[`SocketProtect`] 回调接口——引擎每个新出站 socket 在
+//!   **建连前**回调 Kotlin 层调 `VpnService.protect(fd)`（09-P1-7 起**全链路
+//!   接线**：经 `hydra_core::socket_protect` 钩子在 `TcpSocket` 阶段调用），
+//!   回调返回 `false`（protect 失败）时该连接立即中止——放行会被本应用 TUN
+//!   捕获回环。iOS 等无 VPN 环回问题的平台传 None。
 //! - 引擎生命周期独立 tokio runtime：`start()` 立即返回（绑定监听在后台完成，
 //!   经 [`HydraEngine::bound_addr`] 查询），`stop()` 关停全部任务。
 //!
@@ -50,10 +51,13 @@ pub struct EngineStats {
 }
 
 /// R4 防环回：出站 socket 保护回调（Kotlin 实现 → `VpnService.protect(fd)`）。
-/// fd 为引擎新建出站 socket 的文件描述符；必须在任何 connect 之前调用 protect。
+/// fd 为引擎新建出站 socket 的文件描述符；在任何 connect 之前调用。
+/// **返回 protect 是否成功**：false 时引擎中止该连接（放行 = 流量进自身
+/// TUN 回环，宁失败不放行）。Kotlin 实现示例：
+/// `override fun protect(fd: Long): Boolean = vpnService.protect(fd.toInt())`
 #[uniffi::export(callback_interface)]
 pub trait SocketProtect: Send + Sync {
-    fn protect(&self, fd: i64);
+    fn protect(&self, fd: i64) -> bool;
 }
 
 #[derive(uniffi::Error, thiserror::Error, Debug)]
@@ -105,6 +109,31 @@ impl HydraEngine {
                 msg: "至少需要一个节点".to_string(),
             });
         }
+        // 09-A-1：节点地址逐条解析校验——此前 `filter_map(parse().ok())` 把
+        // 解析失败（典型：域名节点）静默过滤，引擎以 0 节点"成功启动"且无
+        // 任何可用出口。域名节点解析需要系统 resolver（且其 socket 同样要过
+        // protect），M2 tun_core 一并支持；当前显式报错给出明确原因。
+        let mut parsed_nodes = Vec::with_capacity(nodes.len());
+        let mut invalid = Vec::new();
+        for n in &nodes {
+            match n.addr.parse::<std::net::SocketAddr>() {
+                Ok(a) => parsed_nodes.push(a),
+                Err(_) => invalid.push(n.addr.clone()),
+            }
+        }
+        if parsed_nodes.is_empty() {
+            return Err(HydraEngineError::InvalidConfig {
+                msg: format!(
+                    "节点地址全部无法解析为 IP:端口（域名节点暂不支持，M2 接入）：{:?}",
+                    invalid
+                ),
+            });
+        }
+        if !invalid.is_empty() {
+            return Err(HydraEngineError::InvalidConfig {
+                msg: format!("节点地址无法解析为 IP:端口: {:?}", invalid),
+            });
+        }
         let auth_key = hydra_core::auth_key_from_hex(&auth_key_hex).map_err(|msg| {
             HydraEngineError::InvalidConfig { msg }
         })?;
@@ -125,7 +154,7 @@ impl HydraEngine {
         };
         Ok(Arc::new(Self {
             state: Mutex::new(None),
-            nodes: nodes.into_iter().map(|n| n.addr).collect(),
+            nodes: parsed_nodes.into_iter().map(|a| a.to_string()).collect(),
             auth_key,
             trust,
             sni: sni.unwrap_or_else(|| hydra_core::DEFAULT_SNI.to_string()),
@@ -142,8 +171,14 @@ impl HydraEngine {
                 msg: "引擎已在运行".to_string(),
             });
         }
-        // R4：回调交引擎持有（M2 接线到出站建连路径）
-        let _protect = protect;
+        // R4 防环回全链路接线（09-P1-7）：把 Kotlin 回调安装为 hydra-core 的
+        // 进程级出站 socket 保护钩子——引擎每个新出站连接（节点/直连）在
+        // TcpSocket 阶段（connect 前）回调 protect(fd)，失败即中止该连接。
+        // 进程级单次安装：重复 start 传新回调时以首次为准（返回 false 不报错）。
+        if let Some(cb) = protect {
+            let hook: hydra_core::socket_protect::ProtectHook = Box::new(move |fd| cb.protect(fd));
+            let _ = hydra_core::socket_protect::set_socket_protect_hook(hook);
+        }
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)

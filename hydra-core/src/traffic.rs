@@ -317,9 +317,24 @@ impl TrafficMonitor {
         self.total_connections.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// 减少活跃连接数
+    /// 减少活跃连接数（09-P2-8：饱和递减——reset() 与并发关闭竞态时
+    /// wrapping `fetch_sub` 会回绕为 u64::MAX）
     pub fn connection_closed(&self) {
-        self.active_connections.fetch_sub(1, Ordering::Relaxed);
+        let mut cur = self.active_connections.load(Ordering::Relaxed);
+        loop {
+            if cur == 0 {
+                return;
+            }
+            match self.active_connections.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(v) => cur = v,
+            }
+        }
     }
 
     /// 获取当前统计信息（R-28：唯一的 speed_history 加锁点，由 GUI 采样线程每

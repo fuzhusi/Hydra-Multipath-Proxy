@@ -106,9 +106,14 @@ pub fn tun_config_from_settings(
             std::net::IpAddr::V6(ip) => cfg.exclude_routes_v6.push(ip),
         }
     }
-    // 系统 DNS 豁免（best-effort；v1 无 DNS 劫持，DNS 明文直出物理网卡）
+    // 系统 DNS 豁免（best-effort；v1 无 DNS 劫持，DNS 明文直出物理网卡）。
+    // 09-P2-4：v6 DNS 同样豁免——否则 v6 DNS over UDP 被 TUN 代答回不可达
+    // （纯 v6 网络断网观感），over TCP 却被代理，同一目标两种路径分叉。
     for dns in crate::tun::detect_dns_servers() {
         cfg.exclude_routes.push(dns);
+    }
+    for dns in crate::tun::detect_dns_servers_v6() {
+        cfg.exclude_routes_v6.push(dns);
     }
     Ok(cfg)
 }

@@ -19,6 +19,8 @@ pub mod proxy;
 pub mod routing;
 pub mod scheduler;
 pub mod share_link;
+// R4 防环回：出站 socket 保护钩子（Android VpnService 场景；未安装零开销）
+pub mod socket_protect;
 pub mod speedtest;
 pub mod subscription;
 pub mod tcp_transport;
@@ -34,6 +36,7 @@ pub use proxy::*;
 pub use routing::*;
 pub use scheduler::*;
 pub use share_link::*;
+pub use socket_protect::*;
 pub use speedtest::*;
 pub use subscription::*;
 pub use tcp_transport::*;

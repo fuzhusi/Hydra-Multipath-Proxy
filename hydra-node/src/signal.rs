@@ -32,6 +32,11 @@ const DOWNLINK_CAP: usize = 32;
 /// 心跳 60s 一条 + 打洞期数条，10/s 余量充足；超限 = 慢滴滥用，断开。
 pub const SIGNAL_RATE: u32 = 10;
 pub const SIGNAL_BURST: u32 = 20;
+/// 跨连接下行投递限时（09-P2-4）：目标下行队列满（对端零窗口不读）时
+/// `send` 会无限期挂起，把发起方（invite/accept 发出者）的整个信令连接
+/// 卡死在 forward 上——读超时帮不上忙（任务不在 read 上）。超时按目标
+/// 离线处理，发起方会话不受影响。
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── 消息定义（serde，tag = "op"）────────────────────────────────────────────
 
@@ -208,7 +213,7 @@ pub async fn serve_signal_stream<R, W>(
 {
     // 下行队列 + 写任务：把其他连接投递来的序列化 JSON 行写回本连接
     let (tx, rx) = mpsc::channel::<Vec<u8>>(DOWNLINK_CAP);
-    let writer = tokio::spawn(downlink_writer(wr, rx, my_peer_id.clone()));
+    let mut writer = tokio::spawn(downlink_writer(wr, rx, my_peer_id.clone()));
 
     let mut line_buf = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
@@ -268,7 +273,16 @@ pub async fn serve_signal_stream<R, W>(
     // 未写出的下行消息；若 peer 已被新连接顶替（channel 仍开放），限时兜底退出
     registry.remove_if_downlink(&my_peer_id, &tx);
     drop(tx);
-    let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
+    // 限时等待写任务收尾；超时（对端零窗口令 write_all 无限期阻塞）无条件
+    // abort——遗弃的任务会无限期持有 fd 与 TLS 写半（09-P2-5：此前仅等待
+    // 超时，任务本体未中止）。积压未写出的下行消息本就是尽力而为语义。
+    match tokio::time::timeout(Duration::from_secs(2), &mut writer).await {
+        Ok(_) => {}
+        Err(_) => {
+            writer.abort();
+            debug!("信令会话 {my_peer_id} 下行写任务限时未退出，已中止");
+        }
+    }
 }
 
 /// 处理一行 JSON。返回 Err = 协议错误（断开会话）。
@@ -314,7 +328,8 @@ async fn handle_line(
                 let (_, down) = match registry.get(&peer_id) {
                     Some(x) => x,
                     None => {
-                        debug!("invite 目标 {peer_id} 不在线");
+                        // peer_id 来自不可信消息体：日志脱敏（09-P3-3 日志注入）
+                        debug!("invite 目标 {} 不在线", mask_peer_id(&peer_id));
                         send_error(my_downlink, "peer_offline", Some(&peer_id)).await;
                         return Ok(());
                     }
@@ -351,10 +366,16 @@ async fn handle_line(
     Ok(())
 }
 
-/// peer_id 日志脱敏：仅保留尾 4 字符（与 mask_target 同纪律）
+/// peer_id 日志脱敏：仅保留尾 4 字符（与 mask_target 同纪律）。
+/// 输入可能来自未验证的消息体（任意 UTF-8）：尾 4 **字节**可能落在多字节
+/// 字符中间，须推进到完整字符边界再切片（防 panic；09-P3-3）。
 fn mask_peer_id(id: &str) -> String {
     if id.len() > 4 {
-        format!("…{}", &id[id.len() - 4..])
+        let mut start = id.len() - 4;
+        while start < id.len() && !id.is_char_boundary(start) {
+            start += 1;
+        }
+        format!("…{}", &id[start..])
     } else {
         id.to_string()
     }
@@ -370,7 +391,12 @@ fn refill_tokens(tokens: u32, elapsed_secs: f64) -> u32 {
 async fn forward(down: &mpsc::Sender<Vec<u8>>, msg: &SignalDownMessage) -> Result<(), ()> {
     let mut line = serde_json::to_vec(msg).map_err(|_| ())?;
     line.push(b'\n');
-    down.send(line).await.map_err(|_| ())
+    // 09-P2-4：投递限时——目标下行队列满（对端零窗口不读）时 send 无限期
+    // 挂起，会把发起方的信令连接整个卡死。超时/失败统一按目标离线处理。
+    tokio::time::timeout(FORWARD_TIMEOUT, down.send(line))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
 }
 
 /// 回错误消息给本连接

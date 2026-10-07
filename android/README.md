@@ -38,12 +38,23 @@ Rust 侧：`../hydra-android`（cdylib + uniffi 导出 HydraEngine）依赖 `../
 ## 常用命令
 
 ```bash
-# 桌面 JVM 冒烟（先在仓库根 cargo build -p hydra-android）
-./gradlew :app:testDebugUnitTest
+# 0) 一次性：先在仓库根构建 host 动态库（供 JVM 冒烟加载）
+cargo build -p hydra-android
 
-# 交叉编译原生库并打 debug 包（需 cargo-ndk + NDK）
+# 1) 桌面 JVM 冒烟：Kotlin 经 uniffi/JNA 启停引擎（无需设备/NDK）
+cd android && ./gradlew :app:testDebugUnitTest
+
+# 2) 交叉编译原生库并打 debug 包（需 cargo-ndk + NDK）
 ./gradlew :app:assembleDebug
 ```
+
+环境注记（Windows 实测）：
+- Gradle 9.5.1（wrapper 自带分发下载；**9.6+ 与 AGP 8.13 不兼容**，升级 AGP 前勿动）
+- JAVA_HOME 可指向 Android Studio 自带 JBR
+- 国内网络建议给 gradle 加镜像 init 脚本（google/mavenCentral → 阿里云），
+  否则依赖下载极慢；distributionUrl 亦可换腾讯镜像
+  `https://mirrors.cloud.tencent.com/gradle/gradle-9.5.1-bin.zip`
+- `scripts/build-rust.ps1` 需 UTF-8 BOM 编码（PowerShell GBK 环境解析中文注释）
 
 ## 当前状态（M0）
 

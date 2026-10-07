@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+use hydra_protocol::mask_target;
 use hydra_protocol::udp_frame::{
     encode_udp_close, encode_udp_data, read_udp_frame, write_udp_frame, UdpFrame,
 };
@@ -29,6 +30,18 @@ use crate::tcp_transport::{connect_target, TcpNodeStream, TlsTrust};
 /// UDP 中继模式的地址帧目标（节点按保留前缀 `@udp-relay/` 分流）
 pub const UDP_RELAY_TARGET: &str = "@udp-relay/v1";
 
+/// 本地会话映射上限（09-P1-5）：TUN 全流量场景每分钟可出现上千个一次性目标
+/// （DNS/P2P），无上限的映射表既耗内存又加速单调 sid 空间耗尽；超限按 LRU
+/// 淘汰并复用 sid（下行 close 通知节点删旧会话）。
+pub const UDP_MAX_LOCAL_SESSIONS: usize = 4096;
+
+/// 单个本地会话映射条目：sid + 最近使用时刻（LRU 依据）
+#[derive(Clone, Copy)]
+struct SessionEntry {
+    sid: u16,
+    last_used: std::time::Instant,
+}
+
 /// 泛型 UDP 通道（对任意 TLS 流半拆分可用；mock 流便于单测）。
 /// 目标地址 → session_id 的映射由通道内部维护。
 pub struct UdpChannel<R, W>
@@ -39,8 +52,13 @@ where
     rd: R,
     wr: W,
     /// 目标地址 → 已分配的 session_id（同一目标复用同一会话）
-    sessions: HashMap<String, u16>,
+    sessions: HashMap<String, SessionEntry>,
     next_sid: u16,
+    /// 本地会话映射上限（测试可注入小值；生产默认 [`UDP_MAX_LOCAL_SESSIONS`]）
+    max_sessions: usize,
+    /// LRU 淘汰/号回收产生的待发下行 close 帧（下一帧数据前经同一有序流
+    /// 发出，保证节点先删旧会话再建新会话，sid 复用不串话）
+    pending_closes: Vec<u16>,
 }
 
 /// 真实节点流（connect_target 产出的 TcpNodeStream 拆分两半）上的通道
@@ -64,6 +82,8 @@ pub async fn open_udp_channel(
         wr,
         sessions: HashMap::new(),
         next_sid: 1,
+        max_sessions: UDP_MAX_LOCAL_SESSIONS,
+        pending_closes: Vec::new(),
     })
 }
 
@@ -73,42 +93,128 @@ where
     W: AsyncWrite + Unpin,
 {
     /// 为目标地址取（或分配）session_id。
+    ///
+    /// 09-P1-5：sid 不再只增不回收——映射表带容量上限，超限按 LRU 淘汰并
+    /// 复用其 sid（先记待发 close）；单调分配耗尽（u16::MAX）同样走 LRU
+    /// 复用。此前单调分配 + 仅靠节点下行 close 解除映射：一次性目标（DNS/
+    /// P2P）高频出现约 1 小时耗尽 65535，此后每次 `send_to` 永久 Err，通道
+    /// 无自愈。复用正确性：帧在同一 TCP 流上有序，淘汰 close 先于新数据帧
+    /// 到达节点——节点对「同 sid 换目标」按重建绑定语义处理，不串话。
     fn session_for(&mut self, target: &str) -> Result<u16> {
-        if let Some(&sid) = self.sessions.get(target) {
+        if let Some(entry) = self.sessions.get_mut(target) {
+            entry.last_used = std::time::Instant::now();
+            return Ok(entry.sid);
+        }
+        // 单调分配：仅在容量未满且单调空间未耗尽（next_sid != u16::MAX，
+        // 或表空——边界号 u16::MAX 本身仍可分配一次）时走此路径；否则新目标
+        // 经 LRU 淘汰复用 sid（耗尽后允许同号多目标会造成节点侧每帧重建
+        // 绑定的抖动，比一次 close+复用更糟）
+        if self.sessions.len() < self.max_sessions
+            && (self.next_sid != u16::MAX || self.sessions.is_empty())
+        {
+            let sid = self.next_sid;
+            let has_next = sid != u16::MAX;
+            self.sessions.insert(
+                target.to_string(),
+                SessionEntry {
+                    sid,
+                    last_used: std::time::Instant::now(),
+                },
+            );
+            if has_next {
+                self.next_sid += 1;
+            }
             return Ok(sid);
         }
-        // 会话号顺序分配；节点回收的 close 会解除映射，但号本身不回收
-        // （简单优先：u16 空间 65535 个，按目标数远够）；checked_add 防
-        // u16::MAX 回绕为 0（clippy absurd_extreme_comparisons 同源规避）
-        let sid = self.next_sid;
-        self.next_sid = sid.checked_add(1).ok_or_else(|| {
-            hydra_protocol::HydraError::ProtocolError("UDP 会话号耗尽（请重建通道）".to_string())
-        })?;
-        self.sessions.insert(target.to_string(), sid);
-        Ok(sid)
+        // 容量满或单调空间耗尽：LRU 淘汰并复用其 sid
+        let (victim_target, victim) = self
+            .sessions
+            .iter()
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(t, e)| (t.clone(), *e))
+            .ok_or_else(|| {
+                hydra_protocol::HydraError::ProtocolError(
+                    "UDP 会话号耗尽且无会话可回收（请重建通道）".to_string(),
+                )
+            })?;
+        self.sessions.remove(&victim_target);
+        self.pending_closes.push(victim.sid);
+        self.sessions.insert(
+            target.to_string(),
+            SessionEntry {
+                sid: victim.sid,
+                last_used: std::time::Instant::now(),
+            },
+        );
+        Ok(victim.sid)
     }
 
     /// 向目标发一个 UDP 数据报（同一目标复用同一 session；首次发送隐式建立）。
     pub async fn send_to(&mut self, target: &str, datagram: &[u8]) -> Result<()> {
+        // 09-P3-7（审查08 遗留）：sid 分配与编码都在写出前完成；淘汰产生的
+        // close 帧先于数据帧发出。编码失败时映射已建立但 sid 可复用（下次
+        // send_to 同目标直接命中映射），不再出现"登记残留 + sid 空耗"。
         let sid = self.session_for(target)?;
         let frame = encode_udp_data(sid, target, datagram)?;
+        self.flush_pending_closes().await;
         write_udp_frame(&mut self.wr, &frame).await
+    }
+
+    /// 把淘汰产生的下行 close 帧写出（数据帧之前，保证节点先删旧会话）
+    async fn flush_pending_closes(&mut self) {
+        for sid in std::mem::take(&mut self.pending_closes) {
+            if write_udp_frame(&mut self.wr, &encode_udp_close(sid))
+                .await
+                .is_err()
+            {
+                // 写失败：连接已死，后续写同样失败，丢弃剩余
+                self.pending_closes.clear();
+                return;
+            }
+        }
     }
 
     /// 收下一个下行数据报，返回 `(目标地址, 数据报)`。
     /// 途中收到的下行 close 帧（节点空闲回收）内部消化并解除映射后继续等。
+    /// 09-P2-2：按本地映射校验下行帧（target, sid）归属——sid 不匹配或目标
+    /// 无映射的帧（会话关闭后的迟到帧/sid 复用期的旧会话回包）丢弃，防被
+    /// 入侵节点做跨会话混淆。
     pub async fn recv_from(&mut self) -> Result<(String, Vec<u8>)> {
         loop {
             match read_udp_frame(&mut self.rd).await? {
                 UdpFrame::Data {
-                    session_id: _,
+                    session_id,
                     target,
                     datagram,
-                } => return Ok((target, datagram)),
+                } => match self.sessions.get(&target) {
+                    Some(entry) if entry.sid == session_id => {
+                        entry_touch(&mut self.sessions, &target);
+                        return Ok((target, datagram));
+                    }
+                    Some(entry) => {
+                        tracing::debug!(
+                            "UDP 下行帧 sid 不匹配（期望 {}，实际 {}），丢弃: {}",
+                            entry.sid,
+                            session_id,
+                            mask_target(&target)
+                        );
+                        continue;
+                    }
+                    None => {
+                        tracing::debug!(
+                            "UDP 下行帧目标无本地映射（会话已关/迟到帧），丢弃: {}",
+                            mask_target(&target)
+                        );
+                        continue;
+                    }
+                },
                 UdpFrame::Close { session_id } => {
-                    // 回收映射（保持 next_sid 单调，不回收号）
-                    if let Some(t) =
-                        self.sessions.iter().find(|(_, &s)| s == session_id).map(|(t, _)| t.clone())
+                    // 回收映射（09-P1-5 起号可复用）
+                    if let Some(t) = self
+                        .sessions
+                        .iter()
+                        .find(|(_, e)| e.sid == session_id)
+                        .map(|(t, _)| t.clone())
                     {
                         self.sessions.remove(&t);
                     }
@@ -121,8 +227,8 @@ where
     /// 主动关闭目标会话（发 close 帧）。返回是否确有该会话。
     pub async fn close_target(&mut self, target: &str) -> Result<bool> {
         match self.sessions.remove(target) {
-            Some(sid) => {
-                write_udp_frame(&mut self.wr, &encode_udp_close(sid)).await?;
+            Some(entry) => {
+                write_udp_frame(&mut self.wr, &encode_udp_close(entry.sid)).await?;
                 Ok(true)
             }
             None => Ok(false),
@@ -132,6 +238,13 @@ where
     /// 当前活跃会话数（测试/观测用）
     pub fn active_sessions(&self) -> usize {
         self.sessions.len()
+    }
+}
+
+/// 刷新目标会话的最近使用时刻（下行活跃同样计入 LRU）
+fn entry_touch(sessions: &mut HashMap<String, SessionEntry>, target: &str) {
+    if let Some(entry) = sessions.get_mut(target) {
+        entry.last_used = std::time::Instant::now();
     }
 }
 
@@ -175,6 +288,20 @@ mod tests {
             wr,
             sessions: HashMap::new(),
             next_sid: 1,
+            max_sessions: UDP_MAX_LOCAL_SESSIONS,
+            pending_closes: Vec::new(),
+        }
+    }
+
+    fn open_test_channel_with_capacity(cli: tokio::io::DuplexStream, cap: usize) -> TestChannel {
+        let (rd, wr) = tokio::io::split(cli);
+        UdpChannel {
+            rd,
+            wr,
+            sessions: HashMap::new(),
+            next_sid: 1,
+            max_sessions: cap,
+            pending_closes: Vec::new(),
         }
     }
 
@@ -226,23 +353,37 @@ mod tests {
     #[tokio::test]
     async fn 下行close帧被消化并解除映射() {
         let (cli, srv) = duplex(4096);
-        // 节点侧：收到一帧后主动回收该会话（模拟空闲回收下行 close），再回一个
-        // 新会话数据帧，验证 recv_from 跳过 close 继续收数据
+        // 节点侧：回环第一帧后回收该会话（模拟空闲回收下行 close），再对一个
+        // 迟到同 sid 帧与一个新会话帧——验证 close 解除映射、迟到帧被丢弃、
+        // 新会话帧正常分发（09-P2-2 sid 校验语义）
         let mock = async move {
             let mut srv = srv;
             let frame = read_udp_frame(&mut srv).await.unwrap();
             let UdpFrame::Data { session_id, target, .. } = frame else {
                 panic!("应为数据帧");
             };
+            // 回环后立刻 close：映射应在客户端解除
+            write_udp_frame(&mut srv, &encode_udp_data(session_id, &target, b"echo-1").unwrap())
+                .await
+                .unwrap();
             write_udp_frame(&mut srv, &encode_udp_close(session_id))
                 .await
                 .unwrap();
+            // close 之后的迟到同 sid 帧：应被客户端丢弃（会话已关）
             write_udp_frame(
                 &mut srv,
-                &encode_udp_data(session_id + 1, &target, b"after-close").unwrap(),
+                &encode_udp_data(session_id, &target, b"late-after-close").unwrap(),
             )
             .await
             .unwrap();
+            // 客户端对另一目标的新会话帧：原样回环
+            let frame2 = read_udp_frame(&mut srv).await.unwrap();
+            let UdpFrame::Data { session_id: s2, target: t2, datagram: d2 } = frame2 else {
+                panic!("应为数据帧");
+            };
+            write_udp_frame(&mut srv, &encode_udp_data(s2, &t2, &d2).unwrap())
+                .await
+                .unwrap();
         };
         tokio::spawn(mock);
         let mut ch = open_test_channel(cli);
@@ -250,8 +391,98 @@ mod tests {
         ch.send_to("10.0.0.3:443", b"trigger").await.unwrap();
         let (target, data) = ch.recv_from().await.unwrap();
         assert_eq!(target, "10.0.0.3:443");
-        assert_eq!(data, b"after-close");
-        assert_eq!(ch.active_sessions(), 0, "close 帧应解除映射");
+        assert_eq!(data, b"echo-1");
+        // 第二个目标：新会话回环正常；第一个目标的映射已被 close 解除，
+        // 迟到帧被丢弃不误投
+        ch.send_to("10.0.0.4:443", b"second").await.unwrap();
+        let (target, data) = ch.recv_from().await.unwrap();
+        assert_eq!(target, "10.0.0.4:443");
+        assert_eq!(data, b"second");
+        assert_eq!(ch.active_sessions(), 1, "close 帧应解除第一个目标的映射");
+    }
+
+    /// 09-P2-2：sid 与本地映射不匹配的下行帧被丢弃，匹配的正常投递
+    #[tokio::test]
+    async fn 下行帧sid不匹配被丢弃() {
+        let (cli, srv) = duplex(4096);
+        let mock = async move {
+            let mut srv = srv;
+            let frame = read_udp_frame(&mut srv).await.unwrap();
+            let UdpFrame::Data { session_id, target, .. } = frame else {
+                panic!("应为数据帧");
+            };
+            // 伪造 sid（会话混淆帧）→ 客户端应丢弃
+            write_udp_frame(&mut srv, &encode_udp_data(session_id + 100, &target, b"bad").unwrap())
+                .await
+                .unwrap();
+            // 正确 sid → 正常投递
+            write_udp_frame(&mut srv, &encode_udp_data(session_id, &target, b"good").unwrap())
+                .await
+                .unwrap();
+        };
+        tokio::spawn(mock);
+        let mut ch = open_test_channel(cli);
+        ch.send_to("10.0.0.5:53", b"query").await.unwrap();
+        let (target, data) = ch.recv_from().await.unwrap();
+        assert_eq!(target, "10.0.0.5:53");
+        assert_eq!(data, b"good", "混淆帧应被丢弃，仅正确 sid 的帧投递");
+    }
+
+    /// 09-P1-5：容量超限按 LRU 淘汰并复用 sid（淘汰 close 先于新数据帧发出）
+    #[tokio::test]
+    async fn 容量超限_lru淘汰并复用sid() {
+        let closes = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (cli, srv) = duplex(8192);
+        {
+            let closes = closes.clone();
+            tokio::spawn(async move {
+                let mut srv = srv;
+                loop {
+                    match read_udp_frame(&mut srv).await {
+                        Ok(UdpFrame::Data { session_id, target, datagram }) => {
+                            let frame = encode_udp_data(session_id, &target, &datagram).unwrap();
+                            if write_udp_frame(&mut srv, &frame).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(UdpFrame::Close { .. }) => {
+                            closes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        let mut ch = open_test_channel_with_capacity(cli, 2);
+
+        ch.send_to("10.0.0.1:53", b"a").await.unwrap();
+        let _ = ch.recv_from().await.unwrap();
+        // 刷新 10.0.0.1 的 LRU 时钟：10.0.0.2 成为最旧
+        ch.send_to("10.0.0.1:53", b"a2").await.unwrap();
+        let _ = ch.recv_from().await.unwrap();
+        ch.send_to("10.0.0.2:53", b"b").await.unwrap();
+        let _ = ch.recv_from().await.unwrap();
+        assert_eq!(ch.active_sessions(), 2);
+
+        // 第三个目标：触发 LRU 淘汰 10.0.0.2（含待发 close），sid 复用
+        ch.send_to("10.0.0.3:53", b"c").await.unwrap();
+        let _ = ch.recv_from().await.unwrap();
+        assert_eq!(ch.active_sessions(), 2, "容量应维持在上限");
+        for _ in 0..50 {
+            if closes.load(std::sync::atomic::Ordering::Relaxed) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            closes.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "被淘汰会话应发出下行 close"
+        );
+
+        // 被淘汰目标重新发送：映射重建、sid 复用（回环成功）
+        ch.send_to("10.0.0.2:53", b"again").await.unwrap();
+        let (_, data) = ch.recv_from().await.unwrap();
+        assert_eq!(data, b"again");
     }
 
     #[test]
@@ -262,5 +493,18 @@ mod tests {
         assert_eq!(ch.session_for("b:2").unwrap(), 2);
         assert_eq!(ch.session_for("a:1").unwrap(), 1, "同目标复用同号");
         assert_eq!(ch.active_sessions(), 2);
+    }
+
+    /// 09-P1-5：单调 sid 耗尽时走 LRU 复用（注入小容量 + 预置 next_sid）
+    #[test]
+    fn sid_单调耗尽后复用() {
+        let (cli, _srv) = duplex(64);
+        let mut ch = open_test_channel(cli);
+        ch.next_sid = u16::MAX;
+        assert_eq!(ch.session_for("last:1").unwrap(), u16::MAX);
+        // 空间耗尽：淘汰 last:1 复用其号
+        assert_eq!(ch.session_for("next:1").unwrap(), u16::MAX);
+        assert_eq!(ch.active_sessions(), 1);
+        assert!(ch.session_for("next:1").is_ok());
     }
 }
