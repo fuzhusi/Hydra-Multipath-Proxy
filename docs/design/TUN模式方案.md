@@ -72,3 +72,20 @@
 2. 流编排接 proxy 通道 + CLI 接线
 3. smoltcp 回环集成测试 + 全量回归
 4. README/部署指南更新 + 人工验证指引
+
+---
+
+## 交付补记（2026-10，v2 方向落地）
+
+本文"非目标"中的两项已随 UDP-over-proxy 三层交付后接线实现（默认开启）：
+
+- **UDP 转发**：公网目标 UDP（QUIC/HTTP3/DNS/P2P）经节点 UDP 中继加密隧道
+  转发；`HYDRA_TUN_UDP=0` 可恢复本文的 ICMP 代答回落行为。实现：tun.rs
+  UDP 统一分发 + keyed 会话（`UdpChannel::send_to_ext`）+ 中继任务（断线重连
+  + 流表回包构造 v4/v6）。
+- **DNS 经代理加密**：公网系统 DNS 不再豁免出物理网卡，查询随 UDP 隧道经
+  节点解析；`HYDRA_TUN_DNS_DIRECT=1` 恢复直连。未采用 fake-IP——真实 IP +
+  全接管路由天然免劫持匹配。
+
+仍为边界：无域名分流；TCP 仍按 `HYDRA_TUN_PORTS` 端口列表拦截（smoltcp 无
+通配监听，任意端口动态监听为后续方向）。

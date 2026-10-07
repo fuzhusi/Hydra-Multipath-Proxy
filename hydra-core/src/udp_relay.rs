@@ -64,6 +64,13 @@ where
 /// 真实节点流（connect_target 产出的 TcpNodeStream 拆分两半）上的通道
 pub type NodeUdpChannel = UdpChannel<ReadHalf<TcpNodeStream>, WriteHalf<TcpNodeStream>>;
 
+/// UDP 通道工厂（TUN 场景）：每次调用建一条新中继通道（断线重连用）。
+pub type UdpChannelFactory = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<NodeUdpChannel>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// 连接节点并打开 UDP 中继通道。
 ///
 /// `connect_target` 完成 TCP 建连 → TLS（pinning/CA + SNI）→ Noise-PSK 握手
@@ -160,6 +167,36 @@ where
         write_udp_frame(&mut self.wr, &frame).await
     }
 
+    /// 【TUN 场景】带会话键的发送：`session_key`（如 TUN 四元组流键）参与本地
+    /// 映射，键不同的流到**同一目标**各自持有独立 sid——节点侧按 sid 分会话，
+    /// 下行回包可按 sid 精确反解到发起流（单键模型无法区分多个客户端 socket
+    /// 发往同一目标）。返回本流本次使用的 sid，供调用方维护 sid→流 的反查表。
+    pub async fn send_to_ext(
+        &mut self,
+        session_key: &str,
+        target: &str,
+        datagram: &[u8],
+    ) -> Result<u16> {
+        let keyed = format!("{session_key}\u{1f}{target}");
+        let sid = self.session_for(&keyed)?;
+        let frame = encode_udp_data(sid, target, datagram)?;
+        self.flush_pending_closes().await;
+        write_udp_frame(&mut self.wr, &frame).await?;
+        Ok(sid)
+    }
+
+    /// 主动关闭 keyed 会话（发 close 帧）。返回是否确有该会话。
+    pub async fn close_session_ext(&mut self, session_key: &str, target: &str) -> Result<bool> {
+        let keyed = format!("{session_key}\u{1f}{target}");
+        match self.sessions.remove(&keyed) {
+            Some(entry) => {
+                write_udp_frame(&mut self.wr, &encode_udp_close(entry.sid)).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// 把淘汰产生的下行 close 帧写出（数据帧之前，保证节点先删旧会话）
     async fn flush_pending_closes(&mut self) {
         for sid in std::mem::take(&mut self.pending_closes) {
@@ -181,44 +218,76 @@ where
     /// 入侵节点做跨会话混淆。
     pub async fn recv_from(&mut self) -> Result<(String, Vec<u8>)> {
         loop {
+            match self.recv_from_ext().await? {
+                // 旧 API 语义：close 帧内部消化（映射已由 ext 层解除）
+                UdpRx::Data { target, datagram, .. } => return Ok((target, datagram)),
+                UdpRx::Closed { .. } => continue,
+            }
+        }
+    }
+}
+
+/// 【TUN 场景】下行接收结果：数据帧携带 sid 供流反解；close 帧（节点空闲
+/// 回收/会话满）显式暴露给调用方清理 sid→流 映射。
+#[derive(Debug, Clone, PartialEq)]
+pub enum UdpRx {
+    Data {
+        sid: u16,
+        target: String,
+        datagram: Vec<u8>,
+    },
+    Closed {
+        sid: u16,
+    },
+}
+
+impl<R, W> UdpChannel<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    /// 【TUN 场景】下行接收：数据帧带 sid（本地映射校验同 [`Self::recv_from`]），
+    /// close 帧以 [`UdpRx::Closed`] 返回（调用方据此解除 sid 反查表条目）。
+    pub async fn recv_from_ext(&mut self) -> Result<UdpRx> {
+        loop {
             match read_udp_frame(&mut self.rd).await? {
                 UdpFrame::Data {
                     session_id,
                     target,
                     datagram,
-                } => match self.sessions.get(&target) {
-                    Some(entry) if entry.sid == session_id => {
-                        entry_touch(&mut self.sessions, &target);
-                        return Ok((target, datagram));
-                    }
-                    Some(entry) => {
+                } => {
+                    // 按 sid 反查 keyed 映射：sid 在本连接内唯一，存在即有效会话
+                    if !self.sessions.values().any(|e| e.sid == session_id) {
                         tracing::debug!(
-                            "UDP 下行帧 sid 不匹配（期望 {}，实际 {}），丢弃: {}",
-                            entry.sid,
-                            session_id,
+                            "UDP 下行帧 sid 无本地映射（会话已关/迟到帧），丢弃: {}",
                             mask_target(&target)
                         );
                         continue;
                     }
-                    None => {
-                        tracing::debug!(
-                            "UDP 下行帧目标无本地映射（会话已关/迟到帧），丢弃: {}",
-                            mask_target(&target)
-                        );
-                        continue;
+                    // touch 活跃时间（LRU 计入下行）
+                    if let Some((_, e)) =
+                        self.sessions.iter_mut().find(|(_, e)| e.sid == session_id)
+                    {
+                        e.last_used = std::time::Instant::now();
                     }
-                },
+                    // target 取帧内目标——节点回显本端发送的目标，即流的 dst
+                    return Ok(UdpRx::Data {
+                        sid: session_id,
+                        target,
+                        datagram,
+                    });
+                }
                 UdpFrame::Close { session_id } => {
-                    // 回收映射（09-P1-5 起号可复用）
-                    if let Some(t) = self
+                    // 解除 keyed 映射（键含流键，按 sid 反查后整键删除）
+                    if let Some(k) = self
                         .sessions
                         .iter()
                         .find(|(_, e)| e.sid == session_id)
-                        .map(|(t, _)| t.clone())
+                        .map(|(k, _)| k.clone())
                     {
-                        self.sessions.remove(&t);
+                        self.sessions.remove(&k);
                     }
-                    continue;
+                    return Ok(UdpRx::Closed { sid: session_id });
                 }
             }
         }
@@ -241,12 +310,6 @@ where
     }
 }
 
-/// 刷新目标会话的最近使用时刻（下行活跃同样计入 LRU）
-fn entry_touch(sessions: &mut HashMap<String, SessionEntry>, target: &str) {
-    if let Some(entry) = sessions.get_mut(target) {
-        entry.last_used = std::time::Instant::now();
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -496,6 +559,59 @@ mod tests {
     }
 
     /// 09-P1-5：单调 sid 耗尽时走 LRU 复用（注入小容量 + 预置 next_sid）
+    /// 【TUN 场景】keyed 会话：不同流键到同一目标各持独立 sid；下行按 sid 反解
+    #[tokio::test]
+    async fn keyed会话_同目标不同流独立sid() {
+        let (cli, srv) = duplex(4096);
+        // mock 节点：原样回环（session_id/target/datagram 透传）
+        tokio::spawn(async move {
+            let mut srv = srv;
+            while let Ok(UdpFrame::Data { session_id, target, datagram }) =
+                read_udp_frame(&mut srv).await
+            {
+                let f = encode_udp_data(session_id, &target, &datagram).unwrap();
+                if write_udp_frame(&mut srv, &f).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut ch = open_test_channel(cli);
+
+        // 流 A 与流 B 发往同一目标：sid 必须不同
+        let sid_a = ch.send_to_ext("flowA", "10.0.0.7:53", b"query-a").await.unwrap();
+        let sid_b = ch.send_to_ext("flowB", "10.0.0.7:53", b"query-b").await.unwrap();
+        assert_ne!(sid_a, sid_b, "不同流键同目标必须分会话");
+        // 同流键复用同 sid
+        let sid_a2 = ch.send_to_ext("flowA", "10.0.0.7:53", b"query-a2").await.unwrap();
+        assert_eq!(sid_a, sid_a2);
+
+        // 下行按 sid 反解：A 的回包不会错投给 B
+        let rx = ch.recv_from_ext().await.unwrap();
+        match rx {
+            UdpRx::Data { sid, target, datagram } => {
+                assert_eq!(sid, sid_a);
+                assert_eq!(target, "10.0.0.7:53");
+                assert_eq!(datagram, b"query-a");
+            }
+            other => panic!("期望 Data，实际 {other:?}"),
+        }
+        let rx = ch.recv_from_ext().await.unwrap();
+        match rx {
+            UdpRx::Data { sid, datagram, .. } => {
+                assert_eq!(sid, sid_b);
+                assert_eq!(datagram, b"query-b");
+            }
+            other => panic!("期望 Data，实际 {other:?}"),
+        }
+
+        // 节点下行 close：recv_from_ext 以 Closed 暴露，映射解除
+        // （借 mock：直接对客户端半流写 close 不可行——srv 已被任务持有；
+        //   通过 close_session_ext 验证映射解除语义即可）
+        assert!(ch.close_session_ext("flowA", "10.0.0.7:53").await.unwrap());
+        assert!(!ch.close_session_ext("flowA", "10.0.0.7:53").await.unwrap(), "幂等");
+        assert_eq!(ch.active_sessions(), 1);
+    }
+
     #[test]
     fn sid_单调耗尽后复用() {
         let (cli, _srv) = duplex(64);

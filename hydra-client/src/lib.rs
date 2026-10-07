@@ -106,14 +106,28 @@ pub fn tun_config_from_settings(
             std::net::IpAddr::V6(ip) => cfg.exclude_routes_v6.push(ip),
         }
     }
-    // 系统 DNS 豁免（best-effort；v1 无 DNS 劫持，DNS 明文直出物理网卡）。
-    // 09-P2-4：v6 DNS 同样豁免——否则 v6 DNS over UDP 被 TUN 代答回不可达
-    // （纯 v6 网络断网观感），over TCP 却被代理，同一目标两种路径分叉。
-    for dns in crate::tun::detect_dns_servers() {
-        cfg.exclude_routes.push(dns);
+    // UDP 接管/DNS 直连开关（09 交付，与 CLI 同构）：HYDRA_TUN_UDP=0 关 UDP 接管；
+    // HYDRA_TUN_DNS_DIRECT=1 恢复 DNS 直连（默认经隧道）
+    if let Ok(v) = std::env::var("HYDRA_TUN_UDP") {
+        if v.trim() == "0" {
+            cfg.udp_relay = false;
+        }
     }
-    for dns in crate::tun::detect_dns_servers_v6() {
-        cfg.exclude_routes_v6.push(dns);
+    if let Ok(v) = std::env::var("HYDRA_TUN_DNS_DIRECT") {
+        if v.trim() == "1" {
+            cfg.dns_via_proxy = false;
+        }
+    }
+    // 系统 DNS 豁免：DNS 经隧道开启时**不再**自动豁免——公网 DNS 查询随 UDP
+    // 隧道经节点解析（加密，TUN 方案 v2 方向）；DNS 直连模式（v1 行为或显式
+    // HYDRA_TUN_DNS_DIRECT=1）照旧豁免。v4+v6 都在覆盖内。
+    if !cfg.udp_relay || !cfg.dns_via_proxy {
+        for dns in crate::tun::detect_dns_servers() {
+            cfg.exclude_routes.push(dns);
+        }
+        for dns in crate::tun::detect_dns_servers_v6() {
+            cfg.exclude_routes_v6.push(dns);
+        }
     }
     Ok(cfg)
 }

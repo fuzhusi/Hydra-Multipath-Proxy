@@ -315,8 +315,7 @@ impl ProxyServer {
     /// 凭据已设置（auth_key/证书）。
     /// （通道开启器 trait 抽象在 `channel` 模块、平台无关；TUN 设备/栈在
     /// 桌面 hydra-client::tun，未来 Android tun_core——均反向依赖本实现。）
-    pub fn tun_channel_opener(&self) -> Result<crate::channel::ChannelOpener> {
-        use crate::channel::{ChannelOpener, OpenFuture, ProxyDuplex};
+    pub fn tun_channel_opener(&self) -> Result<crate::channel::ChannelOpener> {        use crate::channel::{ChannelOpener, OpenFuture, ProxyDuplex};
 
         if self.auth_key.is_empty() {
             return Err(HydraError::ConnectionError(
@@ -355,6 +354,48 @@ impl ProxyServer {
                 })
             }) as OpenFuture
         }) as ChannelOpener)
+    }
+
+    /// TUN 模式 UDP 通道工厂（09：桌面 TUN 的 UDP-over-proxy 接线）：每次调用
+    /// 建一条**独立的**到节点（当前最优节点）的 UDP 中继通道（TCP+TLS+Noise
+    /// 加 `@udp-relay/v1` 地址帧）。工厂语义支持中继任务在通道断开后重连；每次
+    /// 重连重新按调度器当前优先级选节点（故障切换友好）。
+    ///
+    /// 调用前置条件同 [`Self::tun_channel_opener`]。
+    pub fn tun_udp_channel_factory(&self) -> Result<crate::udp_relay::UdpChannelFactory> {
+        use crate::udp_relay::{open_udp_channel, NodeUdpChannel, UdpChannelFactory};
+
+        if self.auth_key.is_empty() {
+            return Err(HydraError::ConnectionError(
+                "未设置认证密钥：TUN UDP 通道工厂无法构建".to_string(),
+            ));
+        }
+        let trust = self
+            .trust
+            .clone()
+            .unwrap_or_else(|| tcp_transport::TlsTrust::pinned(self.node_certs.clone()));
+        let creds = TcpCreds {
+            trust: Arc::new(trust),
+            sni: self.sni.clone(),
+            auth_key: Arc::new(self.auth_key.clone()),
+        };
+        let scheduler = self.scheduler.clone();
+        Ok(Arc::new(move || {
+            let scheduler = scheduler.clone();
+            let creds = creds.clone();
+            Box::pin(async move {
+                // 每次建连按当前优先级取最优节点（Offline 节点排在尾部被自然跳过）
+                let node = scheduler
+                    .get_nodes_by_priority()
+                    .await
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| HydraError::ConnectionError("无可用节点".to_string()))?;
+                open_udp_channel(node.address, &creds.sni, &creds.trust, &creds.auth_key).await
+            }) as std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<NodeUdpChannel>> + Send>,
+            >
+        }) as UdpChannelFactory)
     }
 
     async fn handle_connection(

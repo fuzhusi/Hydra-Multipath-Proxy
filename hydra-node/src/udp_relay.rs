@@ -57,8 +57,11 @@ use tracing::{debug, info, warn};
 /// UDP 中继模式的保留目标前缀（与 `@hydra-p2p/` 信令分流同款保留前缀）
 pub const UDP_RELAY_PREFIX: &str = "@udp-relay/";
 
-/// 每条连接的 UDP 会话上限（防单连接耗尽 fd/内存）
-pub const UDP_MAX_SESSIONS: usize = 64;
+/// 每条连接的 UDP 会话上限（防单连接耗尽 fd/内存）。
+/// 256（TUN 接线后上调）：桌面 TUN 的全流量 UDP（DNS/QUIC/P2P）单连接会话
+/// 数远超原 64（P2P 场景取值）；实际内存远小于最坏预算（DNS 报文 ≪ 64KB 队列
+/// 上限），且客户端 LRU（4096）+ 节点空闲回收双面限流。
+pub const UDP_MAX_SESSIONS: usize = 256;
 
 /// 会话空闲回收阈值（双向均无活动达此时长即移除会话并下行 close）
 pub const UDP_SESSION_IDLE_SECS: u64 = 60;

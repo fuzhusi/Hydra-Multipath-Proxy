@@ -7,8 +7,8 @@
 > **关于 "Multipath" 命名**：指**连接级多节点加权分发与故障自愈**——每条连接走单一节点，多节点按评分分流新连接、故障自动切换。QUIC 时代的字节级多路径聚合（V3.4）已随 UDP 路径移除，如实声明避免名实脱钩。
 
 > **交付状态：v1.0 可交付产品**（2026-10）。三档如实划分：
-> - **已交付**：TCP/TLS + Noise-PSK 隧道、自签 pinning 与 ACME 真证书双路线、多节点加权分发与故障自愈、测速动态调度、TUN 透明代理 v1 完整版（IPv6 双栈）、NAT 穿透 v1（TCP STUN 分类 + 同时打开打洞 + 中继兜底；真实 NAT 组合环境需人工实网验证）、UDP-over-proxy 协议/节点/客户端三层（桌面 TUN 接线未做，TUN 下 UDP 仍快速回落 TCP）、反代静态页回退、ClientHello 指纹模仿（最大近似方案，见 docs/design/ClientHello指纹模仿方案与实施.md）、UI 重设计 v3 全部批次（含连接页）、GUI 全功能（托盘/分享/订阅/连接页/配置持久化/CA 信任模式）、CI 与 Release 安装包、Android M0 骨架（hydra-core 抽取 + FFI 引擎 + R4 protect 钩子接线）。
-> - **规划中**：Android M1/M2（全局 VPN：VpnService + TUN + DNS 劫持 + 任意端口）、桌面 TUN 的 UDP-over-proxy 接线与 DNS 劫持、多节点并行下载（HTTP Range）、rekey 密钥轮换、main.rs 模块化拆分（内部工程项）。
+> - **已交付**：TCP/TLS + Noise-PSK 隧道、自签 pinning 与 ACME 真证书双路线、多节点加权分发与故障自愈、测速动态调度、TUN 透明代理 v1 完整版（IPv6 双栈 + **UDP-over-proxy 接管**：QUIC/DNS 经加密隧道）、NAT 穿透 v1（TCP STUN 分类 + 同时打开打洞 + 中继兜底；真实 NAT 组合环境需人工实网验证）、反代静态页回退、ClientHello 指纹模仿（最大近似方案，见 docs/design/ClientHello指纹模仿方案与实施.md）、UI 重设计 v3 全部批次（含连接页）、GUI 全功能（托盘/分享/订阅/连接页/配置持久化/CA 信任模式）、CI 与 Release 安装包、Android M1（本地代理应用 + EncryptedSharedPreferences + 前台服务）。
+> - **规划中**：Android M2（全局 VPN：VpnService + tun_core + DNS 劫持 + 任意端口）、多节点并行下载（HTTP Range，透明代理模型下需独立下载器形态）、rekey 密钥轮换（TLS 1.3 每连接密钥 + 短连接已绑定暴露面，V3.3）、main.rs 模块化拆分（内部工程项）。
 
 > **项目性质**：个人自用工具，AI 辅助开发。经多轮独立代码审查（[docs/review/](docs/review/)），本 README 与代码逐项核对——未列出的能力即为未实现，不做夸大宣传。
 >
@@ -44,14 +44,15 @@
 - 全流量接管：应用**无需配置代理**。`0.0.0.0/1 + 128.0.0.0/1 → TUN` → smoltcp 用户态栈 → 既有节点链路（故障切换/流量统计语义零分叉）
 - **防环路**：节点 IP / 系统 DNS / TUN 网段自动豁免路由（/32 回物理网关），物理网关自动探测；退出/崩溃由 drop guard + 下次启动幂等清理恢复（P3-7：/1 接管路由优先摘除，防 5s 停机宽限不足残留）
 - **IPv6 双栈**：`ipv6_enabled` 默认开启——IPv6 TCP 经用户态栈正向代理（动态 AnyIP：smoltcp 0.11 的 any-ip 仅 IPv4，入站 v6 目的地址临时挂为接口 /128 有界轮转池）；v6 非 TCP 包回 ICMPv6 不可达供应用回落 IPv4；节点 IPv6 豁免照旧（`HYDRA_TUN_IPV6=0` 可关闭，关闭时 v6 全部快速失败代答）
-- **UDP 快速回落**：IPv4 UDP 不代理但代答 **ICMPv4 port unreachable**（type 3/code 3，RFC 792 校验和），应用立即失败回落 TCP 而非漫长超时
-- **已知边界（如实）**：UDP 丢弃回包（UDP-over-proxy 协议/节点/客户端封装三层已交付，桌面 TUN 接线未做——UDP 仍快速回落 TCP）、无 DNS 劫持、无域名分流；仅拦截 `HYDRA_TUN_PORTS` 列表内端口（默认 80/443/8080/8443），列表外回 RST；Windows 真机 v6 接管需 netsh + 管理员，未做真机验证（见人工验证清单）
+- **UDP-over-proxy 接管（已交付，默认开）**：公网目标 UDP（QUIC/HTTP3/DNS/P2P）经节点 UDP 中继**加密隧道**转发，回包按流表精确反解注入 TUN；v4/v6 双栈；中继断线自动重连（按当前最优节点）；`HYDRA_TUN_UDP=0` 恢复 v1 行为（公网 UDP 代答 **ICMPv4 port unreachable** type 3/code 3 引导回落 TCP）
+- **DNS 经隧道（已交付，默认开）**：UDP 接管生效时公网系统 DNS 查询随隧道经节点解析（加密、无明文泄漏——TUN 方案 v2 方向落地）；`HYDRA_TUN_DNS_DIRECT=1` 恢复 v1 直连；用户显式指定的 `HYDRA_TUN_DNS` 恒豁免（内网 resolver 场景）
+- **已知边界（如实）**：无域名分流（`HYDRA_SPLIT=cn` 仅 SOCKS 路径生效）；仅拦截 `HYDRA_TUN_PORTS` 列表内 TCP 端口（默认 80/443/8080/8443），列表外回 RST（UDP 无此限制，全端口接管）；Windows 真机 v6 接管需 netsh + 管理员，未做真机验证（见人工验证清单）
 - **私网直连**：RFC1918 + CGNAT（IPv4）与 ULA fc00::/7（IPv6）默认豁免回物理网关（09-P2-1）——路由器/NAS 等内网设备访问不进代理（节点本就 SSRF 拒绝私网目标）；物理网关未知时私网 TCP 丢弃并告警
 - 设计与实现记录：[docs/design/TUN模式方案.md](docs/design/TUN模式方案.md)
 - **人工验证清单（无法本地自动化，需管理员真机执行）**：
   1. Wintun 全链路：管理员运行 `--tun`，浏览器访问 HTTPS 站点经节点出口；退出后 `route print` 无 0.0.0.0/1、128.0.0.0/1 残留
-  2. IPv6 接管：双栈真机 + `HYDRA_TUN_IF=<适配器名>`，`netsh interface ipv6 show route` 出现 ::/1、8000::/1；`curl -6 https://api64.ipify.org` 经节点出口；UDP/QUIC 应用可快速回落
-  3. UDP 回落：TUN 下 QUIC/HTTP3 站点应秒级回落 TCP（收到 ICMPv4 port unreachable）
+  2. IPv6 接管：双栈真机 + `HYDRA_TUN_IF=<适配器名>`，`netsh interface ipv6 show route` 出现 ::/1、8000::/1；`curl -6 https://api64.ipify.org` 经节点出口
+  3. UDP 经隧道（09 交付）：TUN 下 `nslookup google.com 8.8.8.8` 与 QUIC/HTTP3 站点（如 youtube）应正常工作（经节点出口，节点侧日志可见 UDP 中继连接）；`HYDRA_TUN_UDP=0` 时 QUIC 应用应秒级回落 TCP
   4. 强杀清理：TUN 运行中直接关终端（CTRL_CLOSE_EVENT）后确认 /1 接管路由不残留
 
 ### NAT 穿透
@@ -222,6 +223,8 @@ curl -x socks5h://127.0.0.1:1080 https://www.google.com
 | `HYDRA_TUN_IF` / `HYDRA_TUN_ADDR` / `HYDRA_TUN_GW` / `HYDRA_TUN_DNS` | TUN 网卡名/地址/网关/DNS（`HYDRA_TUN_DNS` 支持 v4/v6 混合列表） |
 | `HYDRA_TUN_PORTS` | TUN 拦截的 TCP 端口列表（默认 `80,443,8080,8443`） |
 | `HYDRA_TUN_EXCLUDE` / `HYDRA_TUN_IPV6` | 额外路由豁免 / IPv6 接管开关 |
+| `HYDRA_TUN_UDP` | UDP-over-proxy 接管开关（默认开；`0` 恢复 v1 快速回落 TCP） |
+| `HYDRA_TUN_DNS_DIRECT` | `1` = 系统 DNS 直连物理网卡（v1 行为）；默认经隧道加密 |
 | `HYDRA_PER_IP_CONNECTIONS` | **节点**单源 IP 并发连接上限（默认 256，0=关闭；防单主机钉满连接额度） |
 | `HYDRA_TRANSPORT` | legacy 兼容：`quic` 值告警回落 tcp（QUIC 已移除）；缺省即 TCP |
 
@@ -309,7 +312,7 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 ## 已知限制（如实标注）
 
 - **单连接单流**：TCP 下无多流通道聚合（V3.4 已随 QUIC 移除）；连接级加权分发保留
-- TUN 已交付，已知边界：UDP 丢弃回包、无 DNS 劫持、无域名分流、按端口拦截（详见特性节）；Wintun 全链路 + 真机 v6 接管需管理员人工验证
+- TUN 已交付（含 UDP-over-proxy 接管与 DNS 经隧道），已知边界：无域名分流、TCP 按端口拦截（UDP 全端口，详见特性节）；Wintun 全链路 + 真机 v6 接管需管理员人工验证
 - NAT 穿透已交付 v1：对称型 NAT 打洞成功率有限（自动回落节点中继）；真实 NAT 组合环境（hairpin/EIF/端口漂移）需人工实网验证
 - 分流为域名后缀版（无 GeoIP）；订阅为自有格式（不对接机场）
 - 分享链接含完整凭据时等同于交付节点，仅限可信渠道

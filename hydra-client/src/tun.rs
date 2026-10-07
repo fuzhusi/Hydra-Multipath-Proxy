@@ -32,10 +32,10 @@
 //! 真实设备路径（Wintun 全链路、路由生效、退出清理、真机 v6 接管的 netsh +
 //! 管理员验证）需管理员运行，**人工验证**，见 README 部署指南指引。
 
-use hydra_protocol::{HydraError, Result};
+use hydra_protocol::{mask_target, HydraError, Result};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -72,6 +72,16 @@ pub struct TunConfig {
     pub max_flows: usize,
     /// smoltcp LISTEN 端口列表（smoltcp 无通配监听，v1 已知限制，见模块注释）
     pub listen_ports: Vec<u16>,
+    /// UDP-over-proxy 接管开关（09 交付：默认 **true**）——公网目标的 UDP
+    /// （含 QUIC/HTTP3/DNS）经节点 UDP 中继转发（加密隧道）；私网/组播/广播
+    /// 目标照旧不入隧道。关闭（`HYDRA_TUN_UDP=0`）时恢复 v1 行为：公网 UDP
+    /// 代答 ICMP port unreachable 引导应用回落 TCP。
+    pub udp_relay: bool,
+    /// 系统 DNS 经隧道开关（默认 **true**）：UDP 接管生效时，探测到的公网系统
+    /// DNS **不再**自动豁免出物理网卡，DNS 查询随隧道经节点解析（加密、无明文
+    /// 泄漏——TUN 方案 v2 方向的实现）。`HYDRA_TUN_DNS_DIRECT=1` 恢复 v1 直连
+    /// 行为；用户显式指定的 `HYDRA_TUN_DNS` 恒豁免（可能是内网 resolver）。
+    pub dns_via_proxy: bool,
 }
 
 impl Default for TunConfig {
@@ -88,6 +98,8 @@ impl Default for TunConfig {
             max_flows: 512,
             // 常用明文/加密 Web 端口；其余端口需 HYDRA_TUN_PORTS 扩展
             listen_ports: vec![80, 443, 8080, 8443],
+            udp_relay: true,
+            dns_via_proxy: true,
         }
     }
 }
@@ -1382,12 +1394,345 @@ fn ensure_v6_dst(
     });
 }
 
+// ── UDP-over-proxy 接管（09 交付：TUN 方案 v2 方向落地）────────────────────
+
+use hydra_core::udp_relay::{NodeUdpChannel, UdpChannelFactory, UdpRx};
+
+/// 中继通道任务命令：分发循环把公网 UDP 包转交此通道（带完整流上下文）
+enum UdpCmd {
+    Send {
+        /// 流键（客户端四元组的 src|dst，参与 keyed 会话映射）
+        flow: String,
+        /// 节点侧目标（= 客户端包的目的地）
+        dst: SocketAddr,
+        /// 客户端包的源地址（回包注入 TUN 时的目的地）
+        src: SocketAddr,
+        data: Vec<u8>,
+    },
+}
+
+/// 每流的记录：sid → (流目的地址, 客户端源地址)。回包构造：
+/// src = 流目的地址（应用看到的"远端"），dst = 客户端源地址。
+#[derive(Default)]
+struct UdpFlowTable {
+    by_sid: HashMap<u16, (SocketAddr, SocketAddr)>,
+    last_seen: HashMap<u16, std::time::Instant>,
+}
+
+impl UdpFlowTable {
+    const IDLE_SECS: u64 = 150;
+
+    fn touch(&mut self, sid: u16, dst: SocketAddr, src: SocketAddr) {
+        self.by_sid.insert(sid, (dst, src));
+        self.last_seen.insert(sid, std::time::Instant::now());
+    }
+
+    fn remove(&mut self, sid: u16) {
+        self.by_sid.remove(&sid);
+        self.last_seen.remove(&sid);
+    }
+
+    /// 周期清理空闲流（无回包也无上行超时——节点侧 60s 空闲回收先行，
+    /// 此处兜底防 sid 表泄漏；未及时收到 Closed 帧的场景）
+    fn sweep_idle(&mut self) {
+        let now = std::time::Instant::now();
+        let expired: Vec<u16> = self
+            .last_seen
+            .iter()
+            .filter(|(_, t)| now.duration_since(**t).as_secs() > Self::IDLE_SECS)
+            .map(|(sid, _)| *sid)
+            .collect();
+        for sid in expired {
+            self.remove(sid);
+        }
+    }
+}
+
+/// UDP 中继通道任务：持有到节点的 UdpChannel，双向泵——
+/// 上行：分发循环经 `cmd_rx` 投递公网 UDP 包 → keyed 会话发送；
+/// 下行：节点回包按 sid 反解 → 构造 UDP/IP 包注入 TUN（回给应用 socket）。
+/// 通道断开自动重连（指数退避封顶 10s）；每次重连按当前最优节点建连。
+async fn udp_relay_task(
+    factory: UdpChannelFactory,
+    mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<UdpCmd>,
+    transport: Arc<dyn PacketTransport>,
+    shutdown: CancellationToken,
+) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        // 1. 建连（按当前最优节点）
+        let mut ch: NodeUdpChannel = match (factory)().await {
+            Ok(c) => {
+                backoff = Duration::from_secs(1);
+                info!("TUN UDP 中继通道已建立（加密隧道）");
+                c
+            }
+            Err(e) => {
+                warn!("TUN UDP 中继建连失败（{}s 后重试）: {}", backoff.as_secs(), e);
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(10));
+                continue;
+            }
+        };
+
+        // 2. 双向泵
+        let mut flows = UdpFlowTable::default();
+        let mut janitor = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = janitor.tick() => flows.sweep_idle(),
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(UdpCmd::Send { flow, dst, src, data }) => {
+                        let dst_str = sock_to_target(dst);
+                        match ch.send_to_ext(&flow, &dst_str, &data).await {
+                            Ok(sid) => flows.touch(sid, dst, src),
+                            Err(e) => {
+                                debug!("TUN UDP 中继上行写失败（通道重建）: {e}");
+                                break; // 重建通道；本包丢弃（UDP 语义）
+                            }
+                        }
+                    }
+                    None => return, // 分发循环已退出
+                },
+                rx = ch.recv_from_ext() => match rx {
+                    Ok(UdpRx::Data { sid, target, datagram }) => {
+                        // 回包源/目的取**流表权威数据**（发送时记录的四元组），
+                        // 不信任线上回显的 target 字段
+                        let Some(&(flow_dst, client_src)) = flows.by_sid.get(&sid) else {
+                            debug!("TUN UDP 下行 sid 无流映射（迟到帧），丢弃: {}", mask_target(&target));
+                            continue;
+                        };
+                        let reply = match (flow_dst, client_src) {
+                            (SocketAddr::V4(s), SocketAddr::V4(d)) => Some(build_udp_reply_v4(
+                                *s.ip(), *d.ip(), s.port(), d.port(), &datagram,
+                            )),
+                            (SocketAddr::V6(s), SocketAddr::V6(d)) => Some(build_udp_reply_v6(
+                                *s.ip(), *d.ip(), s.port(), d.port(), &datagram,
+                            )),
+                            _ => None, // v4/v6 混线（不应发生）：丢弃
+                        };
+                        if let Some(pkt) = reply {
+                            if let Err(e) = transport.send(&pkt).await {
+                                error!("TUN UDP 回包注入失败: {e}");
+                            }
+                        }
+                    }
+                    Ok(UdpRx::Closed { sid }) => flows.remove(sid),
+                    Err(e) => {
+                        debug!("TUN UDP 中继下行读失败（通道重建）: {e}");
+                        break;
+                    }
+                },
+            }
+        }
+        // 3. 断线退避后重连（flows 随通道作废：sid 空间在新通道重新分配）
+        drop(ch);
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(10));
+    }
+}
+
+/// SocketAddr → UDP 中继目标串（v6 带方括号："1.2.3.4:53" / "[::1]:53"）
+fn sock_to_target(a: SocketAddr) -> String {
+    match a {
+        SocketAddr::V4(v4) => format!("{}:{}", v4.ip(), v4.port()),
+        SocketAddr::V6(v6) => format!("[{}]:{}", v6.ip(), v6.port()),
+    }
+}
+
+/// v4 UDP 首片可解析性：长度/协议/分片检查（供分发判定）。
+/// 返回 Some((src, dst, payload 起始, payload 长度))；不可解析 → None。
+fn parse_udp_v4(pkt: &[u8]) -> Option<(SocketAddr, SocketAddr, usize, usize)> {
+    if pkt.len() < 28 || pkt[0] >> 4 != 4 || pkt[9] != 17 {
+        return None;
+    }
+    let ihl = usize::from(pkt[0] & 0x0f) * 4;
+    if ihl < 20 || pkt.len() < ihl + 8 {
+        return None;
+    }
+    let frag = u16::from_be_bytes([pkt[6], pkt[7]]);
+    if frag & 0x3fff != 0 {
+        return None; // 有分片（offset 或 MF）：不代理（罕见，MTU 内流量不分片）
+    }
+    // 以 IP 总长字段为准（剥离链路层填充尾巴）
+    let total = usize::from(u16::from_be_bytes([pkt[2], pkt[3]]));
+    let udp_len = usize::from(u16::from_be_bytes([pkt[ihl + 4], pkt[ihl + 5]]));
+    let payload_len = udp_len.saturating_sub(8);
+    if udp_len < 8 || pkt.len() < ihl + udp_len || total < ihl + udp_len {
+        return None;
+    }
+    let src = SocketAddr::new(
+        std::net::IpAddr::V4(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15])),
+        u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]),
+    );
+    let dst = SocketAddr::new(
+        std::net::IpAddr::V4(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19])),
+        u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]),
+    );
+    Some((src, dst, ihl + 8, payload_len))
+}
+
+/// v6 UDP 可解析性（无扩展头直载）：返回 Some((src, dst, payload 起始, 长度))。
+fn parse_udp_v6(pkt: &[u8]) -> Option<(SocketAddr, SocketAddr, usize, usize)> {
+    if pkt.len() < 48 || pkt[0] >> 4 != 6 || pkt[6] != 17 {
+        return None;
+    }
+    let payload_len = usize::from(u16::from_be_bytes([pkt[4], pkt[5]]));
+    if payload_len < 8 || pkt.len() < 40 + payload_len {
+        return None;
+    }
+    let mut s = [0u8; 16];
+    let mut d = [0u8; 16];
+    s.copy_from_slice(&pkt[8..24]);
+    d.copy_from_slice(&pkt[24..40]);
+    let src = SocketAddr::new(
+        std::net::IpAddr::V6(Ipv6Addr::from(s)),
+        u16::from_be_bytes([pkt[40], pkt[41]]),
+    );
+    let dst = SocketAddr::new(
+        std::net::IpAddr::V6(Ipv6Addr::from(d)),
+        u16::from_be_bytes([pkt[42], pkt[43]]),
+    );
+    Some((src, dst, 48, payload_len - 8))
+}
+
+/// 构造回包：UDP/IP 完整帧，src = 流目的地址（应用看到的远端），dst = 客户端源。
+/// v4：UDP 校验和按 RFC 768 伪首部计算（0 视为无校验和，但我们给出真实值，
+/// 与主流栈一致，避免个别应用/中间盒对 0 校验和的兼容性问题）。
+fn build_udp_reply_v4(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+    let udp_len = 8 + payload.len();
+    let total = 20 + udp_len;
+    let mut pkt = vec![0u8; total];
+    pkt[0] = 0x45;
+    let total_be = (total as u16).to_be_bytes();
+    pkt[2..4].copy_from_slice(&total_be);
+    pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+    pkt[8] = 64; // TTL
+    pkt[9] = 17; // proto UDP
+    pkt[12..16].copy_from_slice(&src.octets());
+    pkt[16..20].copy_from_slice(&dst.octets());
+    let csum = checksum16(&pkt[..20]);
+    pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+    // UDP 头
+    pkt[20..22].copy_from_slice(&sport.to_be_bytes());
+    pkt[22..24].copy_from_slice(&dport.to_be_bytes());
+    pkt[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    // 伪首部校验和
+    let mut pseudo = Vec::with_capacity(12 + udp_len);
+    pseudo.extend_from_slice(&src.octets());
+    pseudo.extend_from_slice(&dst.octets());
+    pseudo.push(0);
+    pseudo.push(17);
+    pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    pseudo.extend_from_slice(&pkt[20..]);
+    let uc = checksum16(&pseudo);
+    pkt[26..28].copy_from_slice(&uc.to_be_bytes());
+    pkt[28..].copy_from_slice(payload);
+    pkt
+}
+
+/// v6 版回包（校验和必需，RFC 2460）。
+fn build_udp_reply_v6(src: Ipv6Addr, dst: Ipv6Addr, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+    let udp_len = 8 + payload.len();
+    let mut pkt = vec![0u8; 40 + udp_len];
+    pkt[0] = 0x60;
+    pkt[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    pkt[6] = 17;
+    pkt[7] = 64; // hop limit
+    pkt[8..24].copy_from_slice(&src.octets());
+    pkt[24..40].copy_from_slice(&dst.octets());
+    pkt[40..42].copy_from_slice(&sport.to_be_bytes());
+    pkt[42..44].copy_from_slice(&dport.to_be_bytes());
+    pkt[44..46].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    // 校验和覆盖伪首部 + UDP 头 + 载荷（RFC 2460；checksum16 顺序无关）
+    let pseudo = ipv6_pseudo_header(&src.octets(), &dst.octets(), udp_len as u32, 17);
+    let mut covered = pseudo;
+    covered.extend_from_slice(&pkt[40..]);
+    let uc = checksum16(&covered);
+    pkt[46..48].copy_from_slice(&uc.to_be_bytes());
+    pkt[48..].copy_from_slice(payload);
+    pkt
+}
+
+/// `HYDRA_ALLOW_PRIVATE_TARGETS=1` 放开私网目标（与节点侧同款 OnceLock 语义）：
+/// 自建 LAN 节点场景下节点侧已放开，客户端 TUN 的 UDP 分发应同样放行——
+/// 单边硬拦会让"LAN 节点 + TUN"的私网访问无解（09 之前 TCP 路径即如此：
+/// 包进 TUN 被节点拒；UDP 接管后客户端同样尊重该开关）。
+fn private_targets_allowed() -> bool {
+    static ALLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOW.get_or_init(|| {
+        matches!(std::env::var("HYDRA_ALLOW_PRIVATE_TARGETS"), Ok(v) if v == "1")
+    })
+}
+
+/// 分发入口（run_stack 调用）：解析 + 私网/组播过滤 + 转交中继任务。
+/// 返回 true = 已接管（转发中）；false = 未接管（调用方按旧行为处理）。
+fn try_forward_udp(
+    pkt: &[u8],
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<UdpCmd>,
+) -> bool {
+    let parsed = parse_udp_v4(pkt).or_else(|| parse_udp_v6(pkt));
+    let Some((src, dst, off, len)) = parsed else {
+        return false;
+    };
+    // 目的地过滤：与路由豁免语义一致——私网/回环/链路本地/ULA/组播/广播不入
+    // 隧道；HYDRA_ALLOW_PRIVATE_TARGETS=1 时放开私网类（组播/广播/未指定仍拦）
+    let allow_private = private_targets_allowed();
+    let excluded = match dst.ip() {
+        std::net::IpAddr::V4(v4) => {
+            let private_like = v4.is_loopback() || v4.is_link_local() || v4.is_private()
+                || v4.octets()[0] == 0
+                || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]));
+            if allow_private {
+                v4.is_broadcast() || v4.is_multicast()
+            } else {
+                private_like || v4.is_broadcast() || v4.is_multicast()
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            let private_like = v6.is_loopback() || v6.is_unspecified()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (v6.segments()[0] & 0xfe00) == 0xfc00;
+            if allow_private {
+                v6.is_multicast()
+            } else {
+                private_like || v6.is_multicast()
+            }
+        }
+    };
+    if excluded {
+        return false;
+    }
+    let flow = format!("{src}|{dst}");
+    cmd_tx
+        .send(UdpCmd::Send {
+            flow,
+            dst,
+            src,
+            data: pkt[off..off + len].to_vec(),
+        })
+        .is_ok()
+}
+
 /// 栈主循环（与真实 TUN 设备解耦：任何 [`PacketTransport`] 都可驱动，
 /// 测试用通道对接两个 smoltcp Interface 做回环验证）。
+/// `udp_factory` = Some 时公网 UDP 经节点中继接管（09 交付）；None/关闭时
+/// 保持 v1 行为（公网 UDP 代答 ICMP 不可达回落 TCP）。
 pub async fn run_stack<T: PacketTransport>(
     transport: Arc<T>,
     cfg: TunConfig,
     opener: ChannelOpener,
+    udp_factory: Option<UdpChannelFactory>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let (mut device, _in_q, _out_q) = ChanDevice::new(cfg.mtu as usize);
@@ -1416,6 +1761,36 @@ pub async fn run_stack<T: PacketTransport>(
     // 分配 16KB 再丢弃，持续产生无效内存带宽；09-P3-8 复核发现分配仍在
     // 循环内，本次真正提到循环外）
     let mut stack_buf = vec![0u8; 16 * 1024];
+
+    // ── UDP-over-proxy 接管（09 交付）──
+    // 公网 UDP（DNS/QUIC/HTTP3/P2P）→ 节点中继（加密隧道）。开关关闭或未提供
+    // 工厂时保持 v1 行为（公网 UDP 代答 ICMP 不可达回落 TCP）。
+    let udp_tx = if cfg.udp_relay {
+        match udp_factory {
+            Some(factory) => {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UdpCmd>();
+                tokio::spawn(udp_relay_task(
+                    factory,
+                    rx,
+                    transport.clone(),
+                    shutdown.clone(),
+                ));
+                info!(
+                    "TUN UDP-over-proxy 已接管：公网 UDP（DNS/QUIC）经节点加密中继\
+                     ；DNS {}（HYDRA_TUN_DNS_DIRECT=1 可恢复直连）",
+                    if cfg.dns_via_proxy { "经隧道" } else { "直连" }
+                );
+                Some(tx)
+            }
+            None => {
+                warn!("TUN UDP 接管未启用（未提供 UDP 通道工厂）：公网 UDP 回落 TCP（v1 行为）");
+                None
+            }
+        }
+    } else {
+        info!("TUN UDP 接管已关闭（HYDRA_TUN_UDP=0）：公网 UDP 代答 ICMP 不可达回落 TCP");
+        None
+    };
 
     loop {
         tokio::select! {
@@ -1526,6 +1901,9 @@ pub async fn run_stack<T: PacketTransport>(
                                 // 无法安全解析端口——静默丢弃而非回不可达（让应用
                                 // 快速失败即可，审查批次 C P3-8 同源场景）
                                 debug!("TUN 丢弃带扩展头的 IPv6 包（无 v6 转发能力）");
+                            } else if let Some(tx) = udp_tx.as_ref().filter(|_| !v6_drop).filter(|_| parse_udp_v6(pkt).is_some()) {
+                                // 09 交付：v6 公网 UDP 经节点中继（与 v4 对称）
+                                try_forward_udp(pkt, tx);
                             } else {
                                 let icmp = build_icmpv6_unreachable_v6(pkt);
                                 if let Err(e) = transport.send(&icmp).await {
@@ -1533,16 +1911,28 @@ pub async fn run_stack<T: PacketTransport>(
                                 }
                             }
                         }
-                    } else if is_unproxyable_udp_v4(pkt) {
-                        // IPv4 UDP：项目无 UDP-over-proxy 能力——公网目标代答
-                        // ICMPv4 port unreachable（type 3/code 3，RFC 792 校验
-                        // 和），应用立即失败回落 TCP。
-                        // 09-P3-7：私网目标的 UDP（正常已被私网豁免路由引回物理
-                        // 网关；到达此处 = 物理网关未知豁免未生成）**静默丢弃**——
-                        // 对内网目的回差错违反 RFC 1122/4443 对内网/受限目的的
-                        // 约束精神，且 mDNS/NBNS 等内网服务发现会持续触发噪声
-                        if is_private_udp_v4_dst(pkt) {
-                            debug!("TUN 丢弃发往私网目标的 UDP 包（无豁免路由，不代答差错）");
+                    } else if parse_udp_v4(pkt).is_some() {
+                        // IPv4 UDP（09 交付统一分发）：可解析 UDP 全部在此处理——
+                        // ① UDP 接管开启：公网目标（或 HYDRA_ALLOW_PRIVATE_TARGETS
+                        //    放开的私网目标）经节点中继（加密隧道）；
+                        // ② 广播/组播/未指定源/未放开私网：静默丢弃（RFC 1122 不回
+                        //    差错；私网是豁免路由缺失的降级场景）；
+                        // ③ 接管关闭（v1 行为）：公网 UDP 代答 ICMP port unreachable
+                        //    引导应用回落 TCP。
+                        let (src, dst, _off, _len) = parse_udp_v4(pkt).unwrap();
+                        let private = is_private_udp_v4_dst(pkt);
+                        let allow_private = private_targets_allowed();
+                        let no_relay = dst.ip().is_multicast()
+                            || matches!(dst, SocketAddr::V4(v4) if v4.ip().is_broadcast())
+                            || src.ip().is_unspecified()
+                            || (private && !allow_private);
+                        if let Some(tx) = udp_tx.as_ref().filter(|_| !no_relay) {
+                            try_forward_udp(pkt, tx);
+                        } else if no_relay {
+                            debug!(
+                                "TUN 丢弃 UDP 包（广播/组播/未指定源/私网未放开）: dst={}",
+                                dst
+                            );
                         } else if let Some(icmp) = build_icmpv4_port_unreachable(pkt) {
                             if let Err(e) = transport.send(&icmp).await {
                                 error!("TUN 写 ICMPv4 不可达失败: {}", e);
@@ -2006,6 +2396,7 @@ async fn step(
 pub async fn run_tun(
     cfg: TunConfig,
     opener: ChannelOpener,
+    udp_factory: Option<UdpChannelFactory>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     // 1. 物理 gw 探测 + 路由方案（豁免失败只是告警，见 compute_routes）
@@ -2087,7 +2478,7 @@ pub async fn run_tun(
 
     // 4. 栈主循环
     let transport = Arc::new(Tun2Transport::new(dev));
-    let res = run_stack(transport, cfg, opener, shutdown).await;
+    let res = run_stack(transport, cfg, opener, udp_factory, shutdown).await;
     info!("TUN 模式退出，路由已清理");
     res
 }
@@ -2831,7 +3222,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let shutdown2 = shutdown.clone();
         let _stack_task =
-            tokio::spawn(async move { run_stack(transport, cfg, opener, shutdown2).await });
+            tokio::spawn(async move { run_stack(transport, cfg, opener, None, shutdown2).await });
 
         // 客户端栈（模拟 TUN 后面的应用）
         let cin = Arc::new(Mutex::new(VecDeque::new()));
@@ -2923,7 +3314,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let shutdown2 = shutdown.clone();
         let stack_task =
-            tokio::spawn(async move { run_stack(transport, cfg, opener, shutdown2).await });
+            tokio::spawn(async move { run_stack(transport, cfg, opener, None, shutdown2).await });
 
         let cin = Arc::new(Mutex::new(VecDeque::new()));
         let cout = Arc::new(Mutex::new(VecDeque::new()));
@@ -3092,7 +3483,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let shutdown2 = shutdown.clone();
         let stack_task =
-            tokio::spawn(async move { run_stack(transport, cfg, opener, shutdown2).await });
+            tokio::spawn(async move { run_stack(transport, cfg, opener, None, shutdown2).await });
 
         // 客户端栈（模拟 TUN 后的应用）：两条 socket
         let cin = Arc::new(Mutex::new(VecDeque::new()));
@@ -3197,7 +3588,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let shutdown2 = shutdown.clone();
         let _stack_task =
-            tokio::spawn(async move { run_stack(transport, cfg, opener, shutdown2).await });
+            tokio::spawn(async move { run_stack(transport, cfg, opener, None, shutdown2).await });
 
         let cin = Arc::new(Mutex::new(VecDeque::new()));
         let cout = Arc::new(Mutex::new(VecDeque::new()));
@@ -3295,7 +3686,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let shutdown2 = shutdown.clone();
         let _stack_task =
-            tokio::spawn(async move { run_stack(transport, cfg, opener, shutdown2).await });
+            tokio::spawn(async move { run_stack(transport, cfg, opener, None, shutdown2).await });
 
         let cin = Arc::new(Mutex::new(VecDeque::new()));
         let cout = Arc::new(Mutex::new(VecDeque::new()));
@@ -3438,5 +3829,144 @@ mod tests {
         assert!(cmds[0].contains("8000::/1"), "首删应是 8000::/1: {cmds:?}");
         assert!(cmds[1].contains("::/1"), "次删应是 ::/1: {cmds:?}");
         assert!(cmds[2].contains("2001:db8::9/128"));
+    }
+
+
+    /// 09 交付 E2E：TUN UDP-over-proxy 接线——真节点（进程内 HydraServer）+
+    /// mock TUN 回环。客户端 UDP 包（10.7.0.1:40000 → 127.0.0.1:echo）经
+    /// run_stack 分发 → 中继任务（keyed 会话）→ 节点中继 → 本机 UDP 回显 →
+    /// 回包按流表构造注入 TUN 出口。验证：封装/分发/回包构造/回环全链路。
+    #[tokio::test]
+    async fn run_stack_udp接管_真节点mock回环端到端() {
+        std::env::set_var("HYDRA_ALLOW_PRIVATE_TARGETS", "1");
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .try_init();
+        use hydra_core::udp_relay::{open_udp_channel, UdpChannelFactory};
+        use hydra_node::{HydraServer, NodeOptions};
+        use crate::tcp_transport::TlsTrust;
+
+        // 1. 本机 UDP 回显服务
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 2048];
+            loop {
+                if let Ok((n, from)) = echo.recv_from(&mut b).await {
+                    let _ = echo.send_to(&b[..n], from).await;
+                }
+            }
+        });
+
+        // 2. 进程内节点（随机端口 + 临时证书）
+        let dir = std::env::temp_dir().join(format!(
+            "hydra-tun-udp-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let auth_key = vec![7u8; 32];
+        let server = HydraServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            auth_key.clone(),
+            NodeOptions {
+                max_connections: 16,
+                cert_file: dir.join("cert.der"),
+                key_file: dir.join("key.der"),
+                ..NodeOptions::default()
+            },
+        )
+        .await
+        .expect("节点启动");
+        let node_addr = server.tcp_listen_addr.expect("tcp 监听地址");
+        let cert = server.cert_der().to_vec();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // 3. 构造：栈配置 + 哑 opener（无 TCP 流）+ UDP 通道工厂
+        let cfg = TunConfig {
+            udp_relay: true,
+            dns_via_proxy: true,
+            ..Default::default()
+        };
+        let opener: ChannelOpener = Arc::new(|_t: String| {
+            Box::pin(async { Err(HydraError::ConnectionError("测试未使用 TCP 路径".into())) })
+                as OpenFuture
+        }) as ChannelOpener;
+        let trust = TlsTrust::pinned(vec![cert]);
+        let auth2 = auth_key.clone();
+        let factory: UdpChannelFactory = Arc::new(move || {
+            let trust = trust.clone();
+            let auth = auth2.clone();
+            Box::pin(async move { open_udp_channel(node_addr, "hydra.node", &trust, &auth).await })
+        });
+
+        // 4. mock TUN：入站注入客户端 UDP 包，出站收集回包
+        let (in_tx, in_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let transport = Arc::new(TestTransport {
+            inbound: tokio::sync::Mutex::new(in_rx),
+            outbound: out_tx,
+        });
+        // 客户端包：10.7.0.1:40000 → 127.0.0.1:echo（载荷即回显内容）
+        let payload = b"hydra-tun-udp-e2e";
+        let src_ip = Ipv4Addr::new(10, 7, 0, 1);
+        let mut pkt = Vec::with_capacity(20 + 8 + payload.len());
+        pkt.extend_from_slice(&[0x45, 0, 0, 0]); // 占位总长
+        let total = (28 + payload.len()) as u16;
+        pkt[2..4].copy_from_slice(&total.to_be_bytes());
+        pkt.extend_from_slice(&[0, 1, 0, 0, 64, 17, 0, 0]); // id/flags/TTL/proto/csum(0)
+        pkt.extend_from_slice(&src_ip.octets());
+        let echo_v4 = match echo_addr.ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        _ => panic!("测试回显 socket 应为 v4"),
+    };
+    pkt.extend_from_slice(&echo_v4.octets());
+        pkt.extend_from_slice(&40000u16.to_be_bytes());
+        pkt.extend_from_slice(&echo_addr.port().to_be_bytes());
+        pkt.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        pkt.extend_from_slice(&[0, 0]); // UDP 校验和（v4 可为 0，分发路径不校验）
+        pkt.extend_from_slice(payload);
+        assert!(parse_udp_v4(&pkt).is_some(), "测试包应可被分发解析");
+
+        let shutdown = CancellationToken::new();
+        tokio::spawn(run_stack(
+            transport,
+            cfg,
+            opener,
+            Some(factory),
+            shutdown.clone(),
+        ));
+        in_tx.send(pkt).unwrap();
+
+        // 5. 等回包（最长 8s）：src=echo, dst=10.7.0.1:40000, 载荷回显
+        let mut got = false;
+        for _ in 0..160 {
+            match tokio::time::timeout(Duration::from_millis(50), out_rx.recv()).await {
+                Ok(Some(p)) => {
+                    if p.len() >= 28 + payload.len() && p[0] >> 4 == 4 && p[9] == 17 {
+                        let s = Ipv4Addr::new(p[12], p[13], p[14], p[15]);
+                        let d = Ipv4Addr::new(p[16], p[17], p[18], p[19]);
+                        let sp = u16::from_be_bytes([p[20], p[21]]);
+                        let dp = u16::from_be_bytes([p[22], p[23]]);
+                        if s == echo_addr.ip()
+                            && d == src_ip
+                            && sp == echo_addr.port()
+                            && dp == 40000
+                            && &p[28..] == payload
+                        {
+                            got = true;
+                            break;
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+        shutdown.cancel();
+        assert!(got, "应在超时前收到经中继的 UDP 回包（src/dst/载荷匹配）");
     }
 }

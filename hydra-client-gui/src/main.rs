@@ -1746,6 +1746,20 @@ impl HydraApp {
                         proxy.register_nodes().await;
                         match proxy.tun_channel_opener() {
                             Ok(opener) => {
+                                // UDP 接管（09 交付）：工厂在 TUN 开启时构建
+                                let udp_factory = if tcfg.udp_relay {
+                                    match proxy.tun_udp_channel_factory() {
+                                        Ok(f) => Some(f),
+                                        Err(e) => {
+                                            // 此处已进入代理线程（不可触 UI 状态）；
+                                            // run_stack 对 None 工厂会再输出日志
+                                            tracing::warn!("UDP 接管未启用: {e}");
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
                                 // 令牌本体已在 GUI 线程创建并存入 HydraApp（真退出
                                 // 路径可达），此处取传入的令牌 clone 给 TUN 栈任务。
                                 // tx 用独立克隆（任务内发送失败根因，不占用主通道所有权）
@@ -1755,8 +1769,13 @@ impl HydraApp {
                                     .expect("TUN 已启用时停机令牌必须存在");
                                 let shutdown2 = tun_token.clone();
                                 let task = tokio::spawn(async move {
-                                    if let Err(e) =
-                                        hydra_client::tun::run_tun(tcfg, opener, shutdown2).await
+                                    if let Err(e) = hydra_client::tun::run_tun(
+                                        tcfg,
+                                        opener,
+                                        udp_factory,
+                                        shutdown2,
+                                    )
+                                    .await
                                     {
                                         // 权限不足（非管理员/root）/ 缺 wintun.dll 等根因
                                         // 经就绪通道透传到 GUI 日志区，不静默

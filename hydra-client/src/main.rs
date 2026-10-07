@@ -75,12 +75,30 @@ fn tun_config_from_env(nodes: &[SocketAddr]) -> hydra_client::tun::TunConfig {
         }
     }
     // 系统 DNS 豁免（best-effort；DNS 明文直出物理网卡——v1 无 DNS 劫持，如实边界）。
-    // 09-P2-4：v6 DNS 同样豁免（详见 tun::detect_dns_servers_v6 文档）
-    for dns in hydra_client::tun::detect_dns_servers() {
-        cfg.exclude_routes.push(dns);
+    // UDP 接管开关（09 交付，默认开）：HYDRA_TUN_UDP=0 恢复 v1 行为（公网 UDP
+    // 代答 ICMP 不可达回落 TCP）
+    if let Ok(v) = std::env::var("HYDRA_TUN_UDP") {
+        if v.trim() == "0" {
+            cfg.udp_relay = false;
+        }
     }
-    for dns in hydra_client::tun::detect_dns_servers_v6() {
-        cfg.exclude_routes_v6.push(dns);
+    // DNS 直连开关（09 交付）：默认经隧道（公网系统 DNS 不再豁免出物理网卡，
+    // DNS 查询随隧道加密经节点解析）；HYDRA_TUN_DNS_DIRECT=1 恢复 v1 直连
+    if let Ok(v) = std::env::var("HYDRA_TUN_DNS_DIRECT") {
+        if v.trim() == "1" {
+            cfg.dns_via_proxy = false;
+        }
+    }
+    // 系统 DNS 豁免：DNS 经隧道开启时**不再**自动豁免（DNS 查询入隧道）；
+    // 用户显式指定的 HYDRA_TUN_DNS 恒豁免（可能是内网 resolver）
+    let dns_direct = !cfg.udp_relay || !cfg.dns_via_proxy;
+    if dns_direct {
+        for dns in hydra_client::tun::detect_dns_servers() {
+            cfg.exclude_routes.push(dns);
+        }
+        for dns in hydra_client::tun::detect_dns_servers_v6() {
+            cfg.exclude_routes_v6.push(dns);
+        }
     }
     if let Ok(s) = std::env::var("HYDRA_TUN_EXCLUDE") {
         for ip in s
@@ -450,6 +468,18 @@ async fn main() -> Result<()> {
                 }
             };
             let tcfg = tun_config_from_env(&nodes);
+            // UDP 接管（09 交付）：UDP 通道工厂（断线按当前最优节点重连）
+            let udp_factory = if tcfg.udp_relay {
+                match proxy.tun_udp_channel_factory() {
+                    Ok(f) => Some(f),
+                    Err(e) => {
+                        warn!("UDP 接管未启用: {e}（公网 UDP 回落 TCP）");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let shutdown = new_shutdown_token();
             let shutdown2 = shutdown.clone();
             info!(
@@ -461,7 +491,7 @@ async fn main() -> Result<()> {
             );
             // 保存 JoinHandle：停机时等待栈任务退出（RouteGuard Drop 清理路由）
             let tun_task = tokio::spawn(async move {
-                if let Err(e) = hydra_client::tun::run_tun(tcfg, opener, shutdown2).await {
+                if let Err(e) = hydra_client::tun::run_tun(tcfg, opener, udp_factory, shutdown2).await {
                     error!(
                         "TUN 模式启动失败: {}（设备创建需管理员/root；Windows 还需 wintun.dll）",
                         e

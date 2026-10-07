@@ -5,6 +5,28 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased] - 桌面 TUN UDP-over-proxy 接管 + DNS 经隧道（TUN 方案 v2 方向落地）
+
+### 新增
+
+- **TUN UDP-over-proxy 接管**（默认开，`HYDRA_TUN_UDP=0` 关闭）：公网目标 UDP
+  （QUIC/HTTP3/DNS/P2P）不再代答回落 TCP，而是经节点 UDP 中继**加密隧道**
+  转发——v4/v6 双栈；回包按流表（sid → 四元组）精确反解构造注入 TUN；
+  中继通道断线自动重连（指数退避，每次按调度器当前最优节点）；keyed 会话
+  支持多客户端 socket 到同一目标（`UdpChannel::send_to_ext/recv_from_ext`）；
+  节点单连接会话上限 64 → 256（TUN 全流量场景）。端到端测试：进程内真节点
+  + mock TUN 回环（`run_stack_udp接管_真节点mock回环端到端`）。
+- **DNS 经隧道**（默认开，`HYDRA_TUN_DNS_DIRECT=1` 恢复 v1 直连）：公网系统
+  DNS 不再自动豁免出物理网卡——查询随 UDP 隧道经节点解析（加密、无明文
+  泄漏，TUN 方案明示的 v2 方向）；用户显式 `HYDRA_TUN_DNS` 恒豁免（内网
+  resolver）。
+- 客户端 TUN UDP 分发尊重 `HYDRA_ALLOW_PRIVATE_TARGETS`（与节点侧同款开关）：
+  自建 LAN 节点场景放开私网目标入隧道（组播/广播恒拦）。
+
+### 变更
+
+- README/TUN 交付状态与已知边界同步重写：UDP 接管与 DNS 经隧道移入"已交付"。
+
 ## [Unreleased] - Android M1 + 审查 09 收尾（上批遗留技术项清账）
 
 ### 新增（Android M1）
