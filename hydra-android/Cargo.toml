@@ -1,6 +1,6 @@
 [package]
 name = "hydra-android"
-version = "0.1.0"
+version = "0.2.1"
 license = "PolyForm-Noncommercial-1.0.0"
 edition = "2021"
 description = "Hydra Android 绑定层：uniffi 导出 HydraEngine（进程内 SOCKS 引擎），桌面不用此 crate"

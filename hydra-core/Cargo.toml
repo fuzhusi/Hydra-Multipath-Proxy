@@ -1,6 +1,6 @@
 [package]
 name = "hydra-core"
-version = "0.2.0"
+version = "0.2.1"
 license = "PolyForm-Noncommercial-1.0.0"
 edition = "2021"
 description = "Hydra 跨平台核心库：协议/认证/TCP-TLS 传输/代理调度/故障切换/流量统计（桌面 CLI/GUI 与 Android 共用）"

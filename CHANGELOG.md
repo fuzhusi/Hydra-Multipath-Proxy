@@ -5,12 +5,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased] - 全量代码审查 09 修复（P1/P2 全部 + 高价值 P3 + 文档清账）
+## [0.2.1] - 2026-10-07
 
-> 审查报告：[docs/review/09-全量代码审查报告.md](docs/review/09-全量代码审查报告.md)。
+> 本版本包含两批交付：**全量代码审查 09 修复**（P1 全部 7 项 + P2 主体 + 文档清账）
+> 与 **Android M0 骨架**。审查报告：[docs/review/09-全量代码审查报告.md](docs/review/09-全量代码审查报告.md)。
 > 7 路并行深审（协议/数据面/服务/服务端/TUN/GUI+Android/框架符合度），P0 为零；
 > 本批次修复 P1 全部 7 项、P2 绝大多数、以及文档/构建阻断项。clippy 零警告、
-> 全工作区测试通过。
+> 全工作区测试通过（304 项）。
 
 ### 安全与资源（P1）
 
@@ -106,9 +107,9 @@
   保留 / 测试 set_var）随本批次处理或在代码注释中如实标注。
 - 审查报告与修复记录：[docs/review/09-全量代码审查报告.md](docs/review/09-全量代码审查报告.md)。
 
-## [Unreleased] - Android M0（hydra-core 抽取 + 工程骨架）
+#### Android M0：hydra-core 抽取 + 工程骨架
 
-### 新增
+##### 新增
 
 - **hydra-core crate**：从 hydra-client 抽取 12 个平台无关模块（tcp_transport/
   proxy/nat/udp_relay/scheduler/speedtest/connections/routing/subscription/
@@ -124,14 +125,14 @@
   桌面直接加载 host 动态库跑 uniffi 启停冒烟（EngineSmokeTest）。
 - uniffi Kotlin 绑定生成器（hydra-android 的 uniffi-bindgen bin）与再生成脚本。
 
-### 变更
+##### 变更
 
 - hydra-client 瘦身为桌面壳：全量 re-export hydra-core（GUI/CLI 引用路径不变），
   保留 tun.rs、env 凭据函数、TUN 配置构造、Windows 系统代理检测等桌面专有封装。
 - workspace 新增成员 hydra-core、hydra-android；hydra-client 依赖收敛（rustls 等
   随模块移入 hydra-core）。
 
-### 修复
+##### 修复
 
 - 存量测试笔误三处：udp_frame.rs / udp_relay.rs 测试漏 `.unwrap()`；
   connections.rs 测试缺 `IpAddr` import；`test_eviction_cap` 自相矛盾断言
