@@ -31,3 +31,4 @@ hydra-node-key.der
 *.der
 *.pem
 reg.log
+android/scripts/android/
