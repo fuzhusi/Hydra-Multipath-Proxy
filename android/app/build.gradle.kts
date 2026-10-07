@@ -65,6 +65,8 @@ dependencies {
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.material3)
     implementation(libs.kotlinx.coroutines.android)
+    // R8 密钥存储：EncryptedSharedPreferences（Keystore 主密钥 + AES-GCM 文件级加密）
+    implementation(libs.androidx.security.crypto)
     // uniffi 0.29 生成的 Kotlin 绑定经 JNA 调 FFI。必须选 aar 变体（含各 ABI 的
     // libjnidispatch.so）：默认解析到桌面 jar，真机必 UnsatisfiedLinkError。
     implementation("net.java.dev.jna:jna:${libs.versions.jna.get()}") {

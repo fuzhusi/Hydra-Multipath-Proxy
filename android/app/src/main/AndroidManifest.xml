@@ -3,9 +3,9 @@
 
     <!-- M1 进程内 SOCKS：应用自身出站访问节点 -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- M2 全局 VPN：VpnService + 前台服务常驻通知（评审 R 项：Always-on/Doze） -->
+    <!-- M1 前台服务保活（防 Cached App Freezer 冻结后台引擎）；M2 换 VpnService 常驻 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
@@ -22,6 +22,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- M1：前台服务持有引擎（启停经 Intent action；不对外导出） -->
+        <service
+            android:name=".EngineService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <!-- M2：VpnService 声明（engine 服务 + always-on）随 M2 加入 -->
     </application>
