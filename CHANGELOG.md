@@ -5,6 +5,30 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [待开发计划]（按优先级排序，非当前 Unreleased）
+
+| 优先级 | 项 | 说明 | 前置条件 |
+|---|---|---|---|
+| P1 | Android kill switch | VPN 断连阻断全部出站流量（防泄漏） | VpnService API 直接支持 |
+| P1 | Android always-on VPN | 系统设置"始终开启"+ 开机自启 | 同上 |
+| P2 | Android 分应用代理 | 白名单/黑名单（VpnService addDisallowedApplication） | 同上 |
+| P2 | V3.3 rekey 密钥轮换 | TLS 1.3 KeyUpdate 或应用层重协商；长连接密钥定期更换 | 协议层设计 + 两端同步升级 |
+| P3 | GUI main.rs 模块化拆分 | 6331 行 → 12+ 模块（palette/groups/windows_proxy/theme/pages/*） | 专门会话，一次一模块+编译验证 |
+| P3 | Windows 开机自启 + TUN | 注册表自启 + UAC 免提示 | — |
+| P3 | 托盘菜单禁用态 | tray setEnabled（五项攻坚遗留 P2） | — |
+| P4 | 多节点并行下载 | 需独立下载器形态（CONNECT 隧道字节不透明，代理内无法实现） | 产品决策 |
+| P4 | 节点监控面板 | Prometheus metrics 导出 | — |
+
+### rekey 密钥轮换（V3.3）设计草案
+
+- **动机**：长连接（BT/SSH/流媒体）持续数小时，单一密钥暴露面随时间增长
+- **现状**：TLS 1.3 每连接独立密钥 + Noise-PSK 握手 → 每条连接密钥不同，
+  已绑住单连接暴露面；rekey 仅对**超长连接**有增量价值
+- **方案 A（TLS 层）**：rustls 发送 TLS 1.3 KeyUpdate——rustls 0.23 无主动触发 API（被动支持），需 patch 或等 upstream
+- **方案 B（应用层）**：连接时长/流量超阈值时透明重建（断旧连新 + 应用层重连协议）——TCP 序列号不连续，对应用不透明
+- **方案 C（会话层）**：多连接聚合协议（V3.4 恢复）内做 key rotation——依赖多路径协议恢复
+- **结论**：短期维持现状（每连接独立密钥已足够）；V3.3 多路径恢复时一并设计 C 方案
+
 ## [Unreleased] - Android M2（全局 VPN + 任意端口 + DNS 经隧道）
 
 ### 新增

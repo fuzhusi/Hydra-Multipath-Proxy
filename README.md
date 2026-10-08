@@ -336,7 +336,7 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 - [ ] 多节点并行下载（HTTP Range 切块多节点拼装——TCP 下的差异化方向）
 - [x] ClientHello 指纹模仿（调研结论：ja-tools fork 供应链风险高，落地为 stock rustls 最大近似 + `HYDRA_FINGERPRINT=chrome|none`，[方案与实施](docs/design/ClientHello指纹模仿方案与实施.md)）
 - [x] 门③重放测试以 TCP 形态重写（`hydra-protocol/src/handshake.rs` 真重放单测在库，roadmap 此前未勾——09 审查补正）
-- [ ] rekey 密钥轮换
+- [ ] rekey 密钥轮换（V3.3；TLS 1.3 每连接独立密钥已绑住单连接暴露面，rekey 仅对超长连接有增量价值——方案与取舍见 CHANGELOG 待开发计划表）
 
 完整依据：[docs/design/TCP转型与加密选型方案.md](docs/design/TCP转型与加密选型方案.md) · [docs/review/00-审查总览与改进目标.md](docs/review/00-审查总览与改进目标.md)
 
