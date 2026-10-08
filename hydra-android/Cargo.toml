@@ -20,6 +20,8 @@ hydra-protocol = { path = "../hydra-protocol" }
 # 版本统一由根 [workspace.dependencies] 声明（审查 R-31）
 tokio = { workspace = true }
 tracing = { workspace = true }
+# 分享/订阅导入（证书 DER base64 编码交付 Kotlin）
+base64 = { workspace = true }
 # uniffi：Rust→Kotlin 绑定（proc-macro 导出风格；cli feature 供 bindgen bin）
 uniffi = { version = "0.29", features = ["cli"] }
 # 显式错误类型（uniffi::Error derive 要求 thiserror 风格）

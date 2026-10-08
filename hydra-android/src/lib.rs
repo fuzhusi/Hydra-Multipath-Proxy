@@ -60,6 +60,69 @@ pub trait SocketProtect: Send + Sync {
     fn protect(&self, fd: i64) -> bool;
 }
 
+/// 分享/订阅导入结果（Kotlin 落 EncryptedSharedPreferences）。
+/// 密钥/证书字段为空串 = 链接未携带——调用方**不覆盖**已存值。
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct ParsedShare {
+    /// 节点 "addr:port" 列表（IP 字面量；域名节点计入 skipped）
+    pub nodes: Vec<String>,
+    /// 认证密钥 64 hex（取首个携带密钥的链接）
+    pub auth_key_hex: String,
+    /// 证书 DER base64（STANDARD；取首个携带证书的链接——分享链接 v2 的
+    /// `cc=` 字段自带节点证书，导入后无需再手动选文件）
+    pub cert_der_b64: String,
+    /// 未能导入的条目数（域名节点/坏行——域名支持随 M2 tun_core）
+    pub skipped: u32,
+}
+
+/// 解析分享链接 / 订阅文本（hydra:// 多行、逐行或整体 base64 订阅），
+/// 汇聚为一份引擎配置（节点列表 + 密钥 + 证书）。任一链接携带的 `k=`（密钥）
+/// 与 `cc=`（证书）都会被提取。
+#[uniffi::export]
+pub fn parse_share_text(text: String) -> Result<ParsedShare, HydraEngineError> {
+    let parse = hydra_core::subscription::parse_subscription(&text);
+    let mut nodes: Vec<String> = Vec::new();
+    let mut auth_key_hex = String::new();
+    let mut cert_der_b64 = String::new();
+    let mut skipped = parse.errors.len() as u32;
+    for link in &parse.links {
+        // IP 字面量节点入库；域名节点 M2 前不支持（计数跳过，给出可感知反馈）
+        match link.to_node_info() {
+            Ok(info) => {
+                let addr = info.address.to_string();
+                if !nodes.contains(&addr) {
+                    nodes.push(addr);
+                }
+            }
+            Err(_) => skipped += 1,
+        }
+        if auth_key_hex.is_empty() {
+            if let Ok(Some(k)) = link.auth_key_bytes() {
+                auth_key_hex = hydra_core::share_link::hex_encode_lower(&k);
+            }
+        }
+        if cert_der_b64.is_empty() {
+            if let Ok(Some(der)) = link.cert_der_bytes() {
+                use base64::Engine as _;
+                cert_der_b64 = base64::engine::general_purpose::STANDARD.encode(&der);
+            }
+        }
+    }
+    if nodes.is_empty() {
+        return Err(HydraEngineError::InvalidConfig {
+            msg: format!(
+                "未能识别任何可用节点（跳过 {skipped} 条）。支持 hydra:// 分享链接、                 多行链接文本与整体 base64 订阅"
+            ),
+        });
+    }
+    Ok(ParsedShare {
+        nodes,
+        auth_key_hex,
+        cert_der_b64,
+        skipped,
+    })
+}
+
 #[derive(uniffi::Error, thiserror::Error, Debug)]
 pub enum HydraEngineError {
     #[error("配置非法: {msg}")]

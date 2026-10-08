@@ -8,6 +8,7 @@ coreKtx = "1.17.0"
 activityCompose = "1.11.0"
 composeBom = "2025.10.00"
 securityCrypto = "1.1.0-alpha06"
+zxingEmbedded = "4.3.0"
 junit = "4.13.2"
 jna = "5.17.0"
 
@@ -18,6 +19,8 @@ androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", versi
 androidx-compose-ui = { group = "androidx.compose.ui", name = "ui" }
 androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
 androidx-security-crypto = { group = "androidx.security", name = "security-crypto", version.ref = "securityCrypto" }
+# 二维码扫码导入分享链接（内嵌 CameraX 捕获 Activity，无需 Play Services）
+zxing-android-embedded = { group = "com.journeyapps", name = "zxing-android-embedded", version.ref = "zxingEmbedded" }
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "kotlinxCoroutines" }
 kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "kotlinxCoroutines" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }

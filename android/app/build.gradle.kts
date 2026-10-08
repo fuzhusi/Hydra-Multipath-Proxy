@@ -18,8 +18,8 @@ android {
         applicationId = "dev.hydra.vpn"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.2.1"
+        versionCode = 3
+        versionName = "0.2.2"
         // 首发 ABI（设计 v2.1 §6）：arm64-v8a 真机 + x86_64 模拟器；armeabi-v7a 延后
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
@@ -64,9 +64,13 @@ dependencies {
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.material3)
+    // 基础图标集（Home/List/Settings/Add/Delete；扩展图标用文案/emoji 替代以免引入 10MB extended 包）
+    implementation("androidx.compose.material:material-icons-core")
     implementation(libs.kotlinx.coroutines.android)
     // R8 密钥存储：EncryptedSharedPreferences（Keystore 主密钥 + AES-GCM 文件级加密）
     implementation(libs.androidx.security.crypto)
+    // 扫码导入桌面端分享二维码
+    implementation(libs.zxing.android.embedded)
     // uniffi 0.29 生成的 Kotlin 绑定经 JNA 调 FFI。必须选 aar 变体（含各 ABI 的
     // libjnidispatch.so）：默认解析到桌面 jar，真机必 UnsatisfiedLinkError。
     implementation("net.java.dev.jna:jna:${libs.versions.jna.get()}") {

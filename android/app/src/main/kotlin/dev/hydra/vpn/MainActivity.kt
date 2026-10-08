@@ -13,28 +13,58 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.outlined.List
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -42,49 +72,593 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import uniffi.hydra_android.parseShareText
 import java.util.Base64
 
 /**
- * M1 主界面：节点配置（落 EncryptedSharedPreferences）→ 前台服务启停引擎 →
- * 状态卡（监听地址/流量/连接数）。
+ * Hydra Android（M1.5）：本地 SOCKS5/HTTP 代理引擎 + 三页 UI。
  *
- * M1 使用模型：引擎在本机 [boundAddr] 监听 SOCKS5/HTTP——手机浏览器（如
- * Firefox Android）手动配代理指向该地址即可走节点出网。M2 全局 VPN（TUN）
- * 上线后无需手动配代理。
+ * 页面：连接（状态/启停/流量/事件日志）、节点（卡片列表 + 分享链接/二维码/手动导入）、
+ * 设置（凭据/证书/高级）。
+ *
+ * 使用模型：引擎在本机监听 SOCKS5/HTTP——浏览器手动配代理指向监听地址即可
+ * 走节点出网；M2 全局 VPN（VpnService + TUN）上线后免配置。
  */
 class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // 通知权限（API 33+）：前台服务通知需要
         if (Build.VERSION.SDK_INT >= 33 &&
             ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
             android.content.pm.PackageManager.PERMISSION_GRANTED
         ) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
-        setContent { HydraApp() }
+        setContent { HydraTheme { HydraApp() } }
+    }
+}
+
+/** Material 3 动态配色（Android 12+ 取系统壁纸色；低版本回退默认深色）。 */
+@Composable
+private fun HydraTheme(content: @Composable () -> Unit) {
+    val ctx = LocalContext.current
+    val dark = (ctx.resources.configuration.uiMode and
+        android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+        android.content.res.Configuration.UI_MODE_NIGHT_YES
+    val scheme = if (Build.VERSION.SDK_INT >= 31) {
+        (if (dark) dynamicDarkColorScheme(ctx) else dynamicLightColorScheme(ctx))
+    } else {
+        MaterialTheme.colorScheme
+    }
+    MaterialTheme(colorScheme = scheme, content = content)
+}
+
+private enum class Tab(val label: String) {
+    Home("连接"), Nodes("节点"), Settings("设置")
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun HydraApp() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val store = remember { SecureStore(context) }
+    var cfg by remember { mutableStateOf(store.load()) }
+    var tab by remember { mutableStateOf(Tab.Home) }
+    var toast by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(toast) {
+        toast?.let {
+            Toast.makeText(context, it, Toast.LENGTH_LONG).show()
+            toast = null
+        }
+    }
+
+    fun persist(c: HydraConfig) {
+        cfg = c
+        store.save(c)
+    }
+
+    // ── 分享/订阅导入（粘贴文本或扫码结果共用）──
+    suspend fun doImport(text: String): String = withContext(Dispatchers.IO) {
+        try {
+            val p = parseShareText(text.trim())
+            val cur = store.load()
+            val merged = cur.copy(
+                nodesText = p.nodes.joinToString("\n"),
+                authKeyHex = p.authKeyHex.ifEmpty { cur.authKeyHex },
+                certDerB64 = p.certDerB64.ifEmpty { cur.certDerB64 },
+            )
+            store.save(merged)
+            cfg = merged
+            val extra = buildString {
+                if (p.authKeyHex.isNotEmpty()) append("，密钥✓")
+                if (p.certDerB64.isNotEmpty()) append("，证书✓")
+                if (p.skipped > 0u) append("（跳过 ${p.skipped} 条：域名节点/坏行）")
+            }
+            EngineState.addLog("导入成功：${p.nodes.size} 个节点$extra")
+            "导入成功：${p.nodes.size} 个节点$extra"
+        } catch (e: Exception) {
+            EngineState.addLog("导入失败：${e.message}")
+            "导入失败：${e.message}"
+        }
+    }
+
+    // 扫码导入（桌面端分享二维码 → 手机扫描即完成全部配置）
+    val qrLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
+        val content = result.contents
+        if (content != null) {
+            scope.launch {
+                val msg = doImport(content)
+                toast = msg
+                if (msg.startsWith("导入成功")) tab = Tab.Nodes
+            }
+        }
+    }
+
+    Scaffold(
+        bottomBar = {
+            NavigationBar {
+                Tab.entries.forEach { t ->
+                    NavigationBarItem(
+                        selected = tab == t,
+                        onClick = { tab = t },
+                        icon = {
+                            Icon(
+                                when (t) {
+                                    Tab.Home -> Icons.Filled.Home
+                                    Tab.Nodes -> Icons.Outlined.List
+                                    Tab.Settings -> Icons.Filled.Settings
+                                },
+                                contentDescription = t.label,
+                            )
+                        },
+                        label = { Text(t.label) },
+                    )
+                }
+            }
+        },
+    ) { pad ->
+        Box(Modifier.padding(pad)) {
+            when (tab) {
+                Tab.Home -> HomeScreen(
+                    cfg = cfg,
+                    onGoNodes = { tab = Tab.Nodes },
+                    onStart = {
+                        persist(cfg)
+                        val intent = Intent(context, EngineService::class.java)
+                            .setAction(EngineService.ACTION_START)
+                        if (Build.VERSION.SDK_INT >= 26) {
+                            context.startForegroundService(intent)
+                        } else {
+                            context.startService(intent)
+                        }
+                    },
+                    onStop = {
+                        context.startService(
+                            Intent(context, EngineService::class.java)
+                                .setAction(EngineService.ACTION_STOP),
+                        )
+                    },
+                )
+                Tab.Nodes -> NodesScreen(
+                    cfg = cfg,
+                    onPersist = ::persist,
+                    onImport = { text -> doImport(text) },
+                    onScan = {
+                        qrLauncher.launch(
+                            ScanOptions()
+                                .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                                .setPrompt("对准桌面端生成的 Hydra 分享二维码")
+                                .setBeepEnabled(false),
+                        )
+                    },
+                    onToast = { toast = it },
+                )
+                Tab.Settings -> SettingsScreen(
+                    cfg = cfg,
+                    onPersist = { c ->
+                        persist(c)
+                        toast = "配置已加密保存"
+                    },
+                )
+            }
+        }
+    }
+}
+
+// ── 连接页 ──────────────────────────────────────────────────────────────────
+
+@Composable
+private fun HomeScreen(
+    cfg: HydraConfig,
+    onGoNodes: () -> Unit,
+    onStart: () -> Unit,
+    onStop: () -> Unit,
+) {
+    val ui by EngineState.ui.collectAsState()
+    val logs by EngineState.logs.collectAsState()
+    val context = LocalContext.current
+    val nodeCount = cfg.nodesText.lines().count { it.isNotBlank() }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        // ── 状态主卡 ──
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(20.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = when {
+                    ui.transition?.startsWith("启动失败") == true ->
+                        MaterialTheme.colorScheme.errorContainer
+                    ui.running -> Color(0xFF103C2A).copy(alpha = 0.9f)
+                    else -> MaterialTheme.colorScheme.surfaceVariant
+                },
+            ),
+        ) {
+            Column(
+                Modifier.padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(72.dp)
+                        .background(
+                            when {
+                                ui.running -> Color(0xFF4ADE80)
+                                ui.transition != null -> MaterialTheme.colorScheme.primary
+                                else -> MaterialTheme.colorScheme.outline
+                            },
+                            CircleShape,
+                        ),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (ui.transition != null && !ui.running) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(36.dp),
+                            color = MaterialTheme.colorScheme.onPrimary,
+                        )
+                    } else {
+                        Text(if (ui.running) "ON" else "OFF", fontSize = 20.sp,
+                            color = Color.Black, fontFamily = FontFamily.Monospace)
+                    }
+                }
+                Text(
+                    when {
+                        ui.running -> "运行中"
+                        ui.transition?.startsWith("启动失败") == true -> "启动失败"
+                        ui.transition != null -> "启动中…"
+                        else -> "已停止"
+                    },
+                    style = MaterialTheme.typography.titleLarge,
+                )
+                ui.transition?.takeIf { it.startsWith("启动失败") || it.startsWith("✗") }?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall)
+                }
+                if (ui.running) {
+                    Text(
+                        "运行 ${formatDuration(ui.uptimeSecs)} · 活跃 ${ui.activeConns} · 累计 ${ui.totalConns}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Color(0xFFBBF7D0),
+                    )
+                } else if (nodeCount > 0) {
+                    Text("已配置 $nodeCount 个节点", style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+        }
+
+        // ── 启停按钮 ──
+        val busy = ui.running || (ui.transition != null && !ui.transition!!.startsWith("启动失败"))
+        if (ui.running) {
+            Button(
+                onClick = onStop,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp),
+                shape = RoundedCornerShape(14.dp),
+                colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer,
+                    contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                ),
+            ) { Text("■ 停止代理", fontSize = 16.sp) }
+        } else {
+            Button(
+                onClick = onStart,
+                enabled = !busy,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp),
+                shape = RoundedCornerShape(14.dp),
+            ) { Text("▶ 启动代理", fontSize = 16.sp) }
+        }
+
+        // ── 监听地址 ──
+        val bound = ui.boundAddr
+        if (ui.running && bound != null) {
+            Card(Modifier.fillMaxWidth()) {
+                Row(
+                    Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("本地监听（浏览器代理填这个）",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(bound, fontFamily = FontFamily.Monospace)
+                    }
+                    TextButton(onClick = {
+                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(ClipData.newPlainText("hydra", bound))
+                        Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
+                    }) { Text("复制") }
+                }
+            }
+            // 流量两格
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                StatTile("↑ 发送", fmt(ui.sentBytes), Modifier.weight(1f))
+                StatTile("↓ 接收", fmt(ui.receivedBytes), Modifier.weight(1f))
+            }
+        }
+
+        // ── 节点摘要 ──
+        Card(onClick = onGoNodes, modifier = Modifier.fillMaxWidth()) {
+            Row(
+                Modifier.padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("节点", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        if (nodeCount > 0) "$nodeCount 个节点已配置" else "尚未配置——去节点页导入分享链接",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Text("›", fontSize = 22.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+
+        // ── 事件日志 ──
+        if (logs.isNotEmpty()) {
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text("事件", style = MaterialTheme.typography.titleSmall)
+                    logs.take(8).forEach { e ->
+                        Text(
+                            "${e.time}  ${e.message}",
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
 @Composable
-private fun HydraApp() {
-    val context = LocalContext.current
-    val store = remember { SecureStore(context) }
-    val saved = remember { store.load() }
+private fun StatTile(label: String, value: String, modifier: Modifier = Modifier) {
+    Card(modifier) {
+        Column(Modifier.padding(12.dp)) {
+            Text(label, style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(value, fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.titleMedium)
+        }
+    }
+}
 
-    var nodesText by remember { mutableStateOf(saved.nodesText) }
-    var authKey by remember { mutableStateOf(saved.authKeyHex) }
-    var sni by remember { mutableStateOf(saved.sni) }
-    var trustMode by remember { mutableStateOf(saved.trustMode) }
-    var certB64 by remember { mutableStateOf(saved.certDerB64) }
+// ── 节点页 ──────────────────────────────────────────────────────────────────
+
+@Composable
+private fun NodesScreen(
+    cfg: HydraConfig,
+    onPersist: (HydraConfig) -> Unit,
+    onImport: suspend (String) -> String,
+    onScan: () -> Unit,
+    onToast: (String) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var showImport by remember { mutableStateOf(false) }
+    var importText by remember { mutableStateOf("") }
+    var importBusy by remember { mutableStateOf(false) }
+    var importError by remember { mutableStateOf<String?>(null) }
+    var showManual by remember { mutableStateOf(false) }
+    var manualAddr by remember { mutableStateOf("") }
+    var manualPort by remember { mutableStateOf("443") }
+    var deleteTarget by remember { mutableStateOf<String?>(null) }
+
+    val nodes = cfg.nodesText.lines().map { it.trim() }.filter { it.isNotEmpty() }
+
+    Scaffold(
+        floatingActionButton = {
+            Button(onClick = { showImport = true; importError = null }) {
+                Icon(Icons.Filled.Add, null); Spacer(Modifier.size(4.dp)); Text("导入节点")
+            }
+        },
+    ) { pad ->
+        Column(Modifier.padding(pad).fillMaxSize()) {
+            if (nodes.isEmpty()) {
+                Column(
+                    Modifier.fillMaxWidth().padding(32.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text("还没有节点", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "点击右下角「导入节点」：\n· 扫描桌面端分享二维码\n· 粘贴 hydra:// 分享链接\n· 手动输入 IP:端口",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                LazyColumn(
+                    Modifier.fillMaxSize(),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    items(nodes) { node ->
+                        Card(Modifier.fillMaxWidth()) {
+                            Row(
+                                Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Box(
+                                    Modifier.size(8.dp).background(
+                                        Color(0xFF4ADE80), CircleShape,
+                                    )
+                                )
+                                Spacer(Modifier.size(10.dp))
+                                Text(
+                                    node, fontFamily = FontFamily.Monospace,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                IconButton(onClick = { deleteTarget = node }) {
+                                    Icon(Icons.Filled.Delete, "删除",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 导入对话框 ──
+    if (showImport) {
+        AlertDialog(
+            onDismissRequest = { if (!importBusy) showImport = false },
+            title = { Text("导入节点") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "支持：桌面端分享二维码 / hydra:// 链接（可含密钥与证书）/ 订阅文本",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = onScan) { Text("📷 扫码") }
+                        Button(
+                            onClick = {
+                                if (importText.isBlank()) {
+                                    importError = "请先粘贴分享链接"
+                                } else {
+                                    importBusy = true
+                                    scope.launch {
+                                        val msg = onImport(importText)
+                                        importBusy = false
+                                        if (msg.startsWith("导入成功")) {
+                                            showImport = false
+                                            onToast(msg)
+                                        } else {
+                                            importError = msg
+                                        }
+                                    }
+                                }
+                            },
+                            enabled = !importBusy,
+                        ) {
+                            if (importBusy) {
+                                CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                                Spacer(Modifier.size(6.dp))
+                            }
+                            Text("导入")
+                        }
+                    }
+                    OutlinedTextField(
+                        value = importText,
+                        onValueChange = { importText = it },
+                        label = { Text("粘贴分享链接 / 订阅内容") },
+                        placeholder = { Text("hydra://1.2.3.4:443?k=…&cc=…") },
+                        modifier = Modifier.fillMaxWidth(),
+                        minLines = 3,
+                    )
+                    importError?.let {
+                        Text(it, color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall)
+                    }
+                    TextButton(onClick = { showImport = false; showManual = true }) {
+                        Text("或手动输入 IP:端口 ›")
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {},
+        )
+    }
+
+    // ── 手动添加对话框 ──
+    if (showManual) {
+        AlertDialog(
+            onDismissRequest = { showManual = false },
+            title = { Text("手动添加节点") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(
+                        value = manualAddr,
+                        onValueChange = { manualAddr = it.trim() },
+                        label = { Text("IP 地址") },
+                        placeholder = { Text("1.2.3.4（IPv6 用 [::1]）") },
+                        singleLine = true,
+                    )
+                    OutlinedTextField(
+                        value = manualPort,
+                        onValueChange = { manualPort = it.filter(Char::isDigit).take(5) },
+                        label = { Text("端口") },
+                        singleLine = true,
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    val a = manualAddr.removePrefix("[").removeSuffix("]")
+                    if (a.isEmpty() || manualPort.toIntOrNull() == null) {
+                        onToast("请填写 IP 与端口")
+                        return@Button
+                    }
+                    val node = "${a}:${manualPort}"
+                    val list = cfg.nodesText.lines().map { it.trim() }
+                        .filter { it.isNotEmpty() }.toMutableList()
+                    if (!list.contains(node)) list.add(node)
+                    onPersist(cfg.copy(nodesText = list.joinToString("\n")))
+                    showManual = false
+                    manualAddr = ""; manualPort = "443"
+                }) { Text("添加") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showManual = false }) { Text("取消") }
+            },
+        )
+    }
+
+    // ── 删除确认 ──
+    deleteTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { deleteTarget = null },
+            title = { Text("删除节点") },
+            text = { Text("确定删除 $target ？") },
+            confirmButton = {
+                TextButton(onClick = {
+                    val list = nodes.filter { it != target }
+                    onPersist(cfg.copy(nodesText = list.joinToString("\n")))
+                    deleteTarget = null
+                }) { Text("删除", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteTarget = null }) { Text("取消") }
+            },
+        )
+    }
+}
+
+// ── 设置页 ──────────────────────────────────────────────────────────────────
+
+@Composable
+private fun SettingsScreen(cfg: HydraConfig, onPersist: (HydraConfig) -> Unit) {
+    val context = LocalContext.current
+    var authKey by remember(cfg.authKeyHex) { mutableStateOf(cfg.authKeyHex) }
+    var sni by remember(cfg.sni) { mutableStateOf(cfg.sni) }
+    var trustMode by remember(cfg.trustMode) { mutableStateOf(cfg.trustMode) }
+    var certB64 by remember(cfg.certDerB64) { mutableStateOf(cfg.certDerB64) }
     var listenPort by remember {
-        mutableStateOf(saved.listenPort.takeIf { it != 0 }?.toString() ?: SecureStore.DEFAULT_PORT.toString())
+        mutableStateOf(cfg.listenPort.takeIf { it != 0 }?.toString() ?: SecureStore.DEFAULT_PORT.toString())
     }
     var showKey by remember { mutableStateOf(false) }
-
-    val ui by EngineState.ui.collectAsState()
 
     val certPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri != null) {
@@ -96,47 +670,37 @@ private fun HydraApp() {
         }
     }
 
-    MaterialTheme {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text("Hydra", style = MaterialTheme.typography.headlineMedium)
-            Text(
-                "M1 · 本地 SOCKS5/HTTP 代理引擎\n浏览器手动配代理到下方监听地址即可",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text("设置", style = MaterialTheme.typography.headlineSmall)
 
-            // ── 配置区 ──────────────────────────────────────────────────────
-            OutlinedTextField(
-                value = nodesText,
-                onValueChange = { nodesText = it },
-                label = { Text("节点（每行一条 addr:port）") },
-                placeholder = { Text("1.2.3.4:443") },
-                modifier = Modifier.fillMaxWidth(),
-                minLines = 2,
-            )
+        Section("凭据") {
             OutlinedTextField(
                 value = authKey,
                 onValueChange = { authKey = it.trim() },
                 label = { Text("认证密钥（64 hex）") },
-                visualTransformation = if (showKey) VisualTransformation.None else PasswordVisualTransformation(),
+                supportingText = {
+                    Text(
+                        when {
+                            authKey.isEmpty() -> "未设置——请从分享链接导入或手动填写"
+                            authKey.length != 64 -> "长度 ${authKey.length}/64（须恰好 64 个 hex 字符）"
+                            else -> "✓ 已设置"
+                        }
+                    )
+                },
+                isError = authKey.isNotEmpty() && authKey.length != 64,
+                visualTransformation = if (showKey) VisualTransformation.None
+                else PasswordVisualTransformation(),
                 trailingIcon = {
                     TextButton(onClick = { showKey = !showKey }) {
                         Text(if (showKey) "隐藏" else "显示")
                     }
                 },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
-            OutlinedTextField(
-                value = sni,
-                onValueChange = { sni = it },
-                label = { Text("SNI（留空 = hydra.node）") },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
             )
@@ -154,9 +718,34 @@ private fun HydraApp() {
             }
             if (trustMode == SecureStore.TRUST_PINNED) {
                 OutlinedButton(onClick = { certPicker.launch(arrayOf("*/*")) }) {
-                    Text(if (certB64.isEmpty()) "导入节点证书 DER" else "已导入证书 ✓（重新选）")
+                    Text(
+                        if (certB64.isEmpty()) "导入节点证书 DER"
+                        else {
+                            val size = runCatching {
+                                Base64.getDecoder().decode(certB64).size
+                            }.getOrDefault(0)
+                            "已导入证书 ✓（$size 字节，重新选）"
+                        }
+                    )
+                }
+                if (certB64.isEmpty()) {
+                    Text(
+                        "提示：分享链接携带证书（cc=）时导入链接即可，无需手动选文件",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
+        }
+
+        Section("高级") {
+            OutlinedTextField(
+                value = sni,
+                onValueChange = { sni = it },
+                label = { Text("SNI（留空 = hydra.node）") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+            )
             OutlinedTextField(
                 value = listenPort,
                 onValueChange = { listenPort = it.filter(Char::isDigit).take(5) },
@@ -164,92 +753,42 @@ private fun HydraApp() {
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
             )
+        }
 
-            fun persist() {
-                store.save(
-                    HydraConfig(
-                        nodesText = nodesText, authKeyHex = authKey, sni = sni,
-                        trustMode = trustMode, certDerB64 = certB64,
+        Button(
+            onClick = {
+                onPersist(
+                    cfg.copy(
+                        authKeyHex = authKey,
+                        sni = sni,
+                        trustMode = trustMode,
+                        certDerB64 = certB64,
                         listenPort = listenPort.toIntOrNull() ?: SecureStore.DEFAULT_PORT,
                     ),
                 )
-            }
+            },
+            enabled = authKey.isEmpty() || authKey.length == 64,
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+        ) { Text("保存配置（加密存储）") }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = {
-                    persist()
-                    Toast.makeText(context, "配置已加密保存", Toast.LENGTH_SHORT).show()
-                }) { Text("保存配置") }
-            }
-
-            // ── 启停 ────────────────────────────────────────────────────────
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = {
-                        // 启动前先落盘（服务从 SecureStore 读配置）
-                        persist()
-                        val intent = Intent(context, EngineService::class.java)
-                            .setAction(EngineService.ACTION_START)
-                        if (Build.VERSION.SDK_INT >= 26) {
-                            context.startForegroundService(intent)
-                        } else {
-                            context.startService(intent)
-                        }
-                    },
-                    enabled = !ui.running && ui.transition == null,
-                ) { Text("▶ 启动") }
-                OutlinedButton(
-                    onClick = {
-                        context.startService(
-                            Intent(context, EngineService::class.java)
-                                .setAction(EngineService.ACTION_STOP),
-                        )
-                    },
-                    enabled = ui.running || ui.transition != null,
-                ) { Text("■ 停止") }
-            }
-
-            // ── 状态卡 ──────────────────────────────────────────────────────
-            StatusCard(ui = ui, onCopy = { addr ->
-                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                cm.setPrimaryClip(ClipData.newPlainText("hydra", addr))
-                Toast.makeText(context, "已复制 $addr", Toast.LENGTH_SHORT).show()
-            })
-
-            ui.transition?.let { msg ->
-                Text(
-                    msg,
-                    color = if (msg.startsWith("启动失败")) MaterialTheme.colorScheme.error
-                    else MaterialTheme.colorScheme.primary,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            }
-        }
+        Text(
+            "Hydra v0.2.2 · 配置经 Android Keystore 加密存储，不进云备份\n" +
+                "浏览器代理指向「连接」页的监听地址即可使用",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
 @Composable
-private fun StatusCard(ui: EngineState.Ui, onCopy: (String) -> Unit) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
-    ) {
-        Text("状态", style = MaterialTheme.typography.titleMedium)
-        Text(
-            if (ui.running) "● 运行中" else "○ 已停止",
-            color = if (ui.running) Color(0xFF2E7D32) else MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        if (ui.running) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("监听：${ui.boundAddr ?: "…"}", fontFamily = FontFamily.Monospace)
-                ui.boundAddr?.let { addr ->
-                    TextButton(onClick = { onCopy(addr) }) { Text("复制") }
-                }
-            }
-            Text("↑ ${fmt(ui.sentBytes)}   ↓ ${fmt(ui.receivedBytes)}", fontFamily = FontFamily.Monospace)
-            Text("连接：活跃 ${ui.activeConns} / 累计 ${ui.totalConns}   运行 ${ui.uptimeSecs}s")
+private fun Section(title: String, content: @Composable () -> Unit) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(
+            Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(title, style = MaterialTheme.typography.titleSmall)
+            content()
         }
     }
 }
@@ -258,4 +797,9 @@ private fun fmt(bytes: Long): String = when {
     bytes >= 1 shl 20 -> "%.1f MB".format(bytes.toDouble() / (1 shl 20))
     bytes >= 1 shl 10 -> "%.1f KB".format(bytes.toDouble() / (1 shl 10))
     else -> "$bytes B"
+}
+
+private fun formatDuration(secs: Long): String = when {
+    secs >= 3600 -> "%d:%02d:%02d".format(secs / 3600, (secs % 3600) / 60, secs % 60)
+    else -> "%d:%02d".format(secs / 60, secs % 60)
 }

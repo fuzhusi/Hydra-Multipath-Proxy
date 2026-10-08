@@ -745,6 +745,8 @@ internal open class UniffiVTableCallbackInterfaceSocketProtect(
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -760,7 +762,9 @@ internal open class UniffiVTableCallbackInterfaceSocketProtect(
 // when the library is loaded.
 internal interface IntegrityCheckingUniffiLib : Library {
     // Integrity check functions only
-    fun uniffi_hydra_android_checksum_method_hydraengine_bound_addr(
+    fun uniffi_hydra_android_checksum_func_parse_share_text(
+): Short
+fun uniffi_hydra_android_checksum_method_hydraengine_bound_addr(
 ): Short
 fun uniffi_hydra_android_checksum_method_hydraengine_start(
 ): Short
@@ -838,6 +842,8 @@ fun uniffi_hydra_android_fn_method_hydraengine_stop(`ptr`: Pointer,uniffi_out_er
 ): Unit
 fun uniffi_hydra_android_fn_init_callback_vtable_socketprotect(`vtable`: UniffiVTableCallbackInterfaceSocketProtect,
 ): Unit
+fun uniffi_hydra_android_fn_func_parse_share_text(`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun ffi_hydra_android_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun ffi_hydra_android_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -964,6 +970,9 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
+    if (lib.uniffi_hydra_android_checksum_func_parse_share_text() != 52095.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_hydra_android_checksum_method_hydraengine_bound_addr() != 10632.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1176,6 +1185,29 @@ public object FfiConverterUShort: FfiConverter<UShort, Short> {
 
     override fun write(value: UShort, buf: ByteBuffer) {
         buf.putShort(value.toShort())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterUInt: FfiConverter<UInt, Int> {
+    override fun lift(value: Int): UInt {
+        return value.toUInt()
+    }
+
+    override fun read(buf: ByteBuffer): UInt {
+        return lift(buf.getInt())
+    }
+
+    override fun lower(value: UInt): Int {
+        return value.toInt()
+    }
+
+    override fun allocationSize(value: UInt) = 4UL
+
+    override fun write(value: UInt, buf: ByteBuffer) {
+        buf.putInt(value.toInt())
     }
 }
 
@@ -1760,6 +1792,63 @@ public object FfiConverterTypeNodeSpec: FfiConverterRustBuffer<NodeSpec> {
 
 
 
+/**
+ * 分享/订阅导入结果（Kotlin 落 EncryptedSharedPreferences）。
+ * 密钥/证书字段为空串 = 链接未携带——调用方**不覆盖**已存值。
+ */
+data class ParsedShare (
+    /**
+     * 节点 "addr:port" 列表（IP 字面量；域名节点计入 skipped）
+     */
+    var `nodes`: List<kotlin.String>, 
+    /**
+     * 认证密钥 64 hex（取首个携带密钥的链接）
+     */
+    var `authKeyHex`: kotlin.String, 
+    /**
+     * 证书 DER base64（STANDARD；取首个携带证书的链接——分享链接 v2 的
+     * `cc=` 字段自带节点证书，导入后无需再手动选文件）
+     */
+    var `certDerB64`: kotlin.String, 
+    /**
+     * 未能导入的条目数（域名节点/坏行——域名支持随 M2 tun_core）
+     */
+    var `skipped`: kotlin.UInt
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeParsedShare: FfiConverterRustBuffer<ParsedShare> {
+    override fun read(buf: ByteBuffer): ParsedShare {
+        return ParsedShare(
+            FfiConverterSequenceString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: ParsedShare) = (
+            FfiConverterSequenceString.allocationSize(value.`nodes`) +
+            FfiConverterString.allocationSize(value.`authKeyHex`) +
+            FfiConverterString.allocationSize(value.`certDerB64`) +
+            FfiConverterUInt.allocationSize(value.`skipped`)
+    )
+
+    override fun write(value: ParsedShare, buf: ByteBuffer) {
+            FfiConverterSequenceString.write(value.`nodes`, buf)
+            FfiConverterString.write(value.`authKeyHex`, buf)
+            FfiConverterString.write(value.`certDerB64`, buf)
+            FfiConverterUInt.write(value.`skipped`, buf)
+    }
+}
+
+
+
 
 
 sealed class HydraEngineException: kotlin.Exception() {
@@ -2056,6 +2145,34 @@ public object FfiConverterOptionalTypeSocketProtect: FfiConverterRustBuffer<Sock
 /**
  * @suppress
  */
+public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.String>> {
+    override fun read(buf: ByteBuffer): List<kotlin.String> {
+        val len = buf.getInt()
+        return List<kotlin.String>(len) {
+            FfiConverterString.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<kotlin.String>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterString.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<kotlin.String>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterString.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceByteArray: FfiConverterRustBuffer<List<kotlin.ByteArray>> {
     override fun read(buf: ByteBuffer): List<kotlin.ByteArray> {
         val len = buf.getInt()
@@ -2105,4 +2222,19 @@ public object FfiConverterSequenceTypeNodeSpec: FfiConverterRustBuffer<List<Node
         }
     }
 }
+        /**
+         * 解析分享链接 / 订阅文本（hydra:// 多行、逐行或整体 base64 订阅），
+         * 汇聚为一份引擎配置（节点列表 + 密钥 + 证书）。任一链接携带的 `k=`（密钥）
+         * 与 `cc=`（证书）都会被提取。
+         */
+    @Throws(HydraEngineException::class) fun `parseShareText`(`text`: kotlin.String): ParsedShare {
+            return FfiConverterTypeParsedShare.lift(
+    uniffiRustCallWithError(HydraEngineException) { _status ->
+    UniffiLib.INSTANCE.uniffi_hydra_android_fn_func_parse_share_text(
+        FfiConverterString.lower(`text`),_status)
+}
+    )
+    }
+    
+
 

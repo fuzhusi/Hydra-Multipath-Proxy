@@ -63,6 +63,7 @@ class EngineService : Service() {
     }
 
     private fun startEngineFromStore() {
+        EngineState.addLog("正在启动引擎…")
         EngineState.update { it.copy(transition = "正在启动引擎…") }
         startAsForeground("Hydra 引擎启动中…")
         scope.launch {
@@ -73,13 +74,16 @@ class EngineService : Service() {
                     // M1：无 VpnService 环境，protect 传 null（M2 接线 VpnService.protect）
                     eng.start(null)
                     engine = eng
+                    val addr = eng.boundAddr()
                     EngineState.update {
-                        it.copy(running = true, transition = null, boundAddr = eng.boundAddr())
+                        it.copy(running = true, transition = null, boundAddr = addr)
                     }
+                    EngineState.addLog("✓ 引擎已就绪，监听 ${addr ?: "未知"}")
                     updateNotification()
                     pollStats()
                 } catch (e: Exception) {
                     eng.close()
+                    EngineState.addLog("✗ 启动失败：${e.message}")
                     EngineState.update {
                         it.copy(running = false, transition = "启动失败：${e.message}")
                     }
@@ -87,6 +91,7 @@ class EngineService : Service() {
                     stopSelf()
                 }
             }, onFailure = { e ->
+                EngineState.addLog("✗ 启动失败：${e.message}")
                 EngineState.update {
                     it.copy(running = false, transition = "启动失败：${e.message}")
                 }
@@ -147,6 +152,7 @@ class EngineService : Service() {
         scope.launch(Dispatchers.IO) {
             engine?.let { runCatching { it.stop() }; runCatching { it.close() } }
             engine = null
+            EngineState.addLog("■ 引擎已停止")
             EngineState.update {
                 it.copy(running = false, transition = null, boundAddr = null, sentBytes = 0,
                     receivedBytes = 0, activeConns = 0, totalConns = 0, uptimeSecs = 0)
