@@ -51,8 +51,10 @@ class EngineService : Service() {
                 return START_NOT_STICKY
             }
             else -> {
-                // START（含系统重启服务）：已在运行则只刷新通知
-                if (engine == null && EngineState.ui.value.transition == null) {
+                // START：engine == null 即（重）启动——失败重试、停止后快速再启
+                // 都必须真正生效（此前 transition 非空时 START 被静默忽略，
+                // "失败后按钮永远无效"）；已运行则只刷新通知
+                if (engine == null) {
                     startEngineFromStore()
                 } else {
                     updateNotification()
@@ -63,13 +65,46 @@ class EngineService : Service() {
     }
 
     private fun startEngineFromStore() {
+        // 复位一切残留状态（失败重试/停止未完成竞态下从干净基线开始）
+        EngineState.update {
+            it.copy(running = false, transition = "正在启动引擎…", boundAddr = null,
+                sentBytes = 0, receivedBytes = 0, activeConns = 0,
+                totalConns = 0, uptimeSecs = 0)
+        }
         EngineState.addLog("正在启动引擎…")
-        EngineState.update { it.copy(transition = "正在启动引擎…") }
         startAsForeground("Hydra 引擎启动中…")
+
+        // 看门狗（覆盖整个启动序列：配置读取/引擎构建/JNI 启动都可能 pathological
+        // 挂起——阻塞 JNI 调用无法被协程超时取消，只能由独立线程兜底）：
+        // 20s 未就绪即置失败态并尝试中止，UI 解锁、用户可重试
+        val gen = startGeneration.incrementAndGet()
+        Thread {
+            Thread.sleep(20_000)
+            if (startGeneration.get() == gen && !EngineState.ui.value.running) {
+                engine?.let { e ->
+                    runCatching { e.stop() }
+                    runCatching { e.close() }
+                }
+                engine = null
+                EngineState.addLog("✗ 启动超时（20s）已中止——请重试；若反复出现请把上方完整事件反馈给开发者")
+                EngineState.update {
+                    it.copy(running = false, transition = "启动超时（20s）：请重试")
+                }
+                updateNotification()
+            }
+        }.apply { isDaemon = true; start() }
+
         scope.launch {
+            EngineState.addLog("① 读取加密配置…")
             val cfg = SecureStore(this@EngineService).load()
+            val nodeCount = cfg.nodesText.lines().count { it.isNotBlank() }
+            EngineState.addLog(
+                "② 配置已加载（$nodeCount 个节点，密钥${if (cfg.authKeyHex.isNotEmpty()) "✓" else "✗"}，" +
+                    "证书${if (cfg.certDerB64.isNotEmpty()) "✓" else "✗"}，模式 ${cfg.trustMode}）"
+            )
             val result = runCatching { buildEngine(cfg) }
             result.fold(onSuccess = { eng ->
+                EngineState.addLog("③ 引擎构建完成，开始认证建连（最长约 5s）…")
                 try {
                     // M1：无 VpnService 环境，protect 传 null（M2 接线 VpnService.protect）
                     eng.start(null)
@@ -78,15 +113,16 @@ class EngineService : Service() {
                     EngineState.update {
                         it.copy(running = true, transition = null, boundAddr = addr)
                     }
-                    EngineState.addLog("✓ 引擎已就绪，监听 ${addr ?: "未知"}")
+                    EngineState.addLog("✓ 引擎已就绪，监听 ${addr ?: "未知"}——浏览器代理指向该地址即可")
                     updateNotification()
                     pollStats()
                 } catch (e: Exception) {
-                    eng.close()
+                    runCatching { eng.close() }
                     EngineState.addLog("✗ 启动失败：${e.message}")
                     EngineState.update {
                         it.copy(running = false, transition = "启动失败：${e.message}")
                     }
+                    updateNotification()
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
@@ -95,6 +131,7 @@ class EngineService : Service() {
                 EngineState.update {
                     it.copy(running = false, transition = "启动失败：${e.message}")
                 }
+                updateNotification()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             })
@@ -148,10 +185,15 @@ class EngineService : Service() {
         }
     }
 
+    /** 启动代数：每次启动/停止递增——旧启动序列的看门狗线程据此自动失效 */
+    private val startGeneration = java.util.concurrent.atomic.AtomicLong(0)
+
     private fun stopEngine() {
+        startGeneration.incrementAndGet() // 使在途启动的看门狗失效
+        val e = engine
+        engine = null // 同步置空：停止后立即点启动必须走全新启动流程
         scope.launch(Dispatchers.IO) {
-            engine?.let { runCatching { it.stop() }; runCatching { it.close() } }
-            engine = null
+            e?.let { runCatching { it.stop() }; runCatching { it.close() } }
             EngineState.addLog("■ 引擎已停止")
             EngineState.update {
                 it.copy(running = false, transition = null, boundAddr = null, sentBytes = 0,
