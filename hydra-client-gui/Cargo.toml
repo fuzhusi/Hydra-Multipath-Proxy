@@ -8,7 +8,7 @@ edition = "2021"
 eframe = "0.27"
 egui = "0.27"
 # UI 重设计第三批：总览页仪表盘实时速率双曲线（与 egui/eframe 0.27 版本锁齐）
-egui_plot = "0.27"
+egui_plot = "0.37"
 # 版本统一由根 [workspace.dependencies] 声明（审查 R-31）
 tokio = { workspace = true }
 serde = { workspace = true }
