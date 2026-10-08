@@ -4,9 +4,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-cargo build -p hydra-android
+# M2 起 VPN FFI（start_vpn/stop_vpn）为 target_os=android 专属——绑定必须从
+# Android .so 生成（桌面 dll 生成会缺失 VPN 接口）。cargo-ndk debug 构建即可。
+cargo ndk -t arm64-v8a build -p hydra-android
 cargo run -p hydra-android --bin uniffi-bindgen -- generate \
-    --library target/debug/hydra_android.dll \
+    --library target/aarch64-linux-android/debug/libhydra_android.so \
     --language kotlin \
     --out-dir android/app/src/main/kotlin \
     --no-format

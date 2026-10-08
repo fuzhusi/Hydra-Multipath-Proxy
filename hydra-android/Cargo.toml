@@ -17,6 +17,9 @@ path = "src/bin/uniffi-bindgen.rs"
 [dependencies]
 hydra-core = { path = "../hydra-core" }
 hydra-protocol = { path = "../hydra-protocol" }
+# M2：全局 VPN——用户态栈核心（PacketTransport 抽象 + run_stack，无 tun2）。
+# 保护回调经 socket_protect 钩子（R4），fd 由 Kotlin VpnService 交付。
+hydra-client = { path = "../hydra-client", default-features = false, features = ["tun-core"] }
 # 版本统一由根 [workspace.dependencies] 声明（审查 R-31）
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -26,3 +29,5 @@ base64 = { workspace = true }
 uniffi = { version = "0.29", features = ["cli"] }
 # 显式错误类型（uniffi::Error derive 要求 thiserror 风格）
 thiserror = { workspace = true }
+# VPN 栈停机令牌（与 hydra-client 同版本）
+tokio-util = "0.7"

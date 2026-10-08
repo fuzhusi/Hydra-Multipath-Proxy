@@ -5,6 +5,35 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased] - Android M2（全局 VPN + 任意端口 + DNS 经隧道）
+
+### 新增
+
+- **Android M2 全局 VPN**（VpnService）：`HydraVpnService`（establish TUN → fd
+  交付 Rust 用户态栈 → 节点加密隧道）；consent 授权流程、onRevoke 系统撤销、
+  通知停止动作、启动代数看门狗（20s 超时）；运行模式切换（设置页"全局 VPN/
+  本地端口"双选）；VpnProtectHolder 进程级 protect 委托（code review 发现的
+  陈旧服务引用问题——Rust 钩子首装生效后 Kotlin 侧更新 handler，实例销毁置空）
+- **TCP 任意端口动态监听**（M2/R1）：SYN 驱动挂 listener（上限 256）——
+  smoltcp 无通配监听的运行时补齐，全部 TCP 端口自动接流（tun.rs
+  `tcp_syn_dst_port` + `ensure_dynamic_listener`；Rust FFI start_vpn/stop_vpn）
+- **DNS 经隧道**：系统 DNS（v4/v6）随全局路由进节点解析（加密无泄漏）
+- tun-core feature（hydra-client）：Android 复用用户态栈（PacketTransport 抽象
+  + run_stack）不依赖 tun2 桌面设备层；gen-bindings.sh 改从 Android .so 生成
+
+### 修复（code review 发现）
+
+- **[高] protect 钩子陈旧引用**：start_vpn 的 Rust 钩子首装后捕获第一个
+  HydraVpnService 实例，服务重建后旧引用导致 protect 永远失败 → 零流量。
+  修为 VpnProtectHolder 进程级委托
+- **[中] tcp_syn_dst_port v6 flags 偏移错位**（pkt[54]→pkt[53]）——新单测
+  抓出的真实 bug，v6 SYN 端口解析此前恒返回 None
+- **[低] 日志字符串拼接优先级**修正
+
+### 新增测试
+
+- R1 单元测试：tcp_syn_dst_port（v4/v6/SYN+ACK/UDP）、动态监听挂载/去重/上限
+
 ## [Unreleased] - 桌面 TUN UDP-over-proxy 接管 + DNS 经隧道（TUN 方案 v2 方向落地）
 
 ### 新增

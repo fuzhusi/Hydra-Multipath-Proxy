@@ -825,17 +825,21 @@ pub trait PacketTransport: Send + Sync + 'static {
     fn send<'a>(&'a self, buf: &'a [u8]) -> BoxFut<'a, std::io::Result<()>>;
 }
 
-/// tun2 真实设备适配（Windows: Wintun，需 wintun.dll 随包；Linux: /dev/net/tun）
+/// tun2 真实设备适配（Windows: Wintun，需 wintun.dll 随包；Linux: /dev/net/tun）。
+/// 仅桌面（feature "tun"）；Android 走 VpnService fd 接入（hydra-android FdTransport）。
+#[cfg(feature = "tun")]
 pub struct Tun2Transport {
     dev: Arc<tun2::AsyncDevice>,
 }
 
+#[cfg(feature = "tun")]
 impl Tun2Transport {
     pub fn new(dev: tun2::AsyncDevice) -> Self {
         Self { dev: Arc::new(dev) }
     }
 }
 
+#[cfg(feature = "tun")]
 impl PacketTransport for Tun2Transport {
     fn recv<'a>(&'a self, buf: &'a mut [u8]) -> BoxFut<'a, std::io::Result<usize>> {
         Box::pin(async move {
@@ -1728,6 +1732,55 @@ fn try_forward_udp(
         .is_ok()
 }
 
+/// R1 任意端口（M2）：解析 TCP SYN 的目的端口；SYN(无 ACK) → Some(端口)。
+fn tcp_syn_dst_port(pkt: &[u8]) -> Option<u16> {
+    if pkt.len() < 40 || pkt[0] >> 4 == 4 {
+        if pkt.len() >= 20 && pkt[0] >> 4 == 4 && pkt[9] == 6 {
+            let ihl = usize::from(pkt[0] & 0x0f) * 4;
+            if ihl < 20 || pkt.len() < ihl + 20 {
+                return None;
+            }
+            let dport = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
+            let flags = pkt[ihl + 13];
+            return (flags & 0x12 == 0x02).then_some(dport);
+        }
+        return None;
+    }
+    // IPv6 固定头 40B，TCP 头起始 40：sport@40 dport@42 flags@TCP+13=53
+    //（09/M2 修正：此前读 pkt[54] 错位一字节——新单测抓出）
+    if pkt[0] >> 4 == 6 && pkt.len() > 53 && pkt[6] == 6 {
+        let dport = u16::from_be_bytes([pkt[42], pkt[43]]);
+        let flags = pkt[53];
+        return (flags & 0x12 == 0x02).then_some(dport);
+    }
+    None
+}
+
+/// 动态挂监听（上限 256 防滥用）：smoltcp 无通配监听是静态限制，运行时对
+/// 首个 SYN 的目的端口补挂 listener 后正常投喂栈——三路握手照常完成，
+/// 等价于通配监听（M2/R1 任意端口动态接流）。
+fn ensure_dynamic_listener(
+    pkt: &[u8],
+    sockets: &mut SocketSet<'_>,
+    listeners: &mut Vec<SocketHandle>,
+    fixed_ports: &[u16],
+    dynamic: &mut Vec<u16>,
+) {
+    let Some(dport) = tcp_syn_dst_port(pkt) else {
+        return;
+    };
+    if dport == 0 || fixed_ports.contains(&dport) || dynamic.contains(&dport) {
+        return;
+    }
+    if dynamic.len() >= 256 {
+        debug!("TUN 动态监听端口数达上限（256），忽略 {dport}");
+        return;
+    }
+    dynamic.push(dport);
+    listeners.push(add_listener(sockets, dport));
+    debug!("TUN 动态监听端口 {dport}（R1 任意端口）");
+}
+
 /// 栈主循环（与真实 TUN 设备解耦：任何 [`PacketTransport`] 都可驱动，
 /// 测试用通道对接两个 smoltcp Interface 做回环验证）。
 /// `udp_factory` = Some 时公网 UDP 经节点中继接管（09 交付）；None/关闭时
@@ -1743,11 +1796,13 @@ pub async fn run_stack<T: PacketTransport>(
     let mut iface = build_interface(&cfg, &mut device)?;
     let mut sockets: SocketSet<'_> = SocketSet::new(vec![]);
 
-    // 监听 socket（smoltcp 无通配监听：按端口列表 LISTEN，v1 已知限制）
+    // 监听 socket（smoltcp 无通配监听：按端口列表 LISTEN + 运行时对 SYN 的
+    // 目的端口动态补挂——R1 任意端口）
     let mut listeners: Vec<SocketHandle> = Vec::new();
     for &port in &cfg.listen_ports {
         listeners.push(add_listener(&mut sockets, port));
     }
+    let mut dynamic_ports: Vec<u16> = Vec::new();
     info!(
         "TUN 栈就绪：addr={}/{} mtu={} 监听端口={:?} 流上限={}",
         cfg.addr, cfg.prefix, cfg.mtu, cfg.listen_ports, cfg.max_flows
@@ -1809,6 +1864,11 @@ pub async fn run_stack<T: PacketTransport>(
                 }
                 Ok(n) => {
                     let pkt = &buf[..n];
+                    // R1 任意端口：SYN 目的端口未监听 → 先挂监听再投喂
+                    ensure_dynamic_listener(
+                        pkt, &mut sockets, &mut listeners,
+                        &cfg.listen_ports, &mut dynamic_ports,
+                    );
                     if is_ipv6_packet(pkt) {
                         // 09-P2-3：组播目的/未指定源豁免（上轮 v4 修复的同源遗漏
                         // 在 v6 侧补齐）——对 ff02::fb（mDNS）等回差错违反
@@ -2397,6 +2457,7 @@ async fn step(
 /// TUN 模式入口：创建设备 → 应用路由（带 drop guard）→ 跑栈主循环。
 /// 设备创建失败（Windows 无 wintun.dll / 非管理员；Linux 无 /dev/net/tun 或无
 /// CAP_NET_ADMIN）→ 明确报错。
+#[cfg(feature = "tun")]
 pub async fn run_tun(
     cfg: TunConfig,
     opener: ChannelOpener,
@@ -3835,6 +3896,90 @@ mod tests {
         assert!(cmds[2].contains("2001:db8::9/128"));
     }
 
+
+    /// M2/R1：SYN 目的端口解析（v4/v6、SYN+ACK 不算、非 TCP 不算）
+    #[test]
+    fn tcp_syn_dst_port_解析() {
+        let build = |v6: bool, dport: u16, flags: u8| -> Vec<u8> {
+            let mut tcp = Vec::new();
+            tcp.extend((80u16).to_be_bytes()); // sport
+            tcp.extend(dport.to_be_bytes()); // dport @TCP+2
+            tcp.extend([0, 0, 0, 1]); // seq
+            tcp.extend([0, 0, 0, 0]); // ack
+            tcp.extend([0x50, flags]); // data-offset/flags
+            tcp.extend([0x20, 0]); // window
+            tcp.extend([0, 0]); // checksum
+            tcp.extend([0, 0]); // urgent pointer（TCP 头满 20 字节）
+            if v6 {
+                let mut p = vec![0x60, 0, 0, 0, 0, 20, 6, 64]; // ver/tc/fl(4) len(2) nh hl
+                p.extend([0u8; 16]); // src
+                p.extend([0u8; 16]); // dst
+                p.extend(tcp);
+                p
+            } else {
+                let total = (20 + tcp.len()) as u16;
+                let mut p = vec![0x45, 0];
+                p.extend(total.to_be_bytes()); // @2
+                p.extend([0, 1]); // id
+                p.extend([0x40, 0]); // DF + frag-offset
+                p.extend([64, 6]); // ttl proto@9
+                p.extend([0, 0]); // csum
+                p.extend([10, 0, 0, 1]); // src
+                p.extend([8, 8, 8, 8]); // dst
+                p.extend(tcp);
+                p
+            }
+        };
+        assert_eq!(tcp_syn_dst_port(&build(false, 8443, 0x02)), Some(8443));
+        assert_eq!(tcp_syn_dst_port(&build(false, 8443, 0x12)), None, "SYN+ACK 不是入站 SYN");
+        assert_eq!(tcp_syn_dst_port(&build(true, 993, 0x02)), Some(993));
+        let mut udp = build(false, 53, 0x02);
+        udp[9] = 17;
+        assert_eq!(tcp_syn_dst_port(&udp), None, "UDP 非 TCP");
+    }
+
+    /// M2/R1：动态监听——首个 SYN 挂 listener、同端口去重、上限 256
+    #[test]
+    fn ensure_dynamic_listener_挂载去重与上限() {
+        let mut sockets = SocketSet::new(vec![]);
+        let mut listeners: Vec<SocketHandle> = Vec::new();
+        let mut dynamic: Vec<u16> = Vec::new();
+        let syn = |dport: u16| {
+            let mut tcp = Vec::new();
+            tcp.extend((81u16).to_be_bytes()); // sport
+            tcp.extend(dport.to_be_bytes()); // dport @TCP+2
+            tcp.extend([0, 0, 0, 1]); // seq
+            tcp.extend([0, 0, 0, 0]); // ack
+            tcp.extend([0x50, 0x02]); // SYN
+            tcp.extend([0x20, 0]); // window
+            tcp.extend([0, 0]); // checksum
+            tcp.extend([0, 0]); // urgent pointer
+            let total = (20 + tcp.len()) as u16;
+            let mut p = vec![0x45, 0];
+            p.extend(total.to_be_bytes());
+            p.extend([0, 1]);
+            p.extend([0x40, 0]);
+            p.extend([64, 6]);
+            p.extend([0, 0]);
+            p.extend([10, 0, 0, 1]);
+            p.extend([8, 8, 8, 8]);
+            p.extend(tcp);
+            p
+        };
+        ensure_dynamic_listener(&syn(12345), &mut sockets, &mut listeners, &[80, 443], &mut dynamic);
+        assert_eq!(dynamic, vec![12345]);
+        assert_eq!(listeners.len(), 1);
+        ensure_dynamic_listener(&syn(12345), &mut sockets, &mut listeners, &[80, 443], &mut dynamic);
+        assert_eq!(dynamic, vec![12345], "同端口去重");
+        ensure_dynamic_listener(&syn(80), &mut sockets, &mut listeners, &[80, 443], &mut dynamic);
+        assert_eq!(dynamic, vec![12345], "固定监听端口不重复挂");
+        for i in 0..300u16 {
+            ensure_dynamic_listener(
+                &syn(20000 + i), &mut sockets, &mut listeners, &[], &mut dynamic,
+            );
+        }
+        assert_eq!(dynamic.len(), 256, "动态监听上限 256");
+    }
 
     /// 09 交付 E2E：TUN UDP-over-proxy 接线——真节点（进程内 HydraServer）+
     /// mock TUN 回环。客户端 UDP 包（10.7.0.1:40000 → 127.0.0.1:echo）经

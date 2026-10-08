@@ -749,6 +749,10 @@ internal open class UniffiVTableCallbackInterfaceSocketProtect(
 
 
 
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -765,6 +769,10 @@ internal open class UniffiVTableCallbackInterfaceSocketProtect(
 internal interface IntegrityCheckingUniffiLib : Library {
     // Integrity check functions only
     fun uniffi_hydra_android_checksum_func_parse_share_text(
+): Short
+fun uniffi_hydra_android_checksum_func_start_vpn(
+): Short
+fun uniffi_hydra_android_checksum_func_stop_vpn(
 ): Short
 fun uniffi_hydra_android_checksum_func_test_node_connection(
 ): Short
@@ -848,6 +856,10 @@ fun uniffi_hydra_android_fn_init_callback_vtable_socketprotect(`vtable`: UniffiV
 ): Unit
 fun uniffi_hydra_android_fn_func_parse_share_text(`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_hydra_android_fn_func_start_vpn(`tunFd`: Int,`config`: RustBuffer.ByValue,`protect`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_hydra_android_fn_func_stop_vpn(uniffi_out_err: UniffiRustCallStatus, 
+): Byte
 fun uniffi_hydra_android_fn_func_test_node_connection(`node`: RustBuffer.ByValue,`authKeyHex`: RustBuffer.ByValue,`trust`: RustBuffer.ByValue,`sni`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun ffi_hydra_android_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -977,6 +989,12 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_hydra_android_checksum_func_parse_share_text() != 52095.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_hydra_android_checksum_func_start_vpn() != 57624.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_hydra_android_checksum_func_stop_vpn() != 51.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_hydra_android_checksum_func_test_node_connection() != 57530.toShort()) {
@@ -1177,6 +1195,29 @@ private class JavaLangRefCleanable(
 /**
  * @suppress
  */
+public object FfiConverterUByte: FfiConverter<UByte, Byte> {
+    override fun lift(value: Byte): UByte {
+        return value.toUByte()
+    }
+
+    override fun read(buf: ByteBuffer): UByte {
+        return lift(buf.get())
+    }
+
+    override fun lower(value: UByte): Byte {
+        return value.toByte()
+    }
+
+    override fun allocationSize(value: UByte) = 1UL
+
+    override fun write(value: UByte, buf: ByteBuffer) {
+        buf.put(value.toByte())
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterUShort: FfiConverter<UShort, Short> {
     override fun lift(value: Short): UShort {
         return value.toUShort()
@@ -1217,6 +1258,29 @@ public object FfiConverterUInt: FfiConverter<UInt, Int> {
 
     override fun write(value: UInt, buf: ByteBuffer) {
         buf.putInt(value.toInt())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterInt: FfiConverter<Int, Int> {
+    override fun lift(value: Int): Int {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Int {
+        return buf.getInt()
+    }
+
+    override fun lower(value: Int): Int {
+        return value
+    }
+
+    override fun allocationSize(value: Int) = 4UL
+
+    override fun write(value: Int, buf: ByteBuffer) {
+        buf.putInt(value)
     }
 }
 
@@ -1903,6 +1967,75 @@ public object FfiConverterTypeTestResult: FfiConverterRustBuffer<TestResult> {
 
 
 
+/**
+ * VPN 模式配置（Kotlin 自 SecureStore 组装；地址与 VpnService.Builder 一致）
+ */
+data class VpnConfig (
+    var `nodes`: List<kotlin.String>, 
+    var `authKeyHex`: kotlin.String, 
+    var `trust`: TrustMode, 
+    var `sni`: kotlin.String?, 
+    var `mtu`: kotlin.UShort, 
+    /**
+     * TUN v4 地址（与 Builder.addAddress 一致，默认 10.7.0.1/30）
+     */
+    var `addr4`: kotlin.String, 
+    var `prefix4`: kotlin.UByte, 
+    /**
+     * TUN v6 网关地址（默认 fd07::1）
+     */
+    var `addr6`: kotlin.String, 
+    var `udpRelay`: kotlin.Boolean
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeVpnConfig: FfiConverterRustBuffer<VpnConfig> {
+    override fun read(buf: ByteBuffer): VpnConfig {
+        return VpnConfig(
+            FfiConverterSequenceString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterTypeTrustMode.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterUShort.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterUByte.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: VpnConfig) = (
+            FfiConverterSequenceString.allocationSize(value.`nodes`) +
+            FfiConverterString.allocationSize(value.`authKeyHex`) +
+            FfiConverterTypeTrustMode.allocationSize(value.`trust`) +
+            FfiConverterOptionalString.allocationSize(value.`sni`) +
+            FfiConverterUShort.allocationSize(value.`mtu`) +
+            FfiConverterString.allocationSize(value.`addr4`) +
+            FfiConverterUByte.allocationSize(value.`prefix4`) +
+            FfiConverterString.allocationSize(value.`addr6`) +
+            FfiConverterBoolean.allocationSize(value.`udpRelay`)
+    )
+
+    override fun write(value: VpnConfig, buf: ByteBuffer) {
+            FfiConverterSequenceString.write(value.`nodes`, buf)
+            FfiConverterString.write(value.`authKeyHex`, buf)
+            FfiConverterTypeTrustMode.write(value.`trust`, buf)
+            FfiConverterOptionalString.write(value.`sni`, buf)
+            FfiConverterUShort.write(value.`mtu`, buf)
+            FfiConverterString.write(value.`addr4`, buf)
+            FfiConverterUByte.write(value.`prefix4`, buf)
+            FfiConverterString.write(value.`addr6`, buf)
+            FfiConverterBoolean.write(value.`udpRelay`, buf)
+    }
+}
+
+
+
 
 
 sealed class HydraEngineException: kotlin.Exception() {
@@ -2286,6 +2419,32 @@ public object FfiConverterSequenceTypeNodeSpec: FfiConverterRustBuffer<List<Node
     uniffiRustCallWithError(HydraEngineException) { _status ->
     UniffiLib.INSTANCE.uniffi_hydra_android_fn_func_parse_share_text(
         FfiConverterString.lower(`text`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * 启动全局 VPN 数据面：tun fd → 用户态栈（TCP 任意端口动态接流 + UDP 中继）
+         * → 经节点隧道。protect 回调（R4）在每个出站 socket connect 前调用，失败即
+         * 中止连接。快速返回（栈任务后台运行，建连异步）。
+         */
+    @Throws(HydraEngineException::class) fun `startVpn`(`tunFd`: kotlin.Int, `config`: VpnConfig, `protect`: SocketProtect)
+        = 
+    uniffiRustCallWithError(HydraEngineException) { _status ->
+    UniffiLib.INSTANCE.uniffi_hydra_android_fn_func_start_vpn(
+        FfiConverterInt.lower(`tunFd`),FfiConverterTypeVpnConfig.lower(`config`),FfiConverterTypeSocketProtect.lower(`protect`),_status)
+}
+    
+    
+
+        /**
+         * 停止 VPN 数据面（幂等）。返回是否有运行中的 VPN 被停止。
+         */ fun `stopVpn`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_hydra_android_fn_func_stop_vpn(
+        _status)
 }
     )
     }

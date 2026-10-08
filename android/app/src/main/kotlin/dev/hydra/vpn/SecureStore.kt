@@ -49,6 +49,7 @@ class SecureStore(context: Context) {
         trustMode = prefs.getString(KEY_TRUST_MODE, TRUST_PINNED).orEmpty(),
         certDerB64 = prefs.getString(KEY_CERT_B64, "").orEmpty(),
         listenPort = prefs.getInt(KEY_LISTEN_PORT, DEFAULT_PORT),
+        runMode = prefs.getString(KEY_RUN_MODE, MODE_VPN).orEmpty(),
     )
 
     fun save(c: HydraConfig) {
@@ -59,6 +60,7 @@ class SecureStore(context: Context) {
             .putString(KEY_TRUST_MODE, c.trustMode)
             .putString(KEY_CERT_B64, c.certDerB64)
             .putInt(KEY_LISTEN_PORT, c.listenPort)
+            .putString(KEY_RUN_MODE, c.runMode)
             .apply()
     }
 
@@ -70,10 +72,14 @@ class SecureStore(context: Context) {
         private const val KEY_TRUST_MODE = "trust_mode"
         private const val KEY_CERT_B64 = "cert_der_b64"
         private const val KEY_LISTEN_PORT = "listen_port"
+    private const val KEY_RUN_MODE = "run_mode"
 
         const val TRUST_PINNED = "pinned"
         const val TRUST_CA = "ca"
         const val DEFAULT_PORT = 1080
+    /** 运行模式：vpn = 全局 VPN（VpnService，M2）；local = 本地端口（浏览器代理） */
+    const val MODE_VPN = "vpn"
+    const val MODE_LOCAL = "local"
     }
 }
 
@@ -85,4 +91,6 @@ data class HydraConfig(
     val trustMode: String,
     val certDerB64: String,
     val listenPort: Int,
+    /** "vpn"（默认）/ "local" */
+    val runMode: String,
 )

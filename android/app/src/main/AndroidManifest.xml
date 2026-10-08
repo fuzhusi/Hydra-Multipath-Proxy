@@ -37,6 +37,17 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- M2：全局 VPN（VpnService；系统要求 BIND_VPN_SERVICE 权限声明） -->
+        <service
+            android:name=".HydraVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="dataSync">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+
         <!-- M2：VpnService 声明（engine 服务 + always-on）随 M2 加入 -->
     </application>
 </manifest>

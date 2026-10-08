@@ -187,6 +187,229 @@ pub fn test_node_connection(
     out
 }
 
+// ── M2：全局 VPN（VpnService fd → 用户态栈 → 节点隧道）──────────────────────
+
+/// VPN 模式配置（Kotlin 自 SecureStore 组装；地址与 VpnService.Builder 一致）
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct VpnConfig {
+    pub nodes: Vec<String>,
+    pub auth_key_hex: String,
+    pub trust: TrustMode,
+    pub sni: Option<String>,
+    pub mtu: u16,
+    /// TUN v4 地址（与 Builder.addAddress 一致，默认 10.7.0.1/30）
+    pub addr4: String,
+    pub prefix4: u8,
+    /// TUN v6 网关地址（默认 fd07::1）
+    pub addr6: String,
+    pub udp_relay: bool,
+}
+
+/// fd 包传输：VpnService tun fd → PacketTransport（阻塞 read/write 各入
+/// spawn_blocking，单方向各占一个 blocking 线程——预算内）。
+struct FdTransport {
+    r: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+    w: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+}
+
+impl FdTransport {
+    /// 接管 fd 所有权（Kotlin 侧 detachFd 后交付；drop 时关闭）。
+    /// Windows 主机构建走 not(unix) 分支返回 Unsupported——该路径仅 Android 使用，
+    /// 但符号仍需导出（桌面 JVM 冒烟的绑定 checksum 校验要求全符号在库）。
+    fn new(fd: i32) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::FromRawFd;
+            // Safety：fd 来自 Kotlin `pfd.detachFd()`——所有权唯一移交本侧，
+            // 由 File drop 关闭；Kotlin 不再持有/使用该 fd。
+            let f = unsafe { std::fs::File::from_raw_fd(fd) };
+            let w = f.try_clone()?;
+            Ok(Self {
+                r: std::sync::Arc::new(std::sync::Mutex::new(f)),
+                w: std::sync::Arc::new(std::sync::Mutex::new(w)),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = fd;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "VPN fd 接入仅支持 Android/Unix 平台（桌面 Windows 无此场景）",
+            ))
+        }
+    }
+}
+
+impl hydra_client::tun::PacketTransport for FdTransport {
+    fn recv<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> hydra_client::tun::BoxFut<'a, std::io::Result<usize>> {
+        let r = self.r.clone();
+        let mut owned = buf.to_vec(); // spawn_blocking 需要 'static：读入本地副本
+        Box::pin(async move {
+            let (res, owned) = tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+                let mut f = r.lock().unwrap_or_else(|p| p.into_inner());
+                let res = f.read(&mut owned);
+                (res, owned) // 缓冲随闭包返还，供回拷
+            })
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let n = res?;
+            buf[..n].copy_from_slice(&owned[..n]);
+            Ok(n)
+        })
+    }
+
+    fn send<'a>(&'a self, buf: &'a [u8]) -> hydra_client::tun::BoxFut<'a, std::io::Result<()>> {
+        let data = buf.to_vec();
+        let w = self.w.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let mut f = w.lock().unwrap_or_else(|p| p.into_inner());
+                f.write_all(&data)
+            })
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?
+        })
+    }
+}
+
+/// VPN 运行句柄：独立 runtime + 栈任务 + 停机令牌
+struct VpnHandle {
+    runtime: tokio::runtime::Runtime,
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+static VPN_STATE: std::sync::Mutex<Option<VpnHandle>> = std::sync::Mutex::new(None);
+
+/// 启动全局 VPN 数据面：tun fd → 用户态栈（TCP 任意端口动态接流 + UDP 中继）
+/// → 经节点隧道。protect 回调（R4）在每个出站 socket connect 前调用，失败即
+/// 中止连接。快速返回（栈任务后台运行，建连异步）。
+#[uniffi::export]
+pub fn start_vpn(
+    tun_fd: i32,
+    config: VpnConfig,
+    protect: Box<dyn SocketProtect>,
+) -> Result<(), HydraEngineError> {
+    let mut guard = VPN_STATE.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.is_some() {
+        return Err(HydraEngineError::Start { msg: "VPN 已在运行".into() });
+    }
+
+    // R4：保护钩子进程级安装（首装生效）——出站连接 connect 前回调 protect(fd)
+    {
+        let cb = std::sync::Arc::new(protect);
+        let hook: hydra_core::socket_protect::ProtectHook = Box::new(move |fd| cb.protect(fd));
+        let _ = hydra_core::socket_protect::set_socket_protect_hook(hook);
+    }
+
+    let addr4: std::net::Ipv4Addr = config.addr4.parse().map_err(|_| {
+        HydraEngineError::InvalidConfig { msg: format!("addr4 非法: {}", config.addr4) }
+    })?;
+    let addr6: std::net::Ipv6Addr = config.addr6.parse().map_err(|_| {
+        HydraEngineError::InvalidConfig { msg: format!("addr6 非法: {}", config.addr6) }
+    })?;
+    if config.nodes.is_empty() {
+        return Err(HydraEngineError::InvalidConfig { msg: "至少需要一个节点".into() });
+    }
+    let key = hydra_core::auth_key_from_hex(&config.auth_key_hex)
+        .map_err(|m| HydraEngineError::InvalidConfig { msg: m })?;
+    let tls = match &config.trust {
+        TrustMode::Pinned { cert_der } => {
+            if cert_der.is_empty() {
+                return Err(HydraEngineError::InvalidConfig {
+                    msg: "pin 模式必须提供节点证书".into(),
+                });
+            }
+            hydra_core::tcp_transport::TlsTrust::pinned(cert_der.clone())
+        }
+        TrustMode::PublicCa => hydra_core::tcp_transport::TlsTrust::public_ca(None),
+    };
+    let nodes: Vec<std::net::SocketAddr> = config
+        .nodes
+        .iter()
+        .filter_map(|a| a.parse().ok())
+        .collect();
+    if nodes.is_empty() {
+        return Err(HydraEngineError::InvalidConfig {
+            msg: "节点地址全部无法解析（域名节点 M2 暂不支持）".into(),
+        });
+    }
+    let sni = config.sni.clone().unwrap_or_else(|| hydra_core::DEFAULT_SNI.into());
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| HydraEngineError::Start { msg: e.to_string() })?;
+
+    let transport = FdTransport::new(tun_fd)
+        .map_err(|e| HydraEngineError::Start { msg: format!("tun fd 接管失败: {e}") })?;
+
+    // opener/udp 工厂：复用 ProxyServer 的凭据与调度器（不 start——不监听本地端口）
+    let proxy = hydra_core::proxy::ProxyServer::new("127.0.0.1:0".parse().unwrap())
+        .with_nodes(nodes)
+        .with_auth_key(key)
+        .with_trust(tls)
+        .with_sni(sni);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let shutdown2 = shutdown.clone();
+
+    runtime.spawn(async move {
+        proxy.register_nodes().await;
+        let opener = match proxy.tun_channel_opener() {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!("VPN opener 构建失败: {e}");
+                return;
+            }
+        };
+        let udp_factory = proxy.tun_udp_channel_factory().ok();
+        let tun_cfg = hydra_client::tun::TunConfig {
+            addr: addr4,
+            prefix: config.prefix4,
+            mtu: config.mtu,
+            addr6,
+            ipv6_enabled: true,
+            udp_relay: config.udp_relay,
+            dns_via_proxy: true,
+            ..Default::default()
+        };
+        tracing::info!("Hydra VPN 栈启动（fd 模式，mtu={}）", config.mtu);
+        if let Err(e) = hydra_client::tun::run_stack(
+            std::sync::Arc::new(transport),
+            tun_cfg,
+            opener,
+            udp_factory,
+            shutdown2,
+        )
+        .await
+        {
+            tracing::error!("VPN 栈退出: {e}");
+        }
+    });
+
+    *guard = Some(VpnHandle { runtime, shutdown });
+    Ok(())
+}
+
+/// 停止 VPN 数据面（幂等）。返回是否有运行中的 VPN 被停止。
+#[uniffi::export]
+pub fn stop_vpn() -> bool {
+    let mut guard = VPN_STATE.lock().unwrap_or_else(|p| p.into_inner());
+    match guard.take() {
+        Some(h) => {
+            h.shutdown.cancel();
+            h.runtime.shutdown_timeout(std::time::Duration::from_secs(3));
+            true
+        }
+        None => false,
+    }
+}
+
 #[derive(uniffi::Error, thiserror::Error, Debug)]
 pub enum HydraEngineError {
     #[error("配置非法: {msg}")]

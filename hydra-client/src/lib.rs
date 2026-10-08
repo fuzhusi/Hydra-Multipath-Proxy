@@ -19,7 +19,8 @@ pub use hydra_core::{channel, connections, nat, proxy, routing, scheduler, share
 
 // TUN 透明代理模式（feature = "tun"，见 tun.rs 模块文档；Android 不复用本模块，
 // 其 tun_core 为按评审 R1-R4 增强的独立实现）
-#[cfg(feature = "tun")]
+// tun 模块：桌面全功能（含 tun2 设备层）或 Android 仅栈核心（tun-core）
+#[cfg(any(feature = "tun", feature = "tun-core"))]
 pub mod tun;
 
 #[cfg(feature = "tun")]

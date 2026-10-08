@@ -13,7 +13,12 @@ path = "src/main.rs"
 # `--no-default-features` 可编出无 TUN 的最小客户端（若目标环境无法拉取
 # tun2/smoltcp 依赖，允许此降级）。
 default = ["tun", "fingerprint"]
-tun = ["dep:tun2", "dep:smoltcp", "dep:tokio-util"]
+# tun = 用户态栈全套（含桌面 TUN 设备层 tun2）；
+# tun-core = 仅用户态栈核心（PacketTransport 抽象 + smoltcp + run_stack），
+# 供 Android VpnService fd 接入（M2/R7：无需 tun2，避免桌面 TUN 设备层
+# 阻塞 Android 交叉编译）。
+tun = ["dep:tun2", "dep:smoltcp", "dep:tokio-util", "tun-core"]
+tun-core = ["dep:smoltcp", "dep:tokio-util"]
 # ClientHello 指纹（stock rustls 实现与 brotli 解压器均在 hydra-core，转发开关）
 fingerprint = ["hydra-core/fingerprint"]
 

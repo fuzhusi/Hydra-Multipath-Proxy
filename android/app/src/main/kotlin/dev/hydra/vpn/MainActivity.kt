@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
@@ -245,6 +246,46 @@ private fun HydraApp() {
         }
     }
 
+    // M2 VPN 授权（系统 VpnService.consent 对话框；同意后直接启动 VPN 服务）
+    val vpnConsent = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) {
+            // 授权成功：VPN 服务直启（无需再走 consent）
+            context.startForegroundService(
+                Intent(context, HydraVpnService::class.java)
+                    .setAction(HydraVpnService.ACTION_START),
+            )
+        } else {
+            toast = "未授权 VPN——全局代理需要 VPN 权限"
+            EngineState.addLog("✗ 用户未授权 VPN 权限")
+        }
+    }
+
+    /** 按运行模式启动（Home 启动按钮）：vpn 走 consent/服务，local 走引擎服务 */
+    fun startCurrentMode(context: Context) {
+        val c = store.load()
+        if (c.runMode == SecureStore.MODE_VPN) {
+            val prepare = VpnService.prepare(context)
+            if (prepare != null) {
+                vpnConsent.launch(prepare)
+            } else {
+                context.startForegroundService(
+                    Intent(context, HydraVpnService::class.java)
+                        .setAction(HydraVpnService.ACTION_START),
+                )
+            }
+        } else {
+            val intent = Intent(context, EngineService::class.java)
+                .setAction(EngineService.ACTION_START)
+            if (Build.VERSION.SDK_INT >= 26) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+    }
+
     // 扫码导入（桌面端分享二维码 → 手机扫描即完成全部配置）
     val qrLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         val content = result.contents
@@ -287,18 +328,17 @@ private fun HydraApp() {
                     onGoNodes = { tab = Tab.Nodes },
                     onStart = {
                         persist(cfg)
-                        val intent = Intent(context, EngineService::class.java)
-                            .setAction(EngineService.ACTION_START)
-                        if (Build.VERSION.SDK_INT >= 26) {
-                            context.startForegroundService(intent)
-                        } else {
-                            context.startService(intent)
-                        }
+                        startCurrentMode(context)
                     },
                     onStop = {
+                        // 按运行模式停止（ vpn = HydraVpnService；local = EngineService）
+                        val svc = if (cfg.runMode == SecureStore.MODE_VPN) {
+                            HydraVpnService::class.java
+                        } else {
+                            EngineService::class.java
+                        }
                         context.startService(
-                            Intent(context, EngineService::class.java)
-                                .setAction(EngineService.ACTION_STOP),
+                            Intent(context, svc).setAction(EngineService.ACTION_STOP),
                         )
                     },
                 )
@@ -442,9 +482,20 @@ private fun HomeScreen(
             ) { Text("▶ 启动代理", fontSize = 16.sp) }
         }
 
-        // ── 监听地址 ──
+        // ── 监听地址 / 模式说明 ──
         val bound = ui.boundAddr
-        if (ui.running && bound != null) {
+        if (ui.running && cfg.runMode == SecureStore.MODE_VPN) {
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("全局 VPN 模式", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "已接管所有应用流量（含 DNS），无需任何手动配置；如个别应用异常可在设置页切回「本地端口」模式",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        } else if (ui.running && bound != null) {
             Card(Modifier.fillMaxWidth()) {
                 Row(
                     Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
@@ -905,6 +956,33 @@ private fun SettingsScreen(cfg: HydraConfig, onPersist: (HydraConfig) -> Unit) {
                     )
                 }
             }
+        }
+
+        Section("运行模式") {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = cfg.runMode == SecureStore.MODE_VPN,
+                    onClick = {
+                        onPersist(cfg.copy(runMode = SecureStore.MODE_VPN))
+                    },
+                    label = { Text("全局 VPN") },
+                )
+                FilterChip(
+                    selected = cfg.runMode == SecureStore.MODE_LOCAL,
+                    onClick = {
+                        onPersist(cfg.copy(runMode = SecureStore.MODE_LOCAL))
+                    },
+                    label = { Text("本地端口") },
+                )
+            }
+            Text(
+                if (cfg.runMode == SecureStore.MODE_VPN)
+                    "全局 VPN：无需任何配置，所有应用流量经节点（首次启动需授权）"
+                else
+                    "本地端口：仅浏览器等手动配置代理的应用经节点（连接页复制监听地址）",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
 
         Section("高级") {
