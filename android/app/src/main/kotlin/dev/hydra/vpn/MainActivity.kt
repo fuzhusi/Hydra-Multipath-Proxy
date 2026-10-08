@@ -79,7 +79,9 @@ import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import uniffi.hydra_android.TrustMode
 import uniffi.hydra_android.parseShareText
+import uniffi.hydra_android.testNodeConnection
 import java.util.Base64
 
 /**
@@ -112,7 +114,29 @@ class MainActivity : ComponentActivity() {
         if (wanted.isNotEmpty()) {
             requestPermissions(wanted.toTypedArray(), 1)
         }
+        handleDeepLink(intent)
         setContent { HydraTheme { HydraApp() } }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleDeepLink(intent)
+    }
+
+    private val deepLinkScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + Dispatchers.Main.immediate
+    )
+
+    /** hydra:// 深链：聊天工具/浏览器点开直达导入（设计 §5 输入③） */
+    private fun handleDeepLink(intent: Intent?) {
+        val data = intent?.data ?: return
+        if (data.scheme != "hydra") return
+        val text = data.toString()
+        val appCtx = applicationContext
+        deepLinkScope.launch {
+            val msg = ShareImporter.import(appCtx, text)
+            Toast.makeText(appCtx, msg, Toast.LENGTH_LONG).show()
+        }
     }
 }
 
@@ -133,6 +157,38 @@ private fun HydraTheme(content: @Composable () -> Unit) {
 
 private enum class Tab(val label: String) {
     Home("连接"), Nodes("节点"), Settings("设置")
+}
+
+/** 导入逻辑唯一实现：Activity 深链与 Compose 粘贴/扫码共用。 */
+object ShareImporter {
+    suspend fun import(context: Context, text: String): String =
+        withContext(Dispatchers.IO) {
+            try {
+                val p = parseShareText(text.trim())
+                val store = SecureStore(context)
+                val cur = store.load()
+                // 合并而非替换：手动添加的节点不因导入丢失；链接节点去重后追加
+                val existing = cur.nodesText.lines().map { it.trim() }.filter { it.isNotEmpty() }
+                val mergedNodes = (existing + p.nodes.filter { it !in existing })
+                    .joinToString("\n")
+                val merged = cur.copy(
+                    nodesText = mergedNodes,
+                    authKeyHex = p.authKeyHex.ifEmpty { cur.authKeyHex },
+                    certDerB64 = p.certDerB64.ifEmpty { cur.certDerB64 },
+                )
+                store.save(merged)
+                val extra = buildString {
+                    if (p.authKeyHex.isNotEmpty()) append("，密钥✓")
+                    if (p.certDerB64.isNotEmpty()) append("，证书✓")
+                    if (p.skipped > 0u) append("（跳过 ${p.skipped} 条：域名节点/坏行）")
+                }
+                EngineState.addLog("导入成功：${p.nodes.size} 个节点$extra")
+                "导入成功：${p.nodes.size} 个节点$extra"
+            } catch (e: Exception) {
+                EngineState.addLog("导入失败：${e.message}")
+                "导入失败：${e.message}"
+            }
+        }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -157,31 +213,28 @@ private fun HydraApp() {
     }
 
     // ── 分享/订阅导入（粘贴文本或扫码结果共用）──
-    suspend fun doImport(text: String): String = withContext(Dispatchers.IO) {
-        try {
-            val p = parseShareText(text.trim())
-            val cur = store.load()
-            // 合并而非替换：手动添加的节点不因导入丢失；链接节点去重后追加
-            val existing = cur.nodesText.lines().map { it.trim() }.filter { it.isNotEmpty() }
-            val mergedNodes = (existing + p.nodes.filter { it !in existing })
-                .joinToString("\n")
-            val merged = cur.copy(
-                nodesText = mergedNodes,
-                authKeyHex = p.authKeyHex.ifEmpty { cur.authKeyHex },
-                certDerB64 = p.certDerB64.ifEmpty { cur.certDerB64 },
-            )
-            store.save(merged)
-            cfg = merged
-            val extra = buildString {
-                if (p.authKeyHex.isNotEmpty()) append("，密钥✓")
-                if (p.certDerB64.isNotEmpty()) append("，证书✓")
-                if (p.skipped > 0u) append("（跳过 ${p.skipped} 条：域名节点/坏行）")
+    suspend fun doImport(text: String): String {
+        val msg = ShareImporter.import(context, text)
+        cfg = store.load() // 回读最新落库（节点列表即时刷新）
+        return msg
+    }
+
+    // R1 节点连通性手动测试（完整握手探测，8s 超时；须在 IO 线程）
+    val testNode: suspend (String) -> Pair<Boolean, String> = { addr ->
+        withContext(Dispatchers.IO) {
+            try {
+                val cur = store.load()
+                val t = if (cur.trustMode == SecureStore.TRUST_CA) {
+                    uniffi.hydra_android.TrustMode.PublicCa
+                } else {
+                    uniffi.hydra_android.TrustMode.Pinned(listOf(
+                        java.util.Base64.getDecoder().decode(cur.certDerB64)))
+                }
+                val r = testNodeConnection(addr, cur.authKeyHex, t, cur.sni.ifEmpty { null })
+                if (r.ok) true to "${r.latencyMs}ms" else false to r.detail
+            } catch (e: Exception) {
+                false to (e.message ?: "测试失败")
             }
-            EngineState.addLog("导入成功：${p.nodes.size} 个节点$extra")
-            "导入成功：${p.nodes.size} 个节点$extra"
-        } catch (e: Exception) {
-            EngineState.addLog("导入失败：${e.message}")
-            "导入失败：${e.message}"
         }
     }
 
@@ -255,6 +308,7 @@ private fun HydraApp() {
                         )
                     },
                     onToast = { toast = it },
+                    onTestNode = testNode,
                 )
                 Tab.Settings -> SettingsScreen(
                     cfg = cfg,
@@ -281,6 +335,7 @@ private fun HomeScreen(
     val logs by EngineState.logs.collectAsState()
     val context = LocalContext.current
     val nodeCount = cfg.nodesText.lines().count { it.isNotBlank() }
+    var showAllLogs by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -297,7 +352,7 @@ private fun HomeScreen(
                 containerColor = when {
                     ui.transition?.startsWith("启动失败") == true ->
                         MaterialTheme.colorScheme.errorContainer
-                    ui.running -> Color(0xFF103C2A).copy(alpha = 0.9f)
+                    ui.running -> MaterialTheme.colorScheme.tertiaryContainer
                     else -> MaterialTheme.colorScheme.surfaceVariant
                 },
             ),
@@ -312,7 +367,7 @@ private fun HomeScreen(
                         .size(72.dp)
                         .background(
                             when {
-                                ui.running -> Color(0xFF4ADE80)
+                                ui.running -> MaterialTheme.colorScheme.tertiary
                                 ui.transition != null -> MaterialTheme.colorScheme.primary
                                 else -> MaterialTheme.colorScheme.outline
                             },
@@ -327,7 +382,7 @@ private fun HomeScreen(
                         )
                     } else {
                         Text(if (ui.running) "ON" else "OFF", fontSize = 20.sp,
-                            color = Color.Black, fontFamily = FontFamily.Monospace)
+                            color = MaterialTheme.colorScheme.onTertiary, fontFamily = FontFamily.Monospace)
                     }
                 }
                 Text(
@@ -347,7 +402,7 @@ private fun HomeScreen(
                     Text(
                         "运行 ${formatDuration(ui.uptimeSecs)} · 活跃 ${ui.activeConns} · 累计 ${ui.totalConns}",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = Color(0xFFBBF7D0),
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
                     )
                 } else if (nodeCount > 0) {
                     Text("已配置 $nodeCount 个节点", style = MaterialTheme.typography.bodyMedium)
@@ -426,11 +481,15 @@ private fun HomeScreen(
             }
         }
 
-        // ── 事件日志 ──
+        // ── 事件日志（§9：最近 8 条 + "全部"对话框 + 一键复制）──
         if (logs.isNotEmpty()) {
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                    Text("事件", style = MaterialTheme.typography.titleSmall)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("事件", style = MaterialTheme.typography.titleSmall,
+                            modifier = Modifier.weight(1f))
+                        TextButton(onClick = { showAllLogs = true }) { Text("全部（${logs.size}）") }
+                    }
                     logs.take(8).forEach { e ->
                         Text(
                             "${e.time}  ${e.message}",
@@ -442,6 +501,40 @@ private fun HomeScreen(
                 }
             }
         }
+    }
+
+    if (showAllLogs) {
+        AlertDialog(
+            onDismissRequest = { showAllLogs = false },
+            title = { Text("事件（${logs.size} 条）") },
+            text = {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(420.dp),
+                    verticalArrangement = Arrangement.spacedBy(3.dp),
+                ) {
+                    items(logs) { e ->
+                        Text(
+                            "${e.time}  ${e.message}",
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    cm.setPrimaryClip(ClipData.newPlainText(
+                        "hydra-logs", logs.joinToString("\n") { "${it.time} ${it.message}" }))
+                    Toast.makeText(context, "已复制全部事件", Toast.LENGTH_SHORT).show()
+                }) { Text("复制全部") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAllLogs = false }) { Text("关闭") }
+            },
+        )
     }
 }
 
@@ -466,16 +559,33 @@ private fun NodesScreen(
     onImport: suspend (String) -> String,
     onScan: () -> Unit,
     onToast: (String) -> Unit,
+    onTestNode: suspend (String) -> Pair<Boolean, String>,
 ) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var showImport by remember { mutableStateOf(false) }
     var importText by remember { mutableStateOf("") }
+    var clipHint by remember { mutableStateOf<String?>(null) }
+    // R3 剪贴板预填：打开导入时检测 hydra:// 链接自动填入（省一步粘贴）
+    LaunchedEffect(showImport) {
+        if (showImport && importText.isBlank()) {
+            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = cm.primaryClip?.getItemAt(0)?.text?.toString().orEmpty()
+            if (clip.contains("hydra://")) {
+                importText = clip
+                clipHint = "已从剪贴板填入分享链接"
+            }
+        }
+    }
     var importBusy by remember { mutableStateOf(false) }
     var importError by remember { mutableStateOf<String?>(null) }
     var showManual by remember { mutableStateOf(false) }
     var manualAddr by remember { mutableStateOf("") }
     var manualPort by remember { mutableStateOf("443") }
     var deleteTarget by remember { mutableStateOf<String?>(null) }
+    // R1 手动连通性测试：addr → "✓ 123ms" / "✗ 原因"
+    val testResults = remember { androidx.compose.runtime.mutableStateMapOf<String, String>() }
+    var testingAddr by remember { mutableStateOf<String?>(null) }
 
     val nodes = cfg.nodesText.lines().map { it.trim() }.filter { it.isNotEmpty() }
 
@@ -514,14 +624,38 @@ private fun NodesScreen(
                             ) {
                                 Box(
                                     Modifier.size(8.dp).background(
-                                        Color(0xFF4ADE80), CircleShape,
+                                        MaterialTheme.colorScheme.tertiary, CircleShape,
                                     )
                                 )
                                 Spacer(Modifier.size(10.dp))
-                                Text(
-                                    node, fontFamily = FontFamily.Monospace,
-                                    modifier = Modifier.weight(1f),
-                                )
+                                Column(Modifier.weight(1f)) {
+                                    Text(node, fontFamily = FontFamily.Monospace)
+                                    testResults[node]?.let { r ->
+                                        Text(
+                                            r, fontSize = 11.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            color = if (r.startsWith("✓"))
+                                                MaterialTheme.colorScheme.tertiary
+                                            else MaterialTheme.colorScheme.error,
+                                        )
+                                    }
+                                }
+                                TextButton(
+                                    onClick = {
+                                        if (testingAddr == null) {
+                                            testingAddr = node
+                                            scope.launch {
+                                                val (ok, detail) = onTestNode(node)
+                                                testResults[node] =
+                                                    (if (ok) "✓ " else "✗ ") + detail
+                                                testingAddr = null
+                                            }
+                                        }
+                                    },
+                                    enabled = testingAddr == null,
+                                ) {
+                                    Text(if (testingAddr == node) "测试中" else "测试")
+                                }
                                 IconButton(onClick = { deleteTarget = node }) {
                                     Icon(Icons.Filled.Delete, "删除",
                                         tint = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -583,6 +717,10 @@ private fun NodesScreen(
                         modifier = Modifier.fillMaxWidth(),
                         minLines = 3,
                     )
+                    clipHint?.let {
+                        Text(it, color = MaterialTheme.colorScheme.primary,
+                            style = MaterialTheme.typography.bodySmall)
+                    }
                     importError?.let {
                         Text(it, color = MaterialTheme.colorScheme.error,
                             style = MaterialTheme.typography.bodySmall)

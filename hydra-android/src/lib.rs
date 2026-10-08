@@ -123,6 +123,70 @@ pub fn parse_share_text(text: String) -> Result<ParsedShare, HydraEngineError> {
     })
 }
 
+/// 单节点连通性测试结果（§连通性自检：引擎可用 ≠ 节点可达）
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct TestResult {
+    pub ok: bool,
+    /// 成功时为完整握手耗时（毫秒）；失败为 0
+    pub latency_ms: u64,
+    /// 失败原因（用户可读中文）
+    pub detail: String,
+}
+
+/// 对单个节点发起完整握手探测（TCP+TLS+Noise-PSK，与数据面同路径）。
+/// 阻塞调用（内部一次性 runtime，8s 超时）——Kotlin 侧须在 IO 线程调用。
+#[uniffi::export]
+pub fn test_node_connection(
+    node: String,
+    auth_key_hex: String,
+    trust: TrustMode,
+    sni: Option<String>,
+) -> TestResult {
+    use std::net::SocketAddr;
+    let fail = |detail: String| TestResult { ok: false, latency_ms: 0, detail };
+    let addr: SocketAddr = match node.parse() {
+        Ok(a) => a,
+        Err(_) => {
+            return fail("节点地址无法解析（须 IP:端口；IPv6 用 [::1]:443 形式）".into())
+        }
+    };
+    let key = match hydra_core::auth_key_from_hex(&auth_key_hex) {
+        Ok(k) => k,
+        Err(m) => return fail(format!("认证密钥非法：{m}")),
+    };
+    let tls = match trust {
+        TrustMode::Pinned { cert_der } => hydra_core::tcp_transport::TlsTrust::pinned(cert_der),
+        TrustMode::PublicCa => hydra_core::tcp_transport::TlsTrust::public_ca(None),
+    };
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => return fail(format!("探测 runtime 创建失败: {e}")),
+    };
+    let sni = sni.unwrap_or_else(|| hydra_core::DEFAULT_SNI.to_string());
+    let out = runtime.block_on(async move {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            hydra_core::speedtest::probe_node_once(addr, &sni, &tls, &key),
+        )
+        .await
+        {
+            Ok(Ok(d)) => TestResult {
+                ok: true,
+                latency_ms: d.as_millis() as u64,
+                detail: String::new(),
+            },
+            Ok(Err(e)) => fail(e),
+            Err(_) => fail("探测超时（8s）——节点不可达或网络不通".into()),
+        }
+    });
+    runtime.shutdown_timeout(std::time::Duration::from_millis(200));
+    out
+}
+
 #[derive(uniffi::Error, thiserror::Error, Debug)]
 pub enum HydraEngineError {
     #[error("配置非法: {msg}")]

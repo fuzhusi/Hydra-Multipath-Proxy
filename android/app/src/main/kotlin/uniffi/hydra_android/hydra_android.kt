@@ -747,6 +747,8 @@ internal open class UniffiVTableCallbackInterfaceSocketProtect(
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -763,6 +765,8 @@ internal open class UniffiVTableCallbackInterfaceSocketProtect(
 internal interface IntegrityCheckingUniffiLib : Library {
     // Integrity check functions only
     fun uniffi_hydra_android_checksum_func_parse_share_text(
+): Short
+fun uniffi_hydra_android_checksum_func_test_node_connection(
 ): Short
 fun uniffi_hydra_android_checksum_method_hydraengine_bound_addr(
 ): Short
@@ -843,6 +847,8 @@ fun uniffi_hydra_android_fn_method_hydraengine_stop(`ptr`: Pointer,uniffi_out_er
 fun uniffi_hydra_android_fn_init_callback_vtable_socketprotect(`vtable`: UniffiVTableCallbackInterfaceSocketProtect,
 ): Unit
 fun uniffi_hydra_android_fn_func_parse_share_text(`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_hydra_android_fn_func_test_node_connection(`node`: RustBuffer.ByValue,`authKeyHex`: RustBuffer.ByValue,`trust`: RustBuffer.ByValue,`sni`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun ffi_hydra_android_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -971,6 +977,9 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_hydra_android_checksum_func_parse_share_text() != 52095.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_hydra_android_checksum_func_test_node_connection() != 57530.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_hydra_android_checksum_method_hydraengine_bound_addr() != 10632.toShort()) {
@@ -1849,6 +1858,51 @@ public object FfiConverterTypeParsedShare: FfiConverterRustBuffer<ParsedShare> {
 
 
 
+/**
+ * 单节点连通性测试结果（§连通性自检：引擎可用 ≠ 节点可达）
+ */
+data class TestResult (
+    var `ok`: kotlin.Boolean, 
+    /**
+     * 成功时为完整握手耗时（毫秒）；失败为 0
+     */
+    var `latencyMs`: kotlin.ULong, 
+    /**
+     * 失败原因（用户可读中文）
+     */
+    var `detail`: kotlin.String
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTestResult: FfiConverterRustBuffer<TestResult> {
+    override fun read(buf: ByteBuffer): TestResult {
+        return TestResult(
+            FfiConverterBoolean.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: TestResult) = (
+            FfiConverterBoolean.allocationSize(value.`ok`) +
+            FfiConverterULong.allocationSize(value.`latencyMs`) +
+            FfiConverterString.allocationSize(value.`detail`)
+    )
+
+    override fun write(value: TestResult, buf: ByteBuffer) {
+            FfiConverterBoolean.write(value.`ok`, buf)
+            FfiConverterULong.write(value.`latencyMs`, buf)
+            FfiConverterString.write(value.`detail`, buf)
+    }
+}
+
+
+
 
 
 sealed class HydraEngineException: kotlin.Exception() {
@@ -2232,6 +2286,19 @@ public object FfiConverterSequenceTypeNodeSpec: FfiConverterRustBuffer<List<Node
     uniffiRustCallWithError(HydraEngineException) { _status ->
     UniffiLib.INSTANCE.uniffi_hydra_android_fn_func_parse_share_text(
         FfiConverterString.lower(`text`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * 对单个节点发起完整握手探测（TCP+TLS+Noise-PSK，与数据面同路径）。
+         * 阻塞调用（内部一次性 runtime，8s 超时）——Kotlin 侧须在 IO 线程调用。
+         */ fun `testNodeConnection`(`node`: kotlin.String, `authKeyHex`: kotlin.String, `trust`: TrustMode, `sni`: kotlin.String?): TestResult {
+            return FfiConverterTypeTestResult.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_hydra_android_fn_func_test_node_connection(
+        FfiConverterString.lower(`node`),FfiConverterString.lower(`authKeyHex`),FfiConverterTypeTrustMode.lower(`trust`),FfiConverterOptionalString.lower(`sni`),_status)
 }
     )
     }

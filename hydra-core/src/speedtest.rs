@@ -176,6 +176,18 @@ async fn probe_node(
     }
 }
 
+/// 单次节点连通性探测（完整握手：TCP+TLS+Noise-PSK+地址帧+应答）。
+/// Android 绑定层"测试连接/连通性自检"用——与数据面同路径，认证面故障
+/// 同样可在探测复现。公开包装（probe_connect 为内部实现）。
+pub async fn probe_node_once(
+    addr: SocketAddr,
+    sni: &str,
+    trust: &crate::tcp_transport::TlsTrust,
+    auth_key: &[u8],
+) -> std::result::Result<Duration, String> {
+    probe_connect(addr, sni, trust, auth_key).await
+}
+
 /// 启动常驻探测任务（随 ProxyServer::start 调用）。
 ///
 /// 探测走完整链路（TCP+TLS+Noise-PSK，证书 pinning 与主链路一致）；`traffic`

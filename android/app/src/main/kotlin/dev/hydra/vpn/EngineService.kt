@@ -116,6 +116,31 @@ class EngineService : Service() {
                     EngineState.addLog("✓ 引擎已就绪，监听 ${addr ?: "未知"}——浏览器代理指向该地址即可")
                     updateNotification()
                     pollStats()
+                    // §6 连通性自检（自动）：引擎就绪 ≠ 节点可达，显式验证
+                    scope.launch {
+                        delay(500)
+                        val first = cfg.nodesText.lines().map { it.trim() }
+                            .filter { it.isNotEmpty() }.firstOrNull() ?: return@launch
+                        val r = runCatching {
+                            withContext(Dispatchers.IO) {
+                                val t = if (cfg.trustMode == SecureStore.TRUST_CA) {
+                                    TrustMode.PublicCa
+                                } else {
+                                    TrustMode.Pinned(listOf(
+                                        android.util.Base64.decode(cfg.certDerB64, android.util.Base64.DEFAULT)))
+                                }
+                                uniffi.hydra_android.testNodeConnection(
+                                    first, cfg.authKeyHex, t, cfg.sni.ifEmpty { null })
+                            }
+                        }
+                        r.fold(onSuccess = { res ->
+                            if (res.ok) {
+                                EngineState.addLog("节点连通 ✓ ${res.latencyMs}ms（${first}）")
+                            } else {
+                                EngineState.addLog("⚠ 节点连通失败：${res.detail}——浏览器将无法出网，请换节点或查网络")
+                            }
+                        }, onFailure = { EngineState.addLog("⚠ 连通性测试异常：${it.message}") })
+                    }
                 } catch (e: Exception) {
                     runCatching { eng.close() }
                     EngineState.addLog("✗ 启动失败：${e.message}")
@@ -242,6 +267,15 @@ class EngineService : Service() {
                 PendingIntent.getActivity(
                     this, 0,
                     Intent(this, MainActivity::class.java),
+                    PendingIntent.FLAG_IMMUTABLE,
+                ),
+            )
+            // 设计 §7：通知常驻可控——无需回应用内即可停止
+            .addAction(
+                0, "停止",
+                PendingIntent.getService(
+                    this, 1,
+                    Intent(this, EngineService::class.java).setAction(ACTION_STOP),
                     PendingIntent.FLAG_IMMUTABLE,
                 ),
             )
