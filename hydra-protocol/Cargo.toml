@@ -18,4 +18,4 @@ ring = { workspace = true }
 # V3.2 Noise-PSK 握手 v2：Noise_NNpsk2_25519_ChaChaPoly_SHA256。
 # snow 0.9 的 ring-resolver 绑 ring 0.17；rustls 0.23（Wave 3 起，R-46/N-09 关账）
 # 也统一走 ring 0.17 —— 全工作区 ring 单版本。
-snow = { version = "0.9", default-features = false, features = ["default-resolver", "ring-resolver"] }
+snow = { version = "0.10", default-features = false, features = ["default-resolver", "ring-resolver"] }
