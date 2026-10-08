@@ -50,6 +50,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Shapes
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -152,7 +153,13 @@ private fun HydraTheme(content: @Composable () -> Unit) {
     } else {
         MaterialTheme.colorScheme
     }
-    MaterialTheme(colorScheme = scheme, content = content)
+    // §4 几何体系：状态主卡 20 / 普通卡与对话框 12 / 按钮 14
+    val shapes = Shapes(
+        small = RoundedCornerShape(8.dp),
+        medium = RoundedCornerShape(12.dp),
+        large = RoundedCornerShape(20.dp),
+    )
+    MaterialTheme(colorScheme = scheme, shapes = shapes, content = content)
 }
 
 private enum class Tab(val label: String) {
@@ -597,12 +604,21 @@ private fun NodesScreen(
         },
     ) { pad ->
         Column(Modifier.padding(pad).fillMaxSize()) {
+            Text(
+                "节点", style = MaterialTheme.typography.headlineSmall,
+                modifier = Modifier.padding(start = 16.dp, top = 16.dp, bottom = 4.dp),
+            )
             if (nodes.isEmpty()) {
                 Column(
                     Modifier.fillMaxWidth().padding(32.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
+                    Icon(
+                        Icons.Outlined.List, null,
+                        modifier = Modifier.size(48.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                     Text("还没有节点", style = MaterialTheme.typography.titleMedium)
                     Text(
                         "点击右下角「导入节点」：\n· 扫描桌面端分享二维码\n· 粘贴 hydra:// 分享链接\n· 手动输入 IP:端口",
