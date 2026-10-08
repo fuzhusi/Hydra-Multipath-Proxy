@@ -62,4 +62,4 @@ url = "2.5"
 bytes = { workspace = true }
 # R-42 测试缺口专项：真证书 PEM 路径 E2E 用 rcgen 生成 PEM 证书/私钥
 # （0.13 与 hydra-node 主依赖同版本，内部 ring 0.17 与全工作区对齐）
-rcgen = "0.13"
+rcgen = "0.14"
