@@ -103,7 +103,7 @@ jobs:
 
       - name: 上传构建产物（手动触发时，供下载测试）
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: hydra-windows-dist
           path: |
@@ -153,7 +153,7 @@ jobs:
 
       - name: 上传构建产物（手动触发时）
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: hydra-linux-dist
           path: hydra-linux-x64.tar.gz
