@@ -64,3 +64,23 @@ jobs:
       # -D warnings 防止新债务回流；纯机械项已修，行为类项见审查报告处置表）
       - name: cargo clippy --workspace（-D warnings 阻断）
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ── 安全扫描（S1/S2 安全评估落地：依赖漏洞 + 许可证 + 供应链门禁）────────
+  security-scan:
+    name: Security · audit/deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      # cargo-audit：Cargo.lock vs RustSec Advisory Database——已知 CVE 阻断
+      - name: cargo-audit（依赖漏洞扫描）
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # cargo-deny：许可证合规 + 禁用 crate + 多版本 + 来源检查
+      - name: cargo-deny（来源安全检查）
+        uses: EmbarkStudios/cargo-deny-action@v2

@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Rust 依赖漏洞扫描 + 自动升级 PR
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    reviewers:
+      - fuzhusi
+  # GitHub Actions 版本检查
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

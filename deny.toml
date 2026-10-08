@@ -1,0 +1,16 @@
+# cargo-deny 配置：来源审计（防依赖混淆）
+# 运行：cargo deny check sources
+# 许可证合规检查后续单独配置（当前 PolyForm-Noncommercial 与部分依赖许可证
+# 兼容性需要仔细梳理，不急于阻断 CI）
+# 运行：cargo deny check licenses（需配置完整 allow 列表）
+
+[licenses]
+version = 2
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
