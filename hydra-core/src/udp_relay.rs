@@ -256,26 +256,42 @@ where
                     target,
                     datagram,
                 } => {
-                    // 按 sid 反查 keyed 映射：sid 在本连接内唯一，存在即有效会话
-                    if !self.sessions.values().any(|e| e.sid == session_id) {
-                        tracing::debug!(
-                            "UDP 下行帧 sid 无本地映射（会话已关/迟到帧），丢弃: {}",
-                            mask_target(&target)
-                        );
-                        continue;
+                    // 按 sid 反查 keyed 映射，并校验帧内 target 与键内绑定一致
+                    //（09-P2-2 加固在 keyed 路径的等价实现：被入侵节点不可把
+                    // 会话 A 的数据报伪装成会话 B 的目标——sid 顺序分配可猜，
+                    // target 归属校验是实际防线）
+                    let found = self
+                        .sessions
+                        .iter_mut()
+                        .find(|(_, e)| e.sid == session_id)
+                        .map(|(k, e)| {
+                            e.last_used = std::time::Instant::now();
+                            k.split('\u{1f}').nth(1).unwrap_or(k).to_string()
+                        });
+                    match found {
+                        Some(bound_target) if bound_target == target => {
+                            return Ok(UdpRx::Data {
+                                sid: session_id,
+                                target,
+                                datagram,
+                            });
+                        }
+                        Some(bound_target) => {
+                            tracing::debug!(
+                                "UDP 下行帧 target 与流绑定不一致（期望 {}，实际 {}），丢弃",
+                                mask_target(&bound_target),
+                                mask_target(&target)
+                            );
+                            continue;
+                        }
+                        None => {
+                            tracing::debug!(
+                                "UDP 下行帧 sid 无本地映射（会话已关/迟到帧），丢弃: {}",
+                                mask_target(&target)
+                            );
+                            continue;
+                        }
                     }
-                    // touch 活跃时间（LRU 计入下行）
-                    if let Some((_, e)) =
-                        self.sessions.iter_mut().find(|(_, e)| e.sid == session_id)
-                    {
-                        e.last_used = std::time::Instant::now();
-                    }
-                    // target 取帧内目标——节点回显本端发送的目标，即流的 dst
-                    return Ok(UdpRx::Data {
-                        sid: session_id,
-                        target,
-                        datagram,
-                    });
                 }
                 UdpFrame::Close { session_id } => {
                     // 解除 keyed 映射（键含流键，按 sid 反查后整键删除）

@@ -1472,6 +1472,9 @@ async fn udp_relay_task(
             }
             Err(e) => {
                 warn!("TUN UDP 中继建连失败（{}s 后重试）: {}", backoff.as_secs(), e);
+                // 清空积压的上行命令（UDP 语义允许丢包）——分发循环在通道不可用
+                // 期间持续投递，无界通道会随流量无限积压内存
+                while cmd_rx.try_recv().is_ok() {}
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
                     _ = tokio::time::sleep(backoff) => {}
@@ -1534,6 +1537,7 @@ async fn udp_relay_task(
         }
         // 3. 断线退避后重连（flows 随通道作废：sid 空间在新通道重新分配）
         drop(ch);
+        while cmd_rx.try_recv().is_ok() {} // 清空断连期间积压的上行（UDP 语义）
         tokio::select! {
             _ = shutdown.cancelled() => return,
             _ = tokio::time::sleep(backoff) => {}

@@ -95,11 +95,22 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (Build.VERSION.SDK_INT >= 33 &&
-            ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
-            android.content.pm.PackageManager.PERMISSION_GRANTED
-        ) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+        val wanted = buildList {
+            if (Build.VERSION.SDK_INT >= 33 &&
+                ActivityCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+            // 扫码导入分享二维码的前置条件（zxing CaptureActivity 不代请求）
+            if (ActivityCompat.checkSelfPermission(this@MainActivity, Manifest.permission.CAMERA) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                add(Manifest.permission.CAMERA)
+            }
+        }
+        if (wanted.isNotEmpty()) {
+            requestPermissions(wanted.toTypedArray(), 1)
         }
         setContent { HydraTheme { HydraApp() } }
     }
@@ -150,8 +161,12 @@ private fun HydraApp() {
         try {
             val p = parseShareText(text.trim())
             val cur = store.load()
+            // 合并而非替换：手动添加的节点不因导入丢失；链接节点去重后追加
+            val existing = cur.nodesText.lines().map { it.trim() }.filter { it.isNotEmpty() }
+            val mergedNodes = (existing + p.nodes.filter { it !in existing })
+                .joinToString("\n")
             val merged = cur.copy(
-                nodesText = p.nodes.joinToString("\n"),
+                nodesText = mergedNodes,
                 authKeyHex = p.authKeyHex.ifEmpty { cur.authKeyHex },
                 certDerB64 = p.certDerB64.ifEmpty { cur.certDerB64 },
             )

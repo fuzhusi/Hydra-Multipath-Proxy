@@ -168,6 +168,16 @@ class EngineService : Service() {
         engine?.let { runCatching { it.stop() }; runCatching { it.close() } }
         engine = null
         scope.cancel()
+        // 系统回收服务（非用户停止路径）也要复位状态——否则 UI 残留"运行中"
+        // 而引擎已死，用户误以为代理仍在工作
+        EngineState.update {
+            it.copy(
+                running = false, transition = null, boundAddr = null,
+                sentBytes = 0, receivedBytes = 0, activeConns = 0,
+                totalConns = 0, uptimeSecs = 0,
+            )
+        }
+        EngineState.addLog("服务已回收，引擎停止")
         super.onDestroy()
     }
 

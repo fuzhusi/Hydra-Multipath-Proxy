@@ -23,15 +23,23 @@ import androidx.security.crypto.MasterKey
  */
 class SecureStore(context: Context) {
 
-    private val prefs: SharedPreferences = EncryptedSharedPreferences.create(
-        context,
-        FILE_NAME,
-        MasterKey.Builder(context)
-            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-            .build(),
-        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-    )
+    private val prefs: SharedPreferences = try {
+        EncryptedSharedPreferences.create(
+            context,
+            FILE_NAME,
+            MasterKey.Builder(context)
+                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                .build(),
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+        )
+    } catch (e: Exception) {
+        // 部分厂商 ROM 的 Keystore 损坏会让 EncryptedSharedPreferences 创建
+        // 持续抛异常（启动即崩溃循环）——降级普通存储保可用性：应用沙箱 +
+        // allowBackup=false 仍是底线，但不再对抗本机 root（日志明确留痕）
+        android.util.Log.w("HydraSecureStore", "加密存储不可用，降级普通存储: $e")
+        context.getSharedPreferences("${FILE_NAME}_fallback", Context.MODE_PRIVATE)
+    }
 
     /** 一次性读出全部配置（UI 表单回填与服务端启动共用）。 */
     fun load(): HydraConfig = HydraConfig(
