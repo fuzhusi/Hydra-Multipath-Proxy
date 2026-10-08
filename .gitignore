@@ -33,3 +33,4 @@ hydra-node-key.der
 reg.log
 android/scripts/android/
 android/app/build/
+hydra-android-m1-debug.apk
