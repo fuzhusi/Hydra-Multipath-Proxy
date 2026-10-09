@@ -23,10 +23,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        # 固定 ubuntu-24.04：ubuntu-latest 标签 2026-10-19 起迁移到 Ubuntu 26
+        # （runner-images#14748），待 26 稳定后有意升级，避免迁移期构建漂移
+        os: [windows-latest, ubuntu-24.04]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Rust 工具链（版本以 rust-toolchain / Cargo.lock MSRV 为准，缺省 stable）
       - name: 安装 Rust 工具链
@@ -36,7 +38,7 @@ jobs:
 
       # 依赖缓存：按 Cargo.lock 哈希，避免重复拉取 crates
       - name: 缓存 cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -68,19 +70,27 @@ jobs:
   # ── 安全扫描（S1/S2 安全评估落地：依赖漏洞 + 许可证 + 供应链门禁）────────
   security-scan:
     name: Security · audit/deny
-    runs-on: ubuntu-latest
+    # 与 build 矩阵同款固定 24.04（ubuntu-latest 将迁 Ubuntu 26，见上注释）
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
 
-      # cargo-audit：Cargo.lock vs RustSec Advisory Database——已知 CVE 阻断
-      - name: cargo-audit（依赖漏洞扫描）
-        uses: rustsec/audit-check@v2
+      # cargo-audit：Cargo.lock vs RustSec Advisory Database——已知 CVE 阻断。
+      # （改用 CLI 直装：rustsec/audit-check@v2 action 有「Unexpected end of
+      # JSON input」已知故障——包装层对 advisory DB 的空/畸形响应直接崩溃且
+      # 会掩盖真实漏洞报告；taiki-e/install-action 秒级装预编译二进制）
+      - name: 安装 cargo-audit（预编译二进制）
+        uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+
+      - name: cargo-audit（依赖漏洞扫描）
+        run: cargo audit
 
       # cargo-deny：许可证合规 + 禁用 crate + 多版本 + 来源检查
+      # （容器化 action，无 Node 运行时依赖）
       - name: cargo-deny（来源安全检查）
         uses: EmbarkStudios/cargo-deny-action@v2
