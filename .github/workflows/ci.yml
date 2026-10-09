@@ -38,7 +38,7 @@ jobs:
 
       # 依赖缓存：按 Cargo.lock 哈希，避免重复拉取 crates
       - name: 缓存 cargo
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
