@@ -1,0 +1,10 @@
+# cargo-audit CLI 配置（CI security-scan 步骤读取）。
+# unmaintained 类 advisory 默认即 warning（不阻断），此处只维护漏洞豁免表。
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0257：webbrowser < 1.2.2 Unix `BROWSER` 参数注入。
+    # 理由与缓解事实见 deny.toml [advisories] ignore 同条目（GUI 仅发布
+    # Windows 产物，发布产物不含 Unix 漏洞路径；根治待 eframe/egui 升级）。
+    "RUSTSEC-2026-0257",
+]

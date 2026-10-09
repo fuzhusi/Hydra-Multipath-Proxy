@@ -91,6 +91,9 @@ jobs:
         run: cargo audit
 
       # cargo-deny：许可证合规 + 禁用 crate + 多版本 + 来源检查
-      # （容器化 action，无 Node 运行时依赖）
+      # （容器化 action，无 Node 运行时依赖。范围限定 advisories/bans/sources
+      # ——licenses 按 deny.toml 注释计划后续单独配置，暂不纳入阻断）
       - name: cargo-deny（来源安全检查）
         uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans sources

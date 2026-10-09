@@ -10,6 +10,26 @@ version = 2
 [bans]
 multiple-versions = "warn"
 
+# 依赖漏洞告警：真实漏洞阻断（vulnerability 默认 deny）；维护状态提示不阻断
+[advisories]
+version = 2
+# unmaintained = 生态维护状态提示（非漏洞），Scope 枚举（all/transitive/
+# workspace/none）：derivative/instant/paste/proc-macro-error/rustls-pemfile
+# 均为 eframe 0.27 与 thiserror 1 生态的传递依赖，当前无可用升级，随依赖
+# 生态升级自然消除——置 none 不阻断 CI（deny-cli 版本 0.18+ 的 v2 配置里
+# 该字段是作用域而非严重级别）
+unmaintained = "none"
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2026-0257：webbrowser < 1.2.2 Unix `BROWSER` 参数注入。
+    # 传递依赖链 egui-winit 0.27 → webbrowser 0.8.x（semver 锁定，无法单独
+    # `cargo update` 到 1.2.2）。缓解事实：漏洞代码在 src/unix.rs，本项目
+    # GUI 仅发布 Windows 产物（Windows 启动路径不受影响）；Linux 产物仅
+    # hydra-node（不依赖 eframe/webbrowser）——**发布产物不含漏洞路径**。
+    # 根治 = 升级 eframe/egui（已列入 CHANGELOG 待开发计划），届时移除本条。
+    "RUSTSEC-2026-0257",
+]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

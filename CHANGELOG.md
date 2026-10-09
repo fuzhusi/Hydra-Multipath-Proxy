@@ -11,6 +11,7 @@
 |---|---|---|---|
 | P1 | Android kill switch | VPN 断连阻断全部出站流量（防泄漏） | VpnService API 直接支持 |
 | P1 | Android always-on VPN | 系统设置"始终开启"+ 开机自启 | 同上 |
+| P2 | **eframe/egui 升级（0.27 → 0.33+）** | 根治 RUSTSEC-2026-0257（webbrowser Unix 参数注入，当前已评估豁免：发布产物为 Windows GUI，不含漏洞路径）+ 清除 unmaintained 传递依赖群（instant/derivative 等）；21 文件 GUI 需适配 API 变更 | 专门会话，升级后逐页目检 |
 | P2 | Android 分应用代理 | 白名单/黑名单（VpnService addDisallowedApplication） | 同上 |
 | P2 | V3.3 rekey 密钥轮换 | TLS 1.3 KeyUpdate 或应用层重协商；长连接密钥定期更换 | 协议层设计 + 两端同步升级 |
 | P3 | GUI main.rs 模块化拆分 | 6331 行 → 12+ 模块（palette/groups/windows_proxy/theme/pages/*） | 专门会话，一次一模块+编译验证 |
