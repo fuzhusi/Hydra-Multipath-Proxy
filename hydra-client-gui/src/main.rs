@@ -213,8 +213,18 @@ struct HydraApp {
 
 #[tokio::main]
 async fn main() -> eframe::Result<()> {
-    // 初始化日志
-    tracing_subscriber::fmt::init();
+    // 初始化日志：HYDRA_LOG_LEVEL（默认 info；RUST_LOG 优先）——与 CLI/节点
+    // 同款（应用内日志页之外，内部组件的 tracing 诊断也写 stderr 供排查；
+    // info 级安全：目标地址已在日志层脱敏）
+    {
+        use tracing_subscriber::EnvFilter;
+        let level = std::env::var("HYDRA_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+        let filter = match EnvFilter::try_from_default_env() {
+            Ok(f) => f,
+            Err(_) => EnvFilter::try_new(&level).unwrap_or_else(|_| EnvFilter::new("info")),
+        };
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     // 09-P3-5：双实例互斥——双 GUI 实例会并发写配置、互相抢系统代理开关状态。
     // 守卫存到 main 作用域直至退出。async main 里用阻塞 bind 可接受（一次性、
