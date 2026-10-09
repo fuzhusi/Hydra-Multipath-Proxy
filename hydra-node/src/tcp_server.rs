@@ -35,7 +35,8 @@ use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
-/// 认证阶段超时（版本字节 + 握手 + 地址帧共用；与 QUIC 路径 AUTH_TIMEOUT 同级）
+/// 认证阶段超时（版本字节 + TLS 握手 + Noise 握手三段共用；**地址帧等待已改用
+/// 连接空闲看门狗 `idle`**——Noise 后已认证与转发期同信任级别，见第 4 步）
 const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// TLS 握手超时（审查：认证前 slowloris 防护——握手阶段此前无任何超时，
 /// 慢速滴入 ClientHello 可无限期占用连接额度）

@@ -49,11 +49,12 @@
 
         <!-- M1：前台服务持有引擎（启停经 Intent action；不对外导出）。
              specialUse：本地代理引擎为长驻数据面，dataSync 的 Android 15+
-             6h 超时会杀死引擎 -->
+             6h 超时会杀死引擎；保留 dataSync 供 API 29-33 设备 startForeground
+             类型匹配（34- 不校验，声明仅为语义完备） -->
         <service
             android:name=".EngineService"
             android:exported="false"
-            android:foregroundServiceType="specialUse">
+            android:foregroundServiceType="specialUse|dataSync">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Local proxy engine: long-lived SOCKS/HTTP data plane for user-configured apps" />
@@ -65,7 +66,7 @@
             android:name=".HydraVpnService"
             android:exported="false"
             android:permission="android.permission.BIND_VPN_SERVICE"
-            android:foregroundServiceType="specialUse">
+            android:foregroundServiceType="specialUse|dataSync">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>

@@ -1020,7 +1020,7 @@ private fun SettingsScreen(cfg: HydraConfig, onPersist: (HydraConfig) -> Unit) {
                 )
                 SettingSwitchRow(
                     title = "开机自动启动 VPN",
-                    desc = "重启后自动连接（需已授权过 VPN）。Android 15+ 可能限制自启，可靠方案是下方系统 Always-on",
+                    desc = "重启后自动连接（需已授权过 VPN）。更可靠的是下方系统 Always-on（OS 级强制，含屏蔽无 VPN 网络）",
                     checked = cfg.vpnBootStart,
                     onChange = { onPersist(cfg.copy(vpnBootStart = it)) },
                 )
@@ -1065,8 +1065,8 @@ private fun SettingsScreen(cfg: HydraConfig, onPersist: (HydraConfig) -> Unit) {
                     val allowEmpty = cfg.appFilterMode == SecureStore.APP_FILTER_ALLOW && pkgCount == 0
                     Text(
                         when {
-                            allowEmpty -> "⚠ 白名单为空：不会有任何应用流量走 VPN——请先「选择应用」"
-                            pkgCount > 0 -> "已选 $pkgCount 个应用"
+                            allowEmpty -> "⚠ 白名单为空：当前等同全部应用走 VPN——请「选择应用」以收敛范围"
+                            pkgCount > 0 -> "已选 $pkgCount 个应用（已卸载的应用自动剔除）"
                             else -> "尚未选择应用"
                         },
                         style = MaterialTheme.typography.bodySmall,

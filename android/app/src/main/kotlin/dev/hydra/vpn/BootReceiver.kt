@@ -10,9 +10,8 @@ import android.net.VpnService
  * VPN。约束与语义：
  * - 仅 VPN 模式且已授权过（consent 持久化后 `VpnService.prepare` 返回 null）
  *   才静默启动；未授权静默跳过（开屏后由用户手动启动走正常授权流程）；
- * - Android 15+ 对 BOOT_COMPLETED 启动 dataSync 前台服务有限制——失败仅记
- *   日志不崩溃；**可靠的 Always-on 路径是系统设置**（系统自行拉起 VpnService，
- *   免疫该限制），设置页提供深链引导；
+ * - Android 15+ 曾限制 BOOT_COMPLETED 启动 dataSync 前台服务；服务已改
+ *   specialUse 类型（豁免该限制且无 6h 超时），启动失败仅兜底记日志不崩溃；
  * - intent action 显式用 [HydraVpnService.ACTION_START]（未知 action 不得
    被 service 当启动——见启停修复记录）。
  */

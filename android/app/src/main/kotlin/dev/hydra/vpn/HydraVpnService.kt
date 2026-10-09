@@ -107,13 +107,14 @@ class HydraVpnService : VpnService() {
 
         // 看门狗：仅守首轮建立（establish/FFI pathological 挂起兜底——阻塞 JNI
         // 无法被协程取消，只能由独立线程兜底）。kill switch 重连等待（"隧道中断"
-        // 态）由重连循环自管退避，重连循环存活期间看门狗不得干扰
+        // 态）由重连循环自管退避，看门狗跳过——判定依据是 transition，**不能**
+        // 用 retryJob.isActive（首轮挂起时 retryJob 恰是被卡协程，恒 active，
+        // 看门狗会因此永不触发）
         Thread {
             Thread.sleep(20_000)
             val t = EngineState.ui.value
             if (generation.get() == gen && !t.running
-                && !t.transition.orEmpty().startsWith("隧道中断")
-                && retryJob?.isActive != true) {
+                && !t.transition.orEmpty().startsWith("隧道中断")) {
                 runCatching { stopVpn() }
                 EngineState.addLog("✗ VPN 启动超时（20s）已中止——请重试")
                 EngineState.update {
@@ -138,6 +139,11 @@ class HydraVpnService : VpnService() {
                     } + "）"
             )
 
+            // 本代黑洞 TUN 的**本地**引用（声明在 try 外——Kotlin finally 不可见
+            // try 内局部变量）：finally 只关本代实例——若旧代被取消时新代已写入
+            // 共享字段，旧代 finally 关共享字段会误杀新代黑洞（直连泄漏而 UI
+            // 声称已阻断）
+            var myHold: ParcelFileDescriptor? = null
             try {
                 // 配置预校验：配置类错误直接「启动失败」，不进 kill switch 重连
                 // （重连修复不了配置错误；且 Rust 校验失败发生在 fd 接管之前，
@@ -153,6 +159,7 @@ class HydraVpnService : VpnService() {
                 }
 
                 var attempt = 0
+                var configFatal = false // Rust InvalidConfig：配置终态，不进重连
                 while (true) {
                     if (userStopRequested || generation.get() != gen) return@launch
                     attempt++
@@ -203,6 +210,11 @@ class HydraVpnService : VpnService() {
                             onFailure = { e ->
                                 // 取消异常必须穿透（superseded 兜底之外的正确语义）
                                 if (e is kotlinx.coroutines.CancellationException) throw e
+                                // 配置类错误是**终态**：kill switch 重连修复不了配置
+                                // （Rust 解析权威——预校验漏过的域名节点等在此落地）
+                                if (e is uniffi.hydra_android.HydraEngineException.InvalidConfig) {
+                                    configFatal = true
+                                }
                                 failMsg = e.message
                             },
                         )
@@ -214,7 +226,7 @@ class HydraVpnService : VpnService() {
                     runCatching { stopVpn() } // 清 Rust 态并释放失败尝试的 fd
 
                     val superseded = userStopRequested || generation.get() != gen
-                    if (!cfg.vpnKillSwitch || superseded) {
+                    if (!cfg.vpnKillSwitch || superseded || configFatal) {
                         if (!superseded) {
                             EngineState.update {
                                 it.copy(running = false, transition = "启动失败：$msg")
@@ -226,18 +238,19 @@ class HydraVpnService : VpnService() {
                     }
 
                     // ── kill switch：黑洞 TUN 保持阻断 + 退避重连 ──
-                    // 保持全接管路由的 TUN 不被消费 = 应用流量持续被阻断、零泄漏；
-                    // 用户显式停止才恢复直连。
+                    // 保持全接管路由的 TUN 不被消费 = 应用流量持续被阻断、防真实
+                    // IP 泄漏；用户显式停止才恢复直连。
                     // 顺序权衡：先释放旧黑洞再建新黑洞（毫秒级直连窗口）。若反过来
                     // 「先建后放」依赖系统同应用原子替换 VPN，部分 OEM 可能误触发
                     // onRevoke 导致服务被拆——保守取当前顺序，毫秒窗口记为已知边界
-                    holdTun = establish(cfg)
-                    if (holdTun == null && cfg.appFilterMode != SecureStore.APP_FILTER_ALL) {
+                    myHold = establish(cfg)
+                    if (myHold == null && cfg.appFilterMode != SecureStore.APP_FILTER_ALL) {
                         // 分应用过滤 TUN 建立失败（如含失效包名）：回退全量阻断
                         // ——kill switch 语义「阻断永不回退到直连」
                         EngineState.addLog("⚠ 分应用过滤建立失败——回退全量阻断（防泄漏优先）")
-                        holdTun = establish(cfg.copy(appFilterMode = SecureStore.APP_FILTER_ALL))
+                        myHold = establish(cfg.copy(appFilterMode = SecureStore.APP_FILTER_ALL))
                     }
+                    holdTun = myHold // 停止路径可见（stopVpnLocal 立即关闭恢复直连）
                     val backoff = ((3_000L shl (attempt - 1).coerceAtMost(4))
                         .coerceAtMost(30_000L)) + (0..999L).random()
                     val waitSec = (backoff / 1000).toInt()
@@ -256,8 +269,13 @@ class HydraVpnService : VpnService() {
                     delay(backoff)
                 }
             } finally {
-                // 一切退出路径（成功/停止/取消/新一轮启动）都不得遗留黑洞 TUN
-                releaseHoldTun()
+                // 一切退出路径（成功/停止/取消/新一轮启动）都不得遗留**本代**黑洞：
+                // 只关本地引用；共享字段仅在本代仍持有时置空——旧代 finally 不得
+                // 误杀新代已写入的黑洞（跨代竞态修复）
+                myHold?.let { runCatching { it.close() } }
+                if (holdTun === myHold) {
+                    holdTun = null
+                }
             }
         }
     }
@@ -295,7 +313,10 @@ class HydraVpnService : VpnService() {
 
     /** 配置预校验：返回 null = 可尝试启动；非 null = 用户可修复的错误文案。
      *  配置类错误不进 kill switch 重连（重连修复不了配置；且 Rust 校验失败
-     *  发生在 fd 接管之前，重试每轮泄漏 1 个 fd）。与 Rust 校验对齐。 */
+     *  发生在 fd 接管之前，重试每轮泄漏 1 个 fd）。
+     *  快速路径与 Rust 对齐：v4 用系统正则、v6 必须方括号形态（Rust
+     *  SocketAddr 标准解析形态）；**Rust 解析仍是权威**——此处漏过的配置
+     *  错误由下方 InvalidConfig 终态兜底（不进重连循环）。 */
     private fun validateVpnConfig(cfg: HydraConfig): String? {
         if (cfg.nodesText.isBlank()) return "未配置节点——请先到「节点」页导入"
         val hasParsableNode = cfg.nodesText.lines()
@@ -304,12 +325,17 @@ class HydraVpnService : VpnService() {
             .any { node ->
                 runCatching {
                     val port = node.substringAfterLast(':').toInt()
-                    val host = node.removePrefix("[").substringBefore("]")
-                    host.isNotEmpty() && port in 1..65535
+                    if (port !in 1..65535) return@runCatching false
+                    if (node.startsWith("[")) {
+                        true // v6 方括号形态（Rust SocketAddr 标准解析）
+                    } else {
+                        val host = node.substringBeforeLast(':')
+                        android.util.Patterns.IP_ADDRESS.matcher(host).matches()
+                    }
                 }.getOrDefault(false)
             }
         if (!hasParsableNode) {
-            return "节点地址均无法解析（M2 暂不支持域名节点，需 IP:port）"
+            return "节点地址均无法解析（M2 暂不支持域名节点，需 IP:port，IPv6 用 [..]:port）"
         }
         val keyOk = cfg.authKeyHex.length == 64 &&
             cfg.authKeyHex.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }

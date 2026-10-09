@@ -7,18 +7,19 @@
 
 ## [待开发计划]（按优先级排序，非当前 Unreleased）
 
+> 2026-10-09 更新：kill switch / always-on 开机自启 / 分应用代理 / GUI 模块化
+> 拆分 / 托盘菜单禁用态 / Prometheus metrics 均已交付（见下方 Unreleased 与
+> [README](README.md) 开发路线），从本表移除。
+
 | 优先级 | 项 | 说明 | 前置条件 |
 |---|---|---|---|
-| P1 | Android kill switch | VPN 断连阻断全部出站流量（防泄漏） | VpnService API 直接支持 |
-| P1 | Android always-on VPN | 系统设置"始终开启"+ 开机自启 | 同上 |
+| P1 | 温命中 e2e 回归测试 | 守住节点侧"地址帧等待 10s→300s"与客户端池 60s TTL 的耦合（hydra-client/tests 既有 spawn_node 基建，闲置 11-12s 后 checkout 仍成功） | — |
 | P2 | **eframe/egui 升级（0.27 → 0.33+）** | 根治 RUSTSEC-2026-0257（webbrowser Unix 参数注入，当前已评估豁免：发布产物为 Windows GUI，不含漏洞路径）+ 清除 unmaintained 传递依赖群（instant/derivative 等）；21 文件 GUI 需适配 API 变更 | 专门会话，升级后逐页目检 |
-| P2 | Android 分应用代理 | 白名单/黑名单（VpnService addDisallowedApplication） | 同上 |
-| P2 | V3.3 rekey 密钥轮换 | TLS 1.3 KeyUpdate 或应用层重协商；长连接密钥定期更换 | 协议层设计 + 两端同步升级 |
-| P3 | GUI main.rs 模块化拆分 | 6331 行 → 12+ 模块（palette/groups/windows_proxy/theme/pages/*） | 专门会话，一次一模块+编译验证 |
+| P2 | VPN 数据面死亡感知 | run_stack 罕见路径中途退出时经回调通知 Kotlin 触发 kill switch 重连（当前 UI 停留"运行中"） | Rust→Kotlin 回调 FFI |
+| P3 | 连接池周期清扫 | 永不 checkout 的节点温连接条目滞留客户端（≤2×节点数，节点侧 300s 自行释放） | — |
 | P3 | Windows 开机自启 + TUN | 注册表自启 + UAC 免提示 | — |
-| P3 | 托盘菜单禁用态 | tray setEnabled（五项攻坚遗留 P2） | — |
-| P4 | 多节点并行下载 | 需独立下载器形态（CONNECT 隧道字节不透明，代理内无法实现） | 产品决策 |
-| P4 | 节点监控面板 | Prometheus metrics 导出 | — |
+| P4 | 多节点并行下载 | **需产品决策**：独立下载器形态（CLI/GUI、断点续传）——CONNECT 隧道字节不透明，代理内无法实现 | 产品决策 |
+| P4 | rekey 密钥轮换 | V3.3；TLS 1.3 每连接独立密钥已绑住单连接暴露面 | 随多路径协议恢复设计 |
 
 ### rekey 密钥轮换（V3.3）设计草案
 

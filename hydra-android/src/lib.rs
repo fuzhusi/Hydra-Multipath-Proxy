@@ -297,11 +297,6 @@ pub fn start_vpn(
     protect: Box<dyn SocketProtect>,
 ) -> Result<(), HydraEngineError> {
     let mut guard = VPN_STATE.lock().unwrap_or_else(|p| p.into_inner());
-    if guard.is_some() {
-        return Err(HydraEngineError::Start {
-            msg: "VPN 已在运行".into(),
-        });
-    }
 
     // R4：保护钩子进程级安装（首装生效）——出站连接 connect 前回调 protect(fd)
     {
@@ -310,12 +305,17 @@ pub fn start_vpn(
         let _ = hydra_core::socket_protect::set_socket_protect_hook(hook);
     }
 
-    // fd 接管必须先于一切配置校验：FdTransport 持有 fd 所有权（drop 关闭），
-    // 后续任何 `?` 错误路径都会连 fd 一起释放——否则校验失败的 Err 路径泄漏
-    // fd（Android 侧已 detach，无人认领），kill switch 重试场景下逐轮泄漏
+    // fd 接管必须先于一切**可失败路径**（含下方"已在运行"早退）：FdTransport
+    // 持有 fd 所有权（drop 关闭），任何 Err 返回都连 fd 一起释放——否则 Kotlin
+    // 已 detach 的 fd 无人认领（停止→立即重启竞态下逐次泄漏）
     let transport = FdTransport::new(tun_fd).map_err(|e| HydraEngineError::Start {
         msg: format!("tun fd 接管失败: {e}"),
     })?;
+    if guard.is_some() {
+        return Err(HydraEngineError::Start {
+            msg: "VPN 已在运行".into(),
+        });
+    }
 
     let addr4: std::net::Ipv4Addr =
         config
