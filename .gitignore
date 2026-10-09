@@ -30,6 +30,12 @@ hydra-node-cert.der
 hydra-node-key.der
 *.der
 *.pem
+# 探测/测试密钥（.probe/ 为本地 TLS 探测工件，含认证密钥）
+*.hex
+.probe/
+
+# ZCode 本地会话产物（计划/缓存，与仓库交付无关）
+.zcode/
 reg.log
 android/scripts/android/
 android/app/build/
