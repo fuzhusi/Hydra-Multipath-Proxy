@@ -310,6 +310,13 @@ pub fn start_vpn(
         let _ = hydra_core::socket_protect::set_socket_protect_hook(hook);
     }
 
+    // fd 接管必须先于一切配置校验：FdTransport 持有 fd 所有权（drop 关闭），
+    // 后续任何 `?` 错误路径都会连 fd 一起释放——否则校验失败的 Err 路径泄漏
+    // fd（Android 侧已 detach，无人认领），kill switch 重试场景下逐轮泄漏
+    let transport = FdTransport::new(tun_fd).map_err(|e| HydraEngineError::Start {
+        msg: format!("tun fd 接管失败: {e}"),
+    })?;
+
     let addr4: std::net::Ipv4Addr =
         config
             .addr4
@@ -359,10 +366,6 @@ pub fn start_vpn(
         .enable_all()
         .build()
         .map_err(|e| HydraEngineError::Start { msg: e.to_string() })?;
-
-    let transport = FdTransport::new(tun_fd).map_err(|e| HydraEngineError::Start {
-        msg: format!("tun fd 接管失败: {e}"),
-    })?;
 
     // opener/udp 工厂：复用 ProxyServer 的凭据与调度器（不 start——不监听本地端口）
     let proxy = hydra_core::proxy::ProxyServer::new("127.0.0.1:0".parse().unwrap())

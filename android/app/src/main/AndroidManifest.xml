@@ -7,6 +7,22 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- M2.1 开机自启（设置页开关，默认关） -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- M2.1 FGS specialUse（VPN 数据面）：dataSync 在 Android 15+ 有 6h/24h
+         超时强制停服（会击穿 kill switch）且 BOOT_COMPLETED 启动受限；
+         specialUse 无超时、不受 BOOT_COMPLETED 限制。仅侧载分发，无 Play 审核
+         负担；用途声明见 service 内 property -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <!-- M2.1 分应用代理应用选择器：Android 11+ 包可见性过滤——声明「有启动入口
+         的应用」可见性（免 QUERY_ALL_PACKAGES） -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
 
     <application
         android:label="@string/app_name"
@@ -31,23 +47,44 @@
             </intent-filter>
         </activity>
 
-        <!-- M1：前台服务持有引擎（启停经 Intent action；不对外导出） -->
+        <!-- M1：前台服务持有引擎（启停经 Intent action；不对外导出）。
+             specialUse：本地代理引擎为长驻数据面，dataSync 的 Android 15+
+             6h 超时会杀死引擎 -->
         <service
             android:name=".EngineService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Local proxy engine: long-lived SOCKS/HTTP data plane for user-configured apps" />
+        </service>
 
-        <!-- M2：全局 VPN（VpnService；系统要求 BIND_VPN_SERVICE 权限声明） -->
+        <!-- M2：全局 VPN（VpnService；系统要求 BIND_VPN_SERVICE 权限声明）。
+             specialUse：数据面 + kill switch 阻断路由必须无超时常驻 -->
         <service
             android:name=".HydraVpnService"
             android:exported="false"
             android:permission="android.permission.BIND_VPN_SERVICE"
-            android:foregroundServiceType="dataSync">
+            android:foregroundServiceType="specialUse">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Device-wide VPN data plane: maintains encrypted tunnel and kill-switch blocking routes" />
         </service>
 
         <!-- M2：VpnService 声明（engine 服务 + always-on）随 M2 加入 -->
+
+        <!-- M2.1 开机自启（BOOT_COMPLETED 为受保护广播，仅系统可发；
+             exported 必须为 true 才能收到系统广播） -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

@@ -47,6 +47,49 @@
     刚启动的引擎立即终止（防"UI 显示已停止而引擎仍在跑"的僵尸态；
     EngineService 的阻塞握手 `eng.start()` 返回后二次校验 generation）。
 
+## [Unreleased] - Android VPN 保护（kill switch + 开机自启 + 分应用代理）
+
+### 新增
+
+- **断线阻断（kill switch，默认开）**：隧道建立失败/中断时保持全接管路由的
+  「黑洞 TUN」（不消费 → 内核队列满丢弃 = 流量被阻断、真实 IP 零泄漏），
+  指数退避（3s→30s，含 jitter）自动重连；分应用过滤 TUN 建立失败时回退
+  全量阻断（阻断永不回退直连）。用户显式停止才恢复直连；首页/通知栏均展示
+  阻断与重试状态，重连期间「停止代理（重连中）」按钮保持可达。
+- **开机自动启动 VPN**（默认关）：BootReceiver（BOOT_COMPLETED → 已授权 +
+  已配置才静默拉起）；设置页开关。可靠的 Always-on 路径是系统设置（免一切
+  自启限制），设置页提供深链引导。
+- **分应用代理**：白名单（仅所选应用走 VPN）/ 黑名单（所选应用直连），
+  VpnService addAllowed/DisallowedApplication 实现；设置页模式切换 +
+  应用选择器（Manifest `<queries>` 声明包可见性，Android 11+ 可正常列出；
+  草稿式多选、「完成」一次持久化）。
+
+### 修复（随本批）
+
+- **[高] FGS dataSync → specialUse**：Android 15+ 对 dataSync 前台服务有
+  6h/24h 强制超时——会静默杀死 VPN/本地引擎并击穿 kill switch 承诺，且
+  BOOT_COMPLETED 启动受限（开机自启恒失败）。两个服务换 specialUse 类型
+  （用途声明入 Manifest），无超时、自启恢复可用；补 onTimeout 防御性收敛。
+- **[高] 配置错误 fd 泄漏**：Rust `start_vpn` 配置校验失败发生在 fd 接管
+  之前，Android 已 detach 的 fd 无人认领——kill switch 重试逐轮泄漏直至
+  fd 耗尽。双修复：fd 接管前移至一切校验之前（错误路径连 fd 一起释放）；
+  Kotlin 侧启动前预校验（节点 IP:port / 64 hex 密钥 / pin 证书非空），
+  配置类错误直接「启动失败」不进重连循环。
+- **[中] 失效包名防御**：分应用列表含已卸载包名时部分系统使 establish 持续
+  失败——建立前 PackageManager 校验剔除 + 失败回退全量黑洞。
+- 启动/停止竞态守卫补全（重连 UI 写入前复检 generation）；取消异常穿透；
+  onRevoke 补齐计数复位；看门狗与重连循环互斥。
+
+### 独立评审记录
+
+- 首轮评审 fail（4 P1 / 3 P2 / 7 P3），全部处置：包可见性（P1）→ Manifest
+  queries；fd 泄漏（P1）→ Rust 接管前移 + Kotlin 预校验；6h 超时（P1）→
+  specialUse；失效包名（P1）→ 校验剔除 + 全量回退。黑洞 TUN 保序（先放后建
+  的毫秒直连窗口）记为已知边界（反向依赖 OEM 原子替换行为，真机验证后再换）。
+- 真机验收清单见评审报告：kill switch 抓包（TCP 挂起超时/UDP 丢包/DNS 超时）、
+  分应用正反断连、卸载已选应用后重连、Android 15+ 6h 长跑与开机自启、
+  空配置启动路径、启停竞态连点。
+
 ## [0.2.2] - 2026-10-09
 
 ### 批次：节点侧 v4-only 降噪（DNS AAAA 本地过滤 + v4 优先建连）

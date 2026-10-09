@@ -15,6 +15,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -40,6 +41,8 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.outlined.List
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -441,8 +444,9 @@ private fun HomeScreen(
                 }
                 Text(
                     when {
-                        ui.running -> "运行中"
-                        ui.transition?.startsWith("启动失败") == true -> "启动失败"
+                    ui.running -> "运行中"
+                    ui.transition?.startsWith("隧道中断") == true -> "重连中"
+                    ui.transition?.startsWith("启动失败") == true -> "启动失败"
                         ui.transition != null -> "启动中…"
                         else -> "已停止"
                     },
@@ -450,6 +454,11 @@ private fun HomeScreen(
                 )
                 ui.transition?.takeIf { it.startsWith("启动失败") || it.startsWith("✗") }?.let {
                     Text(it, color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall)
+                }
+                // kill switch 中断态：阻断/重试详情在首页可见（不仅通知栏）
+                ui.transition?.takeIf { it.startsWith("隧道中断") }?.let {
+                    Text(it, color = MaterialTheme.colorScheme.primary,
                         style = MaterialTheme.typography.bodySmall)
                 }
                 if (ui.running) {
@@ -466,7 +475,9 @@ private fun HomeScreen(
 
         // ── 启停按钮 ──
         val busy = ui.running || (ui.transition != null && !ui.transition!!.startsWith("启动失败"))
-        if (ui.running) {
+        // kill switch 重连等待期：必须保持「停止」可达（用户停止 = 结束重连恢复直连）
+        val retrying = ui.transition?.startsWith("隧道中断") == true
+        if (ui.running || retrying) {
             Button(
                 onClick = onStop,
                 modifier = Modifier
@@ -477,7 +488,12 @@ private fun HomeScreen(
                     containerColor = MaterialTheme.colorScheme.errorContainer,
                     contentColor = MaterialTheme.colorScheme.onErrorContainer,
                 ),
-            ) { Text("■ 停止代理", fontSize = 16.sp) }
+            ) {
+                Text(
+                    if (retrying) "■ 停止代理（重连中）" else "■ 停止代理",
+                    fontSize = 16.sp,
+                )
+            }
         } else {
             Button(
                 onClick = onStart,
@@ -886,6 +902,7 @@ private fun SettingsScreen(cfg: HydraConfig, onPersist: (HydraConfig) -> Unit) {
         mutableStateOf(cfg.listenPort.takeIf { it != 0 }?.toString() ?: SecureStore.DEFAULT_PORT.toString())
     }
     var showKey by remember { mutableStateOf(false) }
+    var showAppPicker by remember { mutableStateOf(false) }
 
     val certPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri != null) {
@@ -992,6 +1009,75 @@ private fun SettingsScreen(cfg: HydraConfig, onPersist: (HydraConfig) -> Unit) {
             )
         }
 
+        // ── VPN 保护（M2.1：kill switch / 开机自启 / 分应用代理）──
+        if (cfg.runMode == SecureStore.MODE_VPN) {
+            Section("VPN 保护") {
+                SettingSwitchRow(
+                    title = "断线阻断（kill switch）",
+                    desc = "隧道中断时保持接管路由阻断全部流量并自动重连，防真实 IP 泄漏（推荐开启）",
+                    checked = cfg.vpnKillSwitch,
+                    onChange = { onPersist(cfg.copy(vpnKillSwitch = it)) },
+                )
+                SettingSwitchRow(
+                    title = "开机自动启动 VPN",
+                    desc = "重启后自动连接（需已授权过 VPN）。Android 15+ 可能限制自启，可靠方案是下方系统 Always-on",
+                    checked = cfg.vpnBootStart,
+                    onChange = { onPersist(cfg.copy(vpnBootStart = it)) },
+                )
+                OutlinedButton(onClick = {
+                    // 系统级 Always-on（免疫一切自启限制，OS 强制执行阻断）：
+                    // 深链到系统 VPN 设置页，用户开启「始终开启 + 屏蔽无 VPN 网络」
+                    runCatching {
+                        context.startActivity(
+                            Intent("android.net.vpn.SETTINGS")
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    }.recoverCatching {
+                        context.startActivity(
+                            Intent("android.settings.VPN_SETTINGS")
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    }.onFailure {
+                        Toast.makeText(context, "请到系统设置 → VPN 手动开启", Toast.LENGTH_LONG).show()
+                    }
+                }) { Text("系统 Always-on 设置（推荐开启）") }
+
+                Text("分应用代理", style = MaterialTheme.typography.titleSmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = cfg.appFilterMode == SecureStore.APP_FILTER_ALL,
+                        onClick = { onPersist(cfg.copy(appFilterMode = SecureStore.APP_FILTER_ALL)) },
+                        label = { Text("全部") },
+                    )
+                    FilterChip(
+                        selected = cfg.appFilterMode == SecureStore.APP_FILTER_ALLOW,
+                        onClick = { onPersist(cfg.copy(appFilterMode = SecureStore.APP_FILTER_ALLOW)) },
+                        label = { Text("白名单") },
+                    )
+                    FilterChip(
+                        selected = cfg.appFilterMode == SecureStore.APP_FILTER_DISALLOW,
+                        onClick = { onPersist(cfg.copy(appFilterMode = SecureStore.APP_FILTER_DISALLOW)) },
+                        label = { Text("黑名单") },
+                    )
+                }
+                if (cfg.appFilterMode != SecureStore.APP_FILTER_ALL) {
+                    val pkgCount = cfg.appFilterPkgs.split('\n', ',').count { it.isNotBlank() }
+                    val allowEmpty = cfg.appFilterMode == SecureStore.APP_FILTER_ALLOW && pkgCount == 0
+                    Text(
+                        when {
+                            allowEmpty -> "⚠ 白名单为空：不会有任何应用流量走 VPN——请先「选择应用」"
+                            pkgCount > 0 -> "已选 $pkgCount 个应用"
+                            else -> "尚未选择应用"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (allowEmpty) MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedButton(onClick = { showAppPicker = true }) { Text("选择应用") }
+                }
+            }
+        }
+
         Section("高级") {
             OutlinedTextField(
                 value = sni,
@@ -1032,6 +1118,125 @@ private fun SettingsScreen(cfg: HydraConfig, onPersist: (HydraConfig) -> Unit) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
+
+    // 分应用代理选择器（白/黑名单模式共享）：选择期仅改内存，「完成」一次持久化
+    if (showAppPicker) {
+        val selectedPkgs = cfg.appFilterPkgs.split('\n', ',')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .toSet()
+        AppPickerDialog(
+            mode = cfg.appFilterMode,
+            initialPkgs = selectedPkgs,
+            onDone = { pkgs ->
+                onPersist(cfg.copy(appFilterPkgs = pkgs.sorted().joinToString("\n")))
+                showAppPicker = false
+            },
+            onDismiss = { showAppPicker = false },
+        )
+    }
+}
+
+/** 开关行：标题 + 说明居左，Switch 居右（VPN 保护区专用） */
+@Composable
+private fun SettingSwitchRow(
+    title: String,
+    desc: String,
+    checked: Boolean,
+    onChange: (Boolean) -> Unit,
+) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(
+                desc,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(checked = checked, onCheckedChange = onChange)
+    }
+}
+
+/** 分应用代理应用选择器：列出有启动入口的用户应用（排除自身）；
+ *  选择期间仅改内存草稿，「完成」一次性持久化（避免逐项加密写盘）。 */
+@Composable
+private fun AppPickerDialog(
+    mode: Int,
+    initialPkgs: Set<String>,
+    onDone: (Set<String>) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    var apps by remember { mutableStateOf<List<Pair<String, String>>?>(null) } // null = 加载中
+    var draft by remember { mutableStateOf(initialPkgs) }
+    LaunchedEffect(Unit) {
+        apps = withContext(Dispatchers.IO) {
+            val pm = context.packageManager
+            runCatching {
+                pm.getInstalledPackages(0).mapNotNull { pi ->
+                    val pkg = pi.packageName
+                    // 排除自身与无启动入口的系统组件（分应用语义只对真实应用有意义）
+                    if (pkg == context.packageName) return@mapNotNull null
+                    if (pm.getLaunchIntentForPackage(pkg) == null) return@mapNotNull null
+                    val label = runCatching {
+                        pi.applicationInfo?.loadLabel(pm).toString()
+                    }.getOrDefault(pkg)
+                    pkg to label
+                }.sortedBy { it.second }
+            }.getOrDefault(emptyList())
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                if (mode == SecureStore.APP_FILTER_ALLOW) "选择走 VPN 的应用"
+                else "选择不走 VPN 的应用",
+            )
+        },
+        text = {
+            when {
+                apps == null -> Text("正在加载应用列表…", Modifier.padding(24.dp))
+                apps!!.isEmpty() -> Text(
+                    "未读到应用列表（系统包可见性受限）——已通过 Manifest queries 声明，" +
+                        "若仍为空请反馈机型",
+                    Modifier.padding(24.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                else -> LazyColumn(Modifier.height(420.dp)) {
+                    items(apps!!, key = { it.first }) { app ->
+                        val (pkg, label) = app
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    draft = if (pkg in draft) draft - pkg else draft + pkg
+                                }
+                                .padding(horizontal = 4.dp, vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Checkbox(
+                                checked = pkg in draft,
+                                onCheckedChange = {
+                                    draft = if (pkg in draft) draft - pkg else draft + pkg
+                                },
+                            )
+                            Text(
+                                label,
+                                Modifier.weight(1f),
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 1,
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onDone(draft) }) { Text("完成") }
+        },
+    )
 }
 
 @Composable

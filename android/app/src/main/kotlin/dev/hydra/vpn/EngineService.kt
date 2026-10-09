@@ -308,11 +308,22 @@ class EngineService : Service() {
 
     private fun startAsForeground(text: String) {
         val n: Notification = baseBuilder(text).build()
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        } else {
-            startForeground(NOTIF_ID, n)
+        when {
+            // 34+：specialUse（本地引擎为长驻数据面，dataSync 在 Android 15+
+            // 有 6h 超时会被系统杀死——见 Manifest）
+            Build.VERSION.SDK_INT >= 34 ->
+                startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            Build.VERSION.SDK_INT >= 29 ->
+                startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            else -> startForeground(NOTIF_ID, n)
         }
+    }
+
+    /** Android 15+ FGS 超时兜底（specialUse 不应触发；防御性收敛） */
+    override fun onTimeout(startId: Int) {
+        EngineState.addLog("⚠ 前台服务被系统超时回收——引擎已停止（请重新启动）")
+        stopEngine()
+        super.onTimeout(startId)
     }
 
     private fun updateNotification() {

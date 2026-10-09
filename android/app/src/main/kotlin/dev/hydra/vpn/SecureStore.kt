@@ -50,6 +50,10 @@ class SecureStore(context: Context) {
         certDerB64 = prefs.getString(KEY_CERT_B64, "").orEmpty(),
         listenPort = prefs.getInt(KEY_LISTEN_PORT, DEFAULT_PORT),
         runMode = prefs.getString(KEY_RUN_MODE, MODE_VPN).orEmpty(),
+        vpnKillSwitch = prefs.getBoolean(KEY_VPN_KILL_SWITCH, true),
+        vpnBootStart = prefs.getBoolean(KEY_VPN_BOOT_START, false),
+        appFilterMode = prefs.getInt(KEY_APP_FILTER_MODE, APP_FILTER_ALL),
+        appFilterPkgs = prefs.getString(KEY_APP_FILTER_PKGS, "").orEmpty(),
     )
 
     fun save(c: HydraConfig) {
@@ -61,6 +65,10 @@ class SecureStore(context: Context) {
             .putString(KEY_CERT_B64, c.certDerB64)
             .putInt(KEY_LISTEN_PORT, c.listenPort)
             .putString(KEY_RUN_MODE, c.runMode)
+            .putBoolean(KEY_VPN_KILL_SWITCH, c.vpnKillSwitch)
+            .putBoolean(KEY_VPN_BOOT_START, c.vpnBootStart)
+            .putInt(KEY_APP_FILTER_MODE, c.appFilterMode)
+            .putString(KEY_APP_FILTER_PKGS, c.appFilterPkgs)
             .apply()
     }
 
@@ -72,14 +80,23 @@ class SecureStore(context: Context) {
         private const val KEY_TRUST_MODE = "trust_mode"
         private const val KEY_CERT_B64 = "cert_der_b64"
         private const val KEY_LISTEN_PORT = "listen_port"
-    private const val KEY_RUN_MODE = "run_mode"
+        private const val KEY_RUN_MODE = "run_mode"
+        private const val KEY_VPN_KILL_SWITCH = "vpn_kill_switch"
+        private const val KEY_VPN_BOOT_START = "vpn_boot_start"
+        private const val KEY_APP_FILTER_MODE = "app_filter_mode"
+        private const val KEY_APP_FILTER_PKGS = "app_filter_pkgs"
 
         const val TRUST_PINNED = "pinned"
         const val TRUST_CA = "ca"
         const val DEFAULT_PORT = 1080
-    /** 运行模式：vpn = 全局 VPN（VpnService，M2）；local = 本地端口（浏览器代理） */
-    const val MODE_VPN = "vpn"
-    const val MODE_LOCAL = "local"
+        /** 运行模式：vpn = 全局 VPN（VpnService，M2）；local = 本地端口（浏览器代理） */
+        const val MODE_VPN = "vpn"
+        const val MODE_LOCAL = "local"
+
+        /** 分应用代理模式（M2.1） */
+        const val APP_FILTER_ALL = 0        // 全部应用走 VPN（默认）
+        const val APP_FILTER_ALLOW = 1      // 白名单：仅所选应用走 VPN
+        const val APP_FILTER_DISALLOW = 2   // 黑名单：所选应用不走 VPN
     }
 }
 
@@ -93,4 +110,12 @@ data class HydraConfig(
     val listenPort: Int,
     /** "vpn"（默认）/ "local" */
     val runMode: String,
+    /** 断线阻断：隧道中断时保持接管路由黑洞流量并自动重连，防真实 IP 泄漏（默认开） */
+    val vpnKillSwitch: Boolean = true,
+    /** 开机自动启动 VPN（需已授权过；Android 15+ 可能限制，系统 Always-on 更可靠） */
+    val vpnBootStart: Boolean = false,
+    /** 分应用代理模式：0=全部 / 1=白名单 / 2=黑名单 */
+    val appFilterMode: Int = SecureStore.APP_FILTER_ALL,
+    /** 分应用代理应用包名列表（换行分隔） */
+    val appFilterPkgs: String = "",
 )
