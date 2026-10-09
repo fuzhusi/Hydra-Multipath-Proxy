@@ -29,6 +29,26 @@
 - **方案 C（会话层）**：多连接聚合协议（V3.4 恢复）内做 key rotation——依赖多路径协议恢复
 - **结论**：短期维持现状（每连接独立密钥已足够）；V3.3 多路径恢复时一并设计 C 方案
 
+## [Unreleased] - 节点侧 v4-only 降噪（DNS AAAA 本地过滤 + v4 优先建连）
+
+### 修复
+
+- **[中] v4-only 节点 ENETUNREACH 噪音**（线上实测单节点单日 1.5 万条
+  error）：TUN/VPN 模式下客户端系统 DNS 应答中的 AAAA 记录经 UDP 中继
+  原样回流，应用拿 v6 地址建连 → TUN 以字面 v6 目标交节点 → 无 IPv6 出口
+  的节点直连 v6 秒败（客户端回落 v4 功能无碍，但 error 噪音掩盖真问题）。
+  双保险修复：
+  - **DNS AAAA 本地过滤**（新增 `hydra-node::dns_aaaa`）：节点无 v6 出口
+    路由（UDP connect 探测全球单播，进程级缓存）时，对目标端口 53 的标准
+    查询直接合成 NODATA 应答——不建会话、不出上游流量，客户端 OS 回落 A
+    记录，v6 目标从源头消失；`HYDRA_DNS_FILTER_AAAA=1/0` 强制开/关；
+  - **目标建连 v4 优先逐候选回落**：`resolve_and_connect` 域名解析结果
+    整理为 v4 优先候选列表（保序全量去重），15s 总预算内逐候选尝试
+    （Happy Eyeballs 式），SSRF 过滤逐候选复查；中间失败降 debug 级。
+- 独立 code review 修复：拦截路径下行写失败不再贯穿会话路径；opcode≠QUERY
+  放行（NOTIFY/UPDATE 不掺和）；非相邻重复候选去重；补 AAAA 拦截 duplex
+  级集成测试与 NODATA 帧逐位断言。
+
 ## [Unreleased] - Android M2（全局 VPN + 任意端口 + DNS 经隧道）
 
 ### 新增
