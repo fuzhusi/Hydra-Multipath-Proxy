@@ -25,7 +25,7 @@ jobs:
     name: Windows 产物（安装包 + 便携包）
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
@@ -116,7 +116,7 @@ jobs:
     # 固定 24.04：ubuntu-latest 2026-10-19 起迁 Ubuntu 26（同 ci.yml 注释）
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
