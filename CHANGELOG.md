@@ -30,9 +30,11 @@
 - **方案 C（会话层）**：多连接聚合协议（V3.4 恢复）内做 key rotation——依赖多路径协议恢复
 - **结论**：短期维持现状（每连接独立密钥已足够）；V3.3 多路径恢复时一并设计 C 方案
 
-## [Unreleased] - 节点侧 v4-only 降噪（DNS AAAA 本地过滤 + v4 优先建连）
+## [0.2.2] - 2026-10-09
 
-### 修复
+### 批次：节点侧 v4-only 降噪（DNS AAAA 本地过滤 + v4 优先建连）
+
+#### 修复
 
 - **[中] v4-only 节点 ENETUNREACH 噪音**（线上实测单节点单日 1.5 万条
   error）：TUN/VPN 模式下客户端系统 DNS 应答中的 AAAA 记录经 UDP 中继
@@ -50,9 +52,9 @@
   放行（NOTIFY/UPDATE 不掺和）；非相邻重复候选去重；补 AAAA 拦截 duplex
   级集成测试与 NODATA 帧逐位断言。
 
-## [Unreleased] - Android M2（全局 VPN + 任意端口 + DNS 经隧道）
+### 批次：Android M2（全局 VPN + 任意端口 + DNS 经隧道）
 
-### 新增
+#### 新增
 
 - **Android M2 全局 VPN**（VpnService）：`HydraVpnService`（establish TUN → fd
   交付 Rust 用户态栈 → 节点加密隧道）；consent 授权流程、onRevoke 系统撤销、
@@ -66,7 +68,7 @@
 - tun-core feature（hydra-client）：Android 复用用户态栈（PacketTransport 抽象
   + run_stack）不依赖 tun2 桌面设备层；gen-bindings.sh 改从 Android .so 生成
 
-### 修复（code review 发现）
+#### 修复（code review 发现）
 
 - **[高] protect 钩子陈旧引用**：start_vpn 的 Rust 钩子首装后捕获第一个
   HydraVpnService 实例，服务重建后旧引用导致 protect 永远失败 → 零流量。
@@ -75,13 +77,13 @@
   抓出的真实 bug，v6 SYN 端口解析此前恒返回 None
 - **[低] 日志字符串拼接优先级**修正
 
-### 新增测试
+#### 新增测试
 
 - R1 单元测试：tcp_syn_dst_port（v4/v6/SYN+ACK/UDP）、动态监听挂载/去重/上限
 
-## [Unreleased] - 桌面 TUN UDP-over-proxy 接管 + DNS 经隧道（TUN 方案 v2 方向落地）
+### 批次：桌面 TUN UDP-over-proxy 接管 + DNS 经隧道（TUN 方案 v2 方向落地）
 
-### 新增
+#### 新增
 
 - **TUN UDP-over-proxy 接管**（默认开，`HYDRA_TUN_UDP=0` 关闭）：公网目标 UDP
   （QUIC/HTTP3/DNS/P2P）不再代答回落 TCP，而是经节点 UDP 中继**加密隧道**
@@ -97,13 +99,13 @@
 - 客户端 TUN UDP 分发尊重 `HYDRA_ALLOW_PRIVATE_TARGETS`（与节点侧同款开关）：
   自建 LAN 节点场景放开私网目标入隧道（组播/广播恒拦）。
 
-### 变更
+#### 变更
 
 - README/TUN 交付状态与已知边界同步重写：UDP 接管与 DNS 经隧道移入"已交付"。
 
-## [Unreleased] - Android M1 + 审查 09 收尾（上批遗留技术项清账）
+### 批次：Android M1 + 审查 09 收尾（上批遗留技术项清账）
 
-### 新增（Android M1）
+#### 新增（Android M1）
 
 - **真机可跑的本地代理应用**：Compose UI（节点多行/SNI/认证密钥掩码/自签 pin 与
   CA 双模式/证书 DER 导入/本地端口）→ 前台服务持有 HydraEngine（防 Android 11+
@@ -111,7 +113,7 @@
   密钥存储（R8 必须项：Keystore 主密钥 AES256-GCM，allowBackup=false）。
   cargo-ndk 交叉编译 arm64-v8a + x86_64 release so；桌面 JVM 冒烟回归通过。
 
-### 修复（审查 09 上批遗留，P3 清账）
+#### 修复（审查 09 上批遗留，P3 清账）
 
 - **speedtest 并发探测**（限流 4）：串行探测 N 个离线节点最坏 5N 秒/轮、恢复延迟
   随节点数线性增长——拆分"并发探测/串行应用"后单轮 ≈ ⌈N/4⌉×5s。
@@ -135,7 +137,7 @@
 - **cert.rs 补测试**（此前零覆盖）：rcgen 生成真 PEM 对 → parse_pem_pair 往返
   + 坏输入显式报错。
 
-### 文档
+#### 文档
 
 - README 已知限制补密钥落盘威胁模型（Windows 明文/ACL、Linux 0600、Android
   Keystore；不防本机高权限攻击者）。
