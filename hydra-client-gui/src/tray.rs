@@ -32,6 +32,10 @@ pub enum TrayCommand {
 pub struct HydraTray {
     pub tray: TrayIcon,
     pub command_rx: Receiver<TrayCommand>,
+    /// 菜单项句柄：按运行状态同步禁用态（启动中禁「启动」、停止态禁「停止」）
+    item_start: MenuItem,
+    item_stop: MenuItem,
+    last_running: Option<(bool, bool)>,
 }
 
 impl HydraTray {
@@ -40,6 +44,19 @@ impl HydraTray {
         if let Err(e) = self.tray.set_tooltip(Some(tooltip)) {
             eprintln!("[Tray] set_tooltip 失败: {}", e);
         }
+    }
+
+    /// 同步菜单禁用态：运行/启动中禁「启动代理」；停止态禁「停止代理」。
+    /// （状态未变化时为 no-op；tray-icon 在 Windows 上对未弹出的菜单改
+    /// enabled 无开销，弹出时按最新状态渲染）
+    pub fn set_running_state(&mut self, running: bool, starting: bool) {
+        if self.last_running == Some((running, starting)) {
+            return;
+        }
+        self.last_running = Some((running, starting));
+        // set_enabled 返回 ()：直接调用（失败无副作用可言）
+        self.item_start.set_enabled(!running && !starting);
+        self.item_stop.set_enabled(running || starting);
     }
 }
 
@@ -140,6 +157,9 @@ pub fn create_tray(ctx: egui::Context) -> Result<HydraTray, String> {
     Ok(HydraTray {
         tray,
         command_rx: rx,
+        item_start,
+        item_stop,
+        last_running: None,
     })
 }
 

@@ -185,6 +185,9 @@ pub async fn spawn_tcp_listener(
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
+                    crate::metrics::metrics()
+                        .conn_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // 禁 Nagle：握手与交互式流量的小包延迟敏感
                     let _ = stream.set_nodelay(true);
                     // per-IP 限额（09-P2-6）：单源并发超限立即丢弃（与额度满
@@ -192,6 +195,9 @@ pub async fn spawn_tcp_listener(
                     let Some(ip_guard) = PerIpGuard::acquire(&per_ip_map, peer.ip(), per_ip_limit)
                     else {
                         debug!("per-IP connection limit reached for {}, dropping", peer);
+                        crate::metrics::metrics()
+                            .conn_rejected
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     };
                     // 快速失败（sheding）：额度满时立即丢弃新连接而非让其在内核
@@ -199,6 +205,9 @@ pub async fn spawn_tcp_listener(
                     let Ok(permit) = sem.clone().try_acquire_owned() else {
                         debug!("Connection limit reached, dropping incoming {}", peer);
                         drop(ip_guard);
+                        crate::metrics::metrics()
+                            .conn_rejected
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     };
                     let acceptor = acceptor.clone();
@@ -207,6 +216,7 @@ pub async fn spawn_tcp_listener(
                     let idle = idle.clone();
                     let fallback = fallback_page;
                     tokio::spawn(async move {
+                        let _active = crate::metrics::ActiveGuard::enter(); // 连接结束自动减
                         let _ip_guard = ip_guard; // 连接结束自动递减 per-IP 计数
                         let _permit = permit; // 连接结束自动归还
                                               // TLS 握手超时：认证前 slowloris 防护（超时静默 drop，语义不变）
@@ -243,10 +253,11 @@ pub async fn spawn_tcp_listener(
 /// `fallback_page` = true 时，TLS 建立后的认证失败路径（版本字节非 0x03 /
 /// Noise 握手失败 / 地址帧失步）改回内置静态页（反代伪装，见
 /// [`crate::fallback`]）；TLS 握手本身失败仍静默（无 TLS 层可承载回退响应）。
-/// 回退路径复用既有认证阶段超时（`AUTH_TIMEOUT`）与连接额度语义，不新增
-/// 资源驻留面。
-/// `signal_registry` = Some 时，目标为 `@hydra-p2p/<peer_id>` 的连接进入信令会话
-/// （NAT 穿透方案 §3.2；None/未启用时该前缀走普通 connect 路径，语义不变）。
+/// 回退路径复用认证阶段超时（版本字节/Noise = `AUTH_TIMEOUT`；**地址帧等待
+/// 用连接空闲看门狗 `idle`**——Noise 后已认证，与转发期同信任级别，客户端
+/// 温连接池依赖该窗口预热复用）。`signal_registry` = Some 时，目标为
+/// `@hydra-p2p/<peer_id>` 的连接进入信令会话（NAT 穿透方案 §3.2；None/未启用
+/// 时该前缀走普通 connect 路径，语义不变）。
 async fn handle_tls_stream(
     mut tls: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     handler: Arc<ConnectionHandler>,
@@ -318,8 +329,12 @@ async fn handle_tls_stream(
         }
     }
 
-    // ── 第 4 步：地址帧（已认证，读失败按协议失步按开关回退页/静默关流）
-    let target = match tokio::time::timeout(AUTH_TIMEOUT, read_target(&mut rd)).await {
+    // ── 第 4 步：地址帧（已认证，读失败按协议失步按开关回退页/静默关流）。
+    // 等待期用连接空闲看门狗（idle，默认 300s）而非 AUTH_TIMEOUT：本步已在
+    // Noise 认证之后，与转发期同信任级别（额度/per-IP/空闲看门狗全部在管），
+    // 客户端温连接池（pre-warm，60s TTL）依赖此窗口预热复用——10s 会令池
+    // 永远打不中。慢速攻击防护仍在认证前阶段（TLS/Noise 的 AUTH_TIMEOUT）。
+    let target = match tokio::time::timeout(*idle, read_target(&mut rd)).await {
         Ok(Ok(t)) => t,
         _ => {
             debug!("TCP stream bad target frame");
@@ -378,8 +393,16 @@ async fn handle_tls_stream(
 
     // ── 第 6 步：SSRF 过滤 + DNS + 建目标（复用 handler 逻辑）
     let target_stream = match ConnectionHandler::resolve_and_connect(&target).await {
-        Ok(s) => s,
+        Ok(s) => {
+            crate::metrics::metrics()
+                .target_ok
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            s
+        }
         Err((code, e)) => {
+            crate::metrics::metrics()
+                .target_fail
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug!(
                 "TCP target failure (code 0x{:02x}) for {}: {}",
                 code,

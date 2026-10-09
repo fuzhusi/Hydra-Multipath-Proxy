@@ -379,7 +379,7 @@ impl HydraApp {
         );
     }
 
-    /// 托盘 tooltip 与代理运行状态同步（变化才调用 set_tooltip）
+    /// 托盘 tooltip 与菜单禁用态和代理运行状态同步（变化才调用系统 API）
     pub(crate) fn sync_tray_tooltip(&mut self) {
         let tip = if self.proxy_running {
             "Hydra 代理运行中"
@@ -393,6 +393,12 @@ impl HydraApp {
                 t.set_tooltip(tip);
             }
             self.last_tray_tooltip = tip.to_string();
+        }
+        // 菜单禁用态必须在去重块外无条件同步：last_tray_tooltip 启动即预置
+        // 「已停止」文案，首帧会被 tooltip 去重跳过——若放块内，「停止代理」
+        // 在停止态保持可点（set_running_state 自带 last_running 去重，零成本）
+        if let Some(t) = &mut self.tray {
+            t.set_running_state(self.proxy_running, self.proxy_starting);
         }
     }
 }

@@ -60,7 +60,7 @@ pub fn build_response(method: &str, path: &str, uptime_secs: u64) -> String {
     }
 }
 
-fn simple_response(status: u16, reason: &str, content_type: &str, body: &str) -> String {
+pub(crate) fn simple_response(status: u16, reason: &str, content_type: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         status,
@@ -129,7 +129,11 @@ impl HealthServer {
         let method = parts.next().unwrap_or("");
         let full_path = parts.next().unwrap_or("");
         let path = full_path.split('?').next().unwrap_or("");
-        let resp = build_response(method, path, started.elapsed().as_secs());
+        let uptime = started.elapsed().as_secs();
+        let resp = match path {
+            "/metrics" => crate::metrics::metrics_response(method, uptime),
+            _ => build_response(method, path, uptime),
+        };
         let _ = stream.write_all(resp.as_bytes()).await;
         let _ = stream.shutdown().await;
     }

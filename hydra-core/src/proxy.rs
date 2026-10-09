@@ -33,6 +33,35 @@ struct TcpCreds {
     trust: Arc<tcp_transport::TlsTrust>,
     sni: String,
     auth_key: Arc<Vec<u8>>,
+    /// 温连接池（pre-warm）：Arc 共享，同一实例内全部请求同一池面
+    /// （start 与 TUN opener/UDP 工厂各自构造实例级池；UDP 工厂路径为长驻
+    /// 通道不经池）。池是尽力而为优化——温连接失败一律弃连回退全新握手，
+    /// 不改变任何原有错误语义
+    pool: Arc<crate::pool::ChannelPool>,
+}
+
+impl TcpCreds {
+    /// 后台补充温连接：低于上限才回填（握手与当前请求的转发完全重叠）。
+    /// 构建失败静默丢弃——池是尽力而为优化，不影响请求本身；并发突发下的
+    /// 多余补充在 checkin 处被上限自然丢弃。
+    fn replenish(&self, node: SocketAddr) {
+        if self.pool.idle_len(node) >= crate::pool::IDLE_CAP_PER_NODE {
+            return;
+        }
+        let pool = self.pool.clone();
+        let sni = self.sni.clone();
+        let trust = (*self.trust).clone();
+        let auth_key = (*self.auth_key).clone();
+        tokio::spawn(async move {
+            if pool.idle_len(node) >= crate::pool::IDLE_CAP_PER_NODE {
+                return; // 并发补充已到位，避免超额握手
+            }
+            if let Ok(ch) = tcp_transport::connect_channel(node, &sni, &trust, &auth_key).await {
+                pool.checkin(node, ch);
+                debug!("Pool: warm channel ready for node {}", node);
+            }
+        });
+    }
 }
 
 /// 中继缓冲 16KB（05-R-14 收尾）：与 TLS 1.3 单条记录实际读出量（≤16KB）对齐，
@@ -225,6 +254,7 @@ impl ProxyServer {
             trust: Arc::new(trust.clone()),
             sni: self.sni.clone(),
             auth_key: Arc::new(self.auth_key.clone()),
+            pool: Arc::new(crate::pool::ChannelPool::new()),
         };
         self.register_nodes().await;
         info!("Binding proxy listener to {}...", self.listen_addr);
@@ -332,6 +362,7 @@ impl ProxyServer {
             trust: Arc::new(trust),
             sni: self.sni.clone(),
             auth_key: Arc::new(self.auth_key.clone()),
+            pool: Arc::new(crate::pool::ChannelPool::new()),
         };
         let scheduler = self.scheduler.clone();
         // 流量统计与 SOCKS 路径同一计数面（monitor 未注入时兜底实例）
@@ -379,6 +410,7 @@ impl ProxyServer {
             trust: Arc::new(trust),
             sni: self.sni.clone(),
             auth_key: Arc::new(self.auth_key.clone()),
+            pool: Arc::new(crate::pool::ChannelPool::new()),
         };
         let scheduler = self.scheduler.clone();
         Ok(Arc::new(move || {
@@ -483,6 +515,45 @@ impl ProxyServer {
 
         let mut last_err: Option<HydraError> = None;
         for node in candidates.iter().take(MAX_NODE_ATTEMPTS) {
+            // 温连接优先（pre-warm）：checkout 现成握手好的通道直发目标帧，每请求
+            // 省一次 TCP+TLS+Noise 握手。失败（闲置期被节点关流/应答超时等）一律
+            // **弃连**落回下方全新握手路径——温连接失败不参与节点评分与故障切换
+            // 判定（那些语义由全新路径的既有逻辑负责），池子因此是纯优化层。
+            if let Some(warm) = creds.pool.checkout(node.address) {
+                match tcp_transport::request_target(warm, target).await {
+                    Ok(tls) => {
+                        clear_target_unreachable(target);
+                        info!(
+                            "[{}] ✓ Connected to {} via node {} (pooled channel)",
+                            peer_addr,
+                            mask_target(target),
+                            node.address
+                        );
+                        let node_entry = traffic.node_entry(node.address);
+                        let (r, w) = tokio::io::split(tls);
+                        let send = CountingStream::new(
+                            w,
+                            ByteCounter::up(Some(traffic.clone()), Some(node_entry.clone())),
+                        );
+                        let recv = CountingStream::new(
+                            r,
+                            ByteCounter::down(Some(traffic.clone()), Some(node_entry)),
+                        );
+                        creds.replenish(node.address);
+                        return Ok(NodeLink {
+                            send,
+                            recv,
+                            node: node.address,
+                        });
+                    }
+                    Err(e) => {
+                        debug!(
+                            "[{}] Pooled channel stale (node {}), rebuilding fresh: {}",
+                            peer_addr, node.address, e
+                        );
+                    }
+                }
+            }
             match tcp_transport::connect_target(node.address, sni, &creds.trust, auth_key, target)
                 .await
             {
@@ -506,6 +577,8 @@ impl ProxyServer {
                         r,
                         ByteCounter::down(Some(traffic.clone()), Some(node_entry)),
                     );
+                    // 后台补充温连接：握手与本次转发放大重叠，下一请求即命中
+                    creds.replenish(node.address);
                     return Ok(NodeLink {
                         send,
                         recv,

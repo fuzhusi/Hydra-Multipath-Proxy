@@ -360,7 +360,8 @@ pub(crate) fn enable_tcp_keepalive(stream: &tokio::net::TcpStream) {
     }
 }
 
-/// 经 TCP+TLS 连接节点并打开目标转发。
+/// 经 TCP+TLS 连接节点并打开目标转发（一次性完整路径 = [`connect_channel`]
+/// + [`request_target`]，行为与拆分前逐字节一致）。
 ///
 /// 步骤：TCP 建连（5s）→ TLS 握手（[`TlsTrust`]：pinning 或公共 CA + SNI，5s）
 /// → Noise-PSK 握手（TLS exporter 通道绑定）→ 写地址帧 → 读 2B 应答（20s）。
@@ -376,6 +377,20 @@ pub async fn connect_target(
     trust: &TlsTrust,
     auth_key: &[u8],
     target: &str,
+) -> Result<TcpNodeStream> {
+    let channel = connect_channel(node_addr, sni, trust, auth_key).await?;
+    request_target(channel, target).await
+}
+
+/// 温连接（channel）建立：完整 TCP + TLS + Noise-PSK 握手，**停在发送目标帧
+/// 之前**——供连接池预热（[`crate::pool::ChannelPool`]）；请求到达后经
+/// [`request_target`] 交接，每请求省一次握手（一个 RTT + TLS1.3 + Noise）。
+/// 语义与 [`connect_target`] 前半段完全一致（含 pin 校验/keepalive/Nagle）。
+pub async fn connect_channel(
+    node_addr: SocketAddr,
+    sni: &str,
+    trust: &TlsTrust,
+    auth_key: &[u8],
 ) -> Result<TcpNodeStream> {
     let sni = if sni.is_empty() {
         // 审查 06-P3-6（Wave 3）：空 SNI 静默回退会掩盖"证书不含 hydra.node"这类
@@ -477,35 +492,37 @@ pub async fn connect_target(
     .await
     .map_err(|_| HydraError::ConnectionError(format!("Noise 握手超时: {}", node_addr)))?
     .map_err(|e| HydraError::ConnectionError(format!("Noise 握手失败: {}", e)))?;
+
+    // 握手/帧交互完成，读写两半合回流（同一 split 产物，unsplit 必成功）
+    Ok(rd.unsplit(wr))
+}
+
+/// 阶段二：在温连接上发送目标帧并等待 2B 应答（交接即消费——地址帧已发出，
+/// 失败时连接作废关闭，不再回池）。
+/// 错误语义与单发 [`connect_target`] 一致：`TargetUnreachable` 原样保留供
+/// 故障切换层区分「节点故障」与「目标不可达」。
+pub async fn request_target(stream: TcpNodeStream, target: &str) -> Result<TcpNodeStream> {
+    let (mut rd, mut wr) = tokio::io::split(stream);
     // 地址帧 + 2B 应答（09-P3-1：write_target 是建链序列中唯一无超时 I/O，
     // 恶意节点完成 Noise 后停读可挂住写端——补 CONNECT_TIMEOUT 与同序列对齐）
     tokio::time::timeout(CONNECT_TIMEOUT, write_target(&mut wr, target))
         .await
-        .map_err(|_| {
-            HydraError::ConnectionError(format!("write request to {} timed out", node_addr))
-        })?
-        .map_err(|e| {
-            HydraError::ConnectionError(format!("write request to {} failed: {}", node_addr, e))
-        })?;
+        .map_err(|_| HydraError::ConnectionError("write request timed out".to_string()))?
+        .map_err(|e| HydraError::ConnectionError(format!("write request failed: {}", e)))?;
     match tokio::time::timeout(RESPONSE_TIMEOUT, read_reply(&mut rd)).await {
         // 保留错误类型：TargetUnreachable 供故障切换层区分「节点故障」与「目标不可达」
         Ok(r) => r?,
         Err(_) => {
-            return Err(HydraError::ConnectionError(format!(
-                "Node {} response timeout",
-                node_addr
-            )))
+            return Err(HydraError::ConnectionError(
+                "Node response timeout".to_string(),
+            ))
         }
     }
 
     // 握手/帧交互完成，读写两半合回流（同一 split 产物，unsplit 必成功）
     let tls = rd.unsplit(wr);
     // 日志脱敏：info 级不落目标明文（审查 R-08）
-    info!(
-        "✓ TCP/TLS target {} opened via node {}",
-        mask_target(target),
-        node_addr
-    );
+    info!("✓ TCP/TLS target {} opened", mask_target(target));
     Ok(tls)
 }
 

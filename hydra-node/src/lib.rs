@@ -2,9 +2,11 @@ pub mod cert;
 pub mod config;
 // DNS AAAA 查询本地过滤（v4-only 节点降噪，见模块文档）
 pub mod dns_aaaa;
+// 进程级指标（/metrics，随健康端点开关）
 pub mod fallback;
 pub mod handler;
 pub mod health;
+pub mod metrics;
 pub mod server;
 pub mod signal;
 pub mod tcp_server;

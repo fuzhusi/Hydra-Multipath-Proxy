@@ -15,6 +15,8 @@
 pub mod channel;
 pub mod connections;
 pub mod nat;
+// 节点温连接池（pre-warm）：零协议变更消除每请求握手延迟
+pub mod pool;
 pub mod proxy;
 pub mod routing;
 pub mod scheduler;

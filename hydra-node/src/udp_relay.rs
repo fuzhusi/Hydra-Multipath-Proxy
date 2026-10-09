@@ -357,6 +357,9 @@ async fn serve_with_idle_and_filter<R, W>(
 {
     let aaaa_filter = aaaa_filter.unwrap_or_else(dns_aaaa::aaaa_filter_enabled);
     let table = Arc::new(Mutex::new(UdpSessionTable::new()));
+    crate::metrics::metrics()
+        .udp_relay_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // 下行写端：多个会话任务 + 回收任务并发写，tokio::Mutex 串行化（帧级原子）
     let writer: Arc<tokio::sync::Mutex<W>> = Arc::new(tokio::sync::Mutex::new(wr));
 
