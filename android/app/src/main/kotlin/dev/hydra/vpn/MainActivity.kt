@@ -331,15 +331,22 @@ private fun HydraApp() {
                         startCurrentMode(context)
                     },
                     onStop = {
-                        // 按运行模式停止（ vpn = HydraVpnService；local = EngineService）
-                        val svc = if (cfg.runMode == SecureStore.MODE_VPN) {
-                            HydraVpnService::class.java
+                        // 按运行模式停止（vpn = HydraVpnService；local = EngineService）。
+                        // 必须用各自服务的 ACTION_STOP 常量——此前统一用
+                        // EngineService.ACTION_STOP，HydraVpnService 收到未知 action
+                        // 被误判为启动：点停止 → 伪启动 → "VPN 已在运行" 启动失败，
+                        // 而旧引擎从未收到停止指令继续跑（线上真机实测 bug）
+                        if (cfg.runMode == SecureStore.MODE_VPN) {
+                            context.startService(
+                                Intent(context, HydraVpnService::class.java)
+                                    .setAction(HydraVpnService.ACTION_STOP),
+                            )
                         } else {
-                            EngineService::class.java
+                            context.startService(
+                                Intent(context, EngineService::class.java)
+                                    .setAction(EngineService.ACTION_STOP),
+                            )
                         }
-                        context.startService(
-                            Intent(context, svc).setAction(EngineService.ACTION_STOP),
-                        )
                     },
                 )
                 Tab.Nodes -> NodesScreen(

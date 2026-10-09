@@ -50,7 +50,9 @@ class EngineService : Service() {
                 stopEngine()
                 return START_NOT_STICKY
             }
-            else -> {
+            // 只有显式 START（或无 action 的默认投递）才启动——未知 action 一律
+            // 忽略（与 HydraVpnService 同款防护：误发 action 不得被当启动）
+            ACTION_START, null -> {
                 // START：engine == null 即（重）启动——失败重试、停止后快速再启
                 // 都必须真正生效（此前 transition 非空时 START 被静默忽略，
                 // "失败后按钮永远无效"）；已运行则只刷新通知
@@ -61,6 +63,7 @@ class EngineService : Service() {
                 }
                 return START_NOT_STICKY
             }
+            else -> return START_NOT_STICKY
         }
     }
 
@@ -104,10 +107,30 @@ class EngineService : Service() {
             )
             val result = runCatching { buildEngine(cfg) }
             result.fold(onSuccess = { eng ->
+                // 停止竞态守卫：构建期间收到 STOP（startGeneration 已递增）——
+                // 本轮启动作废：关闭刚构建的引擎、不注册不更新 UI（否则僵尸
+                // 引擎：UI 显示已停止而引擎仍在监听端口转发流量）
+                if (startGeneration.get() != gen) {
+                    runCatching { eng.close() }
+                    EngineState.addLog("启动期间收到停止请求——本轮启动已作废")
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                    return@launch
+                }
                 EngineState.addLog("③ 引擎构建完成，开始认证建连（最长约 5s）…")
                 try {
                     // M1：无 VpnService 环境，protect 传 null（M2 接线 VpnService.protect）
                     eng.start(null)
+                    // 二次守卫：eng.start 是阻塞握手（约 5s）——期间收到 STOP 时
+                    // stopEngine 摘不到尚未注册的 engine，此处必须代为终止
+                    if (startGeneration.get() != gen) {
+                        runCatching { eng.stop() }
+                        runCatching { eng.close() }
+                        EngineState.addLog("启动完成前收到停止请求——引擎已终止")
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                        return@launch
+                    }
                     engine = eng
                     val addr = eng.boundAddr()
                     EngineState.update {
@@ -152,11 +175,14 @@ class EngineService : Service() {
                     stopSelf()
                 }
             }, onFailure = { e ->
-                EngineState.addLog("✗ 启动失败：${e.message}")
-                EngineState.update {
-                    it.copy(running = false, transition = "启动失败：${e.message}")
+                // 过期启动的失败不覆盖新状态（新一轮启动可能已在途）
+                if (startGeneration.get() == gen) {
+                    EngineState.addLog("✗ 启动失败：${e.message}")
+                    EngineState.update {
+                        it.copy(running = false, transition = "启动失败：${e.message}")
+                    }
+                    updateNotification()
                 }
-                updateNotification()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             })

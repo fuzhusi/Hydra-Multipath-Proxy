@@ -30,6 +30,23 @@
 - **方案 C（会话层）**：多连接聚合协议（V3.4 恢复）内做 key rotation——依赖多路径协议恢复
 - **结论**：短期维持现状（每连接独立密钥已足够）；V3.3 多路径恢复时一并设计 C 方案
 
+## [Unreleased] - Android 启停修复（真机实测 bug）
+
+### 修复
+
+- **[高] VPN 模式应用内"停止代理"失效**：MainActivity 对两种运行模式统一用
+  `EngineService.ACTION_STOP` 构造停止 intent，而 `HydraVpnService` 的停止
+  常量是 `ACTION_VPN_STOP`——服务收到未知 action 后落入 else 分支**被当成
+  启动**：点停止 → 伪启动 → Rust 返回"VPN 已在运行"→ UI 一直转并显示
+  "启动失败"，同时旧引擎从未收到停止指令、继续接管全部流量（真机实测）。
+  三层修复：
+  - 停止按钮按运行模式使用各自服务的 ACTION_STOP 常量（根因）；
+  - 两个服务 `onStartCommand` 只认显式 `ACTION_START`（或无 action）启动，
+    未知 action 一律忽略（防同类回归）；
+  - 启动/停止竞态守卫：启动期间收到停止时，过期的启动结果不覆盖 UI 状态、
+    刚启动的引擎立即终止（防"UI 显示已停止而引擎仍在跑"的僵尸态；
+    EngineService 的阻塞握手 `eng.start()` 返回后二次校验 generation）。
+
 ## [0.2.2] - 2026-10-09
 
 ### 批次：节点侧 v4-only 降噪（DNS AAAA 本地过滤 + v4 优先建连）

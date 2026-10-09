@@ -61,10 +61,14 @@ class HydraVpnService : VpnService() {
                 stopVpnLocal()
                 return START_NOT_STICKY
             }
-            else -> {
+            // 只有显式 START（或无 action 的默认投递）才启动——未知 action 一律
+            // 忽略。此前 else 兜底把任何非 STOP action 都当启动：停止按钮发错
+            // action 常量即触发"伪启动 → VPN 已在运行 → 启动失败"且引擎不停
+            ACTION_START, null -> {
                 startVpnFromStore()
                 return START_NOT_STICKY
             }
+            else -> return START_NOT_STICKY
         }
     }
 
@@ -130,6 +134,16 @@ class HydraVpnService : VpnService() {
                 }
             }
             result.fold(onSuccess = {
+                // 停止竞态守卫：启动期间收到 STOP（generation 已递增）——刚启动的
+                // 数据面必须立即终止且不更新 UI（否则僵尸 VPN：UI 显示已停止而
+                // 引擎仍在接管全部流量）
+                if (generation.get() != gen) {
+                    runCatching { stopVpn() }
+                    EngineState.addLog("启动期间收到停止请求——本轮启动已作废")
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                    return@launch
+                }
                 EngineState.update {
                     it.copy(running = true, transition = null,
                         boundAddr = "全局 VPN（所有应用流量经节点）")
@@ -137,9 +151,12 @@ class HydraVpnService : VpnService() {
                 EngineState.addLog("✓ 全局 VPN 已接管——所有应用流量经节点加密隧道")
                 updateNotification()
             }, onFailure = { e ->
-                EngineState.addLog("✗ 启动失败：${e.message}")
-                EngineState.update {
-                    it.copy(running = false, transition = "启动失败：${e.message}")
+                // 过期启动的失败不覆盖新状态（新一轮启动可能已在途）
+                if (generation.get() == gen) {
+                    EngineState.addLog("✗ 启动失败：${e.message}")
+                    EngineState.update {
+                        it.copy(running = false, transition = "启动失败：${e.message}")
+                    }
                 }
                 runCatching { stopVpn() }
                 stopForeground(STOP_FOREGROUND_REMOVE)
