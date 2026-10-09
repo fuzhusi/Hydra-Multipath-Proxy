@@ -200,9 +200,10 @@ impl ConnectionHandler {
         info!("Received target address: {}", mask_target(target_addr_str));
         debug!("Received target address (plaintext): {}", target_addr_str);
 
-        // ── 解析为 SocketAddr，否则节点侧 DNS 解析
-        let target_addr: SocketAddr = if let Ok(addr) = target_addr_str.parse() {
-            addr
+        // ── 解析为候选地址列表：字面 IP 单候选；域名 → 节点侧 DNS，v4 优先
+        // 稳定排序 + 去重（逐候选建连见下方循环——Happy Eyeballs 式回落）
+        let candidates: Vec<SocketAddr> = if let Ok(addr) = target_addr_str.parse() {
+            vec![addr]
         } else {
             info!("Resolving DNS for: {}", mask_target(target_addr_str));
             // DNS 解析 5s 超时（审查 R-26/06-P2-3）：lookup_host 底层是 spawn_blocking
@@ -231,32 +232,22 @@ impl ConnectionHandler {
                 }
                 Ok(r) => match r {
                     Ok(addrs) => {
-                        let addrs_vec: Vec<_> = addrs.collect();
-                        // 优先使用 IPv4 地址
-                        let ipv4_addr = addrs_vec.iter().find(|a| a.is_ipv4());
-                        match ipv4_addr {
-                            Some(a) => *a,
-                            None => match addrs_vec.first() {
-                                Some(a) => *a,
-                                None => {
-                                    error!(
-                                        "DNS resolution failed for {}: no addresses",
-                                        mask_target(target_addr_str)
-                                    );
-                                    debug!(
-                                        "DNS resolution failed (plaintext): {}",
-                                        target_addr_str
-                                    );
-                                    return Err((
-                                        ERR_DNS_FAIL,
-                                        HydraError::ConnectionError(format!(
-                                            "DNS resolution failed for {}",
-                                            mask_target(target_addr_str)
-                                        )),
-                                    ));
-                                }
-                            },
+                        let ordered = order_candidates(addrs.collect());
+                        if ordered.is_empty() {
+                            error!(
+                                "DNS resolution failed for {}: no addresses",
+                                mask_target(target_addr_str)
+                            );
+                            debug!("DNS resolution failed (plaintext): {}", target_addr_str);
+                            return Err((
+                                ERR_DNS_FAIL,
+                                HydraError::ConnectionError(format!(
+                                    "DNS resolution failed for {}",
+                                    mask_target(target_addr_str)
+                                )),
+                            ));
                         }
+                        ordered
                     }
                     Err(e) => {
                         error!(
@@ -278,20 +269,31 @@ impl ConnectionHandler {
             }
         };
 
-        info!(
-            "Connecting to target: {} (with 15s timeout)",
-            mask_target(&target_addr.to_string())
-        );
-
-        // ── SSRF 目标过滤（遗留 P1-3）：字面 IP 与 DNS 解析结果统一复查，命中即拒绝。
-        // 默认拒绝；HYDRA_ALLOW_PRIVATE_TARGETS=1 放开（测试基线依赖 127.0.0.1 回显服务器）。
-        if !private_targets_allowed() {
-            if let Some(reason) = classify_blocked_ip(target_addr.ip()) {
+        // ── SSRF 目标过滤（遗留 P1-3）：逐候选复查（每个候选都可能被连接），
+        // 命中即剔除；全部命中才拒绝（部分合法候选仍可服务）。默认拒绝；
+        // HYDRA_ALLOW_PRIVATE_TARGETS=1 放开（测试基线依赖 127.0.0.1 回显服务器）。
+        let candidates: Vec<SocketAddr> = if private_targets_allowed() {
+            candidates
+        } else {
+            let mut allowed = Vec::with_capacity(candidates.len());
+            let mut first_block: Option<&'static str> = None;
+            for addr in candidates {
+                match classify_blocked_ip(addr.ip()) {
+                    Some(reason) => {
+                        if first_block.is_none() {
+                            first_block = Some(reason);
+                        }
+                    }
+                    None => allowed.push(addr),
+                }
+            }
+            if allowed.is_empty() {
+                let reason = first_block.unwrap_or("private/reserved");
                 // 脱敏日志：只记短哈希，不落目标明文
                 warn!(
                     "Blocked SSRF target (private/reserved: {}): {}",
                     reason,
-                    mask_target(&target_addr.to_string())
+                    mask_target(target_addr_str)
                 );
                 // 走既有 0x11 错误路径（与"无法连接目标"同码，不给探测者额外指纹）
                 return Err((
@@ -302,62 +304,92 @@ impl ConnectionHandler {
                     )),
                 ));
             }
-        }
+            allowed
+        };
+
+        info!(
+            "Connecting to target: {} ({} candidate(s), 15s total timeout)",
+            mask_target(target_addr_str),
+            candidates.len()
+        );
 
         let connect_start = std::time::Instant::now();
 
-        // Connect to target with timeout（须小于客户端 20s 应答超时，否则慢目标被误判为节点故障）
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            TcpStream::connect(target_addr),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => {
-                // 禁 Nagle：目标侧交互式流量延迟敏感（审查 R-11）
-                let _ = stream.set_nodelay(true);
-                let elapsed = connect_start.elapsed();
-                info!(
-                    "Connected to target: {} (took {}ms)",
-                    mask_target(&target_addr.to_string()),
-                    elapsed.as_millis()
-                );
-                Ok(stream)
+        // 逐候选建连（v4 优先）：15s 总预算摊给全部候选，单候选失败即时换下一个
+        // ——双栈节点单族路由故障不再致命；中间失败 debug 级（v4-only 节点的
+        // v6 候选秒败不再刷 error，降噪），仅最终失败 error 级。
+        const CONNECT_TOTAL: std::time::Duration = std::time::Duration::from_secs(15);
+        const MIN_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(500);
+        let mut last_err: Option<HydraError> = None;
+        for candidate in &candidates {
+            let remaining = CONNECT_TOTAL.saturating_sub(connect_start.elapsed());
+            if remaining < MIN_ATTEMPT {
+                break; // 预算耗尽：不再尝试（避免超时叠加突破客户端 20s 预算）
             }
-            Ok(Err(e)) => {
-                let elapsed = connect_start.elapsed();
-                error!(
-                    "Failed to connect to {}: {} (took {}ms)",
-                    mask_target(&target_addr.to_string()),
-                    e,
-                    elapsed.as_millis()
-                );
-                Err((
-                    ERR_TARGET_CONNECT,
-                    HydraError::TargetUnreachable(format!(
-                        "Failed to connect to {}: {}",
-                        mask_target(&target_addr.to_string()),
+            debug!(
+                "Trying candidate: {} (budget {}ms)",
+                mask_target(&candidate.to_string()),
+                remaining.as_millis()
+            );
+            match tokio::time::timeout(remaining, TcpStream::connect(candidate)).await {
+                Ok(Ok(stream)) => {
+                    // 禁 Nagle：目标侧交互式流量延迟敏感（审查 R-11）
+                    let _ = stream.set_nodelay(true);
+                    info!(
+                        "Connected to target: {} (took {}ms)",
+                        mask_target(&candidate.to_string()),
+                        connect_start.elapsed().as_millis()
+                    );
+                    return Ok(stream);
+                }
+                Ok(Err(e)) => {
+                    debug!(
+                        "Candidate unreachable: {}: {}",
+                        mask_target(&candidate.to_string()),
                         e
-                    )),
-                ))
-            }
-            Err(_) => {
-                let elapsed = connect_start.elapsed();
-                error!(
-                    "Timeout connecting to {} ({}ms)",
-                    mask_target(&target_addr.to_string()),
-                    elapsed.as_millis()
-                );
-                Err((
-                    ERR_TARGET_CONNECT,
-                    HydraError::TargetUnreachable(format!(
+                    );
+                    last_err = Some(HydraError::TargetUnreachable(format!(
+                        "Failed to connect to {}: {}",
+                        mask_target(&candidate.to_string()),
+                        e
+                    )));
+                }
+                Err(_) => {
+                    debug!("Candidate timeout: {}", mask_target(&candidate.to_string()));
+                    last_err = Some(HydraError::TargetUnreachable(format!(
                         "Timeout connecting to {}",
-                        mask_target(&target_addr.to_string())
-                    )),
-                ))
+                        mask_target(&candidate.to_string())
+                    )));
+                }
             }
         }
+
+        let err = last_err.unwrap_or_else(|| {
+            HydraError::TargetUnreachable(format!(
+                "Timeout connecting to {}",
+                mask_target(target_addr_str)
+            ))
+        });
+        error!(
+            "Failed to reach target {} ({} candidate(s), took {}ms)",
+            mask_target(target_addr_str),
+            candidates.len(),
+            connect_start.elapsed().as_millis()
+        );
+        Err((ERR_TARGET_CONNECT, err))
     }
+}
+
+/// DNS 解析结果整理为建连候选序列：IPv4 优先（稳定排序，同族内保留解析器
+/// 顺序）+ 全量去重（HashSet retain 保序去重——`dedup()` 只删相邻重复，
+/// 解析器可能返回非相邻重复）。v6-only 目标保留 v6 候选（无 v4 时仍可达）；
+/// v4 优先使 v4-only VPS 不再先撞 v6（配合 [`crate::dns_aaaa`] 的 DNS AAAA
+/// 本地过滤，双保险消除 ENETUNREACH 噪音）。
+fn order_candidates(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    addrs.sort_by_key(|a| !a.is_ipv4());
+    let mut seen = std::collections::HashSet::new();
+    addrs.retain(|a| seen.insert(*a));
+    addrs
 }
 
 #[cfg(test)]
@@ -573,5 +605,48 @@ mod ssrf_tests {
             classify_blocked_ip("2606:4700::1111".parse().unwrap()),
             None
         );
+    }
+
+    #[test]
+    fn candidates_v4_first_stable_and_deduped() {
+        let parse = |s: &str| s.parse::<SocketAddr>().unwrap();
+        // 解析器典型输出（v6 混排在前）：v4 提前，同族内顺序保持
+        let ordered = order_candidates(vec![
+            parse("[2001:4860:4860::8888]:443"),
+            parse("8.8.8.8:443"),
+            parse("[2606:4700::1111]:443"),
+            parse("8.8.4.4:443"),
+        ]);
+        assert_eq!(
+            ordered,
+            vec![
+                parse("8.8.8.8:443"),
+                parse("8.8.4.4:443"),
+                parse("[2001:4860:4860::8888]:443"),
+                parse("[2606:4700::1111]:443"),
+            ]
+        );
+        // v6-only 目标：候选保留（无 v4 时仍可达）
+        let only_v6 = order_candidates(vec![parse("[2001:db8::1]:443")]);
+        assert_eq!(only_v6, vec![parse("[2001:db8::1]:443")]);
+        // 去重（解析器可能返回重复地址，含**非相邻**重复——dedup 只删相邻，
+        // 必须 HashSet 保序去重）
+        let dup = order_candidates(vec![
+            parse("8.8.8.8:443"),
+            parse("8.8.4.4:443"),
+            parse("8.8.8.8:443"),
+            parse("[2001:db8::1]:443"),
+            parse("8.8.8.8:443"),
+        ]);
+        assert_eq!(
+            dup,
+            vec![
+                parse("8.8.8.8:443"),
+                parse("8.8.4.4:443"),
+                parse("[2001:db8::1]:443"),
+            ]
+        );
+        // 空列表安全
+        assert!(order_candidates(vec![]).is_empty());
     }
 }
