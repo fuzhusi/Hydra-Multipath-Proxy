@@ -28,7 +28,7 @@ jobs:
         os: [windows-latest, ubuntu-24.04]
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Rust 工具链（版本以 rust-toolchain / Cargo.lock MSRV 为准，缺省 stable）
       - name: 安装 Rust 工具链
@@ -38,7 +38,7 @@ jobs:
 
       # 依赖缓存：按 Cargo.lock 哈希，避免重复拉取 crates
       - name: 缓存 cargo
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -73,7 +73,7 @@ jobs:
     # 与 build 矩阵同款固定 24.04（ubuntu-latest 将迁 Ubuntu 26，见上注释）
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
