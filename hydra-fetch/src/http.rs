@@ -64,9 +64,7 @@ pub fn build_request(
 
 /// 读取并解析响应头（从流上读至 \r\n\r；流式读取避免一次性吞掉 body 前缀）。
 /// 返回 (解析头, 头部之后已读入缓冲区的 body 前缀)。
-pub async fn read_response_head<S>(
-    stream: &mut S,
-) -> std::io::Result<(ResponseHead, Vec<u8>)>
+pub async fn read_response_head<S>(stream: &mut S) -> std::io::Result<(ResponseHead, Vec<u8>)>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
@@ -105,8 +103,7 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 
 /// 解析响应头（纯函数）。status 非法/缺 Host 结构 → 错误。
 pub fn parse_response_head(head: &[u8]) -> std::io::Result<ResponseHead> {
-    let text = std::str::from_utf8(head)
-        .map_err(|_| invalid("响应头非 UTF-8"))?;
+    let text = std::str::from_utf8(head).map_err(|_| invalid("响应头非 UTF-8"))?;
     let mut lines = text.split("\r\n");
     let status_line = lines.next().ok_or_else(|| invalid("空响应"))?;
     let mut parts = status_line.splitn(3, ' ');
@@ -155,7 +152,9 @@ pub fn parse_response_head(head: &[u8]) -> std::io::Result<ResponseHead> {
 }
 
 pub fn header<'a>(h: &'a ResponseHead, name: &str) -> Option<&'a str> {
-    h.headers.get(&name.to_ascii_lowercase()).map(|s| s.as_str())
+    h.headers
+        .get(&name.to_ascii_lowercase())
+        .map(|s| s.as_str())
 }
 
 pub fn invalid(msg: impl Into<String>) -> std::io::Error {
@@ -338,7 +337,10 @@ mod tests {
     #[test]
     fn 解析_chunked_与_eof_帧式() {
         let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-        assert_eq!(parse_response_head(chunked).unwrap().body_kind, BodyKind::Chunked);
+        assert_eq!(
+            parse_response_head(chunked).unwrap().body_kind,
+            BodyKind::Chunked
+        );
         let eof = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n";
         assert_eq!(parse_response_head(eof).unwrap().body_kind, BodyKind::Eof);
     }
@@ -354,7 +356,13 @@ mod tests {
 
     #[test]
     fn 请求_带_range与if_range() {
-        let req = build_request("GET", "example.com", "/f.iso", Some((0, Some(99))), Some("\"e1\""));
+        let req = build_request(
+            "GET",
+            "example.com",
+            "/f.iso",
+            Some((0, Some(99))),
+            Some("\"e1\""),
+        );
         let s = String::from_utf8(req).unwrap();
         assert!(s.starts_with("GET /f.iso HTTP/1.1\r\nHost: example.com\r\n"));
         assert!(s.contains("Range: bytes=0-99\r\n"));
@@ -362,15 +370,16 @@ mod tests {
         assert!(s.ends_with("Connection: keep-alive\r\n\r\n"));
         // 开放区间
         let req2 = build_request("HEAD", "h", "/", Some((5, None)), None);
-        assert!(String::from_utf8(req2).unwrap().contains("Range: bytes=5-\r\n"));
+        assert!(String::from_utf8(req2)
+            .unwrap()
+            .contains("Range: bytes=5-\r\n"));
     }
 
     #[tokio::test]
     async fn 流式读取_头与body前缀分离() {
         // 模拟流：头 + body 前缀一次性到达
-        let mut stream: std::io::Cursor<Vec<u8>> = std::io::Cursor::new(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nABCD".to_vec(),
-        );
+        let mut stream: std::io::Cursor<Vec<u8>> =
+            std::io::Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nABCD".to_vec());
         let (head, prefix) = read_response_head(&mut stream).await.unwrap();
         assert_eq!(head.status, 200);
         assert_eq!(prefix, b"ABCD");
@@ -421,9 +430,7 @@ mod tests {
 
     #[tokio::test]
     async fn body_reader_eof_死亡标记() {
-        let mut stream = std::io::Cursor::new(
-            b"HTTP/1.1 200 OK\r\n\r\nbody-till-eof".to_vec(),
-        );
+        let mut stream = std::io::Cursor::new(b"HTTP/1.1 200 OK\r\n\r\nbody-till-eof".to_vec());
         let (head, prefix) = read_response_head(&mut stream).await.unwrap();
         let mut reader = BodyReader::new(&mut stream, &head, prefix);
         let mut all = Vec::new();

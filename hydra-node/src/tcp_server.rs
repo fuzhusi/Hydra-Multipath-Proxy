@@ -375,6 +375,8 @@ async fn handle_tls_stream(
                 );
                 return;
             }
+            // Tier1 寿命上限豁免：信令会话自带 90s 读超时（天然短命），
+            // 不接入 max_conn_age（覆盖面：TCP pump + UDP 中继已全覆盖）
             // 与普通目标路径对称：先回 2B OK（客户端认证路径读完应答才进入信令收发）
             if write_reply(&mut wr, REPLY_OK).await.is_err() {
                 return;
@@ -468,7 +470,15 @@ async fn handle_tls_stream(
                 exited.clone(),
                 age_deadline
             ),
-            pump(t_rd, wr, idle, last_active, exit_notify, exited, age_deadline)
+            pump(
+                t_rd,
+                wr,
+                idle,
+                last_active,
+                exit_notify,
+                exited,
+                age_deadline
+            )
         )
     };
     let (up, down) = (c2t.unwrap_or(0), t2c.unwrap_or(0));
@@ -683,8 +693,7 @@ mod tests {
 
         let last_active = Arc::new(AtomicU64::new(now_ms()));
         let idle = std::time::Duration::from_secs(30); // 空闲看门狗远大于寿命
-        let age_deadline =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+        let age_deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
 
         let (mut a_cli, a_srv) = duplex(64);
         let exit_notify = Arc::new(tokio::sync::Notify::new());

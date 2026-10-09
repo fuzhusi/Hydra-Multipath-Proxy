@@ -1510,8 +1510,7 @@ async fn udp_relay_task(
                 continue;
             }
         };
-        let age_deadline =
-            max_age.and_then(|d| std::time::Instant::now().checked_add(d));
+        let age_deadline = max_age.and_then(|d| std::time::Instant::now().checked_add(d));
 
         // 2. 双向泵
         let mut flows = UdpFlowTable::default();

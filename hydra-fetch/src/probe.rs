@@ -36,12 +36,16 @@ pub fn parse_https_url(url: &str) -> Result<(String, u16, String), String> {
     let (host, port) = match hostport.rsplit_once(':') {
         Some((h, p)) => (
             h.to_string(),
-            p.parse::<u16>().map_err(|_| format!("端口非法: {hostport}"))?,
+            p.parse::<u16>()
+                .map_err(|_| format!("端口非法: {hostport}"))?,
         ),
         None => (hostport.to_string(), 443),
     };
     if host.is_empty() {
         return Err(format!("URL 缺主机名: {url}"));
+    }
+    if path.contains(['\r', '\n', '\0']) || host.contains(['\r', '\n', '\0']) {
+        return Err("URL 含非法控制字符（CRLF 注入防御）".to_string());
     }
     Ok((host, port, path))
 }
@@ -59,7 +63,6 @@ pub async fn probe(
         let (_node, tunnel) = factory.open(&host, port).await?;
         let mut tls_stream = tls_connector.connect(&host, tunnel).await?;
 
-        
         // 先 HEAD；405/501 → Range-GET bytes=0-0（从 Content-Range 取总长）
         let head = match issue(&mut tls_stream, &host, &path, "HEAD", None, None).await {
             Ok((h, _)) if h.status == 405 || h.status == 501 => {
@@ -80,8 +83,8 @@ pub async fn probe(
                     }
                     200 => {
                         // 服务器不支持 Range：Content-Length 即总长
-                        let total = header(&h2, "content-length")
-                            .and_then(|v| v.parse::<u64>().ok());
+                        let total =
+                            header(&h2, "content-length").and_then(|v| v.parse::<u64>().ok());
                         (h2, total, false)
                     }
                     code => return Err(format!("Range 探测失败（HTTP {code}）: {current}")),
@@ -105,20 +108,35 @@ pub async fn probe(
                     path,
                     total_len: head.1,
                     accept_ranges: head.2,
-                    etag: header(&head.0, "etag").map(|s| s.to_string()),
-                    last_modified: header(&head.0, "last-modified").map(|s| s.to_string()),
+                    etag: header(&head.0, "etag")
+                        .filter(|v| !v.contains(['\r', '\n']))
+                        .map(|s| s.to_string()),
+                    last_modified: header(&head.0, "last-modified")
+                        .filter(|v| !v.contains(['\r', '\n']))
+                        .map(|s| s.to_string()),
                 });
             }
             301 | 302 | 303 | 307 | 308 => {
                 let loc = header(&head.0, "location")
                     .ok_or_else(|| format!("重定向缺 Location: {current}"))?
                     .to_string();
+                // Location 规范化：协议相对 //host/path、缺前导 / 的相对路径；
+                // CRLF 注入防御（恶意 Location 拼请求头——防御纵深）
+                if loc.contains(['\r', '\n', '\0']) {
+                    return Err("Location 含非法控制字符".to_string());
+                }
                 current = if loc.starts_with("https://") {
                     loc
                 } else if loc.starts_with("http://") {
                     return Err("重定向到明文 http——仅支持 https 目标".to_string());
-                } else {
+                } else if let Some(rest) = loc.strip_prefix("//") {
+                    format!("https://{rest}")
+                } else if loc.starts_with('/') {
                     format!("https://{host}:{port}{loc}")
+                } else {
+                    // 相对路径：基于当前 path 的目录（简单拼接已满足分发场景）
+                    let base = path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                    format!("https://{host}:{port}{base}/{loc}")
                 };
                 continue;
             }

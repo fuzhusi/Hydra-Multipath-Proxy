@@ -14,6 +14,8 @@ use crate::state::FetchState;
 
 /// 单块最大尝试次数（同一轮内；轮间由编排层重新选节点）
 pub const MAX_ATTEMPTS: usize = 3;
+/// 分块下载最大重试轮数（每轮在最新节点状态下重新选节点）
+pub const MAX_ROUNDS: usize = 3;
 
 /// 隧道工厂：`Scheduler`（评分/记账）+ 凭据。Clone 语义 = 共享同一调度器
 /// 评分面（多 worker 的失败记账互相可见）。
@@ -87,22 +89,18 @@ impl TunnelFactory {
             let Some(node) = self.pick_weighted(&candidates) else {
                 break;
             };
-            let stream = match tcp_transport::connect_channel(
-                node,
-                &self.sni,
-                &self.trust,
-                &self.auth_key,
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("节点 {node} 握手失败，标记 Offline 并换节点: {e}");
-                    self.scheduler.mark_node_offline(&node).await;
-                    last_err = e;
-                    continue;
-                }
-            };
+            let stream =
+                match tcp_transport::connect_channel(node, &self.sni, &self.trust, &self.auth_key)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("节点 {node} 握手失败，标记 Offline 并换节点: {e}");
+                        self.scheduler.mark_node_offline(&node).await;
+                        last_err = e;
+                        continue;
+                    }
+                };
             let stream = match tcp_transport::request_target(
                 stream,
                 &format!("{target_host}:{target_port}"),
@@ -111,9 +109,7 @@ impl TunnelFactory {
             {
                 Ok(s) => s,
                 Err(HydraError::TargetUnreachable(m)) => {
-                    return Err(format!(
-                        "目标不可达（节点 {node} 健康，不标记故障）: {m}"
-                    ));
+                    return Err(format!("目标不可达（节点 {node} 健康，不标记故障）: {m}"));
                 }
                 Err(HydraError::ProtocolError(m)) => {
                     return Err(format!("本地协议错误: {m}"));
@@ -175,9 +171,11 @@ pub async fn fetch_chunk(
                 .open(ctx.host, ctx.port)
                 .await
                 .map_err(ChunkError::Retryable)?;
-            let tls_stream = ctx.tls.connect(ctx.host, stream).await.map_err(|e| {
-                ChunkError::Retryable(format!("目标站 TLS 握手失败: {e}"))
-            })?;
+            let tls_stream = ctx
+                .tls
+                .connect(ctx.host, stream)
+                .await
+                .map_err(|e| ChunkError::Retryable(format!("目标站 TLS 握手失败: {e}")))?;
             *tunnel = Some((node, tls_stream));
         }
         let (_, stream) = tunnel.as_mut().expect("上方已建隧道");

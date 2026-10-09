@@ -29,7 +29,13 @@ impl FetchState {
         total_len.div_ceil(chunk_size.max(1)) as usize
     }
 
-    pub fn new(url: &str, total_len: u64, chunk_size: u64, etag: Option<String>, last_modified: Option<String>) -> Self {
+    pub fn new(
+        url: &str,
+        total_len: u64,
+        chunk_size: u64,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    ) -> Self {
         Self {
             url: url.to_string(),
             total_len,
@@ -79,9 +85,9 @@ impl FetchState {
     /// 读取（不存在 → None；损坏 → Err 调用方决定重下）
     pub async fn load(state_path: &Path) -> std::io::Result<Option<Self>> {
         match tokio::fs::read(state_path).await {
-            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(
-                std::io::Error::other,
-            )?)),
+            Ok(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
+            )),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
@@ -107,7 +113,7 @@ mod tests {
         let mut st2 = st.clone();
         st2.done[0] = true;
         st2.done[3] = true; // 尾块 10 字节已完成
-        // 剩余 = 未完成块：idx1(30) + idx2(30)；idx3 已完成不计
+                            // 剩余 = 未完成块：idx1(30) + idx2(30)；idx3 已完成不计
         assert_eq!(st2.remaining_bytes(), 60);
     }
 

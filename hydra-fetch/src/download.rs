@@ -9,7 +9,9 @@ use hydra_protocol::{NodeInfo, NodeStatus};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
-use crate::engine::{mark_done, fetch_chunk, ChunkError, TunnelFactory, WorkerTunnel, MAX_ATTEMPTS};
+use crate::engine::{
+    fetch_chunk, mark_done, ChunkError, TunnelFactory, WorkerTunnel, MAX_ATTEMPTS, MAX_ROUNDS,
+};
 use crate::http::{self, BodyReader};
 use crate::probe::{self, ProbeResult};
 use crate::state::FetchState;
@@ -52,6 +54,8 @@ struct Shared {
     path: String,
     /// 内容变更终止（If-Range 不匹配等）：停止一切重试，要求整文件重下
     content_changed: std::sync::atomic::AtomicBool,
+    /// 致命错误（如 403）：同样终止一切重试，但保留状态文件且错误文案独立
+    fatal: std::sync::Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -72,6 +76,16 @@ impl Shared {
     fn flag_content_changed(&self) {
         self.content_changed
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn flag_fatal(&self, msg: String) {
+        *self.fatal.lock().unwrap() = Some(msg);
+        self.content_changed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn fatal_msg(&self) -> Option<String> {
+        self.fatal.lock().unwrap().clone()
     }
 }
 
@@ -132,7 +146,7 @@ async fn worker(id: usize, shared: Arc<Shared>, fail_tx: mpsc::UnboundedSender<C
                 }
                 Err(ChunkError::Fatal(e)) => {
                     eprintln!("[worker-{id}] 块 {} 致命错误: {e}", job.index);
-                    shared.flag_content_changed();
+                    shared.flag_fatal(e);
                     let _ = fail_tx.send(job.clone());
                     return;
                 }
@@ -196,7 +210,11 @@ pub async fn run(cfg: FetchConfig) -> Result<(), String> {
     println!(
         "目标总长 {:.2}MB | 分块并行: {} | 校验器: {}",
         total as f64 / 1048576.0,
-        if parallel { "是" } else { "否（单流回落）" },
+        if parallel {
+            "是"
+        } else {
+            "否（单流回落）"
+        },
         if pr.etag.is_some() {
             "ETag"
         } else if pr.last_modified.is_some() {
@@ -208,13 +226,60 @@ pub async fn run(cfg: FetchConfig) -> Result<(), String> {
 
     let part_path = cfg.output.with_extension("part");
     let state_path = FetchState::path_for(&cfg.output);
+    let if_range = pr.etag.clone().or_else(|| pr.last_modified.clone());
 
     if !parallel {
-        // 单流回落：清掉过期状态文件
+        // 单流回落：清掉过期状态文件；就位尾段（校验/rename）与并行路径共用
         let _ = tokio::fs::remove_file(&state_path).await;
-        return single_stream(&factory, &tls, &pr, &part_path).await;
+        single_stream(&factory, &tls, &pr, &part_path).await?;
+    } else {
+        parallel_download(
+            cfg.clone(),
+            factory,
+            tls,
+            pr,
+            total,
+            &part_path,
+            &state_path,
+            if_range,
+        )
+        .await?;
     }
 
+    // ── 统一就位尾段：SHA-256 校验 → rename → 删状态文件 ──
+    if let Some(expect) = &cfg.expect_sha256 {
+        print!("校验 SHA-256…");
+        let actual = crate::sha256::file_sha256_hex(part_path.as_path())
+            .await
+            .map_err(|e| format!("SHA-256 计算失败: {e}"))?;
+        if !actual.eq_ignore_ascii_case(expect) {
+            return Err(format!(
+                "SHA-256 不匹配：期望 {expect}，实际 {actual}（文件已保留于 {}）",
+                part_path.display()
+            ));
+        }
+        println!("通过");
+    }
+    tokio::fs::rename(part_path, &cfg.output)
+        .await
+        .map_err(|e| format!("文件就位失败: {e}"))?;
+    let _ = tokio::fs::remove_file(state_path).await;
+    println!("✓ 下载完成: {}", cfg.output.display());
+    Ok(())
+}
+
+/// 并行分块下载（多轮 worker 池；就位尾段由 run() 统一执行）
+#[allow(clippy::too_many_arguments)]
+async fn parallel_download(
+    cfg: FetchConfig,
+    factory: TunnelFactory,
+    tls: TargetTlsConnector,
+    pr: ProbeResult,
+    total: u64,
+    part_path: &PathBuf,
+    state_path: &PathBuf,
+    if_range: Option<String>,
+) -> Result<(), String> {
     // 3. 状态恢复（评审 P0：URL/总长/块大小任一漂移即失效重下）
     let chunk_size = cfg.chunk_size.max(1);
     let mut st = match FetchState::load(&state_path.clone()).await {
@@ -270,7 +335,6 @@ pub async fn run(cfg: FetchConfig) -> Result<(), String> {
     }
 
     // 5. 多轮 worker 池（≤3 轮；轮间节点故障记账已刷新）
-    let if_range = pr.etag.clone().or_else(|| pr.last_modified.clone());
     let mut jobs: Vec<ChunkJob> = st
         .done
         .iter()
@@ -284,7 +348,13 @@ pub async fn run(cfg: FetchConfig) -> Result<(), String> {
         .collect();
     let fetched = Arc::new(AtomicU64::new(0));
     let total_to_fetch: u64 = jobs.iter().map(|j| j.end_excl - j.start).sum();
-    let workers = cfg.workers.clamp(1, 16).min(jobs.len().max(1));
+    // 0 = 自动 min(16, 节点数×4)（与 --help 承诺一致）；显式值 clamp 1..=16
+    let workers = if cfg.workers == 0 {
+        cfg.nodes.len().saturating_mul(4).clamp(1, 16)
+    } else {
+        cfg.workers.clamp(1, 16)
+    }
+    .min(jobs.len().max(1));
 
     // 进度报告（1s 粒度；下载结束即退出）
     let progress_fetched = Arc::clone(&fetched);
@@ -294,8 +364,8 @@ pub async fn run(cfg: FetchConfig) -> Result<(), String> {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             let now = progress_fetched.load(Ordering::Relaxed);
-            let speed = now.saturating_sub(last_bytes) as f64
-                / last_t.elapsed().as_secs_f64().max(0.001);
+            let speed =
+                now.saturating_sub(last_bytes) as f64 / last_t.elapsed().as_secs_f64().max(0.001);
             last_bytes = now;
             last_t = std::time::Instant::now();
             eprint!(
@@ -332,11 +402,16 @@ pub async fn run(cfg: FetchConfig) -> Result<(), String> {
             port: pr.port,
             path: pr.path.clone(),
             content_changed: std::sync::atomic::AtomicBool::new(false),
+            fatal: std::sync::Mutex::new(None),
         });
         let (fail_tx, mut fail_rx) = mpsc::unbounded_channel::<ChunkJob>();
         let mut handles = Vec::new();
         for id in 0..workers {
-            handles.push(tokio::spawn(worker(id, Arc::clone(&shared), fail_tx.clone())));
+            handles.push(tokio::spawn(worker(
+                id,
+                Arc::clone(&shared),
+                fail_tx.clone(),
+            )));
         }
         drop(fail_tx); // 全部 worker 结束后 recv 返回 None
         while fail_rx.recv().await.is_some() {}
@@ -344,6 +419,11 @@ pub async fn run(cfg: FetchConfig) -> Result<(), String> {
             let _ = h.await;
         }
         st = shared.state.lock().unwrap().clone();
+        if let Some(msg) = shared.fatal_msg() {
+            reporter.abort();
+            // 致命错误：保留状态文件（配置修复后续传）
+            return Err(msg);
+        }
         if shared.content_changed() {
             reporter.abort();
             let _ = tokio::fs::remove_file(state_path).await;
@@ -367,31 +447,12 @@ pub async fn run(cfg: FetchConfig) -> Result<(), String> {
 
     if !jobs.is_empty() {
         return Err(format!(
-            "{} 个块在 {} 轮重试后仍失败——已保留断点状态，稍后重跑同一命令可续传",
-            jobs.len(),
-            round
+            "{} 个块在 {MAX_ROUNDS} 轮重试后仍失败——已保留断点状态，稍后重跑同一命令可续传",
+            jobs.len()
         ));
     }
 
-    // 6. 就位：rename + 删状态文件 + 可选 SHA-256 校验
-    if let Some(expect) = &cfg.expect_sha256 {
-        print!("校验 SHA-256…");
-        let actual = crate::sha256::file_sha256_hex(part_path.as_path())
-            .await
-            .map_err(|e| format!("SHA-256 计算失败: {e}"))?;
-        if !actual.eq_ignore_ascii_case(expect) {
-            return Err(format!(
-                "SHA-256 不匹配：期望 {expect}，实际 {actual}（文件已保留于 {}）",
-                part_path.display()
-            ));
-        }
-        println!("通过");
-    }
-    tokio::fs::rename(part_path, &cfg.output)
-        .await
-        .map_err(|e| format!("文件就位失败: {e}"))?;
-    let _ = tokio::fs::remove_file(state_path).await;
-    println!("✓ 下载完成: {}", cfg.output.display());
+    // 6. 就位尾段（校验/rename/删状态）由 run() 统一执行
     Ok(())
 }
 

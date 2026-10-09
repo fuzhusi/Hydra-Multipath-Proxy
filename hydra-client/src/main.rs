@@ -386,21 +386,22 @@ async fn main() -> Result<()> {
     // 裸 fmt::init() 无 RUST_LOG 时默认 error 级 = 完全静默（功能正常但零输出，
     // 用户误以为未启动——v0.2.2 真机部署反馈 2026-10-09）。info 级安全：目标
     // 地址已在日志层脱敏（短哈希，明文仅 debug 级）。
-    let log_level =
-        std::env::var("HYDRA_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+    let log_level = std::env::var("HYDRA_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
     {
         use tracing_subscriber::EnvFilter;
         let filter = match EnvFilter::try_from_default_env() {
             Ok(f) => f, // RUST_LOG 存在时优先
-            Err(_) => EnvFilter::try_new(&log_level)
-                .unwrap_or_else(|_| EnvFilter::new("info")), // 非法值回落 info
+            Err(_) => EnvFilter::try_new(&log_level).unwrap_or_else(|_| EnvFilter::new("info")), // 非法值回落 info
         };
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 
     // 启动横幅：日志系统之外的对等确认（即便日志层配置异常，用户也能看到进程
     // 已启动）。监听地址等细节由后续 info! 日志给出。
-    println!("Hydra 客户端 v{}（日志级别 {log_level}；RUST_LOG 可覆盖）", env!("CARGO_PKG_VERSION"));
+    println!(
+        "Hydra 客户端 v{}（日志级别 {log_level}；RUST_LOG 可覆盖）",
+        env!("CARGO_PKG_VERSION")
+    );
 
     // 审查 R-30 收尾：启动时读取一次 HYDRA_TRANSPORT——设了 legacy `quic` 时
     // 如实告警回退 tcp（兑现 README 行为；此前该函数零调用，告警不存在）

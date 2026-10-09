@@ -33,7 +33,7 @@ async fn main() {
 fn usage() -> String {
     "用法: hydra-fetch [-o 输出文件] [--workers N] [--chunk-mb N] [--sha256 <64hex>] <https://URL> [节点 addr:port...]\n\
      环境变量: HYDRA_AUTH_KEY（64 hex，必填）| HYDRA_NODE_CERT(S)（节点证书 DER，pin 模式必填）|\n\
-    　　　　　 HYDRA_TRUST=pin|ca | HYDRA_SNI | HYDRA_LOG_LEVEL（默认 info）"
+          HYDRA_TRUST=pin|ca | HYDRA_SNI | HYDRA_LOG_LEVEL（默认 info）"
         .to_string()
 }
 
@@ -72,7 +72,10 @@ async fn run() -> Result<(), String> {
                 }
                 sha256 = Some(v.to_ascii_lowercase());
             }
-            "-h" | "--help" => return Err(usage()),
+            "-h" | "--help" => {
+                println!("{}", usage());
+                std::process::exit(0);
+            }
             _ if a.starts_with('-') => return Err(format!("未知参数: {a}\n{}", usage())),
             _ if url.is_none() => url = Some(a),
             _ => nodes.push(a),
@@ -81,8 +84,8 @@ async fn run() -> Result<(), String> {
     let url = url.ok_or_else(usage)?;
 
     // 凭据（与 hydra-client 同款约定）
-    let auth_key_hex =
-        std::env::var("HYDRA_AUTH_KEY").map_err(|_| "未设置 HYDRA_AUTH_KEY（64 位 hex）".to_string())?;
+    let auth_key_hex = std::env::var("HYDRA_AUTH_KEY")
+        .map_err(|_| "未设置 HYDRA_AUTH_KEY（64 位 hex）".to_string())?;
     let auth_key = hydra_core::auth_key_from_hex(&auth_key_hex)
         .map_err(|m| format!("HYDRA_AUTH_KEY 非法: {m}"))?;
     let certs = read_certs()?;
@@ -90,7 +93,9 @@ async fn run() -> Result<(), String> {
         Ok("ca") => TlsTrust::public_ca(None),
         _ => {
             if certs.is_empty() {
-                return Err("pin 模式需 HYDRA_NODE_CERT(S)（或 HYDRA_TRUST=ca 信任公共 CA）".to_string());
+                return Err(
+                    "pin 模式需 HYDRA_NODE_CERT(S)（或 HYDRA_TRUST=ca 信任公共 CA）".to_string(),
+                );
             }
             TlsTrust::pinned(certs)
         }
@@ -99,7 +104,8 @@ async fn run() -> Result<(), String> {
 
     // 节点：位置参数优先，回落 HYDRA_NODES（逗号分隔）
     let nodes_str = if nodes.is_empty() {
-        std::env::var("HYDRA_NODES").map_err(|_| "未配置节点（HYDRA_NODES 或位置参数）".to_string())?
+        std::env::var("HYDRA_NODES")
+            .map_err(|_| "未配置节点（HYDRA_NODES 或位置参数）".to_string())?
     } else {
         nodes.join(",")
     };
