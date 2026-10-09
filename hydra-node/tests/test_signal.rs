@@ -14,8 +14,8 @@ use hydra_node::NodeOptions;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::io::ReadHalf;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -24,7 +24,8 @@ async fn spawn_signal_node() -> (SocketAddr, Vec<u8>) {
     // 信令会话不触达 SSRF 过滤，但与既有测试基线保持一致（允许私有目标）
     std::env::set_var("HYDRA_ALLOW_PRIVATE_TARGETS", "1");
     let seq = SEQ.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("hydra-signal-test-{}-{}", std::process::id(), seq));
+    let dir =
+        std::env::temp_dir().join(format!("hydra-signal-test-{}-{}", std::process::id(), seq));
     std::fs::create_dir_all(&dir).unwrap();
     let opts = NodeOptions {
         cert_file: dir.join("cert.der"),
@@ -32,9 +33,10 @@ async fn spawn_signal_node() -> (SocketAddr, Vec<u8>) {
         p2p_signal: true,
         ..NodeOptions::default()
     };
-    let server = hydra_node::HydraServer::new("127.0.0.1:0".parse().unwrap(), test_auth_key(), opts)
-        .await
-        .unwrap();
+    let server =
+        hydra_node::HydraServer::new("127.0.0.1:0".parse().unwrap(), test_auth_key(), opts)
+            .await
+            .unwrap();
     (server.tcp_listen_addr.unwrap(), server.cert_der().to_vec())
 }
 
@@ -58,9 +60,15 @@ async fn connect_signal(
     hydra_client::tcp_transport::TcpWriteHalf,
 ) {
     let trust = TlsTrust::pinned(vec![cert.to_vec()]);
-    let stream = connect_target(node, "", &trust, &test_auth_key(), &format!("@hydra-p2p/{peer_id}"))
-        .await
-        .expect("信令连接（认证路径）应成功");
+    let stream = connect_target(
+        node,
+        "",
+        &trust,
+        &test_auth_key(),
+        &format!("@hydra-p2p/{peer_id}"),
+    )
+    .await
+    .expect("信令连接（认证路径）应成功");
     let (rd, wr) = tokio::io::split(stream);
     (BufReader::new(rd), wr)
 }
@@ -74,7 +82,9 @@ async fn send(wr: &mut hydra_client::tcp_transport::TcpWriteHalf, msg: &SignalMe
 }
 
 /// 读一条下行消息（JSON 行）
-async fn recv(rd: &mut BufReader<ReadHalf<hydra_client::tcp_transport::TcpNodeStream>>) -> SignalDownMessage {
+async fn recv(
+    rd: &mut BufReader<ReadHalf<hydra_client::tcp_transport::TcpNodeStream>>,
+) -> SignalDownMessage {
     let mut line = String::new();
     let r = tokio::time::timeout(Duration::from_secs(10), rd.read_line(&mut line)).await;
     let n = r.expect("读下行超时").expect("读下行失败");
@@ -262,7 +272,7 @@ async fn 非法json_断开会话() {
     let r = tokio::time::timeout(Duration::from_secs(10), rd.read_line(&mut line)).await;
     match r {
         Err(_) => panic!("等待断开超时"),
-        Ok(Ok(0)) => {} // 干净 EOF
+        Ok(Ok(0)) => {}                                                   // 干净 EOF
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {} // TLS 无 close_notify EOF
         Ok(Err(e)) => panic!("读下行意外错误: {e}"),
         Ok(Ok(n)) => panic!("应断开，实际收到 {n} 字节: {line}"),
@@ -306,8 +316,7 @@ async fn 冒用顶替_伪造proof被拒且原属主不受影响() {
 
     // 冒用者：新连接、同 peer_id、错误 PSK 派生的 proof
     let (mut f_rd, mut f_wr) = connect_signal(addr, &cert, victim).await;
-    let forged_proof =
-        hydra_protocol::p2p_owner_proof(b"wrong-key-wrong-key-wrong-key-32", victim);
+    let forged_proof = hydra_protocol::p2p_owner_proof(b"wrong-key-wrong-key-wrong-key-32", victim);
     send(
         &mut f_wr,
         &SignalMessage::Register {
@@ -344,13 +353,7 @@ async fn 冒用顶替_伪造proof被拒且原属主不受影响() {
         },
     )
     .await;
-    invite_until_online(
-        &mut c_wr,
-        &mut c_rd,
-        victim,
-        vec!["127.0.0.1:40006".into()],
-    )
-    .await;
+    invite_until_online(&mut c_wr, &mut c_rd, victim, vec!["127.0.0.1:40006".into()]).await;
     let incoming = recv(&mut v_rd).await;
     match incoming {
         SignalDownMessage::Incoming { from, .. } => assert_eq!(from, "7777777777777777"),

@@ -234,7 +234,10 @@ mod tests {
     fn pem_空证书与坏输入_显式报错不panic() {
         // 空证书文件
         let err = parse_pem_pair(b"", b"").expect_err("空输入必须报错");
-        assert!(err.to_string().contains("未找到任何证书"), "错误信息应指明原因: {err}");
+        assert!(
+            err.to_string().contains("未找到任何证书"),
+            "错误信息应指明原因: {err}"
+        );
         // 有证书无合法私钥
         let certified = rcgen::generate_simple_self_signed(vec!["hydra.node".into()]).unwrap();
         let err = parse_pem_pair(certified.cert.pem().as_bytes(), b"not a key")

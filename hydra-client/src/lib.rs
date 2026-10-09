@@ -8,14 +8,27 @@
 //! - `tun_config_from_settings` 等 TUN 配置构造（依赖 tun.rs 类型，故留桌面）
 
 pub use hydra_core::{
-    auth_key_from_hex, node_certs_from_paths,
+    auth_key_from_hex,
     // 内容级 re-export（各模块 pub use 于 core::lib 已展开为平铺项）
-    channel::*, connections::*, nat::*, proxy::*, routing::*, scheduler::*, share_link::*,
-    speedtest::*, subscription::*, tcp_transport::*, traffic::*, udp_relay::*,
+    channel::*,
+    connections::*,
+    nat::*,
+    node_certs_from_paths,
+    proxy::*,
+    routing::*,
+    scheduler::*,
+    share_link::*,
+    speedtest::*,
+    subscription::*,
+    tcp_transport::*,
+    traffic::*,
+    udp_relay::*,
 };
 // 模块路径同样保留（`hydra_client::proxy::ProxyServer` 等既有引用）
-pub use hydra_core::{channel, connections, nat, proxy, routing, scheduler, share_link, speedtest,
-    subscription, tcp_transport, traffic, transport, udp_relay};
+pub use hydra_core::{
+    channel, connections, nat, proxy, routing, scheduler, share_link, speedtest, subscription,
+    tcp_transport, traffic, transport, udp_relay,
+};
 
 // TUN 透明代理模式（feature = "tun"，见 tun.rs 模块文档；Android 不复用本模块，
 // 其 tun_core 为按评审 R1-R4 增强的独立实现）
@@ -91,12 +104,11 @@ pub fn tun_config_from_settings(
         }
     }
     if let Some(s) = ports.map(str::trim).filter(|s| !s.is_empty()) {
-        let list: Vec<u16> = s
-            .split(',')
-            .filter_map(|p| p.trim().parse().ok())
-            .collect();
+        let list: Vec<u16> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
         if list.is_empty() {
-            return Err(format!("TUN 端口列表非法（应为逗号分隔端口，如 80,443,8080,8443）: {s}"));
+            return Err(format!(
+                "TUN 端口列表非法（应为逗号分隔端口，如 80,443,8080,8443）: {s}"
+            ));
         }
         cfg.listen_ports = list;
     }
@@ -166,11 +178,15 @@ pub const INSTANCE_PORT_GUI: u16 = 52811;
 /// 其余绑定错误原样透传。守卫须由调用方保存到 main 作用域直至退出。
 pub fn acquire_instance_guard(port: u16) -> Result<InstanceGuard, String> {
     std::net::TcpListener::bind(("127.0.0.1", port))
-        .map(|listener| InstanceGuard { _listener: listener })
+        .map(|listener| InstanceGuard {
+            _listener: listener,
+        })
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::AddrInUse {
-                format!("已有 Hydra 实例在运行（互斥端口 {port} 被占用）——请先退出已有实例；\
-                         若确认没有，可能是其他程序占用了该端口")
+                format!(
+                    "已有 Hydra 实例在运行（互斥端口 {port} 被占用）——请先退出已有实例；\
+                         若确认没有，可能是其他程序占用了该端口"
+                )
             } else {
                 format!("实例互斥端口 {port} 绑定失败: {e}")
             }
@@ -258,7 +274,9 @@ mod tun_settings_tests {
             "[::1]:443".parse::<SocketAddr>().unwrap(),
         ];
         let cfg = tun_config_from_settings(None, None, &nodes).unwrap();
-        assert!(cfg.exclude_routes.contains(&std::net::Ipv4Addr::new(1, 2, 3, 4)));
+        assert!(cfg
+            .exclude_routes
+            .contains(&std::net::Ipv4Addr::new(1, 2, 3, 4)));
         assert_eq!(cfg.exclude_routes_v6.len(), 1);
     }
 }

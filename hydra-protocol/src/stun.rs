@@ -9,8 +9,8 @@
 //! msg_len，再读属性区（超长防御：msg_len > 2048 拒绝）。无新依赖：
 //! FINGERPRINT 的 CRC32（IEEE 802.3）用内置逐位实现（仅属性存在时尽力校验）。
 
-use std::net::SocketAddr;
 use crate::{HydraError, Result};
+use std::net::SocketAddr;
 
 /// RFC 5389 MAGIC_COOKIE（固定值）
 pub const MAGIC_COOKIE: u32 = 0x2112_A442;
@@ -243,16 +243,17 @@ mod tests {
     /// 手工构造一段含 XOR-MAPPED-ADDRESS 的 Binding Success Response。
     /// XOR 值按 RFC 5389 §15.2 规则独立计算（不调用实现内函数）。
     fn build_response(tx_id: &[u8; TX_ID_LEN], addr: SocketAddr) -> Vec<u8> {
-        let (ip, port) = (match addr { SocketAddr::V4(v) => *v.ip(), _ => unreachable!() }, addr.port());
+        let (ip, port) = (
+            match addr {
+                SocketAddr::V4(v) => *v.ip(),
+                _ => unreachable!(),
+            },
+            addr.port(),
+        );
         // 端口异或 cookie 高 16 位（0x2112）；地址逐字节异或 cookie 大端 4 字节
         let xport = port ^ 0x2112;
         let oct = ip.octets();
-        let xaddr = [
-            oct[0] ^ 0x21,
-            oct[1] ^ 0x12,
-            oct[2] ^ 0xA4,
-            oct[3] ^ 0x42,
-        ];
+        let xaddr = [oct[0] ^ 0x21, oct[1] ^ 0x12, oct[2] ^ 0xA4, oct[3] ^ 0x42];
         let mut buf = Vec::new();
         buf.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
         buf.extend_from_slice(&12u16.to_be_bytes()); // 属性区 = 4B 属性头 + 8B 载荷
@@ -337,16 +338,25 @@ mod tests {
         let other_id = [0xAA; TX_ID_LEN];
         let resp = build_response(&tx_id, "1.2.3.4:80".parse().unwrap());
         let err = parse_binding_response(&resp, &other_id).unwrap_err();
-        assert!(err.to_string().contains("事务 ID"), "应为事务 ID 错误: {err}");
+        assert!(
+            err.to_string().contains("事务 ID"),
+            "应为事务 ID 错误: {err}"
+        );
     }
 
     #[test]
     fn classify_两分支() {
         let a: SocketAddr = "203.0.113.7:40000".parse().unwrap();
         // 两个不同 STUN 服务器探测到的「映射地址」相同 → EIM
-        assert_eq!(classify(a, "203.0.113.7:40000".parse().unwrap()), NatType::Eim);
+        assert_eq!(
+            classify(a, "203.0.113.7:40000".parse().unwrap()),
+            NatType::Eim
+        );
         // 映射地址不同 → 对称型（回落中继）
-        assert_eq!(classify(a, "203.0.113.9:40001".parse().unwrap()), NatType::Symmetric);
+        assert_eq!(
+            classify(a, "203.0.113.9:40001".parse().unwrap()),
+            NatType::Symmetric
+        );
     }
 
     #[test]
@@ -390,10 +400,16 @@ mod tests {
         resp[2..4].copy_from_slice(&total_len);
         let crc = crc32_ieee(&resp[..fp_len_pos]) ^ 0x5354_554E;
         resp.extend_from_slice(&crc.to_be_bytes());
-        assert!(parse_binding_response(&resp, &tx_id).is_ok(), "正确 CRC 应通过");
+        assert!(
+            parse_binding_response(&resp, &tx_id).is_ok(),
+            "正确 CRC 应通过"
+        );
         // 篡改 CRC → 报错
         let last = resp.len() - 1;
         resp[last] ^= 0xFF;
-        assert!(parse_binding_response(&resp, &tx_id).is_err(), "错误 CRC 应拒绝");
+        assert!(
+            parse_binding_response(&resp, &tx_id).is_err(),
+            "错误 CRC 应拒绝"
+        );
     }
 }

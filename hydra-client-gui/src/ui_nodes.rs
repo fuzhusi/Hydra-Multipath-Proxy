@@ -1,14 +1,13 @@
 //! 节点页：节点卡片列表 + 组视图 tabs + 「＋」四个对话框
 //!（分享链接导入 / 手动添加 / 分享选择）集中渲染。
 
-use eframe::egui;
 use crate::config;
-use crate::nodes::{filter_nodes_by_group, group_summary, node_group_of, GROUP_MANUAL, Tab};
+use crate::nodes::{filter_nodes_by_group, group_summary, node_group_of, Tab, GROUP_MANUAL};
 use crate::palette;
 use crate::HydraApp;
+use eframe::egui;
 
 impl HydraApp {
-
     /// 节点页（UI 重设计第一批，按老板构想重做）：
     /// - 页面主体 = 节点卡片列表（状态色点/名称/地址/延迟色标/操作按钮）；
     /// - 右上角固定「＋」按钮 → 下拉四项：从分享链接导入 / 扫描二维码导入 /
@@ -57,8 +56,8 @@ impl HydraApp {
 
         // ── 全局凭据缺失横幅（凭据编辑已收敛到「⚙ 设置」页，此处只提示不编辑）──
         let key_missing = self.config.auth_key.trim().is_empty();
-        let cert_missing = self.config.cert_path.trim().is_empty()
-            && self.config.cert_der_b64.trim().is_empty();
+        let cert_missing =
+            self.config.cert_path.trim().is_empty() && self.config.cert_der_b64.trim().is_empty();
         if key_missing || cert_missing {
             egui::Frame::none()
                 .fill(palette::BG_CARD)
@@ -68,7 +67,10 @@ impl HydraApp {
                     palette::SPACING_XS + 2.0,
                 ))
                 .outer_margin(egui::Margin::symmetric(0.0_f32, palette::SPACING_XS))
-                .stroke(egui::Stroke::new(1.0_f32, palette::WARNING.gamma_multiply(0.5)))
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    palette::WARNING.gamma_multiply(0.5),
+                ))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.colored_label(
@@ -86,9 +88,7 @@ impl HydraApp {
         // 组 = 数据来源过滤：全部 / 手动认领 / 某订阅认领的地址（与 GuiConfig 认领机制一致）。
         // 选中的订阅组已被删除时回落「全部」（订阅在「📡 订阅」页删除的场景）
         if let Some(g) = &self.node_group {
-            if g != GROUP_MANUAL
-                && !self.config.subscriptions.iter().any(|s| &s.name == g)
-            {
+            if g != GROUP_MANUAL && !self.config.subscriptions.iter().any(|s| &s.name == g) {
                 self.node_group = None;
             }
         }
@@ -122,7 +122,10 @@ impl HydraApp {
                 for (key, label) in &tabs {
                     let selected = self.node_group.as_deref() == key.as_deref();
                     if ui
-                        .selectable_label(selected, egui::RichText::new(label).size(palette::FONT_BODY))
+                        .selectable_label(
+                            selected,
+                            egui::RichText::new(label).size(palette::FONT_BODY),
+                        )
                         .clicked()
                     {
                         self.node_group = key.clone();
@@ -133,7 +136,8 @@ impl HydraApp {
         ui.separator();
 
         // ── 组头栏：组名 + 节点数 + 在线/离线摘要 +「⚡ 全部测速（本组）」──
-        let members = filter_nodes_by_group(&self.config, &self.config.node_addrs, &self.node_group);
+        let members =
+            filter_nodes_by_group(&self.config, &self.config.node_addrs, &self.node_group);
         let (online, offline) = group_summary(&self.node_status, &members);
         let group_name = match &self.node_group {
             None => "全部节点".to_string(),
@@ -144,9 +148,9 @@ impl HydraApp {
             .fill(palette::BG_CARD)
             .rounding(egui::Rounding::same(8.0))
             .inner_margin(egui::Margin::symmetric(
-                    palette::SPACING_MD,
-                    palette::SPACING_XS + 2.0,
-                ))
+                palette::SPACING_MD,
+                palette::SPACING_XS + 2.0,
+            ))
             .outer_margin(egui::Margin::symmetric(0.0_f32, palette::SPACING_XS))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -157,7 +161,12 @@ impl HydraApp {
                     );
                     ui.colored_label(
                         palette::TEXT_WEAK,
-                        format!("{} 节点 ｜ 在线 {} / 离线 {}", members.len(), online, offline),
+                        format!(
+                            "{} 节点 ｜ 在线 {} / 离线 {}",
+                            members.len(),
+                            online,
+                            offline
+                        ),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
@@ -205,8 +214,7 @@ impl HydraApp {
         let card_min = 300.0_f32;
         let cols = ((ui.available_width() / card_min).floor() as usize).clamp(1, 3);
         // 列距 = SPACING_MD（与上方 Grid spacing 一致，卡片净宽相应扣减）
-        let cell_width = ((ui.available_width()
-            - palette::SPACING_MD * (cols as f32 - 1.0))
+        let cell_width = ((ui.available_width() - palette::SPACING_MD * (cols as f32 - 1.0))
             / cols as f32
             - palette::SPACING_MD)
             .max(220.0);
@@ -545,13 +553,16 @@ impl HydraApp {
                         ui.horizontal(|ui| {
                             ui.label(self.config.node_display_name(addr));
                             ui.small(addr);
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("分享").clicked() {
-                                    // 打开现有分享对话框（二维码 + 完整/紧凑链接）
-                                    self.open_share_dialog(addr.clone());
-                                    self.share_pick_open = false;
-                                }
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("分享").clicked() {
+                                        // 打开现有分享对话框（二维码 + 完整/紧凑链接）
+                                        self.open_share_dialog(addr.clone());
+                                        self.share_pick_open = false;
+                                    }
+                                },
+                            );
                         });
                     }
                     ui.separator();

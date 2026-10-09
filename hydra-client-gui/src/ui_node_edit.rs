@@ -1,15 +1,14 @@
 //! 节点编辑对话框：备注名/地址 + 全局安全与传输参数（实时校验）。
 
-use eframe::egui;
 use crate::config;
 use crate::config::GuiConfig;
 use crate::palette;
 use crate::HydraApp;
+use eframe::egui;
 use hydra_client::sha256_hex;
 use std::net::SocketAddr;
 
 impl HydraApp {
-
     // ═══════════════ Team-UI：节点编辑对话框 ═══════════════
 
     /// 打开节点编辑对话框（备注名/地址 + 全局安全与传输参数）

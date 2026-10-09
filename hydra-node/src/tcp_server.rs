@@ -365,7 +365,10 @@ async fn handle_tls_stream(
     // `@hydra-p2p/` 信令分流）。回 2B OK 后该流不再走 TCP 目标转发，改承载
     // hydra_protocol::udp_frame 定义的变长 UDP 会话帧；空闲/资源/SSRF 语义见
     // udp_relay 模块文档。普通 TCP 目标路径零改动。
-    if target.strip_prefix(crate::udp_relay::UDP_RELAY_PREFIX).is_some() {
+    if target
+        .strip_prefix(crate::udp_relay::UDP_RELAY_PREFIX)
+        .is_some()
+    {
         if write_reply(&mut wr, REPLY_OK).await.is_err() {
             return;
         }

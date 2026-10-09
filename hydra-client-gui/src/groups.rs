@@ -4,8 +4,8 @@
 use crate::config::{GuiConfig, SubscriptionConfig};
 use hydra_client::{parse_subscription, ShareLink, TransportChoice, TransportMode};
 use hydra_protocol::{NodeInfo, NodeStatus};
-use std::net::SocketAddr;
 use std::collections::HashSet;
+use std::net::SocketAddr;
 
 // ── 「从分享链接导入」→ 创建命名分组（复刻 Clash Profile 语义）──
 
@@ -163,7 +163,10 @@ pub(crate) fn import_share_links_as_group(
         let detail = if parsed.errors.is_empty() {
             "未在文本中找到 hydra:// 分享链接".to_string()
         } else {
-            format!("全部链接解析失败（{} 条坏行），未创建分组", parsed.errors.len())
+            format!(
+                "全部链接解析失败（{} 条坏行），未创建分组",
+                parsed.errors.len()
+            )
         };
         return Err(detail);
     }
@@ -223,7 +226,10 @@ pub(crate) fn build_form_share_url(
         .parse()
         .map_err(|_| format!("端口非法：「{}」（需要 1..=65535 的数字）", port_text))?;
     if port == 0 {
-        return Err(format!("端口非法：「{}」（需要 1..=65535 的数字）", port_text));
+        return Err(format!(
+            "端口非法：「{}」（需要 1..=65535 的数字）",
+            port_text
+        ));
     }
 
     // 认证密钥：填了则覆盖全局（与 build_share_link 的 with_auth_key_bytes 一致）
@@ -273,9 +279,7 @@ pub(crate) fn build_form_share_url(
     link.address = link_address;
     if let Some(key) = &key_bytes {
         // 09-P3-6：非法长度显式报错（builder 不再 panic）
-        link = link
-            .with_auth_key_bytes(key)
-            .map_err(|e| e.to_string())?;
+        link = link.with_auth_key_bytes(key).map_err(|e| e.to_string())?;
     }
     if let Some(der) = &cert_der {
         link = link.with_cert_der(der);
@@ -318,8 +322,8 @@ pub(crate) fn subscription_source_label(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nodes::{filter_nodes_by_group, GROUP_MANUAL};
     use crate::nodes::tests::group_fixture;
+    use crate::nodes::{filter_nodes_by_group, GROUP_MANUAL};
     use crate::subscription;
 
     // ── 「从分享链接导入」→ 创建命名分组 ──
@@ -376,7 +380,9 @@ mod tests {
         assert!(cfg.subscriptions[0]
             .source
             .starts_with(LOCAL_TEXT_SOURCE_PREFIX));
-        assert!(cfg.subscriptions[0].source.contains(&share_link_line("10.1.0.1", 1001)));
+        assert!(cfg.subscriptions[0]
+            .source
+            .contains(&share_link_line("10.1.0.1", 1001)));
         // 2 个节点认领进该分组，1 条坏行
         assert_eq!(result.node_count, 2);
         assert_eq!(result.bad_lines, 1);
@@ -409,18 +415,16 @@ mod tests {
             nodes: Vec::new(),
         });
         // 名称重复 → 报错，不新建
-        let err = import_share_links_as_group(
-            &mut cfg,
-            "已有分组",
-            &share_link_line("10.2.0.1", 2001),
-        )
-        .unwrap_err();
+        let err =
+            import_share_links_as_group(&mut cfg, "已有分组", &share_link_line("10.2.0.1", 2001))
+                .unwrap_err();
         assert!(err.contains("已存在"), "err: {}", err);
         assert_eq!(cfg.subscriptions.len(), 1);
         // 空名称 → 报错
         assert!(import_share_links_as_group(&mut cfg, "  ", "x").is_err());
         // 全部链接解析失败 → 报错，不创建分组
-        let err = import_share_links_as_group(&mut cfg, "新分组", "不是链接\n也不是链接").unwrap_err();
+        let err =
+            import_share_links_as_group(&mut cfg, "新分组", "不是链接\n也不是链接").unwrap_err();
         assert!(err.contains("未创建分组"), "err: {}", err);
         assert!(cfg.subscriptions.len() == 1 && cfg.node_addrs.is_empty());
         // 空文本 → 报错
@@ -432,8 +436,9 @@ mod tests {
         // 目标地址已被其他订阅认领 → 新分组认领 0 节点 → 撤销创建（空分组清理）
         let mut cfg = group_fixture();
         let owned = "10.0.0.2:2"; // 已被「订阅A」认领
-        let err = import_share_links_as_group(&mut cfg, "分享导入X", &share_link_line("10.0.0.2", 2))
-            .unwrap_err();
+        let err =
+            import_share_links_as_group(&mut cfg, "分享导入X", &share_link_line("10.0.0.2", 2))
+                .unwrap_err();
         assert!(err.contains("未认领到任何节点"), "err: {}", err);
         // 未留下空分组，节点列表无变化
         assert!(!cfg.subscriptions.iter().any(|s| s.name == "分享导入X"));
@@ -444,7 +449,11 @@ mod tests {
     #[test]
     fn local_text_source_reparse_produces_same_links() {
         // 「更新」语义：source（hydra-text:// + 原文）重解析 = 原导入同样的节点集合
-        let text = format!("{}\n{}\n", share_link_line("10.3.0.1", 3001), share_link_line("10.3.0.2", 3002));
+        let text = format!(
+            "{}\n{}\n",
+            share_link_line("10.3.0.1", 3001),
+            share_link_line("10.3.0.2", 3002)
+        );
         let mut cfg = GuiConfig::default();
         import_share_links_as_group(&mut cfg, "分享导入1", &text).unwrap();
         let source = cfg.subscriptions[0].source.clone();
@@ -529,8 +538,8 @@ mod tests {
         let cert_path = dir.join("node.der");
         let der: Vec<u8> = (0..=255u8).cycle().take(512).collect();
         std::fs::write(&cert_path, &der).unwrap();
-        let url = build_form_share_url("10.0.0.9", "443", "", &cert_path.display().to_string())
-            .unwrap();
+        let url =
+            build_form_share_url("10.0.0.9", "443", "", &cert_path.display().to_string()).unwrap();
         let parsed = ShareLink::from_share_url(&url).unwrap();
         assert_eq!(parsed.cert_der_bytes().unwrap().unwrap(), der);
         assert!(parsed.cert_fp.is_some());
@@ -545,7 +554,9 @@ mod tests {
         let result = import_share_links_as_group(&mut cfg, "分享导入1", &url).unwrap();
         assert_eq!(result.node_count, 1);
         assert_eq!(cfg.node_addrs, vec!["10.4.0.7:9443".to_string()]);
-        assert!(cfg.subscriptions[0].source.starts_with(LOCAL_TEXT_SOURCE_PREFIX));
+        assert!(cfg.subscriptions[0]
+            .source
+            .starts_with(LOCAL_TEXT_SOURCE_PREFIX));
         // 「更新」语义：hydra-text:// 存的是构造出的链接文本，重解析照常工作
         let reparsed = subscription::fetch_and_parse_subscription(
             "分享导入1".to_string(),
@@ -599,7 +610,9 @@ mod tests {
         // 分组条目出现在订阅列表，source = hydra-text:// + 构造链接
         assert_eq!(cfg.subscriptions.len(), 1);
         assert_eq!(cfg.subscriptions[0].name, "手动节点1");
-        assert!(cfg.subscriptions[0].source.starts_with(LOCAL_TEXT_SOURCE_PREFIX));
+        assert!(cfg.subscriptions[0]
+            .source
+            .starts_with(LOCAL_TEXT_SOURCE_PREFIX));
         assert_eq!(cfg.node_addrs, vec!["10.5.0.9:443".to_string()]);
         // 组过滤：该分组能看到节点；「手动」组为空
         let filtered = filter_nodes_by_group(

@@ -474,10 +474,8 @@ pub fn resolve_node_certs_for_nodes(
             let der = match cfg.node_cert_paths.get(addr).map(|s| s.trim()) {
                 Some(p) if !p.is_empty() => std::fs::read(p)
                     .map_err(|e| format!("读取节点 {} 的证书 {} 失败: {}", addr, p, e)),
-                _ => resolve_node_certs(cfg).and_then(|mut v| {
-                    v.pop()
-                        .ok_or_else(|| "节点证书解析结果为空".to_string())
-                }),
+                _ => resolve_node_certs(cfg)
+                    .and_then(|mut v| v.pop().ok_or_else(|| "节点证书解析结果为空".to_string())),
             }?;
             Ok(der)
         })
@@ -904,10 +902,7 @@ mod tests {
 
     #[test]
     fn test_node_cert_paths_per_node_and_migration() {
-        let dir = std::env::temp_dir().join(format!(
-            "hydra-gui-nodes-cert-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("hydra-gui-nodes-cert-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("a.der");
         let b = dir.join("b.der");
@@ -917,8 +912,14 @@ mod tests {
         let cfg = GuiConfig {
             node_addrs: vec!["10.0.0.1:4433".into(), "10.0.0.2:4433".into()],
             node_cert_paths: [
-                ("10.0.0.1:4433".to_string(), a.to_string_lossy().into_owned()),
-                ("10.0.0.2:4433".to_string(), b.to_string_lossy().into_owned()),
+                (
+                    "10.0.0.1:4433".to_string(),
+                    a.to_string_lossy().into_owned(),
+                ),
+                (
+                    "10.0.0.2:4433".to_string(),
+                    b.to_string_lossy().into_owned(),
+                ),
             ]
             .into_iter()
             .collect(),

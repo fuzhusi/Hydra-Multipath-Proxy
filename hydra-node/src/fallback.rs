@@ -179,7 +179,10 @@ mod tests {
         let text = String::from_utf8(buf.clone()).unwrap();
 
         // 状态行
-        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "状态行必须是 200 OK");
+        assert!(
+            text.starts_with("HTTP/1.1 200 OK\r\n"),
+            "状态行必须是 200 OK"
+        );
 
         // 头部齐全且顺序稳定
         assert!(text.contains("Content-Type: text/html; charset=utf-8\r\n"));
@@ -216,7 +219,11 @@ mod tests {
         for probe in [&b""[..], &b"\x01\x02"[..], &b"GET / HTTP/1.1\r\n"[..]] {
             let mut buf = Vec::new();
             http_serve_fallback(&mut buf).await.unwrap();
-            assert!(buf.starts_with(b"HTTP/1.1 200 OK\r\n"), "输入 {:?} 也应得到整页", probe);
+            assert!(
+                buf.starts_with(b"HTTP/1.1 200 OK\r\n"),
+                "输入 {:?} 也应得到整页",
+                probe
+            );
         }
     }
 }

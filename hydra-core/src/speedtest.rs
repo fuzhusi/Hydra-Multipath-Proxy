@@ -310,7 +310,9 @@ async fn apply_online_probe(
                     "节点 {addr} 连续 {} 次活性探测失败，转 Degraded（继续探测，成功即恢复）",
                     *fails
                 );
-                scheduler.update_node_status(&addr, NodeStatus::Degraded).await;
+                scheduler
+                    .update_node_status(&addr, NodeStatus::Degraded)
+                    .await;
                 online_failures.remove(&addr);
                 if speedtest_enabled {
                     last_offline_event.insert(addr, Instant::now());
@@ -330,7 +332,9 @@ async fn apply_online_probe(
                     "节点 {addr} 连续 {} 次活性探测超时，转 Degraded（继续探测，成功即恢复）",
                     *fails
                 );
-                scheduler.update_node_status(&addr, NodeStatus::Degraded).await;
+                scheduler
+                    .update_node_status(&addr, NodeStatus::Degraded)
+                    .await;
                 online_failures.remove(&addr);
                 if speedtest_enabled {
                     last_offline_event.insert(addr, Instant::now());
@@ -374,9 +378,7 @@ async fn apply_online_probe(
             score
         );
     } else {
-        debug!(
-            "节点 {addr} 本窗口无实测数据，仅 loss 衰减写回（{loss:.3}）"
-        );
+        debug!("节点 {addr} 本窗口无实测数据，仅 loss 衰减写回（{loss:.3}）");
     }
 }
 
@@ -394,7 +396,9 @@ async fn apply_offline_probe(
         ProbeOutcome::Reachable(rtt) => {
             let rtt = if speedtest_enabled { Some(rtt) } else { None };
             consecutive_failures.remove(&addr);
-            scheduler.update_node_status(&addr, NodeStatus::Online).await;
+            scheduler
+                .update_node_status(&addr, NodeStatus::Online)
+                .await;
             info!("节点 {addr} 探测成功，恢复 Online");
             if let Some(rtt) = rtt {
                 // 刚恢复的节点先以实测 RTT 修正延迟，其余字段沿用静态值

@@ -2,12 +2,12 @@
 //! 系统代理开关（经 windows_proxy，仅 Windows）、停机收敛。
 
 use crate::config;
-use crate::HydraApp;
 use crate::probe::probe_runtime;
+use crate::HydraApp;
 use hydra_client::{ProxyServer, TrafficMonitor};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// 代理线程异步主体（抽出为自由函数以便单测时序回归）。
 ///
@@ -72,7 +72,6 @@ pub(crate) async fn run_proxy_until_stopped(
 }
 
 impl HydraApp {
-
     pub(crate) fn start_proxy(&mut self) {
         if self.proxy_running {
             self.add_log("代理已经在运行".to_string());
@@ -286,68 +285,67 @@ impl HydraApp {
                 // ── TUN 叠加（已交付）：与 SOCKS 监听并存。register_nodes 需在
                 // start 之前让调度器已有节点（tun_channel_opener 依赖节点优先级表）
                 // tun_task = (停机令牌, TUN 栈任务句柄)；None = 未开启或启动失败
-                let tun_task: Option<(
-                    hydra_client::ShutdownToken,
-                    tokio::task::JoinHandle<()>,
-                )> = if let Some(tcfg) = tun_cfg {
-                    // GUI 依赖 hydra-client 默认 features（含 tun）；配置构造失败已在
-                    // GUI 线程拦截，此处失败（设备创建/路由）经通道透传日志区
-                    {
-                        proxy.register_nodes().await;
-                        match proxy.tun_channel_opener() {
-                            Ok(opener) => {
-                                // UDP 接管（09 交付）：工厂在 TUN 开启时构建
-                                let udp_factory = if tcfg.udp_relay {
-                                    match proxy.tun_udp_channel_factory() {
-                                        Ok(f) => Some(f),
-                                        Err(e) => {
-                                            // 此处已进入代理线程（不可触 UI 状态）；
-                                            // run_stack 对 None 工厂会再输出日志
-                                            tracing::warn!("UDP 接管未启用: {e}");
-                                            None
+                let tun_task: Option<(hydra_client::ShutdownToken, tokio::task::JoinHandle<()>)> =
+                    if let Some(tcfg) = tun_cfg {
+                        // GUI 依赖 hydra-client 默认 features（含 tun）；配置构造失败已在
+                        // GUI 线程拦截，此处失败（设备创建/路由）经通道透传日志区
+                        {
+                            proxy.register_nodes().await;
+                            match proxy.tun_channel_opener() {
+                                Ok(opener) => {
+                                    // UDP 接管（09 交付）：工厂在 TUN 开启时构建
+                                    let udp_factory = if tcfg.udp_relay {
+                                        match proxy.tun_udp_channel_factory() {
+                                            Ok(f) => Some(f),
+                                            Err(e) => {
+                                                // 此处已进入代理线程（不可触 UI 状态）；
+                                                // run_stack 对 None 工厂会再输出日志
+                                                tracing::warn!("UDP 接管未启用: {e}");
+                                                None
+                                            }
                                         }
-                                    }
-                                } else {
-                                    None
-                                };
-                                // 令牌本体已在 GUI 线程创建并存入 HydraApp（真退出
-                                // 路径可达），此处取传入的令牌 clone 给 TUN 栈任务。
-                                // tx 用独立克隆（任务内发送失败根因，不占用主通道所有权）
-                                let tun_tx = tx.clone();
-                                let tun_token = tun_token_for_thread
-                                    .take()
-                                    .expect("TUN 已启用时停机令牌必须存在");
-                                let shutdown2 = tun_token.clone();
-                                let task = tokio::spawn(async move {
-                                    if let Err(e) = hydra_client::tun::run_tun(
-                                        tcfg,
-                                        opener,
-                                        udp_factory,
-                                        shutdown2,
-                                    )
-                                    .await
-                                    {
-                                        // 权限不足（非管理员/root）/ 缺 wintun.dll 等根因
-                                        // 经就绪通道透传到 GUI 日志区，不静默
-                                        let _ = tun_tx.send(Err(std::io::Error::other(format!(
+                                    } else {
+                                        None
+                                    };
+                                    // 令牌本体已在 GUI 线程创建并存入 HydraApp（真退出
+                                    // 路径可达），此处取传入的令牌 clone 给 TUN 栈任务。
+                                    // tx 用独立克隆（任务内发送失败根因，不占用主通道所有权）
+                                    let tun_tx = tx.clone();
+                                    let tun_token = tun_token_for_thread
+                                        .take()
+                                        .expect("TUN 已启用时停机令牌必须存在");
+                                    let shutdown2 = tun_token.clone();
+                                    let task = tokio::spawn(async move {
+                                        if let Err(e) = hydra_client::tun::run_tun(
+                                            tcfg,
+                                            opener,
+                                            udp_factory,
+                                            shutdown2,
+                                        )
+                                        .await
+                                        {
+                                            // 权限不足（非管理员/root）/ 缺 wintun.dll 等根因
+                                            // 经就绪通道透传到 GUI 日志区，不静默
+                                            let _ =
+                                                tun_tx.send(Err(std::io::Error::other(format!(
                                             "TUN 模式启动失败: {e}（设备创建需管理员/root；\
                                              Windows 还需 wintun.dll）"
                                         ))));
-                                    }
-                                });
-                                Some((tun_token, task))
-                            }
-                            Err(e) => {
-                                let _ = tx.send(Err(std::io::Error::other(format!(
-                                    "TUN 模式启动失败: {e}"
-                                ))));
-                                None
+                                        }
+                                    });
+                                    Some((tun_token, task))
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Err(std::io::Error::other(format!(
+                                        "TUN 模式启动失败: {e}"
+                                    ))));
+                                    None
+                                }
                             }
                         }
-                    }
-                } else {
-                    None
-                };
+                    } else {
+                        None
+                    };
                 run_proxy_until_stopped(proxy, tx, stop_flag_clone, tun_task).await;
             });
             println!("[Proxy Thread] Thread exiting...");
@@ -432,7 +430,9 @@ impl HydraApp {
                     // 审查修复：TUN 模式已全局接管流量，就绪后不再叠加系统代理
                     //（否则制造"系统代理 + TUN"二次进本代理的被警示终态）
                     if self.config.tun_enabled {
-                        self.add_log("TUN 模式运行中：已全局接管流量，跳过系统代理设置".to_string());
+                        self.add_log(
+                            "TUN 模式运行中：已全局接管流量，跳过系统代理设置".to_string(),
+                        );
                     } else {
                         let proxy_url = format!("socks5://{addr}");
                         self.set_system_proxy(&proxy_url);
@@ -703,9 +703,8 @@ impl HydraApp {
     /// 5s 内可接受）；超时也保证 cancel 已发出，路由清理由线程随后完成。
     /// 注：GUI 退出等待逻辑依赖真实窗口事件循环，无法自动化单测，以人工验证为准。
     pub(crate) fn shutdown_and_wait_for_exit(&mut self) {
-        let running = self.proxy_running
-            || self.stop_flag.is_some()
-            || self.proxy_exit_receiver.is_some();
+        let running =
+            self.proxy_running || self.stop_flag.is_some() || self.proxy_exit_receiver.is_some();
         if !running {
             return; // 代理未在运行，无需等待
         }
@@ -781,14 +780,11 @@ mod tests {
         let proxy = test_proxy(addr);
         let (tx, rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let task =
-            tokio::spawn(run_proxy_until_stopped(proxy, tx, stop.clone(), None));
+        let task = tokio::spawn(run_proxy_until_stopped(proxy, tx, stop.clone(), None));
         // 阻塞 recv 移入 spawn_blocking，避免冻结异步测试执行器
         let signal = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            tokio::task::spawn_blocking(move || {
-                rx.recv_timeout(std::time::Duration::from_secs(3))
-            }),
+            tokio::task::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(3))),
         )
         .await
         .expect("bound_addr 未在 3s 内就绪（问题 2 回归）")
@@ -811,8 +807,7 @@ mod tests {
             let proxy = test_proxy(addr);
             let (tx, rx) = std::sync::mpsc::channel();
             let stop = Arc::new(AtomicBool::new(false));
-            let task =
-                tokio::spawn(run_proxy_until_stopped(proxy, tx, stop.clone(), None));
+            let task = tokio::spawn(run_proxy_until_stopped(proxy, tx, stop.clone(), None));
             let signal = tokio::time::timeout(
                 std::time::Duration::from_secs(3),
                 tokio::task::spawn_blocking(move || {
@@ -850,14 +845,11 @@ mod tests {
         let proxy = test_proxy(addr);
         let (tx, rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let task =
-            tokio::spawn(run_proxy_until_stopped(proxy, tx, stop.clone(), None));
+        let task = tokio::spawn(run_proxy_until_stopped(proxy, tx, stop.clone(), None));
         let started = std::time::Instant::now();
         let signal = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            tokio::task::spawn_blocking(move || {
-                rx.recv_timeout(std::time::Duration::from_secs(3))
-            }),
+            tokio::task::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(3))),
         )
         .await
         .expect("并发负载下 bound_addr 未在 3s 内就绪")

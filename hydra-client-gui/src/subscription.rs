@@ -173,7 +173,8 @@ mod tests {
     fn test_local_text_source_is_parsed_directly() {
         // 分享导入分组（hydra-text:// 前缀 = 内嵌原文）：更新时直接重解析原文，
         // 不走 http/文件路径；多行原文逐行解析，坏行计入 errors
-        let pasted = "hydra://127.0.0.1:8080?bandwidth=100&latency=10&loss_rate=0.01&status=online\n坏行\n";
+        let pasted =
+            "hydra://127.0.0.1:8080?bandwidth=100&latency=10&loss_rate=0.01&status=online\n坏行\n";
         let outcome = fetch_and_parse_subscription(
             "分享导入1".to_string(),
             format!("hydra-text://{}", pasted),

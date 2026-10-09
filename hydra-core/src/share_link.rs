@@ -270,16 +270,17 @@ impl ShareLink {
     }
 
     pub fn to_node_info(&self) -> Result<NodeInfo> {
-        let address: SocketAddr = format!("{}:{}", self.address, self.port)
-            .parse()
-            .map_err(|_| {
-                // 09-P3-5：域名节点此前报裸 AddrParseError，用户无从判断原因
-                HydraError::ProtocolError(format!(
-                    "节点地址 \"{}:{}\" 不是合法的 IP:端口（域名节点暂不支持，请先解析为 IP；\
+        let address: SocketAddr =
+            format!("{}:{}", self.address, self.port)
+                .parse()
+                .map_err(|_| {
+                    // 09-P3-5：域名节点此前报裸 AddrParseError，用户无从判断原因
+                    HydraError::ProtocolError(format!(
+                        "节点地址 \"{}:{}\" 不是合法的 IP:端口（域名节点暂不支持，请先解析为 IP；\
                      IPv6 用 [::1]:443 字面量形式）",
-                    self.address, self.port
-                ))
-            })?;
+                        self.address, self.port
+                    ))
+                })?;
 
         Ok(NodeInfo {
             address,
@@ -462,9 +463,11 @@ impl ShareLink {
                     }
                 }
                 std::net::IpAddr::V6(v6) => {
-                    let loopback_or_local =
-                        v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80;
-                    let ula_or_multicast = (v6.segments()[0] & 0xfe00) == 0xfc00 || v6.is_multicast();
+                    let loopback_or_local = v6.is_loopback()
+                        || v6.is_unspecified()
+                        || (v6.segments()[0] & 0xffc0) == 0xfe80;
+                    let ula_or_multicast =
+                        (v6.segments()[0] & 0xfe00) == 0xfc00 || v6.is_multicast();
                     if loopback_or_local || ula_or_multicast {
                         Some("IPv6 回环/链路本地/ULA/组播")
                     } else {
@@ -965,7 +968,10 @@ hydra://192.168.1.100:8080?bandwidth=80&latency=15&loss_rate=0.02&status=online
         let err = ShareLink::new_with_mode(&sample_node(), TransportMode::Masquerade)
             .with_auth_key_bytes(&[9u8; 16])
             .expect_err("16 字节密钥必须被拒绝");
-        assert!(err.to_string().contains("32 字节"), "错误应指明长度要求: {err}");
+        assert!(
+            err.to_string().contains("32 字节"),
+            "错误应指明长度要求: {err}"
+        );
 
         // 解析侧：携带非法长度密钥的链接 → auth_key_bytes 显式报错（导入即拦截，
         // 不等对端启动/握手才发现）

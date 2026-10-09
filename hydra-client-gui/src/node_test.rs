@@ -1,26 +1,25 @@
 //! 节点测速 / 健康检查动作：单节点测速、全量测速、组测速、
 //! 结果轮询回收、Windows 系统代理状态后台检测。
 
+use crate::config;
 use crate::nodes::NodeStatusInfo;
 use crate::probe::{probe_runtime, probe_target};
-use crate::config;
 use crate::HydraApp;
 use std::net::SocketAddr;
 
-    /// Test connectivity to a single node（A5：失败根因以 Err 透出，不再吞掉）
-    /// 信任根由调用方按「配置文件 > 环境变量」构造后传入（config.rs resolve_trust，
-    /// 支持 pin/ca 双信任模式与逐节点证书）
-    /// 0-7 修复"测速假绿"：不再只做 TCP connect（测不出密钥错误），而是完整走
-    /// `connect_target`（TCP+TLS+Noise-PSK 认证 + 节点应答）。探测目标默认
-    /// `1.1.1.1:443`（问题 3：原 `192.0.0.1:9` 撞静默丢包防火墙导致健康节点被
-    /// 误判"测速超时"；现可用 `HYDRA_PROBE_TARGET` env 覆盖，见 PROBE_TARGET_*），
-    /// 错误分类：
-    /// - 节点回"目标不可达"（TargetUnreachable / 应答 0x01）→ **认证已通过，节点健康 ✓**，
-    ///   返回耗时 ms（测速语义不变）；
-    /// - Noise 握手失败 → 认证/密钥错误 ✗；
-    /// - TCP 连接失败/超时 → 节点不可达 ✗。
+/// Test connectivity to a single node（A5：失败根因以 Err 透出，不再吞掉）
+/// 信任根由调用方按「配置文件 > 环境变量」构造后传入（config.rs resolve_trust，
+/// 支持 pin/ca 双信任模式与逐节点证书）
+/// 0-7 修复"测速假绿"：不再只做 TCP connect（测不出密钥错误），而是完整走
+/// `connect_target`（TCP+TLS+Noise-PSK 认证 + 节点应答）。探测目标默认
+/// `1.1.1.1:443`（问题 3：原 `192.0.0.1:9` 撞静默丢包防火墙导致健康节点被
+/// 误判"测速超时"；现可用 `HYDRA_PROBE_TARGET` env 覆盖，见 PROBE_TARGET_*），
+/// 错误分类：
+/// - 节点回"目标不可达"（TargetUnreachable / 应答 0x01）→ **认证已通过，节点健康 ✓**，
+///   返回耗时 ms（测速语义不变）；
+/// - Noise 握手失败 → 认证/密钥错误 ✗；
+/// - TCP 连接失败/超时 → 节点不可达 ✗。
 impl HydraApp {
-
     pub(crate) async fn test_node_connection(
         addr_str: &str,
         trust: hydra_client::tcp_transport::TlsTrust,
@@ -38,7 +37,13 @@ impl HydraApp {
         // 正常远小于该值；覆盖 TCP/TLS 5s+握手
         let probe = tokio::time::timeout(
             std::time::Duration::from_millis(10_000),
-            connect_target(addr, hydra_client::DEFAULT_SNI, &trust, &auth_key, &probe_target()),
+            connect_target(
+                addr,
+                hydra_client::DEFAULT_SNI,
+                &trust,
+                &auth_key,
+                &probe_target(),
+            ),
         )
         .await;
         match probe {

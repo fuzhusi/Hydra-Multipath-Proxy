@@ -245,7 +245,11 @@ pub fn compute_routes_for(
         // "与无 VPN 时一致"的语义豁免回物理网关（TUN 自身网段 /30 更精确，
         // 不受影响）。节点本就不接受私网目标，豁免无功能损失。
         for (dest, prefix) in PRIVATE_EXCLUDE_V4 {
-            add.push(RouteCmd { dest, prefix, gateway: gw });
+            add.push(RouteCmd {
+                dest,
+                prefix,
+                gateway: gw,
+            });
         }
     } else if !tun.exclude_routes.is_empty() {
         warn!(
@@ -628,8 +632,7 @@ pub fn detect_physical_gateway() -> Option<Ipv4Addr> {
         // CREATE_NO_WINDOW：网关探测不弹控制台窗口
         let mut c = std::process::Command::new("route");
         c.args(["print", "-4", "0.0.0.0"]);
-        if let Ok(out) = crate::hide_console_window(&mut c).output()
-        {
+        if let Ok(out) = crate::hide_console_window(&mut c).output() {
             let text = String::from_utf8_lossy(&out.stdout);
             for line in text.lines() {
                 let toks: Vec<&str> = line.split_whitespace().collect();
@@ -681,8 +684,7 @@ pub fn detect_physical_gateway_v6() -> Option<Ipv6Addr> {
         // CREATE_NO_WINDOW：IPv6 网关探测不弹控制台窗口
         let mut c = std::process::Command::new("route");
         c.args(["print", "-6"]);
-        if let Ok(out) = crate::hide_console_window(&mut c).output()
-        {
+        if let Ok(out) = crate::hide_console_window(&mut c).output() {
             let text = String::from_utf8_lossy(&out.stdout);
             for line in text.lines() {
                 let toks: Vec<&str> = line.split_whitespace().collect();
@@ -742,20 +744,20 @@ pub fn detect_dns_servers_v6() -> Vec<Ipv6Addr> {
 fn detect_dns_all() -> (Vec<Ipv4Addr>, Vec<Ipv6Addr>) {
     let mut v4_out = Vec::new();
     let mut v6_out = Vec::new();
-    let push = |tok: &str, v4: &mut Vec<Ipv4Addr>, v6: &mut Vec<Ipv6Addr>| {
-        match tok.parse::<std::net::IpAddr>() {
-            Ok(std::net::IpAddr::V4(ip)) => {
-                if !v4.contains(&ip) {
-                    v4.push(ip);
-                }
+    let push = |tok: &str, v4: &mut Vec<Ipv4Addr>, v6: &mut Vec<Ipv6Addr>| match tok
+        .parse::<std::net::IpAddr>()
+    {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            if !v4.contains(&ip) {
+                v4.push(ip);
             }
-            Ok(std::net::IpAddr::V6(ip)) => {
-                if !v6.contains(&ip) {
-                    v6.push(ip);
-                }
-            }
-            Err(_) => {}
         }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            if !v6.contains(&ip) {
+                v6.push(ip);
+            }
+        }
+        Err(_) => {}
     };
     if let Ok(s) = std::env::var("HYDRA_TUN_DNS") {
         let mut any = false;
@@ -1257,7 +1259,8 @@ fn is_private_udp_v4_dst(pkt: &[u8]) -> bool {
         || dst.octets()[0] & 0xf0 == 0xf0
 }
 
-fn is_unproxyable_udp_v4(pkt: &[u8]) -> bool {    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+fn is_unproxyable_udp_v4(pkt: &[u8]) -> bool {
+    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
         return false;
     }
     let ihl = (pkt[0] & 0x0f) as usize * 4;
@@ -1385,11 +1388,12 @@ fn ensure_v6_dst(
     iface.update_ip_addrs(|addrs| {
         // 审查批次 P3-9：push 失败（静态地址挤占）时不入池——池认为已挂载而
         // 接口实际没有会造成「每包重试 + 误淘汰他人」的失同步抖动
-        if addrs.push(IpCidr::new(
-            IpAddress::Ipv6(smoltcp::wire::Ipv6Address(addr.octets())),
-            128,
-        ))
-        .is_err()
+        if addrs
+            .push(IpCidr::new(
+                IpAddress::Ipv6(smoltcp::wire::Ipv6Address(addr.octets())),
+                128,
+            ))
+            .is_err()
         {
             debug!("v6 动态地址挂载失败（地址表满），{addr} 不入池");
             return;
@@ -1475,7 +1479,11 @@ async fn udp_relay_task(
                 c
             }
             Err(e) => {
-                warn!("TUN UDP 中继建连失败（{}s 后重试）: {}", backoff.as_secs(), e);
+                warn!(
+                    "TUN UDP 中继建连失败（{}s 后重试）: {}",
+                    backoff.as_secs(),
+                    e
+                );
                 // 清空积压的上行命令（UDP 语义允许丢包）——分发循环在通道不可用
                 // 期间持续投递，无界通道会随流量无限积压内存
                 while cmd_rx.try_recv().is_ok() {}
@@ -1617,7 +1625,13 @@ fn parse_udp_v6(pkt: &[u8]) -> Option<(SocketAddr, SocketAddr, usize, usize)> {
 /// 构造回包：UDP/IP 完整帧，src = 流目的地址（应用看到的远端），dst = 客户端源。
 /// v4：UDP 校验和按 RFC 768 伪首部计算（0 视为无校验和，但我们给出真实值，
 /// 与主流栈一致，避免个别应用/中间盒对 0 校验和的兼容性问题）。
-fn build_udp_reply_v4(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+fn build_udp_reply_v4(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    sport: u16,
+    dport: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     let udp_len = 8 + payload.len();
     let total = 20 + udp_len;
     let mut pkt = vec![0u8; total];
@@ -1650,7 +1664,13 @@ fn build_udp_reply_v4(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, payl
 }
 
 /// v6 版回包（校验和必需，RFC 2460）。
-fn build_udp_reply_v6(src: Ipv6Addr, dst: Ipv6Addr, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+fn build_udp_reply_v6(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    sport: u16,
+    dport: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     let udp_len = 8 + payload.len();
     let mut pkt = vec![0u8; 40 + udp_len];
     pkt[0] = 0x60;
@@ -1678,17 +1698,12 @@ fn build_udp_reply_v6(src: Ipv6Addr, dst: Ipv6Addr, sport: u16, dport: u16, payl
 /// 包进 TUN 被节点拒；UDP 接管后客户端同样尊重该开关）。
 fn private_targets_allowed() -> bool {
     static ALLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ALLOW.get_or_init(|| {
-        matches!(std::env::var("HYDRA_ALLOW_PRIVATE_TARGETS"), Ok(v) if v == "1")
-    })
+    *ALLOW.get_or_init(|| matches!(std::env::var("HYDRA_ALLOW_PRIVATE_TARGETS"), Ok(v) if v == "1"))
 }
 
 /// 分发入口（run_stack 调用）：解析 + 私网/组播过滤 + 转交中继任务。
 /// 返回 true = 已接管（转发中）；false = 未接管（调用方按旧行为处理）。
-fn try_forward_udp(
-    pkt: &[u8],
-    cmd_tx: &tokio::sync::mpsc::UnboundedSender<UdpCmd>,
-) -> bool {
+fn try_forward_udp(pkt: &[u8], cmd_tx: &tokio::sync::mpsc::UnboundedSender<UdpCmd>) -> bool {
     let parsed = parse_udp_v4(pkt).or_else(|| parse_udp_v6(pkt));
     let Some((src, dst, off, len)) = parsed else {
         return false;
@@ -1698,7 +1713,9 @@ fn try_forward_udp(
     let allow_private = private_targets_allowed();
     let excluded = match dst.ip() {
         std::net::IpAddr::V4(v4) => {
-            let private_like = v4.is_loopback() || v4.is_link_local() || v4.is_private()
+            let private_like = v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_private()
                 || v4.octets()[0] == 0
                 || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]));
             if allow_private {
@@ -1708,7 +1725,8 @@ fn try_forward_udp(
             }
         }
         std::net::IpAddr::V6(v6) => {
-            let private_like = v6.is_loopback() || v6.is_unspecified()
+            let private_like = v6.is_loopback()
+                || v6.is_unspecified()
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
                 || (v6.segments()[0] & 0xfe00) == 0xfc00;
             if allow_private {
@@ -1837,7 +1855,11 @@ pub async fn run_stack<T: PacketTransport>(
                 info!(
                     "TUN UDP-over-proxy 已接管：公网 UDP（DNS/QUIC）经节点加密中继\
                      ；DNS {}（HYDRA_TUN_DNS_DIRECT=1 可恢复直连）",
-                    if cfg.dns_via_proxy { "经隧道" } else { "直连" }
+                    if cfg.dns_via_proxy {
+                        "经隧道"
+                    } else {
+                        "直连"
+                    }
                 );
                 Some(tx)
             }
@@ -2065,12 +2087,7 @@ pub async fn run_stack<T: PacketTransport>(
 ///   引回物理网关；仅当物理网关未知、豁免未生成时包才会到达此处——
 ///   丢弃并一次性告警（节点会 SSRF 拒绝私网目标，盲转发注定失败且无诊断）。
 /// - 其余（TCP 到公网目标等）原样投喂栈。
-fn handle_v4_else(
-    pkt: &[u8],
-    cfg: &TunConfig,
-    device: &mut ChanDevice,
-    warned_private: &mut bool,
-) {
+fn handle_v4_else(pkt: &[u8], cfg: &TunConfig, device: &mut ChanDevice, warned_private: &mut bool) {
     if pkt.len() < 20 || pkt[0] >> 4 != 4 {
         // 非 IPv4（ARP 等非 IP 帧）：原样投喂由栈自行处理
         device.push_inbound(pkt);
@@ -2766,9 +2783,7 @@ mod tests {
 
             // 前 V6_DYNAMIC_SLOTS 个目的地址全部挂载成功
             let addrs: Vec<std::net::Ipv6Addr> = (1..=V6_DYNAMIC_SLOTS as u16 + 2)
-                .map(|i| {
-                    std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i)
-                })
+                .map(|i| std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i))
                 .collect();
             for a in &addrs[..V6_DYNAMIC_SLOTS] {
                 ensure_v6_dst(&mut iface, *a, &mut pool, &empty);
@@ -2777,12 +2792,11 @@ mod tests {
             // 第 7 个：池满 → 淘汰最旧非活跃（addrs[0]），新地址挂载成功
             ensure_v6_dst(&mut iface, addrs[V6_DYNAMIC_SLOTS], &mut pool, &empty);
             assert!(pool.contains(&addrs[V6_DYNAMIC_SLOTS]));
+            assert!(!pool.contains(&addrs[0]), "最旧非活跃地址应被淘汰");
             assert!(
-                !pool.contains(&addrs[0]),
-                "最旧非活跃地址应被淘汰"
-            );
-            assert!(
-                !iface.has_ip_addr(IpAddress::Ipv6(smoltcp::wire::Ipv6Address(addrs[0].octets()))),
+                !iface.has_ip_addr(IpAddress::Ipv6(smoltcp::wire::Ipv6Address(
+                    addrs[0].octets()
+                ))),
                 "被淘汰地址应从接口摘除"
             );
             assert!(pool.len() <= V6_DYNAMIC_SLOTS, "池容量应有界");
@@ -3670,7 +3684,9 @@ mod tests {
             .connect(
                 ciface.context(),
                 (
-                    IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                    IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(
+                        0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+                    )),
                     443,
                 ),
                 (
@@ -3851,8 +3867,14 @@ mod tests {
         let cmds = exec.commands.lock().unwrap();
         assert_eq!(cmds.len(), 4);
         // 前两条必须是 /1 接管路由（稳定排序保持两者原相对次序）
-        assert!(cmds[0].ends_with("/1 via 10.7.0.1"), "首删应是 /1 接管: {cmds:?}");
-        assert!(cmds[1].ends_with("/1 via 10.7.0.1"), "次删应是 /1 接管: {cmds:?}");
+        assert!(
+            cmds[0].ends_with("/1 via 10.7.0.1"),
+            "首删应是 /1 接管: {cmds:?}"
+        );
+        assert!(
+            cmds[1].ends_with("/1 via 10.7.0.1"),
+            "次删应是 /1 接管: {cmds:?}"
+        );
         // 豁免项保持原相对顺序排后
         assert!(cmds[2].contains("203.0.113.7/32"));
         assert!(cmds[3].contains("8.8.8.8/32"));
@@ -3862,7 +3884,8 @@ mod tests {
     #[test]
     fn cleanup_routes_v6_接管路由先删() {
         let mut cfg = tun_v6();
-        cfg.exclude_routes_v6.push(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 9));
+        cfg.exclude_routes_v6
+            .push(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 9));
         // 乱序：豁免排在接管前（直接构造，验证排序而非构造顺序）
         let plan = RoutePlanV6 {
             add: vec![
@@ -3895,7 +3918,6 @@ mod tests {
         assert!(cmds[1].contains("::/1"), "次删应是 ::/1: {cmds:?}");
         assert!(cmds[2].contains("2001:db8::9/128"));
     }
-
 
     /// M2/R1：SYN 目的端口解析（v4/v6、SYN+ACK 不算、非 TCP 不算）
     #[test]
@@ -3931,7 +3953,11 @@ mod tests {
             }
         };
         assert_eq!(tcp_syn_dst_port(&build(false, 8443, 0x02)), Some(8443));
-        assert_eq!(tcp_syn_dst_port(&build(false, 8443, 0x12)), None, "SYN+ACK 不是入站 SYN");
+        assert_eq!(
+            tcp_syn_dst_port(&build(false, 8443, 0x12)),
+            None,
+            "SYN+ACK 不是入站 SYN"
+        );
         assert_eq!(tcp_syn_dst_port(&build(true, 993, 0x02)), Some(993));
         let mut udp = build(false, 53, 0x02);
         udp[9] = 17;
@@ -3966,16 +3992,38 @@ mod tests {
             p.extend(tcp);
             p
         };
-        ensure_dynamic_listener(&syn(12345), &mut sockets, &mut listeners, &[80, 443], &mut dynamic);
+        ensure_dynamic_listener(
+            &syn(12345),
+            &mut sockets,
+            &mut listeners,
+            &[80, 443],
+            &mut dynamic,
+        );
         assert_eq!(dynamic, vec![12345]);
         assert_eq!(listeners.len(), 1);
-        ensure_dynamic_listener(&syn(12345), &mut sockets, &mut listeners, &[80, 443], &mut dynamic);
+        ensure_dynamic_listener(
+            &syn(12345),
+            &mut sockets,
+            &mut listeners,
+            &[80, 443],
+            &mut dynamic,
+        );
         assert_eq!(dynamic, vec![12345], "同端口去重");
-        ensure_dynamic_listener(&syn(80), &mut sockets, &mut listeners, &[80, 443], &mut dynamic);
+        ensure_dynamic_listener(
+            &syn(80),
+            &mut sockets,
+            &mut listeners,
+            &[80, 443],
+            &mut dynamic,
+        );
         assert_eq!(dynamic, vec![12345], "固定监听端口不重复挂");
         for i in 0..300u16 {
             ensure_dynamic_listener(
-                &syn(20000 + i), &mut sockets, &mut listeners, &[], &mut dynamic,
+                &syn(20000 + i),
+                &mut sockets,
+                &mut listeners,
+                &[],
+                &mut dynamic,
             );
         }
         assert_eq!(dynamic.len(), 256, "动态监听上限 256");
@@ -3992,9 +4040,9 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .with_test_writer()
             .try_init();
+        use crate::tcp_transport::TlsTrust;
         use hydra_core::udp_relay::{open_udp_channel, UdpChannelFactory};
         use hydra_node::{HydraServer, NodeOptions};
-        use crate::tcp_transport::TlsTrust;
 
         // 1. 本机 UDP 回显服务
         let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -4042,8 +4090,9 @@ mod tests {
             ..Default::default()
         };
         let opener: ChannelOpener = Arc::new(|_t: String| {
-            Box::pin(async { Err(HydraError::ConnectionError("测试未使用 TCP 路径".into())) })
-                as OpenFuture
+            Box::pin(async {
+                Err(HydraError::ConnectionError("测试未使用 TCP 路径".into()))
+            }) as OpenFuture
         }) as ChannelOpener;
         let trust = TlsTrust::pinned(vec![cert]);
         let auth2 = auth_key.clone();
@@ -4070,10 +4119,10 @@ mod tests {
         pkt.extend_from_slice(&[0, 1, 0, 0, 64, 17, 0, 0]); // id/flags/TTL/proto/csum(0)
         pkt.extend_from_slice(&src_ip.octets());
         let echo_v4 = match echo_addr.ip() {
-        std::net::IpAddr::V4(v4) => v4,
-        _ => panic!("测试回显 socket 应为 v4"),
-    };
-    pkt.extend_from_slice(&echo_v4.octets());
+            std::net::IpAddr::V4(v4) => v4,
+            _ => panic!("测试回显 socket 应为 v4"),
+        };
+        pkt.extend_from_slice(&echo_v4.octets());
         pkt.extend_from_slice(&40000u16.to_be_bytes());
         pkt.extend_from_slice(&echo_addr.port().to_be_bytes());
         pkt.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());

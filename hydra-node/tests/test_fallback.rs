@@ -58,7 +58,9 @@ async fn probe_connect(
     // 证书 pinning：节点自签证书加入本地信任根（与 tests/common 同构）
     let mut roots = rustls::RootCertStore::empty();
     roots
-        .add(rustls::pki_types::CertificateDer::from(node_cert_der.to_vec()))
+        .add(rustls::pki_types::CertificateDer::from(
+            node_cert_der.to_vec(),
+        ))
         .expect("无效的节点证书");
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
@@ -69,8 +71,7 @@ async fn probe_connect(
     crypto.alpn_protocols = Vec::new();
     crypto.resumption = rustls::client::Resumption::disabled();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(crypto));
-    let server_name =
-        rustls::pki_types::ServerName::try_from("hydra.node".to_owned()).unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from("hydra.node".to_owned()).unwrap();
 
     let tcp = tokio::net::TcpStream::connect(node_addr)
         .await
@@ -89,9 +90,7 @@ async fn probe_connect(
 /// 读取节点回包直至连接关闭；返回全部字节。
 /// 注意：节点侧 drop TLS 流不发 close_notify，rustls 客户端会以
 /// UnexpectedEof 报错——此处把该错误视为 EOF（已收字节仍有效）。
-async fn read_to_close(
-    mut tls: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
-) -> Vec<u8> {
+async fn read_to_close(mut tls: tokio_rustls::client::TlsStream<tokio::net::TcpStream>) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -116,7 +115,10 @@ async fn 开关开启_版本字节错误回整页() {
     let tls = probe_connect(node.addr, &node.cert, b"\x01garbage-not-http").await;
     let resp = read_to_close(tls).await;
     let text = String::from_utf8(resp.clone()).unwrap();
-    assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "应回 200: {text:.80}");
+    assert!(
+        text.starts_with("HTTP/1.1 200 OK\r\n"),
+        "应回 200: {text:.80}"
+    );
     assert!(text.contains("Content-Type: text/html; charset=utf-8\r\n"));
     assert!(text.contains("Connection: close\r\n"));
     let len_line = text

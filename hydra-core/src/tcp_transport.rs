@@ -275,10 +275,7 @@ fn build_tls_connector_uncached(trust: &TlsTrust, mode: FingerprintMode) -> Resu
 
 /// 构建共享 `ClientConfig`（[`build_tls_connector_uncached`] 的配置主体，
 /// 独立暴露供单测对 ALPN/解压器/套件顺序直接断言——`TlsConnector` 不透出字段）。
-fn build_client_config(
-    trust: &TlsTrust,
-    mode: FingerprintMode,
-) -> Result<rustls::ClientConfig> {
+fn build_client_config(trust: &TlsTrust, mode: FingerprintMode) -> Result<rustls::ClientConfig> {
     // 信任根：pin 模式 = 节点自签证书入本地信任根；CA 模式 = webpki 公共根
     let mut roots = rustls::RootCertStore::empty();
     if trust.use_public_ca {
@@ -320,8 +317,7 @@ fn build_client_config(
             // certCompression：feature fingerprint → rustls/brotli → 声明 brotli
             // 解压器（与 Chrome certCompression 对齐；zstd Chrome 有而 rustls 无，
             // 如实缺席）
-            crypto.cert_decompressors =
-                rustls::compress::default_cert_decompressors().to_vec();
+            crypto.cert_decompressors = rustls::compress::default_cert_decompressors().to_vec();
         }
         // stock rustls：原"无 ALPN = 普通 HTTPS 客户端"伪装策略不变
         FingerprintMode::None => {

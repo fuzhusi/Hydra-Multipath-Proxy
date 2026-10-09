@@ -1,12 +1,11 @@
 //! 设置页：七分区折叠配置（凭据/核心/安全信任/TUN/系统/外观/关于）。
 
-use eframe::egui;
-use crate::palette;
 use crate::config;
+use crate::palette;
 use crate::HydraApp;
+use eframe::egui;
 
 impl HydraApp {
-
     /// 设置页（UI 重设计第三批：7 分区 CollapsingHeader 折叠，标题带图标）：
     /// ① 🔑 全局凭据（默认展开）② 🛰 代理核心（默认展开）③ 🛡 安全与信任（收起）
     /// ④ 🌐 TUN 透明代理（收起）⑤ 🖥 系统（收起）⑥ 🎨 外观与数据（收起）⑦ ℹ 关于与退出（收起）。
@@ -114,35 +113,36 @@ impl HydraApp {
                 palette::TEXT_WEAK,
                 "说明：本地 SOCKS5 监听地址与 Offline 节点自动恢复探测间隔",
             );
-        ui.horizontal(|ui| {
-            ui.label("本地监听地址:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.config.proxy_listen_addr)
-                    .desired_width(180.0)
-                    .hint_text("127.0.0.1:1080"),
-            );
-        });
-        // Offline 恢复探测间隔（对应 HYDRA_PROBE_INTERVAL_SECS）
-        ui.horizontal(|ui| {
-            ui.label("探测间隔(秒):");
-            let mut secs = self.config.probe_interval_secs.unwrap_or(30);
-            if ui
-                .add(egui::DragValue::new(&mut secs).clamp_range(1..=3600))
-                .changed()
-            {
-                self.config.probe_interval_secs = Some(secs);
+            ui.horizontal(|ui| {
+                ui.label("本地监听地址:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.config.proxy_listen_addr)
+                        .desired_width(180.0)
+                        .hint_text("127.0.0.1:1080"),
+                );
+            });
+            // Offline 恢复探测间隔（对应 HYDRA_PROBE_INTERVAL_SECS）
+            ui.horizontal(|ui| {
+                ui.label("探测间隔(秒):");
+                let mut secs = self.config.probe_interval_secs.unwrap_or(30);
+                if ui
+                    .add(egui::DragValue::new(&mut secs).clamp_range(1..=3600))
+                    .changed()
+                {
+                    self.config.probe_interval_secs = Some(secs);
+                }
+                if self.config.probe_interval_secs.is_some() && ui.small_button("默认").clicked()
+                {
+                    self.config.probe_interval_secs = None;
+                }
+                ui.weak("（Offline 节点自动恢复探测，默认 30 秒）");
+            });
+            ui.small("认证密钥与节点证书在本页上方「全局凭据」区；新手引导可随时重看");
+            if ui.button("显示新手引导").clicked() {
+                for line in HydraApp::wizard_lines() {
+                    self.add_log(line);
+                }
             }
-            if self.config.probe_interval_secs.is_some() && ui.small_button("默认").clicked() {
-                self.config.probe_interval_secs = None;
-            }
-            ui.weak("（Offline 节点自动恢复探测，默认 30 秒）");
-        });
-        ui.small("认证密钥与节点证书在本页上方「全局凭据」区；新手引导可随时重看");
-        if ui.button("显示新手引导").clicked() {
-            for line in HydraApp::wizard_lines() {
-                self.add_log(line);
-            }
-        }
         });
 
         // ◈ ③ 安全与信任（默认收起：信任模式属高级项）
@@ -295,22 +295,22 @@ impl HydraApp {
                 palette::TEXT_WEAK,
                 "说明：开机自启（规划中）、关窗隐藏到托盘与托盘菜单行为",
             );
-        ui.add_enabled(false, egui::Checkbox::new(&mut false, "开机自启（规划中）"))
-            .on_disabled_hover_text("规划中：需随 TUN 服务模式一并实现");
-        if ui
-            .checkbox(
-                &mut self.config.close_to_tray,
-                "关闭窗口时隐藏到系统托盘（代理继续运行）",
-            )
-            .changed()
-        {
-            self.add_log(if self.config.close_to_tray {
-                "关窗行为：隐藏到系统托盘".to_string()
-            } else {
-                "关窗行为：直接退出（停止代理并清理系统代理）".to_string()
-            });
-        }
-        ui.small("托盘左键单击 = 显示/隐藏主窗；托盘右键菜单 = 显示主窗 / 启动 / 停止 / 退出");
+            ui.add_enabled(false, egui::Checkbox::new(&mut false, "开机自启（规划中）"))
+                .on_disabled_hover_text("规划中：需随 TUN 服务模式一并实现");
+            if ui
+                .checkbox(
+                    &mut self.config.close_to_tray,
+                    "关闭窗口时隐藏到系统托盘（代理继续运行）",
+                )
+                .changed()
+            {
+                self.add_log(if self.config.close_to_tray {
+                    "关窗行为：隐藏到系统托盘".to_string()
+                } else {
+                    "关窗行为：直接退出（停止代理并清理系统代理）".to_string()
+                });
+            }
+            ui.small("托盘左键单击 = 显示/隐藏主窗；托盘右键菜单 = 显示主窗 / 启动 / 停止 / 退出");
         });
 
         // ◈ ⑥ 外观与数据（默认收起：主题与配置目录）
@@ -325,41 +325,41 @@ impl HydraApp {
                 palette::TEXT_WEAK,
                 "说明：主题（当前仅深色）与配置目录/配置文件位置",
             );
-        ui.horizontal(|ui| {
-            ui.label("主题:");
-            ui.add_enabled(
-                false,
-                egui::Checkbox::new(&mut false, "深色（当前唯一主题）"),
-            )
-            .on_disabled_hover_text("主题选择预留，后续版本提供多主题");
-        });
-        ui.horizontal(|ui| {
-            ui.label("配置目录:");
-            ui.monospace(
-                config::config_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "(配置目录不可用)".to_string()),
-            );
-            if ui.button("打开目录").clicked() {
-                if let Some(dir) = config::config_dir() {
-                    #[cfg(windows)]
-                    {
-                        // CREATE_NO_WINDOW：打开目录不闪控制台窗口（点击时一次性调用）
-                        let mut c = std::process::Command::new("explorer");
-                        c.arg(&dir);
-                        let _ = hydra_client::hide_console_window(&mut c).spawn();
+            ui.horizontal(|ui| {
+                ui.label("主题:");
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(&mut false, "深色（当前唯一主题）"),
+                )
+                .on_disabled_hover_text("主题选择预留，后续版本提供多主题");
+            });
+            ui.horizontal(|ui| {
+                ui.label("配置目录:");
+                ui.monospace(
+                    config::config_dir()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(配置目录不可用)".to_string()),
+                );
+                if ui.button("打开目录").clicked() {
+                    if let Some(dir) = config::config_dir() {
+                        #[cfg(windows)]
+                        {
+                            // CREATE_NO_WINDOW：打开目录不闪控制台窗口（点击时一次性调用）
+                            let mut c = std::process::Command::new("explorer");
+                            c.arg(&dir);
+                            let _ = hydra_client::hide_console_window(&mut c).spawn();
+                        }
+                        #[cfg(not(windows))]
+                        let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
                     }
-                    #[cfg(not(windows))]
-                    let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
                 }
-            }
-        });
-        ui.small(format!(
-            "配置文件: {}（自动保存）",
-            config::config_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(配置目录不可用)".to_string())
-        ));
+            });
+            ui.small(format!(
+                "配置文件: {}（自动保存）",
+                config::config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(配置目录不可用)".to_string())
+            ));
         });
 
         // ◈ ⑦ 关于与退出（默认收起；退出入口收进分区，托盘菜单同样可退出）
@@ -374,28 +374,31 @@ impl HydraApp {
                 palette::TEXT_WEAK,
                 "说明：版本信息、项目文档与程序退出入口（运行日志见「📜 日志」页）",
             );
-        ui.label(format!(
-            "Hydra Multipath Proxy v{}",
-            env!("CARGO_PKG_VERSION")
-        ));
-        ui.hyperlink_to(
-            "项目文档（GitHub）",
-            "https://github.com/hydra-multipath-proxy/hydra-multipath-proxy",
-        );
-        ui.small("检查更新：预留");
+            ui.label(format!(
+                "Hydra Multipath Proxy v{}",
+                env!("CARGO_PKG_VERSION")
+            ));
+            ui.hyperlink_to(
+                "项目文档（GitHub）",
+                "https://github.com/hydra-multipath-proxy/hydra-multipath-proxy",
+            );
+            ui.small("检查更新：预留");
 
-        ui.add_space(palette::SPACING_SM);
+            ui.add_space(palette::SPACING_SM);
 
-        // 退出入口（托盘菜单同样可退出）
-        if ui
-            .button(egui::RichText::new("退出程序（停止代理并清理系统代理）").color(palette::DANGER))
-            .clicked()
-        {
-            // 真退出：带超时等待代理线程退出（含 TUN 停机 + 路由清理）再关窗
-            self.shutdown_and_wait_for_exit();
-            self.really_quit = true;
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-        }
+            // 退出入口（托盘菜单同样可退出）
+            if ui
+                .button(
+                    egui::RichText::new("退出程序（停止代理并清理系统代理）")
+                        .color(palette::DANGER),
+                )
+                .clicked()
+            {
+                // 真退出：带超时等待代理线程退出（含 TUN 停机 + 路由清理）再关窗
+                self.shutdown_and_wait_for_exit();
+                self.really_quit = true;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         });
         ui.add_space(palette::SPACING_XL);
     }

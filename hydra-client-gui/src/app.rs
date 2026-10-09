@@ -4,10 +4,10 @@
 use crate::config;
 use crate::config::GuiConfig;
 use crate::nodes::{NodeStatusInfo, Tab};
+use crate::speed_history::SpeedHistory;
 use crate::theme::{apply_dark_theme, setup_custom_fonts};
 use crate::tray;
 use crate::HydraApp;
-use crate::speed_history::SpeedHistory;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -107,7 +107,10 @@ impl Drop for HydraApp {
 /// - 运行态（bound 就绪）：「■ 停止代理」可点；
 /// - 失败/异常退出：poll_start_receiver / 异常退出分支把两个状态位复位，
 ///   自然回到「▶ 启动代理」，日志区给出失败根因。
-pub(crate) fn start_button_state(proxy_running: bool, proxy_starting: bool) -> (&'static str, bool) {
+pub(crate) fn start_button_state(
+    proxy_running: bool,
+    proxy_starting: bool,
+) -> (&'static str, bool) {
     if proxy_running {
         ("■ 停止代理", true)
     } else if proxy_starting {
@@ -118,7 +121,6 @@ pub(crate) fn start_button_state(proxy_running: bool, proxy_starting: bool) -> (
 }
 
 impl HydraApp {
-
     pub(crate) fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // 设置自定义字体
         setup_custom_fonts(&cc.egui_ctx);

@@ -143,12 +143,14 @@ pub fn test_node_connection(
     sni: Option<String>,
 ) -> TestResult {
     use std::net::SocketAddr;
-    let fail = |detail: String| TestResult { ok: false, latency_ms: 0, detail };
+    let fail = |detail: String| TestResult {
+        ok: false,
+        latency_ms: 0,
+        detail,
+    };
     let addr: SocketAddr = match node.parse() {
         Ok(a) => a,
-        Err(_) => {
-            return fail("节点地址无法解析（须 IP:端口；IPv6 用 [::1]:443 形式）".into())
-        }
+        Err(_) => return fail("节点地址无法解析（须 IP:端口；IPv6 用 [::1]:443 形式）".into()),
     };
     let key = match hydra_core::auth_key_from_hex(&auth_key_hex) {
         Ok(k) => k,
@@ -296,7 +298,9 @@ pub fn start_vpn(
 ) -> Result<(), HydraEngineError> {
     let mut guard = VPN_STATE.lock().unwrap_or_else(|p| p.into_inner());
     if guard.is_some() {
-        return Err(HydraEngineError::Start { msg: "VPN 已在运行".into() });
+        return Err(HydraEngineError::Start {
+            msg: "VPN 已在运行".into(),
+        });
     }
 
     // R4：保护钩子进程级安装（首装生效）——出站连接 connect 前回调 protect(fd)
@@ -306,14 +310,24 @@ pub fn start_vpn(
         let _ = hydra_core::socket_protect::set_socket_protect_hook(hook);
     }
 
-    let addr4: std::net::Ipv4Addr = config.addr4.parse().map_err(|_| {
-        HydraEngineError::InvalidConfig { msg: format!("addr4 非法: {}", config.addr4) }
-    })?;
-    let addr6: std::net::Ipv6Addr = config.addr6.parse().map_err(|_| {
-        HydraEngineError::InvalidConfig { msg: format!("addr6 非法: {}", config.addr6) }
-    })?;
+    let addr4: std::net::Ipv4Addr =
+        config
+            .addr4
+            .parse()
+            .map_err(|_| HydraEngineError::InvalidConfig {
+                msg: format!("addr4 非法: {}", config.addr4),
+            })?;
+    let addr6: std::net::Ipv6Addr =
+        config
+            .addr6
+            .parse()
+            .map_err(|_| HydraEngineError::InvalidConfig {
+                msg: format!("addr6 非法: {}", config.addr6),
+            })?;
     if config.nodes.is_empty() {
-        return Err(HydraEngineError::InvalidConfig { msg: "至少需要一个节点".into() });
+        return Err(HydraEngineError::InvalidConfig {
+            msg: "至少需要一个节点".into(),
+        });
     }
     let key = hydra_core::auth_key_from_hex(&config.auth_key_hex)
         .map_err(|m| HydraEngineError::InvalidConfig { msg: m })?;
@@ -328,17 +342,17 @@ pub fn start_vpn(
         }
         TrustMode::PublicCa => hydra_core::tcp_transport::TlsTrust::public_ca(None),
     };
-    let nodes: Vec<std::net::SocketAddr> = config
-        .nodes
-        .iter()
-        .filter_map(|a| a.parse().ok())
-        .collect();
+    let nodes: Vec<std::net::SocketAddr> =
+        config.nodes.iter().filter_map(|a| a.parse().ok()).collect();
     if nodes.is_empty() {
         return Err(HydraEngineError::InvalidConfig {
             msg: "节点地址全部无法解析（域名节点 M2 暂不支持）".into(),
         });
     }
-    let sni = config.sni.clone().unwrap_or_else(|| hydra_core::DEFAULT_SNI.into());
+    let sni = config
+        .sni
+        .clone()
+        .unwrap_or_else(|| hydra_core::DEFAULT_SNI.into());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -346,8 +360,9 @@ pub fn start_vpn(
         .build()
         .map_err(|e| HydraEngineError::Start { msg: e.to_string() })?;
 
-    let transport = FdTransport::new(tun_fd)
-        .map_err(|e| HydraEngineError::Start { msg: format!("tun fd 接管失败: {e}") })?;
+    let transport = FdTransport::new(tun_fd).map_err(|e| HydraEngineError::Start {
+        msg: format!("tun fd 接管失败: {e}"),
+    })?;
 
     // opener/udp 工厂：复用 ProxyServer 的凭据与调度器（不 start——不监听本地端口）
     let proxy = hydra_core::proxy::ProxyServer::new("127.0.0.1:0".parse().unwrap())
@@ -403,7 +418,8 @@ pub fn stop_vpn() -> bool {
     match guard.take() {
         Some(h) => {
             h.shutdown.cancel();
-            h.runtime.shutdown_timeout(std::time::Duration::from_secs(3));
+            h.runtime
+                .shutdown_timeout(std::time::Duration::from_secs(3));
             true
         }
         None => false,
@@ -484,9 +500,8 @@ impl HydraEngine {
                 msg: format!("节点地址无法解析为 IP:端口: {:?}", invalid),
             });
         }
-        let auth_key = hydra_core::auth_key_from_hex(&auth_key_hex).map_err(|msg| {
-            HydraEngineError::InvalidConfig { msg }
-        })?;
+        let auth_key = hydra_core::auth_key_from_hex(&auth_key_hex)
+            .map_err(|msg| HydraEngineError::InvalidConfig { msg })?;
         let trust = match trust {
             TrustMode::Pinned { cert_der } => {
                 if cert_der.is_empty() {
@@ -514,7 +529,10 @@ impl HydraEngine {
 
     /// 启动引擎（绑定进程内 SOCKS5 监听并常驻；重复调用报 Start 错误）。
     /// `protect`：R4 出站 socket 保护回调，可传 None（仅调试/直连节点场景）。
-    pub fn start(self: Arc<Self>, protect: Option<Box<dyn SocketProtect>>) -> Result<(), HydraEngineError> {
+    pub fn start(
+        self: Arc<Self>,
+        protect: Option<Box<dyn SocketProtect>>,
+    ) -> Result<(), HydraEngineError> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.is_some() {
             return Err(HydraEngineError::Start {
@@ -536,15 +554,11 @@ impl HydraEngine {
             .build()
             .map_err(|e| HydraEngineError::Start { msg: e.to_string() })?;
 
-        let mut server = ProxyServer::new(
-            std::net::SocketAddr::from(([127, 0, 0, 1], self.listen_port)),
-        )
-        .with_nodes(
-            self.nodes
-                .iter()
-                .filter_map(|a| a.parse().ok())
-                .collect(),
-        )
+        let mut server = ProxyServer::new(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            self.listen_port,
+        )))
+        .with_nodes(self.nodes.iter().filter_map(|a| a.parse().ok()).collect())
         .with_auth_key(self.auth_key.clone())
         .with_trust(self.trust.clone())
         .with_sni(self.sni.clone());
@@ -634,7 +648,9 @@ mod tests {
 
     fn engine(port: u16) -> Arc<HydraEngine> {
         HydraEngine::new(
-            vec![NodeSpec { addr: "127.0.0.1:44300".to_string() }],
+            vec![NodeSpec {
+                addr: "127.0.0.1:44300".to_string(),
+            }],
             HEX.repeat(32),
             TrustMode::Pinned {
                 // 占位 der（启动只校验非空，握手期才会真正解析）
@@ -652,7 +668,8 @@ mod tests {
         // start(self: Arc<Self>) 消费句柄——测试里先克隆一份供断言复用
         let e2 = e.clone();
         let e3 = e.clone();
-        e2.start(None).expect("启动应成功（绑定 127.0.0.1 随机端口）");
+        e2.start(None)
+            .expect("启动应成功（绑定 127.0.0.1 随机端口）");
         let bound = e.bound_addr().expect("启动后应有监听地址");
         assert!(bound.starts_with("127.0.0.1:"), "bound={bound}");
         // 重复启动必须报错
@@ -668,15 +685,37 @@ mod tests {
 
     #[test]
     fn engine_rejects_bad_config() {
-        assert!(HydraEngine::new(vec![], "00".repeat(32),
-            TrustMode::Pinned { cert_der: vec![vec![0x30]] }, None, 0).is_err());
         assert!(HydraEngine::new(
-            vec![NodeSpec { addr: "127.0.0.1:443".to_string() }],
-            "00".repeat(31), // 31 字节：NNpsk2 约束必须 32
-            TrustMode::Pinned { cert_der: vec![vec![0x30]] }, None, 0).is_err());
-        assert!(HydraEngine::new(
-            vec![NodeSpec { addr: "127.0.0.1:443".to_string() }],
+            vec![],
             "00".repeat(32),
-            TrustMode::Pinned { cert_der: vec![] }, None, 0).is_err());
+            TrustMode::Pinned {
+                cert_der: vec![vec![0x30]]
+            },
+            None,
+            0
+        )
+        .is_err());
+        assert!(HydraEngine::new(
+            vec![NodeSpec {
+                addr: "127.0.0.1:443".to_string()
+            }],
+            "00".repeat(31), // 31 字节：NNpsk2 约束必须 32
+            TrustMode::Pinned {
+                cert_der: vec![vec![0x30]]
+            },
+            None,
+            0
+        )
+        .is_err());
+        assert!(HydraEngine::new(
+            vec![NodeSpec {
+                addr: "127.0.0.1:443".to_string()
+            }],
+            "00".repeat(32),
+            TrustMode::Pinned { cert_der: vec![] },
+            None,
+            0
+        )
+        .is_err());
     }
 }

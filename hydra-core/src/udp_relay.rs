@@ -220,7 +220,9 @@ where
         loop {
             match self.recv_from_ext().await? {
                 // 旧 API 语义：close 帧内部消化（映射已由 ext 层解除）
-                UdpRx::Data { target, datagram, .. } => return Ok((target, datagram)),
+                UdpRx::Data {
+                    target, datagram, ..
+                } => return Ok((target, datagram)),
                 UdpRx::Closed { .. } => continue,
             }
         }
@@ -326,7 +328,6 @@ where
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,7 +339,10 @@ mod tests {
     >;
 
     /// mock 节点：读上行帧并回显下行数据帧（同 session 同目标），close 帧仅记录
-    async fn mock_node_relay(srv: tokio::io::DuplexStream, closes: std::sync::Arc<std::sync::atomic::AtomicU32>) {
+    async fn mock_node_relay(
+        srv: tokio::io::DuplexStream,
+        closes: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) {
         let mut srv = srv;
         loop {
             match read_udp_frame(&mut srv).await {
@@ -438,13 +442,19 @@ mod tests {
         let mock = async move {
             let mut srv = srv;
             let frame = read_udp_frame(&mut srv).await.unwrap();
-            let UdpFrame::Data { session_id, target, .. } = frame else {
+            let UdpFrame::Data {
+                session_id, target, ..
+            } = frame
+            else {
                 panic!("应为数据帧");
             };
             // 回环后立刻 close：映射应在客户端解除
-            write_udp_frame(&mut srv, &encode_udp_data(session_id, &target, b"echo-1").unwrap())
-                .await
-                .unwrap();
+            write_udp_frame(
+                &mut srv,
+                &encode_udp_data(session_id, &target, b"echo-1").unwrap(),
+            )
+            .await
+            .unwrap();
             write_udp_frame(&mut srv, &encode_udp_close(session_id))
                 .await
                 .unwrap();
@@ -457,7 +467,12 @@ mod tests {
             .unwrap();
             // 客户端对另一目标的新会话帧：原样回环
             let frame2 = read_udp_frame(&mut srv).await.unwrap();
-            let UdpFrame::Data { session_id: s2, target: t2, datagram: d2 } = frame2 else {
+            let UdpFrame::Data {
+                session_id: s2,
+                target: t2,
+                datagram: d2,
+            } = frame2
+            else {
                 panic!("应为数据帧");
             };
             write_udp_frame(&mut srv, &encode_udp_data(s2, &t2, &d2).unwrap())
@@ -487,17 +502,26 @@ mod tests {
         let mock = async move {
             let mut srv = srv;
             let frame = read_udp_frame(&mut srv).await.unwrap();
-            let UdpFrame::Data { session_id, target, .. } = frame else {
+            let UdpFrame::Data {
+                session_id, target, ..
+            } = frame
+            else {
                 panic!("应为数据帧");
             };
             // 伪造 sid（会话混淆帧）→ 客户端应丢弃
-            write_udp_frame(&mut srv, &encode_udp_data(session_id + 100, &target, b"bad").unwrap())
-                .await
-                .unwrap();
+            write_udp_frame(
+                &mut srv,
+                &encode_udp_data(session_id + 100, &target, b"bad").unwrap(),
+            )
+            .await
+            .unwrap();
             // 正确 sid → 正常投递
-            write_udp_frame(&mut srv, &encode_udp_data(session_id, &target, b"good").unwrap())
-                .await
-                .unwrap();
+            write_udp_frame(
+                &mut srv,
+                &encode_udp_data(session_id, &target, b"good").unwrap(),
+            )
+            .await
+            .unwrap();
         };
         tokio::spawn(mock);
         let mut ch = open_test_channel(cli);
@@ -518,7 +542,11 @@ mod tests {
                 let mut srv = srv;
                 loop {
                     match read_udp_frame(&mut srv).await {
-                        Ok(UdpFrame::Data { session_id, target, datagram }) => {
+                        Ok(UdpFrame::Data {
+                            session_id,
+                            target,
+                            datagram,
+                        }) => {
                             let frame = encode_udp_data(session_id, &target, &datagram).unwrap();
                             if write_udp_frame(&mut srv, &frame).await.is_err() {
                                 break;
@@ -582,8 +610,11 @@ mod tests {
         // mock 节点：原样回环（session_id/target/datagram 透传）
         tokio::spawn(async move {
             let mut srv = srv;
-            while let Ok(UdpFrame::Data { session_id, target, datagram }) =
-                read_udp_frame(&mut srv).await
+            while let Ok(UdpFrame::Data {
+                session_id,
+                target,
+                datagram,
+            }) = read_udp_frame(&mut srv).await
             {
                 let f = encode_udp_data(session_id, &target, &datagram).unwrap();
                 if write_udp_frame(&mut srv, &f).await.is_err() {
@@ -594,17 +625,30 @@ mod tests {
         let mut ch = open_test_channel(cli);
 
         // 流 A 与流 B 发往同一目标：sid 必须不同
-        let sid_a = ch.send_to_ext("flowA", "10.0.0.7:53", b"query-a").await.unwrap();
-        let sid_b = ch.send_to_ext("flowB", "10.0.0.7:53", b"query-b").await.unwrap();
+        let sid_a = ch
+            .send_to_ext("flowA", "10.0.0.7:53", b"query-a")
+            .await
+            .unwrap();
+        let sid_b = ch
+            .send_to_ext("flowB", "10.0.0.7:53", b"query-b")
+            .await
+            .unwrap();
         assert_ne!(sid_a, sid_b, "不同流键同目标必须分会话");
         // 同流键复用同 sid
-        let sid_a2 = ch.send_to_ext("flowA", "10.0.0.7:53", b"query-a2").await.unwrap();
+        let sid_a2 = ch
+            .send_to_ext("flowA", "10.0.0.7:53", b"query-a2")
+            .await
+            .unwrap();
         assert_eq!(sid_a, sid_a2);
 
         // 下行按 sid 反解：A 的回包不会错投给 B
         let rx = ch.recv_from_ext().await.unwrap();
         match rx {
-            UdpRx::Data { sid, target, datagram } => {
+            UdpRx::Data {
+                sid,
+                target,
+                datagram,
+            } => {
                 assert_eq!(sid, sid_a);
                 assert_eq!(target, "10.0.0.7:53");
                 assert_eq!(datagram, b"query-a");
@@ -624,7 +668,10 @@ mod tests {
         // （借 mock：直接对客户端半流写 close 不可行——srv 已被任务持有；
         //   通过 close_session_ext 验证映射解除语义即可）
         assert!(ch.close_session_ext("flowA", "10.0.0.7:53").await.unwrap());
-        assert!(!ch.close_session_ext("flowA", "10.0.0.7:53").await.unwrap(), "幂等");
+        assert!(
+            !ch.close_session_ext("flowA", "10.0.0.7:53").await.unwrap(),
+            "幂等"
+        );
         assert_eq!(ch.active_sessions(), 1);
     }
 

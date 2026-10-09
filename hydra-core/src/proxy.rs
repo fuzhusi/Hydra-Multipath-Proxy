@@ -39,7 +39,7 @@ struct TcpCreds {
 /// 与节点侧 pump 一致；1000 并发常驻缓冲从 128MB 降到 32MB，64KB 无收益
 const RELAY_BUF: usize = 16 * 1024;
 
-    /// HTTP 头部区最大长度（防恶意超大头部无限累积）
+/// HTTP 头部区最大长度（防恶意超大头部无限累积）
 const MAX_HTTP_HEAD: usize = 64 * 1024;
 /// HTTP 头阶段**总时限**（09-P2-1 slowloris 修复）：此前每段读各自重置 30s
 /// 超时且无总时长约束，攻击者每 29s 发 1 字节可让单连接合法存续约 22 天
@@ -66,8 +66,8 @@ const TARGET_UNREACH_FAILOVER_THRESHOLD: u32 = 3;
 const TARGET_UNREACH_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 const TARGET_UNREACH_MAX_ENTRIES: usize = 100_000;
 
-fn target_unreach_counts()
--> &'static std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>> {
+fn target_unreach_counts(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>> {
     static COUNTS: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>,
     > = std::sync::OnceLock::new();
@@ -315,7 +315,8 @@ impl ProxyServer {
     /// 凭据已设置（auth_key/证书）。
     /// （通道开启器 trait 抽象在 `channel` 模块、平台无关；TUN 设备/栈在
     /// 桌面 hydra-client::tun，未来 Android tun_core——均反向依赖本实现。）
-    pub fn tun_channel_opener(&self) -> Result<crate::channel::ChannelOpener> {        use crate::channel::{ChannelOpener, OpenFuture, ProxyDuplex};
+    pub fn tun_channel_opener(&self) -> Result<crate::channel::ChannelOpener> {
+        use crate::channel::{ChannelOpener, OpenFuture, ProxyDuplex};
 
         if self.auth_key.is_empty() {
             return Err(HydraError::ConnectionError(
@@ -392,9 +393,10 @@ impl ProxyServer {
                     .next()
                     .ok_or_else(|| HydraError::ConnectionError("无可用节点".to_string()))?;
                 open_udp_channel(node.address, &creds.sni, &creds.trust, &creds.auth_key).await
-            }) as std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<NodeUdpChannel>> + Send>,
-            >
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<NodeUdpChannel>> + Send>,
+                >
         }) as UdpChannelFactory)
     }
 
@@ -723,9 +725,7 @@ impl ProxyServer {
                             Ok(port) => (host, port),
                             Err(_) => {
                                 parse_failure(peer_addr, &authority);
-                                let _ = stream
-                                    .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                                    .await;
+                                let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
                                 return Err(HydraError::ProtocolError(
                                     "Invalid authority port".to_string(),
                                 ));
@@ -971,7 +971,10 @@ impl ProxyServer {
         // 0x00 时必须回 0xFF（无可接受方法）——此前恒回 0x00，只提供 user/pass
         // (0x02) 的客户端会随即开始子协商，与我们的请求解析必然失步。
         if !methods.contains(&0x00) {
-            info!("[{}] SOCKS5 client offers no no-auth method, rejecting", peer_addr);
+            info!(
+                "[{}] SOCKS5 client offers no no-auth method, rejecting",
+                peer_addr
+            );
             let _ = stream.write_all(&[0x05, 0xFF]).await;
             return Err(HydraError::ProtocolError(
                 "No acceptable SOCKS5 auth method".to_string(),
@@ -1031,8 +1034,8 @@ impl ProxyServer {
         let target_str = match atyp {
             0x01 => {
                 // IPv4：4B 地址 + 2B 端口
-                if let Err(e) = Self::read_exact_socks(&mut stream, &mut pending, &mut body[..6])
-                    .await
+                if let Err(e) =
+                    Self::read_exact_socks(&mut stream, &mut pending, &mut body[..6]).await
                 {
                     error!("[{}] Invalid IPv4 address length: {}", peer_addr, e);
                     let _ = stream
@@ -1051,16 +1054,14 @@ impl ProxyServer {
             }
             0x03 => {
                 // Domain name - 发送域名到节点，由节点解析 DNS（域名不明文离开加密通道）
-                if let Err(e) = Self::read_exact_socks(&mut stream, &mut pending, &mut body[..1])
-                    .await
+                if let Err(e) =
+                    Self::read_exact_socks(&mut stream, &mut pending, &mut body[..1]).await
                 {
                     error!("[{}] Invalid domain name length byte: {}", peer_addr, e);
                     let _ = stream
                         .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                         .await;
-                    return Err(HydraError::ProtocolError(
-                        "Invalid domain name".to_string(),
-                    ));
+                    return Err(HydraError::ProtocolError("Invalid domain name".to_string()));
                 }
                 let domain_len = body[0] as usize;
                 if domain_len == 0 {
@@ -1106,8 +1107,8 @@ impl ProxyServer {
             }
             0x04 => {
                 // IPv6：16B 地址 + 2B 端口
-                if let Err(e) = Self::read_exact_socks(&mut stream, &mut pending, &mut body[..18])
-                    .await
+                if let Err(e) =
+                    Self::read_exact_socks(&mut stream, &mut pending, &mut body[..18]).await
                 {
                     error!("[{}] Invalid IPv6 address length: {}", peer_addr, e);
                     let _ = stream
@@ -1298,9 +1299,7 @@ impl ProxyServer {
             match &link {
                 RemoteLink::Node { link } => link.node,
                 // 直连（CN 分流）无节点归属：0.0.0.0:0 占位（UI 显示「直连」）
-                RemoteLink::Direct(_) => {
-                    SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0)
-                }
+                RemoteLink::Direct(_) => SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0),
             },
         );
 

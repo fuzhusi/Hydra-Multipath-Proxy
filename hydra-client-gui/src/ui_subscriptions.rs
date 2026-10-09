@@ -1,13 +1,12 @@
 //! 订阅页：订阅源生命周期（增/改/更新/删除）+ 归属节点展开 +
 //! 「添加订阅源」对话框。
 
-use eframe::egui;
 use crate::groups::{next_import_group_name, next_manual_group_name, subscription_source_label};
 use crate::palette;
 use crate::HydraApp;
+use eframe::egui;
 
 impl HydraApp {
-
     /// 订阅页（v2 方案 §2.3）：只管订阅源的生命周期（增/改/更新/删除）。
     /// 每条订阅可展开查看归属节点（只读标记 + 「另存为手动」）；
     /// 节点的统一列表与来源标记见「🛰 节点」页。
@@ -89,10 +88,7 @@ impl HydraApp {
             let expanded = self.expanded_sub.as_deref() == Some(sub.name.as_str());
             ui.horizontal(|ui| {
                 ui.strong(&sub.name);
-                ui.colored_label(
-                    palette::TEXT_WEAK,
-                    format!("{} 节点", sub.nodes.len()),
-                );
+                ui.colored_label(palette::TEXT_WEAK, format!("{} 节点", sub.nodes.len()));
                 ui.weak(format!("更新于 {}", updated));
                 if ui.small_button("立即更新").clicked() {
                     self.queue_subscription_update(sub.name.clone(), sub.source.clone());
@@ -313,7 +309,9 @@ impl HydraApp {
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui
-                        .add(egui::Button::new(egui::RichText::new("➕ 添加订阅").strong()))
+                        .add(egui::Button::new(
+                            egui::RichText::new("➕ 添加订阅").strong(),
+                        ))
                         .clicked()
                     {
                         add_clicked = true;

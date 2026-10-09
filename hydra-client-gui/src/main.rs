@@ -219,14 +219,14 @@ async fn main() -> eframe::Result<()> {
     // 09-P3-5：双实例互斥——双 GUI 实例会并发写配置、互相抢系统代理开关状态。
     // 守卫存到 main 作用域直至退出。async main 里用阻塞 bind 可接受（一次性、
     // 内核立即返回、无 await 竞争）。
-    let _instance_guard = match hydra_client::acquire_instance_guard(hydra_client::INSTANCE_PORT_GUI)
-    {
-        Ok(g) => Some(g),
-        Err(e) => {
-            eprintln!("Hydra GUI 无法启动：{e}");
-            std::process::exit(1);
-        }
-    };
+    let _instance_guard =
+        match hydra_client::acquire_instance_guard(hydra_client::INSTANCE_PORT_GUI) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                eprintln!("Hydra GUI 无法启动：{e}");
+                std::process::exit(1);
+            }
+        };
 
     // 设置 panic hook，确保代理异常时清除系统代理
     let main_thread_id = std::thread::current().id();

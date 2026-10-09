@@ -21,7 +21,10 @@ pub(crate) fn median_online_latency(status: &HashMap<String, NodeStatusInfo>) ->
 /// 当前节点候选（纯函数，总览统计卡与单测共用）：
 /// 在线节点中延迟最低者（与调度器「最低延迟优先」语义一致，作参考展示）。
 /// 返回 (地址, 延迟ms)；地址为 owned String——UI 在借用 cfg 前取快照，避免渲染闭包借用冲突。
-pub(crate) fn best_online_node(cfg: &GuiConfig, status: &HashMap<String, NodeStatusInfo>) -> Option<(String, u64)> {
+pub(crate) fn best_online_node(
+    cfg: &GuiConfig,
+    status: &HashMap<String, NodeStatusInfo>,
+) -> Option<(String, u64)> {
     cfg.node_addrs
         .iter()
         .filter_map(|a| {
@@ -145,10 +148,10 @@ pub(crate) mod tests {
     pub(crate) fn group_fixture() -> GuiConfig {
         let mut cfg = GuiConfig {
             node_addrs: vec![
-                "10.0.0.1:1".to_string(),  // 手动
-                "10.0.0.2:2".to_string(),  // 订阅A
-                "10.0.0.3:3".to_string(),  // 订阅A
-                "10.0.0.4:4".to_string(),  // 订阅B
+                "10.0.0.1:1".to_string(), // 手动
+                "10.0.0.2:2".to_string(), // 订阅A
+                "10.0.0.3:3".to_string(), // 订阅A
+                "10.0.0.4:4".to_string(), // 订阅B
             ],
             ..GuiConfig::default()
         };
@@ -211,9 +214,7 @@ pub(crate) mod tests {
             filter_nodes_by_group(&cfg, &addrs, &Some(GROUP_MANUAL.to_string())),
             addrs
         );
-        assert!(
-            filter_nodes_by_group(&cfg, &addrs, &Some("订阅A".to_string())).is_empty()
-        );
+        assert!(filter_nodes_by_group(&cfg, &addrs, &Some("订阅A".to_string())).is_empty());
         // 空列表
         assert!(filter_nodes_by_group(&cfg, &[], &None).is_empty());
     }

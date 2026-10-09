@@ -55,7 +55,9 @@ pub async fn connect_and_request(
     // （rustls 0.23 / Wave 3：pki-types + 显式 ring provider，语义不变）
     let mut roots = rustls::RootCertStore::empty();
     roots
-        .add(rustls::pki_types::CertificateDer::from(node_cert_der.to_vec()))
+        .add(rustls::pki_types::CertificateDer::from(
+            node_cert_der.to_vec(),
+        ))
         .expect("无效的节点证书");
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider)

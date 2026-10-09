@@ -66,7 +66,8 @@ impl SpeedHistory {
         self.last_sent = Some(stats.bytes_sent);
         self.last_recv = Some(stats.bytes_received);
 
-        self.samples.push_back((stats.upload_speed, stats.download_speed));
+        self.samples
+            .push_back((stats.upload_speed, stats.download_speed));
         while self.samples.len() > Self::CAPACITY {
             self.samples.pop_front();
         }

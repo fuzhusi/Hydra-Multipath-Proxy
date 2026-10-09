@@ -146,9 +146,8 @@ pub fn decode_udp_frame(buf: &[u8]) -> Result<UdpFrame> {
                     "UDP 数据帧截断（目标地址不完整）".to_string(),
                 ));
             }
-            let target = String::from_utf8(rest[2..total].to_vec()).map_err(|e| {
-                HydraError::ProtocolError(format!("UDP 目标地址非 UTF-8: {e}"))
-            })?;
+            let target = String::from_utf8(rest[2..total].to_vec())
+                .map_err(|e| HydraError::ProtocolError(format!("UDP 目标地址非 UTF-8: {e}")))?;
             // 数据报上限校验（审查 P3）：编码侧保证 ≤65507，解码侧同样把关——
             // 超限帧若放行，节点 socket.send 必然 EMSGSIZE 导致整条会话被拆
             let datagram = &rest[total..];
@@ -317,9 +316,12 @@ mod tests {
     async fn stream_roundtrip_data_and_close() {
         use tokio::io::duplex;
         let (mut c, mut s) = duplex(4096);
-        write_udp_frame(&mut c, &encode_udp_data(9, "10.0.0.1:5353", b"abc").unwrap())
-            .await
-            .unwrap();
+        write_udp_frame(
+            &mut c,
+            &encode_udp_data(9, "10.0.0.1:5353", b"abc").unwrap(),
+        )
+        .await
+        .unwrap();
         write_udp_frame(&mut c, &encode_udp_close(9)).await.unwrap();
         drop(c);
         match read_udp_frame(&mut s).await.unwrap() {

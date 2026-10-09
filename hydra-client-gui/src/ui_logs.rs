@@ -1,11 +1,10 @@
 //! 日志页：运行日志自动滚动 + 清空/刷新。
 
-use eframe::egui;
 use crate::palette;
 use crate::HydraApp;
+use eframe::egui;
 
 impl HydraApp {
-
     /// 运行日志（保留自动滚动 + 清空/刷新）
     pub(crate) fn ui_logs(&mut self, ui: &mut egui::Ui) {
         ui.label(

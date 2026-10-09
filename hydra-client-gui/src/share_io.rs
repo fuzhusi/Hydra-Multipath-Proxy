@@ -1,16 +1,17 @@
 //! 分享链接导入/导出、单节点分享对话框数据、二维码图片导入、
 //! 手动添加表单提交（全部为 HydraApp 动作方法）。
 
-use crate::groups::{build_form_share_url, import_share_links_as_group};
-use crate::HydraApp;
 use crate::config;
+use crate::groups::{build_form_share_url, import_share_links_as_group};
 use crate::nodes::NodeStatusInfo;
-use hydra_client::{generate_share_links, hex_encode_lower, parse_share_links, sha256_hex, ShareLink};
+use crate::HydraApp;
+use hydra_client::{
+    generate_share_links, hex_encode_lower, parse_share_links, sha256_hex, ShareLink,
+};
 use hydra_protocol::{NodeInfo, NodeStatus};
 use std::net::SocketAddr;
 
 impl HydraApp {
-
     pub(crate) fn export_share_links(&mut self) {
         // 将当前节点配置转换为NodeInfo列表
         let mut nodes = Vec::new();
@@ -258,10 +259,7 @@ impl HydraApp {
                 true
             }
             Err(e) => {
-                self.set_import_status(
-                    false,
-                    format!("读取文件 {} 失败: {}", path.display(), e),
-                );
+                self.set_import_status(false, format!("读取文件 {} 失败: {}", path.display(), e));
                 false
             }
         }

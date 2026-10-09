@@ -256,9 +256,7 @@ pub fn resolve(
         Some("1") => true,
         Some("0") => false,
         Some(v) if !v.is_empty() => {
-            return Err(format!(
-                "HYDRA_FALLBACK_PAGE 非法（期望 0 或 1）: {v}"
-            ));
+            return Err(format!("HYDRA_FALLBACK_PAGE 非法（期望 0 或 1）: {v}"));
         }
         // 空白 env 值 = 未设置该层（模块约定）
         _ => f.fallback_page.unwrap_or(d.fallback_page),
@@ -364,8 +362,7 @@ mod tests {
     fn parse_u32_field_空白env回落文件与默认() {
         // 空白 env + 无文件值 → 默认
         assert_eq!(
-            parse_u32_field(Some(&"  ".to_string()), None, "HYDRA_MAX_CONNECTIONS", 1000)
-                .unwrap(),
+            parse_u32_field(Some(&"  ".to_string()), None, "HYDRA_MAX_CONNECTIONS", 1000).unwrap(),
             1000
         );
         // 空白 env + 有文件值 → 文件值优先级保持（env 未设置语义）
@@ -414,9 +411,21 @@ mod tests {
         // 默认关（保守升级）
         assert!(!resolve(&cli, &env_of(None), None).unwrap().fallback_page);
         // env "1" 开 / "0" 关；空白 = 未设置回落默认
-        assert!(resolve(&cli, &env_of(Some("1")), None).unwrap().fallback_page);
-        assert!(!resolve(&cli, &env_of(Some("0")), None).unwrap().fallback_page);
-        assert!(!resolve(&cli, &env_of(Some("  ")), None).unwrap().fallback_page);
+        assert!(
+            resolve(&cli, &env_of(Some("1")), None)
+                .unwrap()
+                .fallback_page
+        );
+        assert!(
+            !resolve(&cli, &env_of(Some("0")), None)
+                .unwrap()
+                .fallback_page
+        );
+        assert!(
+            !resolve(&cli, &env_of(Some("  ")), None)
+                .unwrap()
+                .fallback_page
+        );
         // toml 字段：true 生效；env "0" 覆盖 toml true（env 优先）
         assert!(
             resolve(&cli, &env_of(None), Some(&file(Some(true))))

@@ -134,19 +134,24 @@ fn build(psk: &[u8], initiator: bool) -> Result<snow::HandshakeState> {
             psk.len()
         )));
     }
-    let params: snow::params::NoiseParams = NOISE_PATTERN.parse().map_err(|e| err(&format!("模式串解析失败: {e}")))?;
+    let params: snow::params::NoiseParams = NOISE_PATTERN
+        .parse()
+        .map_err(|e| err(&format!("模式串解析失败: {e}")))?;
     // ring 优先（RNG/Cipher/Hash）；snow 0.9.6 的 RingResolver 不含 X25519 DH，
     // DH 回退默认 resolver（x25519-dalek，RustCrypto 审计件）——如实标注。
     let resolver = snow::resolvers::FallbackResolver::new(
         Box::new(snow::resolvers::RingResolver),
         Box::new(snow::resolvers::DefaultResolver),
     );
-    let builder = snow::Builder::with_resolver(params, Box::new(resolver))
-        .psk(2, psk); // NNpsk2：PSK 位于第 2 位置（与 msg2 的 "e, ee, psk" 对应）
+    let builder = snow::Builder::with_resolver(params, Box::new(resolver)).psk(2, psk); // NNpsk2：PSK 位于第 2 位置（与 msg2 的 "e, ee, psk" 对应）
     if initiator {
-        builder.build_initiator().map_err(|e| err(&format!("build_initiator: {e}")))
+        builder
+            .build_initiator()
+            .map_err(|e| err(&format!("build_initiator: {e}")))
     } else {
-        builder.build_responder().map_err(|e| err(&format!("build_responder: {e}")))
+        builder
+            .build_responder()
+            .map_err(|e| err(&format!("build_responder: {e}")))
     }
 }
 
@@ -158,12 +163,18 @@ fn derive_confirm(
     exporter: &[u8; 32],
     info: &[u8],
 ) -> Result<[u8; CONFIRM_LEN]> {
-    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &[cert_fp.as_ref(), exporter.as_ref()].concat());
+    let salt = hkdf::Salt::new(
+        hkdf::HKDF_SHA256,
+        &[cert_fp.as_ref(), exporter.as_ref()].concat(),
+    );
     let prk = salt.extract(handshake_hash);
     let mut out = [0u8; CONFIRM_LEN];
     let infos = [info];
-    let okm = prk.expand(&infos, hkdf::HKDF_SHA256).map_err(|e| err(&format!("HKDF expand: {e}")))?;
-    okm.fill(&mut out).map_err(|e| err(&format!("HKDF fill: {e}")))?;
+    let okm = prk
+        .expand(&infos, hkdf::HKDF_SHA256)
+        .map_err(|e| err(&format!("HKDF expand: {e}")))?;
+    okm.fill(&mut out)
+        .map_err(|e| err(&format!("HKDF fill: {e}")))?;
     Ok(out)
 }
 
@@ -194,28 +205,41 @@ where
     let mut msg1 = [0u8; MSG1_LEN];
     let mut frame = Vec::with_capacity(1 + MSG1_LEN);
     frame.push(HANDSHAKE_VERSION_BYTE);
-    let n = hs.write_message(&[], &mut msg1).map_err(|e| err(&format!("write msg1: {e}")))?;
+    let n = hs
+        .write_message(&[], &mut msg1)
+        .map_err(|e| err(&format!("write msg1: {e}")))?;
     frame.extend_from_slice(&msg1[..n]);
-    send.write_all(&frame).await.map_err(|e| err(&format!("send msg1: {e}")))?;
+    send.write_all(&frame)
+        .await
+        .map_err(|e| err(&format!("send msg1: {e}")))?;
 
     // [msg2]
     let mut msg2 = [0u8; MSG2_LEN];
-    recv.read_exact(&mut msg2).await.map_err(|e| err(&format!("recv msg2: {e}")))?;
+    recv.read_exact(&mut msg2)
+        .await
+        .map_err(|e| err(&format!("recv msg2: {e}")))?;
     let mut buf = [0u8; 64];
-    hs.read_message(&msg2, &mut buf).map_err(|e| err(&format!("read msg2: {e}")))?;
+    hs.read_message(&msg2, &mut buf)
+        .map_err(|e| err(&format!("read msg2: {e}")))?;
 
     // confirm_c
     let mut hh = [0u8; 32];
     hh.copy_from_slice(hs.get_handshake_hash());
     let confirm_c = derive_confirm(&hh, cert_fp, exporter, INFO_C2S)?;
-    send.write_all(&confirm_c).await.map_err(|e| err(&format!("send confirm: {e}")))?;
+    send.write_all(&confirm_c)
+        .await
+        .map_err(|e| err(&format!("send confirm: {e}")))?;
 
     // confirm_s
     let mut confirm_s = [0u8; CONFIRM_LEN];
-    recv.read_exact(&mut confirm_s).await.map_err(|e| err(&format!("recv confirm_s: {e}")))?;
+    recv.read_exact(&mut confirm_s)
+        .await
+        .map_err(|e| err(&format!("recv confirm_s: {e}")))?;
     let expected = derive_confirm(&hh, cert_fp, exporter, INFO_S2C)?;
     if !constant_time_eq(&expected, &confirm_s) {
-        return Err(err("节点确认值不匹配（PSK/证书/exporter 不一致或握手被篡改）"));
+        return Err(err(
+            "节点确认值不匹配（PSK/证书/exporter 不一致或握手被篡改）",
+        ));
     }
     Ok(hh)
 }
@@ -236,17 +260,26 @@ where
     let mut hs = build(psk, false)?;
 
     let mut msg1 = [0u8; MSG1_LEN];
-    recv.read_exact(&mut msg1).await.map_err(|e| err(&format!("recv msg1: {e}")))?;
+    recv.read_exact(&mut msg1)
+        .await
+        .map_err(|e| err(&format!("recv msg1: {e}")))?;
     let mut buf = [0u8; 64];
-    hs.read_message(&msg1, &mut buf).map_err(|e| err(&format!("read msg1: {e}")))?;
+    hs.read_message(&msg1, &mut buf)
+        .map_err(|e| err(&format!("read msg1: {e}")))?;
 
     let mut msg2 = [0u8; MSG2_LEN];
-    let n = hs.write_message(&[], &mut msg2).map_err(|e| err(&format!("write msg2: {e}")))?;
-    send.write_all(&msg2[..n]).await.map_err(|e| err(&format!("send msg2: {e}")))?;
+    let n = hs
+        .write_message(&[], &mut msg2)
+        .map_err(|e| err(&format!("write msg2: {e}")))?;
+    send.write_all(&msg2[..n])
+        .await
+        .map_err(|e| err(&format!("send msg2: {e}")))?;
 
     // verify confirm_c（重放防线：节点 e 新鲜 → hash 不同 → 重放的 confirm 必不匹配）
     let mut confirm_c = [0u8; CONFIRM_LEN];
-    recv.read_exact(&mut confirm_c).await.map_err(|e| err(&format!("recv confirm_c: {e}")))?;
+    recv.read_exact(&mut confirm_c)
+        .await
+        .map_err(|e| err(&format!("recv confirm_c: {e}")))?;
     let mut hh = [0u8; 32];
     hh.copy_from_slice(hs.get_handshake_hash());
     let expected = derive_confirm(&hh, cert_fp, exporter, INFO_C2S)?;
@@ -255,7 +288,9 @@ where
     }
 
     let confirm_s = derive_confirm(&hh, cert_fp, exporter, INFO_S2C)?;
-    send.write_all(&confirm_s).await.map_err(|e| err(&format!("send confirm_s: {e}")))?;
+    send.write_all(&confirm_s)
+        .await
+        .map_err(|e| err(&format!("send confirm_s: {e}")))?;
     Ok(hh)
 }
 
@@ -310,8 +345,9 @@ mod tests {
         let (mut c_send, mut s_recv) = duplex(4096);
         let (mut s_send, mut c_recv) = duplex(4096);
         let other_fp = [10u8; 32];
-        let client =
-            tokio::spawn(async move { client_side(&mut c_send, &mut c_recv, &PSK, &other_fp, &EXPORTER).await });
+        let client = tokio::spawn(async move {
+            client_side(&mut c_send, &mut c_recv, &PSK, &other_fp, &EXPORTER).await
+        });
         let server = tokio::spawn(async move {
             let mut vb = [0u8; 1];
             s_recv.read_exact(&mut vb).await.unwrap(); // 消费版本字节（生产中由 handler 消费）
@@ -328,8 +364,9 @@ mod tests {
         let (mut c_send, mut s_recv) = duplex(4096);
         let (mut s_send, mut c_recv) = duplex(4096);
         let other_ex = [12u8; 32];
-        let client =
-            tokio::spawn(async move { client_side(&mut c_send, &mut c_recv, &PSK, &CERT_FP, &other_ex).await });
+        let client = tokio::spawn(async move {
+            client_side(&mut c_send, &mut c_recv, &PSK, &CERT_FP, &other_ex).await
+        });
         let server = tokio::spawn(async move {
             let mut vb = [0u8; 1];
             s_recv.read_exact(&mut vb).await.unwrap(); // 消费版本字节（生产中由 handler 消费）
@@ -433,4 +470,3 @@ mod tests {
         assert_eq!(fp.as_ref(), d.as_ref());
     }
 }
-

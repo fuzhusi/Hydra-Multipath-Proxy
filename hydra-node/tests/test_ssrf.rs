@@ -13,7 +13,10 @@ use tokio::io::AsyncReadExt;
 
 /// 验证目标被拒时客户端读到 2B 应答码 [0x00, 0x01]（REPLY_TARGET_FAIL，
 /// 而非成功前导或静默关流）
-async fn expect_target_fail(mut tls: tokio_rustls::client::TlsStream<tokio::net::TcpStream>, target_desc: &str) {
+async fn expect_target_fail(
+    mut tls: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    target_desc: &str,
+) {
     let mut buf = [0u8; REPLY_LEN];
     let outcome = tokio::time::timeout(Duration::from_secs(10), tls.read_exact(&mut buf)).await;
     match outcome {
@@ -85,13 +88,9 @@ async fn default_denies_new_reserved_segments_before_connect() {
         ("255.255.255.255:80", "受限广播 255.255.255.255"),
     ] {
         let node = common::spawn_node().await;
-        let tls = common::connect_and_request(
-            node.addr,
-            &node.cert,
-            &common::test_auth_key(),
-            target,
-        )
-        .await;
+        let tls =
+            common::connect_and_request(node.addr, &node.cert, &common::test_auth_key(), target)
+                .await;
         expect_target_fail(tls, desc).await;
     }
 }

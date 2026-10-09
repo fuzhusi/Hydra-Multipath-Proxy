@@ -53,7 +53,8 @@ pub fn load_window_icon() -> Option<egui::IconData> {
 pub fn load_tray_icon_rgba() -> Option<Vec<u8>> {
     match decode_largest_rgba() {
         Ok(rgba) => {
-            let resized = image::imageops::resize(&rgba, 32, 32, image::imageops::FilterType::Lanczos3);
+            let resized =
+                image::imageops::resize(&rgba, 32, 32, image::imageops::FilterType::Lanczos3);
             Some(resized.into_raw())
         }
         Err(e) => {

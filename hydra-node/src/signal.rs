@@ -169,9 +169,7 @@ impl SignalRegistry {
     /// 查询（投递 invite/accept 时用）
     pub fn get(&self, peer_id: &str) -> Option<(SocketAddr, mpsc::Sender<Vec<u8>>)> {
         let peers = self.peers.lock().unwrap();
-        peers
-            .get(peer_id)
-            .map(|e| (e.mapped, e.downlink.clone()))
+        peers.get(peer_id).map(|e| (e.mapped, e.downlink.clone()))
     }
 
     /// 当前注册数（测试/监控用）
@@ -232,7 +230,10 @@ pub async fn serve_signal_stream<R, W>(
                 break;
             }
             Err(_) => {
-                debug!("信令会话 {my_peer_id} 读超时（{}s），断开", SIGNAL_READ_TIMEOUT.as_secs());
+                debug!(
+                    "信令会话 {my_peer_id} 读超时（{}s），断开",
+                    SIGNAL_READ_TIMEOUT.as_secs()
+                );
                 break;
             }
         };
@@ -256,7 +257,10 @@ pub async fn serve_signal_stream<R, W>(
             if !expired.is_empty() {
                 info!("信令注册表摘除超时条目: {} 个", expired.len());
             }
-            if handle_line(&registry, &my_peer_id, &auth_key, &line, &tx).await.is_err() {
+            if handle_line(&registry, &my_peer_id, &auth_key, &line, &tx)
+                .await
+                .is_err()
+            {
                 break; // 协议错误（JSON 失败/未知 op/行超长）→ 断开
             }
             continue;
@@ -301,7 +305,11 @@ async fn handle_line(
     })?;
     let now = Instant::now();
     match msg {
-        SignalMessage::Register { peer_id, mapped, proof } => {
+        SignalMessage::Register {
+            peer_id,
+            mapped,
+            proof,
+        } => {
             if peer_id != my_peer_id {
                 // 身份由地址帧决定：消息体 peer_id 不一致 = 协议错误
                 send_error(my_downlink, "peer_id_mismatch", Some(&peer_id)).await;
@@ -310,12 +318,16 @@ async fn handle_line(
             // 属主证明（评审-专家团队-安全与协议）：节点用 PSK 独立复算校验，
             // 伪造/空缺 proof 直接拒绝——防止已认证连接冒用他人 peer_id 抢注。
             if !hydra_protocol::verify_p2p_owner_proof(auth_key, my_peer_id, &proof) {
-                warn!("信令注册属主证明校验失败（{}），拒绝", mask_peer_id(my_peer_id));
+                warn!(
+                    "信令注册属主证明校验失败（{}），拒绝",
+                    mask_peer_id(my_peer_id)
+                );
                 send_error(my_downlink, "owner_proof_invalid", Some(my_peer_id)).await;
                 return Err(());
             }
             let mapped_addr: SocketAddr = mapped.parse().map_err(|_| ())?;
-            if let Err(e) = registry.register(my_peer_id, mapped_addr, &proof, now, my_downlink.clone())
+            if let Err(e) =
+                registry.register(my_peer_id, mapped_addr, &proof, now, my_downlink.clone())
             {
                 send_error(my_downlink, &e, None).await;
                 return Err(());
@@ -468,14 +480,20 @@ mod tests {
             cand: vec!["1.2.3.4:5".into()],
         };
         let line = serde_json::to_string(&invite).unwrap();
-        assert_eq!(serde_json::from_str::<SignalMessage>(&line).unwrap(), invite);
+        assert_eq!(
+            serde_json::from_str::<SignalMessage>(&line).unwrap(),
+            invite
+        );
 
         let accept = SignalMessage::Accept {
             to: "a".into(),
             cand: vec![],
         };
         let line = serde_json::to_string(&accept).unwrap();
-        assert_eq!(serde_json::from_str::<SignalMessage>(&line).unwrap(), accept);
+        assert_eq!(
+            serde_json::from_str::<SignalMessage>(&line).unwrap(),
+            accept
+        );
 
         // 下行
         let incoming = SignalDownMessage::Incoming {
@@ -506,29 +524,53 @@ mod tests {
         let proof = hydra_protocol::p2p_owner_proof(&test_key(), "a");
 
         // 正常注册 + touch（touch 到近期时刻：距 sweep 检查点仅 50s < ttl）
-        reg.register("a", "1.1.1.1:1".parse().unwrap(), &proof, now, tx.clone()).unwrap();
+        reg.register("a", "1.1.1.1:1".parse().unwrap(), &proof, now, tx.clone())
+            .unwrap();
         assert_eq!(reg.len(), 1);
         reg.touch("a", now + Duration::from_secs(150));
         assert_eq!(reg.get("a").unwrap().0, "1.1.1.1:1".parse().unwrap());
 
         // 重复注册（upsert）：同 proof 心跳/地址更新，不占新额度，覆盖旧值
-        reg.register("a", "2.2.2.2:2".parse().unwrap(), &proof, now + Duration::from_secs(150), tx.clone()).unwrap();
+        reg.register(
+            "a",
+            "2.2.2.2:2".parse().unwrap(),
+            &proof,
+            now + Duration::from_secs(150),
+            tx.clone(),
+        )
+        .unwrap();
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.get("a").unwrap().0, "2.2.2.2:2".parse().unwrap());
 
         // 冒用顶替（Wave1-7 核心）：同 peer_id、不同 proof 的二次注册必须被拒，
         // 且原注册不被顶替
         let forged = hydra_protocol::p2p_owner_proof(&[9u8; 32], "a");
-        assert!(reg.register("a", "6.6.6.6:6".parse().unwrap(), &forged, now, tx.clone()).is_err());
+        assert!(reg
+            .register("a", "6.6.6.6:6".parse().unwrap(), &forged, now, tx.clone())
+            .is_err());
         assert_eq!(reg.get("a").unwrap().0, "2.2.2.2:2".parse().unwrap());
 
         // 上限：注册到 MAX_PEERS 后拒绝新 peer
         for i in 1..MAX_PEERS {
-            reg.register(&format!("p{i}"), "3.3.3.3:3".parse().unwrap(), &hydra_protocol::p2p_owner_proof(&test_key(), &format!("p{i}")), now, tx.clone())
-                .unwrap();
+            reg.register(
+                &format!("p{i}"),
+                "3.3.3.3:3".parse().unwrap(),
+                &hydra_protocol::p2p_owner_proof(&test_key(), &format!("p{i}")),
+                now,
+                tx.clone(),
+            )
+            .unwrap();
         }
         assert_eq!(reg.len(), MAX_PEERS);
-        assert!(reg.register("overflow", "3.3.3.3:3".parse().unwrap(), "p", now, tx.clone()).is_err());
+        assert!(reg
+            .register(
+                "overflow",
+                "3.3.3.3:3".parse().unwrap(),
+                "p",
+                now,
+                tx.clone()
+            )
+            .is_err());
 
         // 超时摘除：a 的 last_active 在 ttl 内（刚 touch），p1 已超时
         let later = now + Duration::from_secs(200);
@@ -565,7 +607,9 @@ mod tests {
             mapped: "1.1.1.1:1".into(),
             proof: hydra_protocol::p2p_owner_proof(&key, "aaaa"),
         };
-        c_wr.write_all(serde_json::to_string(&ok).unwrap().as_bytes()).await.unwrap();
+        c_wr.write_all(serde_json::to_string(&ok).unwrap().as_bytes())
+            .await
+            .unwrap();
         c_wr.write_all(b"\n").await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(reg.len(), 1, "正确 proof 应注册成功");
@@ -574,9 +618,17 @@ mod tests {
         // owner_proof_mismatch 拒绝（节点 HMAC 校验已在 serve 路径覆盖）
         let (tx_forged, _rx_forged) = mpsc::channel(8);
         let forged = hydra_protocol::p2p_owner_proof(&[9u8; 32], "aaaa");
-        assert!(reg
-            .register("aaaa", "6.6.6.6:6".parse().unwrap(), &forged, Instant::now(), tx_forged)
-            .is_err(), "伪造 proof 的顶替注册必须被拒");
+        assert!(
+            reg.register(
+                "aaaa",
+                "6.6.6.6:6".parse().unwrap(),
+                &forged,
+                Instant::now(),
+                tx_forged
+            )
+            .is_err(),
+            "伪造 proof 的顶替注册必须被拒"
+        );
 
         // 错误 proof 走 serve 路径：节点直接断开会话（handle_line Err）
         let (client2, server2) = tokio::io::duplex(4096);
@@ -595,7 +647,9 @@ mod tests {
             mapped: "1.1.1.1:2".into(),
             proof: hydra_protocol::p2p_owner_proof(&[1u8; 32], "bbbb"),
         };
-        d_wr.write_all(serde_json::to_string(&bad).unwrap().as_bytes()).await.unwrap();
+        d_wr.write_all(serde_json::to_string(&bad).unwrap().as_bytes())
+            .await
+            .unwrap();
         d_wr.write_all(b"\n").await.unwrap();
         // 节点应回 error(owner_proof_invalid) 后断开
         let mut line = String::new();
@@ -627,9 +681,11 @@ mod tests {
         let (tx1, _rx1) = mpsc::channel(8);
         let (tx2, _rx2) = mpsc::channel(8);
         let proof = hydra_protocol::p2p_owner_proof(&test_key(), "a");
-        reg.register("a", "1.1.1.1:1".parse().unwrap(), &proof, now, tx1.clone()).unwrap();
+        reg.register("a", "1.1.1.1:1".parse().unwrap(), &proof, now, tx1.clone())
+            .unwrap();
         // 新连接重新注册（同 proof 合法顶替 = 地址/下行端更新）
-        reg.register("a", "1.1.1.1:1".parse().unwrap(), &proof, now, tx2.clone()).unwrap();
+        reg.register("a", "1.1.1.1:1".parse().unwrap(), &proof, now, tx2.clone())
+            .unwrap();
         // 旧连接退出：其下行端已不匹配，不应误删新连接的注册
         reg.remove_if_downlink("a", &tx1);
         assert!(reg.get("a").is_some());
@@ -675,7 +731,9 @@ mod tests {
             mapped: "1.1.1.1:2".into(),
             proof: hydra_protocol::p2p_owner_proof(&[7u8; 32], "bbbb"),
         };
-        b_wr.write_all(serde_json::to_string(&reg_b).unwrap().as_bytes()).await.unwrap();
+        b_wr.write_all(serde_json::to_string(&reg_b).unwrap().as_bytes())
+            .await
+            .unwrap();
         b_wr.write_all(b"\n").await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(reg.get("bbbb").is_some(), "bbbb 应已注册");
@@ -687,13 +745,17 @@ mod tests {
             mapped: "1.1.1.1:1".into(),
             proof: hydra_protocol::p2p_owner_proof(&[7u8; 32], "aaaa"),
         };
-        a_wr.write_all(serde_json::to_string(&reg_a).unwrap().as_bytes()).await.unwrap();
+        a_wr.write_all(serde_json::to_string(&reg_a).unwrap().as_bytes())
+            .await
+            .unwrap();
         a_wr.write_all(b"\n").await.unwrap();
         let inv = SignalMessage::Invite {
             peer_id: "bbbb".into(),
             cand: vec!["1.1.1.1:2".into()],
         };
-        a_wr.write_all(serde_json::to_string(&inv).unwrap().as_bytes()).await.unwrap();
+        a_wr.write_all(serde_json::to_string(&inv).unwrap().as_bytes())
+            .await
+            .unwrap();
         a_wr.write_all(b"\n").await.unwrap();
 
         // B 应收到 incoming

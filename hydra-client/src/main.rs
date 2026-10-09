@@ -159,7 +159,9 @@ fn parse_args() -> (Option<SocketAddr>, Vec<SocketAddr>, Option<P2pArgs>) {
                     // 09-P3-6：解析失败显式退出（此前静默回退默认且吞掉该参数位）
                     Some(Err(_)) => {
                         let raw = args.get(i + 1).cloned().unwrap_or_default();
-                        error!("--listen 参数 \"{raw}\" 无法解析（应为 地址:端口，如 127.0.0.1:1080）");
+                        error!(
+                            "--listen 参数 \"{raw}\" 无法解析（应为 地址:端口，如 127.0.0.1:1080）"
+                        );
                         std::process::exit(1);
                     }
                     None => {
@@ -491,7 +493,9 @@ async fn main() -> Result<()> {
             );
             // 保存 JoinHandle：停机时等待栈任务退出（RouteGuard Drop 清理路由）
             let tun_task = tokio::spawn(async move {
-                if let Err(e) = hydra_client::tun::run_tun(tcfg, opener, udp_factory, shutdown2).await {
+                if let Err(e) =
+                    hydra_client::tun::run_tun(tcfg, opener, udp_factory, shutdown2).await
+                {
                     error!(
                         "TUN 模式启动失败: {}（设备创建需管理员/root；Windows 还需 wintun.dll）",
                         e

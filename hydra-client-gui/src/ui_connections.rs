@@ -1,9 +1,9 @@
 //! 连接页：经代理的活跃连接表格（500ms 节流快照 + 差分速率）。
 
-use eframe::egui;
 use crate::palette;
 use crate::theme::card_frame;
 use crate::HydraApp;
+use eframe::egui;
 use hydra_client::{format_bytes, format_duration, format_speed};
 use std::collections::HashMap;
 
@@ -161,11 +161,7 @@ impl HydraApp {
                         )
                         .on_hover_text(node_str);
                         // 速率（差分推算；首帧或无新数据显示 0）
-                        let (up, down) = self
-                            .conn_rates
-                            .get(&c.id)
-                            .copied()
-                            .unwrap_or((0.0, 0.0));
+                        let (up, down) = self.conn_rates.get(&c.id).copied().unwrap_or((0.0, 0.0));
                         ui.label(
                             egui::RichText::new(format_speed(up))
                                 .monospace()

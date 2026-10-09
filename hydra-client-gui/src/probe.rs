@@ -58,9 +58,6 @@ mod tests {
     fn probe_target_env_override() {
         // env 覆盖生效（去首尾空白）；纯函数无进程 env 副作用，可并行
         assert_eq!(probe_target_from(Some("10.0.0.1:8080")), "10.0.0.1:8080");
-        assert_eq!(
-            probe_target_from(Some("  1.2.3.4:443  ")),
-            "1.2.3.4:443"
-        );
+        assert_eq!(probe_target_from(Some("  1.2.3.4:443  ")), "1.2.3.4:443");
     }
 }

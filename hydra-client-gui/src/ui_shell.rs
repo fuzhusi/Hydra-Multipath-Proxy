@@ -1,13 +1,13 @@
 //! 应用骨架 UI：eframe::App 主循环（轮询回收 / 页面分发 / 对话框集中渲染）
 //! + 系统托盘接线（命令轮询 / 关窗行为 / tooltip 同步）。
 
-use eframe::egui;
+use crate::config;
 use crate::nodes::Tab;
 use crate::palette;
 use crate::qr;
 use crate::tray::TrayCommand;
-use crate::config;
 use crate::HydraApp;
+use eframe::egui;
 
 impl eframe::App for HydraApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

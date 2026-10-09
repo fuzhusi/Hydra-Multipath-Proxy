@@ -69,16 +69,13 @@ pub async fn read_target<R: AsyncRead + Unpin>(recv: &mut R) -> Result<String> {
         .map_err(|e| HydraError::ProtocolError(format!("读取地址帧长度失败: {e}")))?;
     let len = u16::from_be_bytes(len_buf) as usize;
     if len == 0 || len > MAX_TARGET_LEN {
-        return Err(HydraError::ProtocolError(format!(
-            "地址帧长度非法: {len}"
-        )));
+        return Err(HydraError::ProtocolError(format!("地址帧长度非法: {len}")));
     }
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf)
         .await
         .map_err(|e| HydraError::ProtocolError(format!("读取地址帧失败: {e}")))?;
-    String::from_utf8(buf)
-        .map_err(|e| HydraError::ProtocolError(format!("目标地址非 UTF-8: {e}")))
+    String::from_utf8(buf).map_err(|e| HydraError::ProtocolError(format!("目标地址非 UTF-8: {e}")))
 }
 
 /// 写地址帧到流。

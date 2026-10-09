@@ -1,7 +1,7 @@
 //! 视觉规范装配：自定义字体装载、统一深色主题、统一卡片 Frame。
 
-use eframe::egui;
 use crate::palette;
+use eframe::egui;
 
 /// UI 重设计第三批：统一卡片 Frame 规范——卡片底色 + 1px 描边 + 圆角 8 + 内边距 MD、
 /// 外边距 XS（视觉规范收口：所有新卡片走本函数，不再散落 Frame::group）。
@@ -75,7 +75,7 @@ pub(crate) fn apply_dark_theme(ctx: &egui::Context) {
     vis.window_fill = bg_window;
     vis.extreme_bg_color = bg_extreme; // TextEdit / 折叠区背景
     vis.faint_bg_color = palette::BG_FAINT; // 斑马纹/弱分隔
-                                                                    // 文字：正文高对比，次要文字（ui.small / weak）仍 ≥7:1
+                                            // 文字：正文高对比，次要文字（ui.small / weak）仍 ≥7:1
     vis.override_text_color = Some(text);
     vis.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, weak); // 分隔线文字等
     vis.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, text);

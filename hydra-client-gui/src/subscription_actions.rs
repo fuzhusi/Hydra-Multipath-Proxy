@@ -1,15 +1,14 @@
 //! 订阅管理动作：添加/删除订阅、串行后台更新队列、合并替换落库。
 
-use crate::groups::apply_subscription_node_update;
 use crate::config::SubscriptionConfig;
+use crate::groups::apply_subscription_node_update;
 use crate::nodes::NodeStatusInfo;
 use crate::subscription;
 use crate::HydraApp;
-use std::collections::HashSet;
 use hydra_client::ShareLink;
+use std::collections::HashSet;
 
 impl HydraApp {
-
     // ═══════════════ Exec-C：订阅（hydra-sub v1）═══════════════
     //
     // 数据流：UI 线程 queue_subscription_update → 后台线程 fetch_and_parse_subscription
