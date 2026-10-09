@@ -139,6 +139,7 @@ pub async fn spawn_tcp_listener(
     p2p_signal: bool,
     fallback_page: bool,
     idle_timeout: Option<std::time::Duration>,
+    max_conn_age: Option<std::time::Duration>,
 ) -> Result<SocketAddr> {
     // rustls 0.23（Wave 3）：显式 ring provider（与客户端同一选择，全工作区 ring 0.17）；
     // 协议版本 = 安全默认（TLS 1.2 + 1.3）。
@@ -165,6 +166,9 @@ pub async fn spawn_tcp_listener(
     // 07-P2-4：idle 超时在监听启动时解析一次（显式注入优先，回落 env/默认值），
     // 经 Arc 随连接任务传递——不再每连接读 env
     let idle = Arc::new(effective_idle_timeout(idle_timeout));
+    // 连接最长寿命（V3.3 Tier1，防御纵深）：None/0 = 关闭；env
+    // HYDRA_MAX_CONN_AGE_SECS（server.rs from_env 已解析，0 值归一 None）
+    let max_age = max_conn_age.filter(|d| !d.is_zero());
     // 信令注册表：开启信令模式时创建（跨连接共享）；关闭时 None = 零开销
     let registry = if p2p_signal {
         Some(Arc::new(SignalRegistry::new()))
@@ -225,8 +229,15 @@ pub async fn spawn_tcp_listener(
                             .await
                         {
                             Ok(Ok(tls)) => {
-                                handle_tls_stream(tls, handler, registry.clone(), fallback, idle)
-                                    .await
+                                handle_tls_stream(
+                                    tls,
+                                    handler,
+                                    registry.clone(),
+                                    fallback,
+                                    idle,
+                                    max_age,
+                                )
+                                .await
                             }
                             Ok(Err(e)) => {
                                 // 握手失败（扫描/探测）不回显任何信息，仅 debug 记录
@@ -265,7 +276,12 @@ async fn handle_tls_stream(
     signal_registry: Option<Arc<SignalRegistry>>,
     fallback_page: bool,
     idle: Arc<std::time::Duration>,
+    max_age: Option<std::time::Duration>,
 ) {
+    // 连接最长寿命（V3.3 Tier1）：起点 = TLS 建立后（认证前不计——攻击者
+    // 无法以未认证状态驻留，AUTH_TIMEOUT 已封顶）
+    let started = std::time::Instant::now();
+    let age_deadline = max_age.and_then(|d| started.checked_add(d));
     // ── 第 1 步：版本字节判别（0x03 = Noise-PSK；其他值按开关回退页/静默关流）
     let mut version = [0u8; 1];
     match tokio::time::timeout(AUTH_TIMEOUT, tls.read_exact(&mut version)).await {
@@ -388,7 +404,7 @@ async fn handle_tls_stream(
         if write_reply(&mut wr, REPLY_OK).await.is_err() {
             return;
         }
-        crate::udp_relay::serve(rd, wr).await;
+        crate::udp_relay::serve(rd, wr, max_age).await;
         return;
     }
 
@@ -449,9 +465,10 @@ async fn handle_tls_stream(
                 idle,
                 last_active.clone(),
                 exit_notify.clone(),
-                exited.clone()
+                exited.clone(),
+                age_deadline
             ),
-            pump(t_rd, wr, idle, last_active, exit_notify, exited)
+            pump(t_rd, wr, idle, last_active, exit_notify, exited, age_deadline)
         )
     };
     let (up, down) = (c2t.unwrap_or(0), t2c.unwrap_or(0));
@@ -482,6 +499,7 @@ async fn pump<R, W>(
     last_active: Arc<std::sync::atomic::AtomicU64>,
     peer_exit: Arc<tokio::sync::Notify>,
     peer_done: Arc<std::sync::atomic::AtomicBool>,
+    age_deadline: Option<std::time::Instant>,
 ) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -494,6 +512,15 @@ where
         // 对侧泵已结束：立即收尾（下行先结束/写错误等场景不再空挂）
         if peer_done.load(Ordering::Relaxed) {
             break Ok(total);
+        }
+        // 连接最长寿命（V3.3 Tier1，防御纵深）：到期强制关闭——数据路径无应用层
+        // 控制通道，对客户端这是一次普通传输故障（定位与边界见 README 已知限制；
+        // rustls 已按套件约束自动刷新 TLS 流量密钥，本上限是会话寿命/资源边界）
+        if let Some(dl) = age_deadline {
+            if std::time::Instant::now() >= dl {
+                info!("relay max connection age reached, closing connection");
+                break Ok(total);
+            }
         }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -509,8 +536,13 @@ where
             break Ok(total);
         }
         // read 包超时兜底唤醒（到期后由上方共享时间戳判定是否真正全局空闲）；
-        // 对侧退出通知可随时打断阻塞中的 read
-        let budget = idle_ms - now_ms.saturating_sub(last);
+        // 对侧退出通知可随时打断阻塞中的 read。
+        // budget = min(空闲剩余, 寿命剩余)：寿命到期即便活跃也会被唤醒关闭
+        let mut budget = idle_ms - now_ms.saturating_sub(last);
+        if let Some(dl) = age_deadline {
+            let age_rem = dl.saturating_duration_since(std::time::Instant::now());
+            budget = budget.min(age_rem.as_millis() as u64);
+        }
         let n = tokio::select! {
             biased;
             _ = peer_exit.notified() => {
@@ -597,6 +629,7 @@ mod tests {
             last_active.clone(),
             exit_notify.clone(),
             peer_done.clone(),
+            None,
         ));
         let pump_a = tokio::spawn(pump(
             a_srv,
@@ -605,6 +638,7 @@ mod tests {
             last_active,
             exit_notify,
             peer_done,
+            None,
         ));
 
         // 静默 pump 运行 1s（约为 idle 的 3 倍），期间活跃 pump 持续喂数据
@@ -631,5 +665,56 @@ mod tests {
         })
         .await
         .expect("双向静默达到 idle 后 pump 应结束");
+    }
+
+    /// 连接最长寿命（V3.3 Tier1）：**持续活跃**的 pump 到达寿命 deadline 也必须
+    /// 结束（寿命上限独立于空闲看门狗——空闲不会刷新寿命计时）
+    #[tokio::test]
+    async fn pump_寿命到期_活跃也关闭() {
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::duplex;
+
+        fn now_ms() -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        }
+
+        let last_active = Arc::new(AtomicU64::new(now_ms()));
+        let idle = std::time::Duration::from_secs(30); // 空闲看门狗远大于寿命
+        let age_deadline =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+
+        let (mut a_cli, a_srv) = duplex(64);
+        let exit_notify = Arc::new(tokio::sync::Notify::new());
+        let peer_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = tokio::spawn(pump(
+            a_srv,
+            tokio::io::sink(),
+            idle,
+            last_active,
+            exit_notify,
+            peer_done,
+            age_deadline,
+        ));
+
+        // 持续喂数据（保持活跃，刷新空闲时间戳），超过寿命 deadline 后 pump 应结束
+        use tokio::io::AsyncWriteExt;
+        for _ in 0..30 {
+            if a_cli.write_all(b"x").await.is_err() {
+                break; // pump 已关闭（写端对端消失）
+            }
+            let _ = a_cli.flush().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let _ = handle.await;
+        })
+        .await;
+        assert!(
+            closed.is_ok() || a_cli.write_all(b"x").await.is_err(),
+            "寿命到期后 pump 应结束（即便持续活跃）"
+        );
     }
 }

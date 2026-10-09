@@ -335,27 +335,40 @@ async fn resolve_udp_target(target: &str) -> Option<SocketAddr> {
 // ── 中继服务 ────────────────────────────────────────────────────────────
 
 /// UDP 中继服务入口（tcp_server 分流后调用；默认 60s 空闲回收）。
-pub(crate) async fn serve<R, W>(rd: R, wr: W)
+pub(crate) async fn serve<R, W>(rd: R, wr: W, max_age: Option<Duration>)
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    serve_with_idle_and_filter(rd, wr, Duration::from_secs(UDP_SESSION_IDLE_SECS), None).await;
+    serve_with_idle_and_filter(
+        rd,
+        wr,
+        Duration::from_secs(UDP_SESSION_IDLE_SECS),
+        None,
+        max_age,
+    )
+    .await;
 }
 
 /// 完整形态：`aaaa_filter = None` 按节点配置自动判定（每连接读取一次，
 /// 不逐帧查 env/OnceLock）；`Some(bool)` 显式强制（测试注入用）。
+/// `max_age` = 连接最长寿命（V3.3 Tier1；None = 关闭）——UDP 中继是长寿命
+/// 主力路径，寿命到期整连接关闭（客户端侧 UDP 通道自带重连，会话丢失由
+/// 节点侧会话回收语义兜底）。
 /// Send + 'static：会话/回收任务经 tokio::spawn 持有共享的 writer/表。
 async fn serve_with_idle_and_filter<R, W>(
     mut rd: R,
     wr: W,
     idle: Duration,
     aaaa_filter: Option<bool>,
+    max_age: Option<Duration>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let aaaa_filter = aaaa_filter.unwrap_or_else(dns_aaaa::aaaa_filter_enabled);
+    let started = std::time::Instant::now();
+    let age_deadline = max_age.and_then(|d| started.checked_add(d));
     let table = Arc::new(Mutex::new(UdpSessionTable::new()));
     crate::metrics::metrics()
         .udp_relay_total
@@ -422,15 +435,31 @@ async fn serve_with_idle_and_filter<R, W>(
                     None => break,
                 }
             }
-            frame = tokio::time::timeout(conn_idle, read_udp_frame(&mut rd)) => {
+            frame = tokio::time::timeout(
+                // budget = min(连接空闲看门狗, 寿命剩余)：寿命到期即便活跃也唤醒
+                age_deadline
+                    .map(|dl| {
+                        conn_idle.min(dl.saturating_duration_since(std::time::Instant::now()))
+                    })
+                    .unwrap_or(conn_idle),
+                read_udp_frame(&mut rd),
+            ) => {
                 match frame {
                     // 连接级空闲超时：会话表可能为空（回收先行），客户端静默不关流
-                    // ——主动关闭，释放 permit/fd/reaper（09-P1-1）
+                    // ——主动关闭，释放 permit/fd/reaper（09-P1-1）。
+                    // 寿命到期（V3.3 Tier1）：整连接关闭（区别于空闲的日志语义）
                     Err(_) => {
-                        info!(
-                            "UDP 中继连接空闲超时（{}s 无上行帧），主动关闭",
-                            conn_idle.as_secs()
-                        );
+                        let aged = age_deadline
+                            .map(|dl| std::time::Instant::now() >= dl)
+                            .unwrap_or(false);
+                        if aged {
+                            info!("UDP 中继连接达到最长寿命，主动关闭（客户端通道将自动重连）");
+                        } else {
+                            info!(
+                                "UDP 中继连接空闲超时（{}s 无上行帧），主动关闭",
+                                conn_idle.as_secs()
+                            );
+                        }
                         break;
                     }
                     Ok(Err(e)) => {
@@ -873,6 +902,7 @@ mod tests {
             srv_wr,
             Duration::from_secs(60),
             None,
+            None, // max_age
         ));
 
         // 两个会话各自隐式建立并回环（数据报按 session_id 分发不串线）
@@ -919,6 +949,7 @@ mod tests {
             srv_wr,
             Duration::from_secs(60),
             None,
+            None, // max_age
         ));
         // 同一 session 先打 A 后打 B：两次都应回环成功（绑定已更新）
         write_udp_frame(&mut cli, &encode_udp_data(7, &echo, b"first").unwrap())
@@ -951,6 +982,7 @@ mod tests {
             srv_wr,
             Duration::from_millis(300),
             None,
+            None, // max_age
         ));
         write_udp_frame(&mut cli, &encode_udp_data(3, &echo, b"go").unwrap())
             .await
@@ -984,6 +1016,7 @@ mod tests {
             srv_wr,
             Duration::from_secs(60),
             None,
+            None, // max_age
         ));
         // 240.0.0.0/4 保留段：恒被拒绝（无论 env 放宽与否）
         write_udp_frame(
@@ -1010,6 +1043,7 @@ mod tests {
             srv_wr,
             Duration::from_secs(60),
             Some(true),
+            None, // max_age
         ));
 
         // 构造真实 AAAA 查询（ID 0xABCD + qname + qtype=AAAA/qclass=IN）

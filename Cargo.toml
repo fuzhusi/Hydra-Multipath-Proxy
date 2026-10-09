@@ -3,6 +3,7 @@ members = [
     "hydra-client",
     "hydra-core",
     "hydra-android",
+    "hydra-fetch",
     "hydra-node",
     "hydra-protocol",
     "hydra-client-gui",

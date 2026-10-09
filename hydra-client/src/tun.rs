@@ -1467,6 +1467,21 @@ async fn udp_relay_task(
     shutdown: CancellationToken,
 ) {
     let mut backoff = Duration::from_secs(1);
+    // 连接最长寿命（V3.3 Tier1，防御纵深）：通道超龄**主动轮换**（break → 外层
+    // 既有重连逻辑按当前最优节点重建 = 新密钥）。与节点侧同一 env；None/0 = 关闭。
+    // UDP 语义容忍轮换代价：流表重建，在途回包丢弃。定位：rustls 已自动刷新
+    // TLS 流量密钥，此为会话寿命/资源边界而非密码学必需。
+    let max_age: Option<Duration> = match std::env::var("HYDRA_MAX_CONN_AGE_SECS") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(Duration::from_secs(n.clamp(60, 604_800))),
+            Err(_) => {
+                warn!("HYDRA_MAX_CONN_AGE_SECS=\"{v}\" 非法（期望秒数，0=关闭），忽略");
+                None
+            }
+        },
+        Err(_) => None,
+    };
     loop {
         if shutdown.is_cancelled() {
             return;
@@ -1495,6 +1510,8 @@ async fn udp_relay_task(
                 continue;
             }
         };
+        let age_deadline =
+            max_age.and_then(|d| std::time::Instant::now().checked_add(d));
 
         // 2. 双向泵
         let mut flows = UdpFlowTable::default();
@@ -1502,7 +1519,16 @@ async fn udp_relay_task(
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return,
-                _ = janitor.tick() => flows.sweep_idle(),
+                _ = janitor.tick() => {
+                    flows.sweep_idle();
+                    // 寿命到期（V3.3 Tier1）：主动轮换通道（janitor 30s 粒度足够）
+                    if let Some(dl) = age_deadline {
+                        if std::time::Instant::now() >= dl {
+                            info!("TUN UDP 中继通道达到最长寿命，主动轮换（新通道 = 新密钥）");
+                            break;
+                        }
+                    }
+                }
                 cmd = cmd_rx.recv() => match cmd {
                     Some(UdpCmd::Send { flow, dst, src, data }) => {
                         let dst_str = sock_to_target(dst);

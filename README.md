@@ -8,7 +8,7 @@
 
 > **交付状态：v1.0 可交付产品**（2026-10）。三档如实划分：
 > - **已交付**：TCP/TLS + Noise-PSK 隧道、自签 pinning 与 ACME 真证书双路线、多节点加权分发与故障自愈、测速动态调度、**温连接池**（预热复用，每请求省一次节点握手）、TUN 透明代理完整版（IPv6 双栈 + **UDP-over-proxy 接管** + **DNS 经隧道** + **TCP 任意端口动态接流**）、**节点侧 v4-only 降噪**（DNS AAAA 本地过滤 + 目标建连 v4 优先）、NAT 穿透 v1（TCP STUN 分类 + 同时打开打洞 + 中继兜底；真实 NAT 组合环境需人工实网验证）、反代静态页回退、ClientHello 指纹模仿（最大近似方案，见 docs/design/ClientHello指纹模仿方案与实施.md）、UI 重设计 v3 全部批次（含连接页）+ **GUI 模块化拆分**（21 文件）、GUI 全功能（托盘/分享/订阅/连接页/配置持久化/CA 信任模式/**托盘菜单禁用态**）、**节点 /metrics（Prometheus）**、CI 与 Release 安装包、**Android M1 本地代理 + M2 全局 VPN**（VpnService 全接管 + TCP 任意端口 + DNS 经隧道）+ **M2.1 VPN 保护**（kill switch 断线阻断自动重连 / 开机自启 / 分应用代理白黑名单）。
-> - **规划中**：多节点并行下载（HTTP Range，透明代理模型下需独立下载器形态——产品决策待定）、rekey 密钥轮换（TLS 1.3 每连接密钥 + 短连接已绑定暴露面，V3.3）、eframe/egui 升级 0.27→0.33+（根治 webbrowser 漏洞告警与 unmaintained 依赖群，当前已评估豁免）。
+> - **规划中**：eframe/egui 升级 0.27→0.33+（根治 webbrowser 漏洞告警与 unmaintained 依赖群，当前已评估豁免）、多节点并行下载 GUI 前端（CLI 已交付）、rekey Tier2（并入 v4 帧化协议——snow 0.9.6 具备 rekey API 但现协议 Noise 仅认证、数据面为 TLS 1.3，对现协议无效果）。
 
 > **项目性质**：个人自用工具，AI 辅助开发。经多轮独立代码审查（[docs/review/](docs/review/)），本 README 与代码逐项核对——未列出的能力即为未实现，不做夸大宣传。
 >
@@ -32,6 +32,8 @@
 - **测速动态调度**：主动探测 RTT + 被动吞吐差分（按节点字节计数）+ 故障衰减，实测写回节点评分
 - **温连接池（pre-warm）**：节点握手在上一请求转发期间后台完成（每节点 ≤2 根温连接、60s TTL），请求到达复用现成通道直发目标帧——浏览器式短请求**每请求省一次 TCP+TLS+Noise 握手（300–500ms → ~0）**；零协议变更，温连接失败自动回退全新握手（纯优化层，不碰评分/故障切换语义）
 - **v4-only 节点降噪**（节点侧）：无 IPv6 出口的节点对 DNS AAAA 查询直接合成 NODATA 应答（客户端回落 A，v6 目标从源头消失）+ 目标建连 v4 优先逐候选回落——消除 v4-only VPS 的 ENETUNREACH 错误噪音（实测单节点单日 1.5 万条 → 0）
+- **多节点并行下载器**（`hydra-fetch` CLI）：HTTP Range 分块按节点评分加权分散到多节点并行拉取 + 断点续传（状态文件 ETag/Last-Modified 强校验）+ 单流回落 + 可选 SHA-256 校验；worker 持久隧道复用（keep-alive），经加密隧道端到端 TLS
+- **连接最长寿命**（V3.3 Tier1，可选）：`HYDRA_MAX_CONN_AGE_SECS` 超龄强制关闭（默认关，推荐 24h）——会话寿命/资源边界的防御纵深；数据面 TLS 流量密钥 rustls 本已按套件约束自动刷新，此项关闭"单连接挂一周"类极端暴露窗
 - **拥塞与转发调优**：节点侧一键启用内核 **BBR + fq**（[deploy/99-hydra-bbr.conf](deploy/99-hydra-bbr.conf)）；转发空闲看门狗（`HYDRA_IDLE_TIMEOUT_SECS`）防连接额度耗尽
 - **半关闭语义**：一侧 EOF 时显式 shutdown 对侧写端（浏览器提前关写侧不挂起响应）
 - **优雅停机**：节点监听 SIGTERM/SIGINT，退出前完成资源清理
@@ -219,6 +221,7 @@ curl -x socks5h://127.0.0.1:1080 https://www.google.com
 | `HYDRA_HEALTH_ADDR` | 健康检查 + 指标端点（如 `127.0.0.1:8081`；`GET /health` 状态 JSON，`GET /metrics` Prometheus 文本；未设=关闭） |
 | `HYDRA_IDLE_TIMEOUT_SECS` | 转发空闲看门狗（默认 300s，双向无数据即断开；**也是已认证连接等待目标地址帧的时限**——客户端温连接池依赖该窗口） |
 | `HYDRA_DNS_FILTER_AAAA` | `1` 强制开启 DNS AAAA 本地过滤 / `0` 关闭；默认自动（节点无 IPv6 出口路由时开启，v4-only VPS 降噪） |
+| `HYDRA_MAX_CONN_AGE_SECS` | 连接最长寿命（V3.3 Tier1，默认 0=关；clamp 60..604800）：超龄强制关闭（客户端按传输故障处理/UDP 通道自动重连）——会话寿命上限的防御纵深（rustls 已自动刷新 TLS 流量密钥）；运营推荐 86400（24h）。**客户端 TUN 的 UDP 通道轮换读同一变量** |
 | `HYDRA_NODE_CONFIG` | toml 配置路径（自动探测 `./node.toml` → `/etc/hydra/node.toml`） |
 | `HYDRA_ALLOW_PRIVATE_TARGETS` | `1` 放行私有目标（默认拒绝，仅测试/本地开发） |
 | `HYDRA_P2P_SIGNAL` | `1` 开启 P2P 信令模式（NAT 穿透） |
@@ -286,6 +289,7 @@ Hydra-Multipath-Proxy/
 ├── hydra-protocol/     # 协议：Noise-PSK 握手、TCP/UDP 帧编解码、认证 token、日志脱敏
 ├── hydra-node/         # 节点：TCP/TLS 服务、握手认证、SSRF 过滤、UDP 中继、DNS AAAA 过滤、/health + /metrics、信号停机、toml 配置
 ├── hydra-client/       # 客户端：SOCKS5/HTTP、TCP 传输、温连接池、故障切换、测速调度、分流、TUN（用户态栈）、NAT/STUN、订阅
+├── hydra-fetch/        # 多节点并行下载器 CLI：Range 分块 + 评分加权 + 断点续传 + 单流回落
 ├── hydra-core/         # 跨平台核心库：代理/调度/测速/传输/池/订阅/分流（桌面与 Android 共用）
 ├── hydra-client-gui/   # GUI：模块化拆分（main + 20 模块，现 src 共 26 个 .rs；六页导航/托盘/分享/订阅/主题）
 ├── hydra-android/      # Android FFI 库（uniffi）：HydraEngine、start_vpn/stop_vpn（VPN 数据面）、protect 钩子、分享解析
@@ -354,11 +358,12 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 - [x] **全量代码审查 09 + P1/P2 修复：资源生命周期（连接看门狗/keepalive/计数表上限/sid 回收）、调度劫持（f64 校验/Online 下线探测）、GUI TUN 竞态降级、SSRF 单源、UDP 中继连接超时/DNS 缓存（docs/review/09）**
 - [x] **Android M2 全局 VPN + M2.1 VPN 保护：VpnService 全接管 + TCP 任意端口动态接流 + DNS 经隧道 + kill switch 断线阻断自动重连 + 开机自启 + 分应用代理白黑名单（2026-10，v0.2.2 + Unreleased）**
 - [x] **性能与运维批次：温连接池（每请求省一次节点握手）+ 节点 v4-only 降噪（DNS AAAA 本地过滤 + v4 优先建连）+ 托盘菜单禁用态 + 节点 /metrics（Prometheus）+ GUI 模块化拆分 21 文件（2026-10）**
-- [ ] 多节点并行下载（HTTP Range 切块多节点拼装——需独立下载器形态，产品决策待定）
+- [x] **多节点并行下载 v1（CLI）**：`hydra-fetch`（Range 分块按节点评分加权 + 断点续传 + 单流回落 + keep-alive 隧道复用；方案经设计评审修正——公开低层 API 组合，hydra-core 零改动）（2026-10；GUI 前端待产品需求）
 - [ ] eframe/egui 升级 0.27→0.33+（根治 webbrowser 漏洞告警 + unmaintained 依赖群；21 文件 GUI 需适配）
 - [x] ClientHello 指纹模仿（调研结论：ja-tools fork 供应链风险高，落地为 stock rustls 最大近似 + `HYDRA_FINGERPRINT=chrome|none`，[方案与实施](docs/design/ClientHello指纹模仿方案与实施.md)）
 - [x] 门③重放测试以 TCP 形态重写（`hydra-protocol/src/handshake.rs` 真重放单测在库，roadmap 此前未勾——09 审查补正）
-- [ ] rekey 密钥轮换（V3.3；TLS 1.3 每连接独立密钥已绑住单连接暴露面，rekey 仅对超长连接有增量价值——方案与取舍见 CHANGELOG 待开发计划表）
+- [x] **rekey Tier1：连接最长寿命策略**（`HYDRA_MAX_CONN_AGE_SECS` 节点双侧 + 客户端 UDP 通道轮换；rustls 已自动刷新 TLS 流量密钥——定位防御纵深，2026-10）
+- [ ] rekey Tier2（v3.3 正体）：**snow 0.9.6 具备完整 rekey API 但现协议 Noise 仅做认证（数据面 = TLS 1.3），对现协议无效果**——并入 v4 帧化协议一并决策（v4 数据面若为 TLS：换钥 = rustls refresh_traffic_keys 公开 API；若为 Noise 帧化：snow rekey 才有意义）
 
 完整依据：[docs/design/TCP转型与加密选型方案.md](docs/design/TCP转型与加密选型方案.md) · [docs/review/00-审查总览与改进目标.md](docs/review/00-审查总览与改进目标.md)
 

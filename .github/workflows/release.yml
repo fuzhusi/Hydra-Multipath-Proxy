@@ -50,6 +50,7 @@ jobs:
           New-Item -ItemType Directory -Path dist | Out-Null
           Copy-Item target/release/hydra-client-gui.exe dist/
           Copy-Item target/release/hydra-client.exe dist/
+          Copy-Item target/release/hydra-fetch.exe dist/
           Copy-Item README.md dist/
           Get-ChildItem dist
 
@@ -131,14 +132,15 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-release-
 
-      # 仅构建节点（Linux 产物定位是 VPS 服务端；客户端 GUI 走 Windows 包）
-      - name: cargo build --release -p hydra-node
-        run: cargo build --release -p hydra-node
+      # 构建节点 + 下载器（Linux 产物定位是 VPS 服务端/服务器侧工具；客户端 GUI 走 Windows 包）
+      - name: cargo build --release -p hydra-node -p hydra-fetch
+        run: cargo build --release -p hydra-node -p hydra-fetch
 
       - name: 打包 tar.gz
         run: |
           mkdir -p dist
           cp target/release/hydra-node dist/
+          cp target/release/hydra-fetch dist/
           cp README.md dist/
           cp deploy/hydra-node.service dist/
           cp deploy/install.sh dist/

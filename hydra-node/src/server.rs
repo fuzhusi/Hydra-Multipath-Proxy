@@ -32,6 +32,11 @@ pub struct NodeOptions {
     /// 转发空闲看门狗超时（07-P2-4：显式注入优先于 env `HYDRA_IDLE_TIMEOUT_SECS`，
     /// 避免测试进程内 set_var 与并行线程 env 读取的数据竞争；None = env/默认值）
     pub idle_timeout: Option<std::time::Duration>,
+    /// 连接最长寿命（V3.3 Tier1，防御纵深）：超龄**强制关闭**——数据路径无
+    /// 应用层控制通道，对客户端表现为普通传输故障。定位是会话寿命/资源边界
+    /// 而非密码学必需（rustls 已按套件约束自动刷新 TLS 流量密钥）。
+    /// None/0 = 关闭；env `HYDRA_MAX_CONN_AGE_SECS`（clamp 60..=604800）
+    pub max_conn_age: Option<std::time::Duration>,
 }
 
 impl Default for NodeOptions {
@@ -44,6 +49,7 @@ impl Default for NodeOptions {
             p2p_signal: false,
             fallback_page: false,
             idle_timeout: None,
+            max_conn_age: None,
         }
     }
 }
@@ -76,6 +82,20 @@ impl NodeOptions {
         }
         if let Ok(v) = std::env::var("HYDRA_P2P_SIGNAL") {
             opts.p2p_signal = v.trim() == "1";
+        }
+        if let Ok(v) = std::env::var("HYDRA_MAX_CONN_AGE_SECS") {
+            // V3.3 Tier1：0 = 显式关闭；其余 clamp 60s..=7d（防误配 1s 抖动断连
+            // 或一年不轮换）
+            match v.trim().parse::<u64>() {
+                Ok(0) => opts.max_conn_age = None,
+                Ok(n) => {
+                    opts.max_conn_age = Some(std::time::Duration::from_secs(n.clamp(60, 604_800)));
+                }
+                Err(_) => {
+                    eprintln!("错误：HYDRA_MAX_CONN_AGE_SECS=\"{v}\" 非法（期望秒数，0=关闭）");
+                    std::process::exit(1);
+                }
+            }
         }
         if let Ok(v) = std::env::var("HYDRA_FALLBACK_PAGE") {
             // 语义与 config.rs 三层解析一致（审查 P3-3）：空白=未设置、"1"/"0"，
@@ -140,6 +160,8 @@ impl HydraServer {
             opts.fallback_page,
             // 07-P2-4：显式注入优先，未注入回落 env/默认（spawn_tcp_listener 内解析）
             opts.idle_timeout,
+            // V3.3 Tier1：连接最长寿命（None = 关闭）
+            opts.max_conn_age,
         )
         .await?;
 

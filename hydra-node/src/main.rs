@@ -144,6 +144,8 @@ async fn main() -> Result<()> {
         fallback_page,
         // 07-P2-4：idle 超时无显式注入 → 回落 env/默认值
         idle_timeout: None,
+        // V3.3 Tier1：连接最长寿命（env HYDRA_MAX_CONN_AGE_SECS，默认关）
+        max_conn_age: NodeOptions::from_env().max_conn_age,
     };
 
     info!(

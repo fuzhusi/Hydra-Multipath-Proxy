@@ -31,6 +31,44 @@
 - **方案 C（会话层）**：多连接聚合协议（V3.4 恢复）内做 key rotation——依赖多路径协议恢复
 - **结论**：短期维持现状（每连接独立密钥已足够）；V3.3 多路径恢复时一并设计 C 方案
 
+## [Unreleased] - hydra-fetch 多节点下载器 + rekey Tier1（连接最长寿命）
+
+### 新增
+
+- **hydra-fetch 多节点并行下载器（CLI）**：HTTP Range 分块按**节点评分加权**
+  分散到多节点并行拉取 + 断点续传（状态文件 ETag/Last-Modified 强校验，参数
+  漂移即失效防位图错位写花文件）+ 单流回落（无 Range/无 Content-Length）+
+  可选整文件 SHA-256 校验 + worker 持久隧道复用（keep-alive，省每块握手）。
+  走公开低层 API 组合（Scheduler + connect_channel/request_target +
+  spawn_recovery_probe——设计评审修正：TcpCreds/open_target 私有且
+  tun_channel_opener 无法指定节点，原设计会导致并行度退化为单节点；
+  **hydra-core 零改动**）。目标站 TLS-in-TLS：webpki 公共 CA + 主机名校验 +
+  **ALPN 锁定 http/1.1**（评审 P0：h2 协商成功即死锁）。已加入 release 产物。
+- **rekey Tier1：连接最长寿命**（`HYDRA_MAX_CONN_AGE_SECS`，默认 0=关，
+  clamp 60..604800）：节点侧 TCP pump 寿命 deadline（独立于空闲看门狗——
+  活跃连接到期也关闭）+ UDP 中继 serve 寿命 + 客户端 TUN UDP 通道超龄主动
+  轮换（break → 既有重连逻辑 = 新密钥）。**诚实定位**：超龄为强制关闭
+  （数据路径无控制通道），rustls 已按套件约束自动刷新 TLS 流量密钥——
+  本项是会话寿命/资源边界的防御纵深，非密码学必需。
+
+### 方案评审 + spike 结论（先评审后执行的流程记录）
+
+- 设计评审结论"需修正后执行"：下载器改公开低层 API 组合（原两条路径矛盾/
+  不可行）；状态文件补参数校验；续传强校验（无校验器不续传 + If-Range 恒带）；
+  目标 TLS ALPN 锁定。rekey Tier1 修正：客户端仅 UDP 通道实施（TCP 用户流
+  节点侧已强制）；"优雅退役"改如实"强制关闭"；覆盖 UDP 中继 serve 路径。
+- **snow spike（snow 0.9.6）**：`TransportState` 具备完整 rekey API
+  （rekey_outgoing/rekey_incoming/rekey_manually + nonce 读取）；**但
+  hydra-protocol 握手后即丢弃 TransportState（Noise 仅认证，数据面 = TLS 1.3）
+  ——snow rekey 对现协议是无效果能力**。Tier2 并入 v4 帧化协议一并决策
+  （v4 数据面 TLS → rustls refresh_traffic_keys；Noise 帧化 → snow rekey）。
+
+### 测试
+
+- hydra-fetch 14 项单测（HTTP 解析含 chunked/EOF、BodyReader 三帧式与前缀
+  边界、状态文件校验/原子写、SHA-256 已知向量）；hydra-node 新增 pump 寿命
+  deadline 单测（活跃也关闭）。
+
 ## [Unreleased] - 性能与运维批次（温连接池 + 托盘禁用态 + 节点 /metrics）
 
 ### 新增
