@@ -132,7 +132,7 @@ fn validate_peer_id(peer_id: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 /// 进程启动锚点（单调钟毫秒时间戳的公共基准——pump 共享时间戳用；
 /// 企业级评审 P3：SystemTime 墙钟受 NTP 步进影响，统一为单调钟）
-fn mono_ms() -> u64 {
+pub(crate) fn mono_ms() -> u64 {
     static ANCHOR: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let anchor = ANCHOR.get_or_init(std::time::Instant::now);
     std::time::Instant::now().duration_since(*anchor).as_millis() as u64
@@ -589,14 +589,10 @@ where
             );
             break Ok(total);
         }
-        // read 包超时兜底唤醒（到期后由上方共享时间戳判定是否真正全局空闲）；
+        // read 兜底唤醒（内核优化 #8）：timeout 上限从"每包变预算"改为常数
+        // 1s（定时器创建/摘除成本恒定；空闲/寿命精确判定仍由顶部共享时间戳
+        // 与 deadline 完成——1s 粒度下关闭延迟最多 +1s，可接受）。
         // 对侧退出通知可随时打断阻塞中的 read。
-        // budget = min(空闲剩余, 寿命剩余)：寿命到期即便活跃也会被唤醒关闭
-        let mut budget = idle_ms - now_ms.saturating_sub(last);
-        if let Some(dl) = age_deadline {
-            let age_rem = dl.saturating_duration_since(std::time::Instant::now());
-            budget = budget.min(age_rem.as_millis() as u64);
-        }
         let n = tokio::select! {
             biased;
             _ = peer_exit.notified() => {
@@ -605,16 +601,13 @@ where
                 }
                 continue;
             }
-            x = tokio::time::timeout(
-                std::time::Duration::from_millis(budget),
-                r.read(&mut buf),
-            ) => {
+            x = tokio::time::timeout(std::time::Duration::from_secs(1), r.read(&mut buf)) => {
                 match x {
                     Ok(x) => match x {
                         Ok(n) => n,
                         Err(e) => break Err(e), // 读错误：记录后在统一出口 shutdown
                     },
-                    Err(_) => continue, // 超时醒来：回到循环顶部按共享时间戳重新判定
+                    Err(_) => continue, // 唤醒：回到循环顶部重新判定
                 }
             }
         };

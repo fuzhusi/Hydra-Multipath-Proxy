@@ -182,7 +182,9 @@ impl UdpSessionTable {
             .sessions
             .iter()
             .filter(|(_, h)| {
-                now.saturating_sub(h.last_active_ms.load(Ordering::Relaxed)) >= idle_ms
+                // wrapping：mono_ms 环绕周期 594 年（实际永不）；测试可构造
+                // "未来锚点回退"场景，saturating 会把其判为刚活跃（失真）
+                now.wrapping_sub(h.last_active_ms.load(Ordering::Relaxed)) >= idle_ms
             })
             .map(|(&sid, _)| sid)
             .collect();
@@ -194,10 +196,9 @@ impl UdpSessionTable {
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    // 内核优化 #9：与 tcp_server mono_ms 同源单调钟（SystemTime 墙钟受
+    // NTP 步进影响——会话批量误回收/误保活）
+    crate::tcp_server::mono_ms()
 }
 
 // ── SSRF 过滤（单源复用 handler::classify_blocked_ip，09-P2-5）──────────
@@ -763,7 +764,11 @@ async fn session_task<W>(
 {
     // Metrics v2：活跃会话 gauge（任务生命周期 = 会话生命周期）
     let _session_guard = crate::metrics::UdpSessionGuard::enter();
-    let mut buf = vec![0u8; MAX_DATAGRAM_LEN];
+    // 内核优化 #9：接收 buf 分层——起步 8KB（DNS/QUIC 小报文占绝大多数），
+    // 收到截断包（n == buf.len()）后升档 8K→16K→64K；每会话急切面
+    // 70KB → ~10KB，最坏面 16GB → ~2.5GB
+    let mut buf_cap = 8 * 1024usize;
+    let mut buf = vec![0u8; buf_cap];
     loop {
         // 不用 biased：持续高速上行不应饥饿下行回包（审查批次 P3）
         tokio::select! {
@@ -790,6 +795,11 @@ async fn session_task<W>(
             n = socket.recv(&mut buf) => match n {
                 Ok(n) => {
                     last_active.store(now_ms(), Ordering::Relaxed);
+                    // 内核优化 #9：截断检测（收满 buf 且未达上限）→ 升档
+                    if n == buf.len() && buf_cap < MAX_DATAGRAM_LEN {
+                        buf_cap = (buf_cap * 2).min(MAX_DATAGRAM_LEN);
+                        buf.resize(buf_cap, 0);
+                    }
                     // 下行帧与上行对称：session_id + 目标地址帧 + 数据报
                     let frame = match encode_udp_data(session_id, &target, &buf[..n]) {
                         Ok(f) => f,
@@ -822,7 +832,11 @@ mod tests {
 
     fn handle_with_age(age_ms: u64) -> (SessionHandle, mpsc::Receiver<Vec<u8>>, Arc<AtomicU64>) {
         let (tx, rx) = mpsc::channel(4);
-        let last = Arc::new(AtomicU64::new(now_ms().saturating_sub(age_ms)));
+        // mono_ms 从进程启动起算：测试进程启动初期 now_ms 可能 < age_ms，
+        // saturating_sub 会把"老会话"钳成 0（= 刚活跃）→ 回收测试失真。
+        // 测试场景需要的是"绝对过去的时刻"——用包装运算保证下溢环绕回
+        // 高位（u64 环绕在 reap 的比较 saturating_sub 下同样成立）
+        let last = Arc::new(AtomicU64::new(now_ms().wrapping_sub(age_ms)));
         (
             SessionHandle::new(tx, last.clone(), "127.0.0.1:5353".to_string()),
             rx,

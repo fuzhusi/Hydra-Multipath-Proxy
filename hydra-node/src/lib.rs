@@ -2,6 +2,8 @@ pub mod cert;
 pub mod config;
 // DNS AAAA 查询本地过滤（v4-only 节点降噪，见模块文档）
 pub mod dns_aaaa;
+// 节点级 DNS 共享缓存 + 全局解析并发闸（内核优化 #6）
+pub mod dns_cache;
 // 进程级指标（/metrics，随健康端点开关）
 pub mod fallback;
 pub mod handler;

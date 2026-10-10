@@ -206,66 +206,54 @@ impl ConnectionHandler {
             vec![addr]
         } else {
             info!("Resolving DNS for: {}", mask_target(target_addr_str));
-            // DNS 解析 5s 超时（审查 R-26/06-P2-3）：lookup_host 底层是 spawn_blocking
-            // 里的 getaddrinfo，解析器黑洞时可阻塞数十秒——期间已认证连接持续占用
-            // 并发额度，且 DNS+connect 最坏总和会突破"节点总响应 < 客户端 20s"预算。
-            // 超时归入既有 ERR_DNS_FAIL(0x02) 路径，维持 DNS 5s < connect 15s < 20s 层次。
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                tokio::net::lookup_host(target_addr_str.to_string()),
-            )
-            .await
-            {
-                Err(_) => {
+            // 内核优化 #6：共享 DNS 缓存 + 全局解析并发闸（负缓存 10s 防
+            // 解析器故障期间每连接重打；并发 64 封顶 blocking 池占用）。
+            // 解析超时/负缓存归入既有 ERR_DNS_FAIL(0x02) 路径，维持
+            // DNS 5s < connect 15s < 20s 层次。
+            let dns_start = std::time::Instant::now();
+            let host = target_addr_str
+                .rsplit_once(':')
+                .map(|(h, _)| h)
+                .unwrap_or(target_addr_str);
+            match crate::dns_cache::resolve_host_cached(host).await {
+                None => {
                     error!(
-                        "DNS resolution timed out (5s) for {}",
+                        "DNS resolution failed (timeout/negative cache) for {}",
                         mask_target(target_addr_str)
                     );
-                    debug!("DNS resolution timed out (plaintext): {}", target_addr_str);
+                    debug!("DNS resolution failed (plaintext): {}", target_addr_str);
+                    crate::metrics::metrics()
+                        .hs_dns
+                        .observe(dns_start.elapsed().as_secs_f64());
                     return Err((
                         ERR_DNS_FAIL,
                         HydraError::ConnectionError(format!(
-                            "DNS resolution timed out for {}",
+                            "DNS resolution failed for {}",
                             mask_target(target_addr_str)
                         )),
                     ));
                 }
-                Ok(r) => match r {
-                    Ok(addrs) => {
-                        let ordered = order_candidates(addrs.collect());
-                        if ordered.is_empty() {
-                            error!(
-                                "DNS resolution failed for {}: no addresses",
-                                mask_target(target_addr_str)
-                            );
-                            debug!("DNS resolution failed (plaintext): {}", target_addr_str);
-                            return Err((
-                                ERR_DNS_FAIL,
-                                HydraError::ConnectionError(format!(
-                                    "DNS resolution failed for {}",
-                                    mask_target(target_addr_str)
-                                )),
-                            ));
-                        }
-                        ordered
-                    }
-                    Err(e) => {
+                Some(addrs) => {
+                    crate::metrics::metrics()
+                        .hs_dns
+                        .observe(dns_start.elapsed().as_secs_f64());
+                    let ordered = order_candidates(addrs);
+                    if ordered.is_empty() {
                         error!(
-                            "DNS resolution failed for {}: {}",
-                            mask_target(target_addr_str),
-                            e
+                            "DNS resolution failed for {}: no addresses",
+                            mask_target(target_addr_str)
                         );
                         debug!("DNS resolution failed (plaintext): {}", target_addr_str);
                         return Err((
                             ERR_DNS_FAIL,
                             HydraError::ConnectionError(format!(
-                                "DNS resolution failed for {}: {}",
-                                mask_target(target_addr_str),
-                                e
+                                "DNS resolution failed for {}",
+                                mask_target(target_addr_str)
                             )),
                         ));
                     }
-                },
+                    ordered
+                }
             }
         };
 
