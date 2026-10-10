@@ -98,6 +98,22 @@ impl<S> ChannelPool<S> {
             .map_or(0, |s| s.len())
     }
 
+    /// 周期清扫：淘汰全部过期条目（返回清除数）。配 ProxyServer reaper
+    /// 周期调用——checkout 惰性淘汰之外的第二道防线（永不 checkout 的
+    /// 节点条目不再无限期驻留 fd）。
+    pub fn evict_expired(&self) -> usize {
+        let mut m = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let now = std::time::Instant::now();
+        let mut removed = 0usize;
+        m.retain(|_, slot| {
+            let before = slot.len();
+            slot.retain(|e| now.duration_since(e.warmed_at) < IDLE_TTL);
+            removed += before - slot.len();
+            !slot.is_empty()
+        });
+        removed
+    }
+
     /// 全池空闲连接总数（测试/可观测性）。
     pub fn total_idle(&self) -> usize {
         self.inner
@@ -170,6 +186,24 @@ mod tests {
         }
         assert!(p.checkout(node(3)).is_none(), "过期条目应被淘汰而非交付");
         assert_eq!(p.idle_len(node(3)), 0, "淘汰后空槽位清理");
+    }
+
+    #[test]
+    fn 周期清扫_只清过期_保活新鲜() {
+        let p = ChannelPool::<DuplexStream>::new();
+        p.checkin(node(7), chan()); // 将过期
+        p.checkin(node(7), chan()); // 新鲜
+        {
+            let mut m = p.inner.lock().unwrap();
+            let slot = m.get_mut(&node(7)).unwrap();
+            slot[0].warmed_at = Instant::now() - IDLE_TTL - Duration::from_secs(1);
+        }
+        assert_eq!(p.evict_expired(), 1);
+        assert_eq!(p.idle_len(node(7)), 1);
+        assert_eq!(p.evict_expired(), 0);
+        assert_eq!(p.idle_len(node(7)), 1);
+        let _ = p.checkout(node(7));
+        assert_eq!(p.evict_expired(), 0);
     }
 
     #[test]

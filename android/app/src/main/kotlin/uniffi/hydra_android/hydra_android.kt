@@ -657,6 +657,9 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 internal interface UniffiCallbackInterfaceSocketProtectMethod0 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`fd`: Long,`uniffiOutReturn`: ByteByReference,uniffiCallStatus: UniffiRustCallStatus,)
 }
+internal interface UniffiCallbackInterfaceVpnExitCallbackMethod0 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`reason`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
 @Structure.FieldOrder("protect", "uniffiFree")
 internal open class UniffiVTableCallbackInterfaceSocketProtect(
     @JvmField internal var `protect`: UniffiCallbackInterfaceSocketProtectMethod0? = null,
@@ -673,6 +676,24 @@ internal open class UniffiVTableCallbackInterfaceSocketProtect(
     }
 
 }
+@Structure.FieldOrder("onStackExit", "uniffiFree")
+internal open class UniffiVTableCallbackInterfaceVpnExitCallback(
+    @JvmField internal var `onStackExit`: UniffiCallbackInterfaceVpnExitCallbackMethod0? = null,
+    @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+) : Structure() {
+    class UniffiByValue(
+        `onStackExit`: UniffiCallbackInterfaceVpnExitCallbackMethod0? = null,
+        `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+    ): UniffiVTableCallbackInterfaceVpnExitCallback(`onStackExit`,`uniffiFree`,), Structure.ByValue
+
+   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceVpnExitCallback) {
+        `onStackExit` = other.`onStackExit`
+        `uniffiFree` = other.`uniffiFree`
+    }
+
+}
+
+
 
 
 
@@ -788,6 +809,8 @@ fun uniffi_hydra_android_checksum_constructor_hydraengine_new(
 ): Short
 fun uniffi_hydra_android_checksum_method_socketprotect_protect(
 ): Short
+fun uniffi_hydra_android_checksum_method_vpnexitcallback_on_stack_exit(
+): Short
 fun ffi_hydra_android_uniffi_contract_version(
 ): Int
 
@@ -827,6 +850,7 @@ internal interface UniffiLib : Library {
             // No need to check the contract version and checksums, since 
             // we already did that with `IntegrityCheckingUniffiLib` above.
             uniffiCallbackInterfaceSocketProtect.register(lib)
+            uniffiCallbackInterfaceVpnExitCallback.register(lib)
             // Loading of library with integrity check done.
             lib
         }
@@ -854,9 +878,11 @@ fun uniffi_hydra_android_fn_method_hydraengine_stop(`ptr`: Pointer,uniffi_out_er
 ): Unit
 fun uniffi_hydra_android_fn_init_callback_vtable_socketprotect(`vtable`: UniffiVTableCallbackInterfaceSocketProtect,
 ): Unit
+fun uniffi_hydra_android_fn_init_callback_vtable_vpnexitcallback(`vtable`: UniffiVTableCallbackInterfaceVpnExitCallback,
+): Unit
 fun uniffi_hydra_android_fn_func_parse_share_text(`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-fun uniffi_hydra_android_fn_func_start_vpn(`tunFd`: Int,`config`: RustBuffer.ByValue,`protect`: Long,uniffi_out_err: UniffiRustCallStatus, 
+fun uniffi_hydra_android_fn_func_start_vpn(`tunFd`: Int,`config`: RustBuffer.ByValue,`protect`: Long,`onExit`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_hydra_android_fn_func_stop_vpn(uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
@@ -991,7 +1017,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_hydra_android_checksum_func_parse_share_text() != 52095.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_hydra_android_checksum_func_start_vpn() != 57624.toShort()) {
+    if (lib.uniffi_hydra_android_checksum_func_start_vpn() != 20408.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_hydra_android_checksum_func_stop_vpn() != 51.toShort()) {
@@ -1016,6 +1042,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_hydra_android_checksum_method_socketprotect_protect() != 63365.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_hydra_android_checksum_method_vpnexitcallback_on_stack_exit() != 33624.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -2265,6 +2294,66 @@ public object FfiConverterTypeSocketProtect: FfiConverterCallbackInterface<Socke
 
 
 
+
+/**
+ * VPN 数据面退出回调（评审方案 2：数据面死亡感知）——`run_stack` 因任何原因
+ * 返回时调用（含正常停止：Kotlin 侧以 userStopRequested/generation 守卫忽略）。
+ * **硬约束（评审 P1）**：回调运行在 Rust runtime 工作线程，且 `stop_vpn` 持
+ * VPN_STATE 锁执行 shutdown（最长 3s）——回调体内**禁止同步调用本 crate 任何
+ * FFI**（死锁面）；Kotlin 侧应只做 `scope.launch` 后返回。
+ */
+public interface VpnExitCallback {
+    
+    fun `onStackExit`(`reason`: kotlin.String)
+    
+    companion object
+}
+
+
+
+// Put the implementation in an object so we don't pollute the top-level namespace
+internal object uniffiCallbackInterfaceVpnExitCallback {
+    internal object `onStackExit`: UniffiCallbackInterfaceVpnExitCallbackMethod0 {
+        override fun callback(`uniffiHandle`: Long,`reason`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeVpnExitCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onStackExit`(
+                    FfiConverterString.lift(`reason`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
+        override fun callback(handle: Long) {
+            FfiConverterTypeVpnExitCallback.handleMap.remove(handle)
+        }
+    }
+
+    internal var vtable = UniffiVTableCallbackInterfaceVpnExitCallback.UniffiByValue(
+        `onStackExit`,
+        uniffiFree,
+    )
+
+    // Registers the foreign callback with the Rust side.
+    // This method is generated for each callback interface.
+    internal fun register(lib: UniffiLib) {
+        lib.uniffi_hydra_android_fn_init_callback_vtable_vpnexitcallback(vtable)
+    }
+}
+
+/**
+ * The ffiConverter which transforms the Callbacks in to handles to pass to Rust.
+ *
+ * @suppress
+ */
+public object FfiConverterTypeVpnExitCallback: FfiConverterCallbackInterface<VpnExitCallback>()
+
+
+
+
 /**
  * @suppress
  */
@@ -2428,12 +2517,14 @@ public object FfiConverterSequenceTypeNodeSpec: FfiConverterRustBuffer<List<Node
          * 启动全局 VPN 数据面：tun fd → 用户态栈（TCP 任意端口动态接流 + UDP 中继）
          * → 经节点隧道。protect 回调（R4）在每个出站 socket connect 前调用，失败即
          * 中止连接。快速返回（栈任务后台运行，建连异步）。
+         * `on_exit`：数据面退出回调（数据面死亡感知——Kotlin 据此触发自动重连；
+         * 正常停止也会回调，Kotlin 侧守卫忽略）。
          */
-    @Throws(HydraEngineException::class) fun `startVpn`(`tunFd`: kotlin.Int, `config`: VpnConfig, `protect`: SocketProtect)
+    @Throws(HydraEngineException::class) fun `startVpn`(`tunFd`: kotlin.Int, `config`: VpnConfig, `protect`: SocketProtect, `onExit`: VpnExitCallback)
         = 
     uniffiRustCallWithError(HydraEngineException) { _status ->
     UniffiLib.INSTANCE.uniffi_hydra_android_fn_func_start_vpn(
-        FfiConverterInt.lower(`tunFd`),FfiConverterTypeVpnConfig.lower(`config`),FfiConverterTypeSocketProtect.lower(`protect`),_status)
+        FfiConverterInt.lower(`tunFd`),FfiConverterTypeVpnConfig.lower(`config`),FfiConverterTypeSocketProtect.lower(`protect`),FfiConverterTypeVpnExitCallback.lower(`onExit`),_status)
 }
     
     

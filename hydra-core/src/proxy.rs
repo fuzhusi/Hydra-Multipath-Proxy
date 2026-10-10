@@ -33,9 +33,9 @@ struct TcpCreds {
     trust: Arc<tcp_transport::TlsTrust>,
     sni: String,
     auth_key: Arc<Vec<u8>>,
-    /// 温连接池（pre-warm）：Arc 共享，同一实例内全部请求同一池面
-    /// （start 与 TUN opener/UDP 工厂各自构造实例级池；UDP 工厂路径为长驻
-    /// 通道不经池）。池是尽力而为优化——温连接失败一律弃连回退全新握手，
+    /// 温连接池（pre-warm）：Arc 共享 ProxyServer 实例级单池（start /
+    /// tun_channel_opener / udp_factory 三处凭据构建点共享同一池面与
+    /// reaper）。池是尽力而为优化——温连接失败一律弃连回退全新握手，
     /// 不改变任何原有错误语义
     pool: Arc<crate::pool::ChannelPool>,
 }
@@ -157,6 +157,9 @@ const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct ProxyServer {
     listen_addr: SocketAddr,
     scheduler: Arc<Scheduler>,
+    /// 温连接池（实例级单池，三处凭据构建点共享 + reaper 周期清扫）
+    pool: Arc<crate::pool::ChannelPool>,
+    pool_reaper_started: std::sync::OnceLock<()>,
     nodes: Vec<SocketAddr>,
     traffic_monitor: Option<Arc<TrafficMonitor>>,
     auth_key: Vec<u8>,
@@ -171,6 +174,8 @@ impl ProxyServer {
         Self {
             listen_addr,
             scheduler: Arc::new(Scheduler::new()),
+            pool: Arc::new(crate::pool::ChannelPool::new()),
+            pool_reaper_started: std::sync::OnceLock::new(),
             nodes: Vec::new(),
             traffic_monitor: None,
             auth_key: Vec::new(),
@@ -217,6 +222,29 @@ impl ProxyServer {
         self.bound_addr.get().copied()
     }
 
+    /// 温连接池周期清扫（spawn-once 守卫：start() 与 tun_channel_opener()
+    /// 双入口触发，任务只起一次——60s 周期淘汰过期温连接，防永不 checkout
+    /// 的节点条目驻留 fd）。容忍无运行时上下文（TUN opener 可能在
+    /// runtime 外构建——此时不挂 reaper，池仍由 checkout 惰性淘汰兜底）。
+    fn start_pool_reaper(&self) {
+        self.pool_reaper_started.get_or_init(|| {
+            if tokio::runtime::Handle::try_current().is_err() {
+                return;
+            }
+            let pool = Arc::clone(&self.pool);
+            tokio::spawn(async move {
+                let mut iv = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    iv.tick().await;
+                    let n = pool.evict_expired();
+                    if n > 0 {
+                        tracing::debug!("Pool: evicted {} expired warm channels", n);
+                    }
+                }
+            });
+        });
+    }
+
     /// 调度器句柄（供测试/上层观测节点状态，如 A2 恢复探测验证）
     pub fn scheduler(&self) -> &Arc<Scheduler> {
         &self.scheduler
@@ -254,8 +282,9 @@ impl ProxyServer {
             trust: Arc::new(trust.clone()),
             sni: self.sni.clone(),
             auth_key: Arc::new(self.auth_key.clone()),
-            pool: Arc::new(crate::pool::ChannelPool::new()),
+            pool: Arc::clone(&self.pool),
         };
+        self.start_pool_reaper();
         self.register_nodes().await;
         info!("Binding proxy listener to {}...", self.listen_addr);
         let listener = TcpListener::bind(self.listen_addr).await?;
@@ -362,8 +391,9 @@ impl ProxyServer {
             trust: Arc::new(trust),
             sni: self.sni.clone(),
             auth_key: Arc::new(self.auth_key.clone()),
-            pool: Arc::new(crate::pool::ChannelPool::new()),
+            pool: Arc::clone(&self.pool),
         };
+        self.start_pool_reaper();
         let scheduler = self.scheduler.clone();
         // 流量统计与 SOCKS 路径同一计数面（monitor 未注入时兜底实例）
         let traffic = self
@@ -410,7 +440,7 @@ impl ProxyServer {
             trust: Arc::new(trust),
             sni: self.sni.clone(),
             auth_key: Arc::new(self.auth_key.clone()),
-            pool: Arc::new(crate::pool::ChannelPool::new()),
+            pool: Arc::clone(&self.pool),
         };
         let scheduler = self.scheduler.clone();
         Ok(Arc::new(move || {

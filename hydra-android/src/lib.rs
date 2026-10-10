@@ -287,14 +287,27 @@ struct VpnHandle {
 
 static VPN_STATE: std::sync::Mutex<Option<VpnHandle>> = std::sync::Mutex::new(None);
 
+/// VPN 数据面退出回调（评审方案 2：数据面死亡感知）——`run_stack` 因任何原因
+/// 返回时调用（含正常停止：Kotlin 侧以 userStopRequested/generation 守卫忽略）。
+/// **硬约束（评审 P1）**：回调运行在 Rust runtime 工作线程，且 `stop_vpn` 持
+/// VPN_STATE 锁执行 shutdown（最长 3s）——回调体内**禁止同步调用本 crate 任何
+/// FFI**（死锁面）；Kotlin 侧应只做 `scope.launch` 后返回。
+#[uniffi::export(callback_interface)]
+pub trait VpnExitCallback: Send + Sync {
+    fn on_stack_exit(&self, reason: String);
+}
+
 /// 启动全局 VPN 数据面：tun fd → 用户态栈（TCP 任意端口动态接流 + UDP 中继）
 /// → 经节点隧道。protect 回调（R4）在每个出站 socket connect 前调用，失败即
 /// 中止连接。快速返回（栈任务后台运行，建连异步）。
+/// `on_exit`：数据面退出回调（数据面死亡感知——Kotlin 据此触发自动重连；
+/// 正常停止也会回调，Kotlin 侧守卫忽略）。
 #[uniffi::export]
 pub fn start_vpn(
     tun_fd: i32,
     config: VpnConfig,
     protect: Box<dyn SocketProtect>,
+    on_exit: Box<dyn VpnExitCallback>,
 ) -> Result<(), HydraEngineError> {
     let mut guard = VPN_STATE.lock().unwrap_or_else(|p| p.into_inner());
 
@@ -375,6 +388,7 @@ pub fn start_vpn(
         .with_sni(sni);
     let shutdown = tokio_util::sync::CancellationToken::new();
     let shutdown2 = shutdown.clone();
+    let on_exit = std::sync::Arc::new(on_exit);
 
     runtime.spawn(async move {
         proxy.register_nodes().await;
@@ -397,17 +411,26 @@ pub fn start_vpn(
             ..Default::default()
         };
         tracing::info!("Hydra VPN 栈启动（fd 模式，mtu={}）", config.mtu);
-        if let Err(e) = hydra_client::tun::run_stack(
+        let stack_res = hydra_client::tun::run_stack(
             std::sync::Arc::new(transport),
             tun_cfg,
             opener,
             udp_factory,
-            shutdown2,
+            shutdown2.clone(),
         )
-        .await
-        {
-            tracing::error!("VPN 栈退出: {e}");
+        .await;
+        let reason = match &stack_res {
+            Err(e) => format!("错误：{e}"),
+            Ok(()) if shutdown2.is_cancelled() => "正常停止".to_string(),
+            Ok(()) => "异常退出".to_string(),
+        };
+        match &stack_res {
+            Err(e) => tracing::error!("VPN 栈退出: {e}"),
+            Ok(()) => tracing::info!("VPN 栈退出: {reason}"),
         }
+        // 数据面死亡感知（评审方案 2）：任何退出都通知 Kotlin（其守卫决定
+        // 是否自动重连）；回调由包装任务闭包持有至触发，勿提前丢弃（评审 P2）
+        on_exit.on_stack_exit(reason);
     });
 
     *guard = Some(VpnHandle { runtime, shutdown });

@@ -21,6 +21,7 @@ import kotlinx.coroutines.withContext
 import uniffi.hydra_android.SocketProtect
 import uniffi.hydra_android.TrustMode
 import uniffi.hydra_android.VpnConfig
+import uniffi.hydra_android.VpnExitCallback
 import uniffi.hydra_android.startVpn
 import uniffi.hydra_android.stopVpn
 import java.util.Base64
@@ -56,6 +57,12 @@ class HydraVpnService : VpnService() {
     @Volatile
     private var userStopRequested = false
 
+    /** 数据面自动重连：连退计数与最近启动时刻（>60s 正常运行重置计数） */
+    @Volatile
+    private var lastStartAt = 0L
+
+    private var restartCount = 0
+
     /**
      * kill switch 阻断用黑洞 TUN：隧道中断的退避期间保持全接管路由的 TUN
      * 不被消费——应用出站包进入内核 TUN 队列填满后丢弃 = **流量被阻断、
@@ -70,6 +77,43 @@ class HydraVpnService : VpnService() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    /**
+     * 数据面死亡感知（评审方案 2）：Rust `run_stack` 因任何原因退出时回调。
+     * 守卫链：userStopRequested / generation → 防风暴（连退计数 + 退避，
+     * >60s 正常运行重置）→ delay 后**重查守卫** → stopVpn() 清 Rust 死句柄
+     * → 切主线程 startVpnFromStore()（全新 TUN + 数据面）。
+     * **硬约束（评审 P1）**：本回调运行在 Rust runtime 线程且 stop_vpn 持锁
+     * shutdown 最长 3s——回调体内禁止同步调用任何 FFI，只做协程调度。
+     */
+    private inner class StackExitCb(private val startGen: Long) : VpnExitCallback {
+        override fun onStackExit(reason: String) {
+            scope.launch {
+                if (userStopRequested || generation.get() != startGen) return@launch
+                val now = System.currentTimeMillis()
+                if (now - lastStartAt > 60_000) restartCount = 0 // 健康运行重置连退
+                restartCount++
+                EngineState.addLog("✗ 数据面退出（$reason）——自动重连（第 $restartCount 次）")
+                if (restartCount > 5) {
+                    EngineState.addLog("✗ 连续 5 次数据面退出——停止自动重连，请检查网络/节点后手动重试")
+                    EngineState.update {
+                        it.copy(running = false, transition = "启动失败：数据面反复退出（$reason）")
+                    }
+                    stopVpnLocal()
+                    return@launch
+                }
+                // 先清 Rust 死句柄（run_stack 已返回但 VPN_STATE 仍占位——
+                // 不清则 start_vpn 报"已在运行"永远失败）
+                runCatching { stopVpn() }
+                val backoff = (2_000L * restartCount).coerceAtMost(10_000L)
+                delay(backoff)
+                if (userStopRequested || generation.get() != startGen) return@launch
+                withContext(Dispatchers.Main) {
+                    startVpnFromStore() // startForeground 需主线程（评审 P0-2）
+                }
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -104,6 +148,7 @@ class HydraVpnService : VpnService() {
 
         userStopRequested = false
         val gen = generation.incrementAndGet()
+        lastStartAt = System.currentTimeMillis()
 
         // 看门狗：仅守首轮建立（establish/FFI pathological 挂起兜底——阻塞 JNI
         // 无法被协程取消，只能由独立线程兜底）。kill switch 重连等待（"隧道中断"
@@ -186,7 +231,7 @@ class HydraVpnService : VpnService() {
                         EngineState.addLog("④ 启动用户态栈与隧道…")
                         runCatching {
                             withContext(Dispatchers.IO) {
-                                startVpn(fd, cfg.toVpnConfig(), protect)
+                                startVpn(fd, cfg.toVpnConfig(), protect, StackExitCb(gen))
                             }
                         }.fold(
                             onSuccess = {

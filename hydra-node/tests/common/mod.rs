@@ -23,12 +23,18 @@ pub struct TestNode {
 
 /// 启动一个监听随机端口的节点服务器（证书写入按进程/序号隔离的临时目录）
 pub async fn spawn_node() -> TestNode {
+    spawn_node_with_idle(None).await
+}
+
+/// 变体：注入 idle 超时（温连接等待窗口测试用——注入值不经 env clamp）
+pub async fn spawn_node_with_idle(idle_timeout: Option<std::time::Duration>) -> TestNode {
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("hydra-ssrf-test-{}-{}", std::process::id(), seq));
     std::fs::create_dir_all(&dir).unwrap();
     let opts = NodeOptions {
         cert_file: dir.join("cert.der"),
         key_file: dir.join("key.der"),
+        idle_timeout,
         ..NodeOptions::default()
     };
     let server = HydraServer::new("127.0.0.1:0".parse().unwrap(), test_auth_key(), opts)
@@ -96,6 +102,56 @@ pub async fn connect_and_request(
     // 地址帧；读写两半合回流
     write_target(&mut wr, target).await.expect("write target");
     rd.unsplit(wr)
+}
+
+/// **温连接**变体：握手完成后**不发目标帧**即返回（连接池预热语义）。
+/// 调用方稍后自行 write_target + 读 2B 应答——用于守护节点侧"认证后地址帧
+/// 等待窗口"（10s AUTH_TIMEOUT → idle）的耦合（评审方案 1）。
+pub async fn connect_and_handshake(
+    node_addr: SocketAddr,
+    node_cert_der: &[u8],
+    auth_key: &[u8],
+) -> (
+    tokio::io::ReadHalf<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    tokio::io::WriteHalf<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+) {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(
+            node_cert_der.to_vec(),
+        ))
+        .expect("无效的节点证书");
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("TLS 协议版本配置失败")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    crypto.alpn_protocols = Vec::new();
+    crypto.resumption = rustls::client::Resumption::disabled();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(crypto));
+    let server_name = rustls::pki_types::ServerName::try_from("hydra.node".to_owned()).unwrap();
+
+    let tcp = tokio::net::TcpStream::connect(node_addr)
+        .await
+        .expect("TCP connect to node");
+    let tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("TLS handshake with node");
+
+    let mut exporter = [0u8; handshake::EXPORTER_LEN];
+    tls.get_ref()
+        .1
+        .export_keying_material(&mut exporter, handshake::EXPORTER_LABEL, Some(b""))
+        .expect("TLS exporter 不可用");
+
+    let cert_fp = handshake::cert_fingerprint(node_cert_der);
+    let (mut rd, mut wr) = tokio::io::split(tls);
+    handshake::client_side(&mut wr, &mut rd, auth_key, &cert_fp, &exporter)
+        .await
+        .expect("Noise handshake with node");
+    (rd, wr)
 }
 
 /// 启动 TCP 回显服务器，返回端口
