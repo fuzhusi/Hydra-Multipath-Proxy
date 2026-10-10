@@ -430,7 +430,32 @@ async fn serve_with_idle_and_filter<R, W>(
     let mut aaaa_local_replies = 0usize;
 
     // ── 上行读循环：TLS 流帧 → 会话表 → 数据报 ──
+    // 帧读取独立任务（企业评审并发 B-1 修复）：read_udp_frame 是两次
+    // read_exact、裸流无内部缓冲——**取消不安全**（被 select 其他分支取消
+    // 会丢已消费的半帧字节，下一轮从帧中间解析 = 整条连接流失步断连）。
+    // 移入专属任务（永不取消，随 rd EOF / 主循环退出后通道关闭自然结束），
+    // 主循环经 mpsc 消费——mpsc::recv 取消安全，dead 分支触发不再丢字节。
+    let (frame_tx, mut frame_rx) = mpsc::channel::<hydra_protocol::Result<UdpFrame>>(8);
+    tokio::spawn(async move {
+        loop {
+            match read_udp_frame(&mut rd).await {
+                Ok(f) => {
+                    if frame_tx.send(Ok(f)).await.is_err() {
+                        break; // 主循环已退出（连接关闭），任务随之结束
+                    }
+                }
+                Err(e) => {
+                    let _ = frame_tx.send(Err(e)).await; // 送达后任务退出
+                    break;
+                }
+            }
+        }
+    });
     loop {
+        // budget = min(连接空闲看门狗, 寿命剩余)：寿命到期即便活跃也唤醒
+        let timeout_dur = age_deadline
+            .map(|dl| conn_idle.min(dl.saturating_duration_since(std::time::Instant::now())))
+            .unwrap_or(conn_idle);
         tokio::select! {
             // 会话任务异常死亡：删表项 + 下行 close（客户端解除映射后可重建）
             dead = dead_rx.recv() => {
@@ -447,15 +472,9 @@ async fn serve_with_idle_and_filter<R, W>(
                     None => break,
                 }
             }
-            frame = tokio::time::timeout(
-                // budget = min(连接空闲看门狗, 寿命剩余)：寿命到期即便活跃也唤醒
-                age_deadline
-                    .map(|dl| {
-                        conn_idle.min(dl.saturating_duration_since(std::time::Instant::now()))
-                    })
-                    .unwrap_or(conn_idle),
-                read_udp_frame(&mut rd),
-            ) => {
+            frame = tokio::time::timeout(timeout_dur, frame_rx.recv()) => {
+                // 帧来源 = 帧读取任务的 mpsc（recv 取消安全）；None = 任务已
+                // 退出（EOF/协议错误/主循环退出后通道关闭）
                 match frame {
                     // 连接级空闲超时：会话表可能为空（回收先行），客户端静默不关流
                     // ——主动关闭，释放 permit/fd/reaper（09-P1-1）。
@@ -474,11 +493,15 @@ async fn serve_with_idle_and_filter<R, W>(
                         }
                         break;
                     }
-                    Ok(Err(e)) => {
+                    Ok(None) => {
+                        debug!("UDP 帧读取任务已退出（客户端关闭或协议错误），连接结束");
+                        break;
+                    }
+                    Ok(Some(Err(e))) => {
                         debug!("UDP 中继上行读结束: {e}");
                         break;
                     }
-                    Ok(Ok(f)) => match f {
+                    Ok(Some(Ok(f))) => match f {
                         UdpFrame::Close { session_id } => {
                             if table.lock().unwrap().remove(session_id).is_some() {
                                 debug!("UDP 会话 {session_id} 客户端请求关闭");

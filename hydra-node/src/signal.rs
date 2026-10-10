@@ -360,7 +360,11 @@ async fn handle_line(
                 cand,
             };
             if forward(&down, &out).await.is_err() {
-                // 目标下行队列满/写端关闭：视作离线
+                // 目标下行队列满/写端关闭：视作离线。审查 B-2：先做归属校验
+                // 摘除——若条目已被顶替（remove_if_downlink 不命中）则保留新
+                // 连接；否则死条目立即摘除，缩短 A 重试连续打中死 sender 的
+                // 窗口（否则残留至 90s sweep）
+                registry.remove_if_downlink(&peer_id, &down);
                 send_error(my_downlink, "peer_offline", Some(&peer_id)).await;
             }
         }
@@ -378,6 +382,7 @@ async fn handle_line(
                 cand,
             };
             if forward(&down, &out).await.is_err() {
+                registry.remove_if_downlink(&to, &down); // 审查 B-2：同 Invite
                 send_error(my_downlink, "peer_offline", Some(&to)).await;
             }
         }

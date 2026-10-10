@@ -1,6 +1,6 @@
-# Rust
+# Rust（Cargo.lock 必须入库：二进制 workspace 官方建议；否则 CI 缓存 key
+# hashFiles('**/Cargo.lock') 恒空、构建不可复现、cargo audit 扫描漂移）
 target/
-Cargo.lock
 
 # IDE
 .vscode/
@@ -41,3 +41,7 @@ android/scripts/android/
 android/app/build/
 hydra-android-m1-debug.apk
 *.apk
+# Android 原生库是构建产物（cargo-ndk 产出，不入库）
+*.so
+android/.gradle/
+*.tmp

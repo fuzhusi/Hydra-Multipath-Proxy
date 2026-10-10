@@ -62,7 +62,18 @@ jobs:
             -o wintun.zip https://www.wintun.net/builds/wintun-$($env:WINTUN_VERSION).zip
           Expand-Archive -Path wintun.zip -DestinationPath wintun-extracted -Force
           Copy-Item "wintun-extracted/wintun/bin/amd64/wintun.dll" dist/wintun.dll
-          Get-AuthenticodeSignature dist/wintun.dll | Select-Object Status, SignerCertificate
+          # 供应链门禁（评审 P1-1）：签名必须 Valid 且签发者为 WireGuard，
+          # 否则构建失败——只打印不拦截等于没有校验
+          $sig = Get-AuthenticodeSignature dist/wintun.dll
+          if ($sig.Status -ne 'Valid') {
+            Write-Error "wintun.dll 签名校验失败: $($sig.Status)——中止构建（供应链防护）"
+            exit 1
+          }
+          if ($sig.SignerCertificate.Subject -notmatch 'WireGuard') {
+            Write-Error "wintun.dll 签发者非 WireGuard: $($sig.SignerCertificate.Subject)——中止构建"
+            exit 1
+          }
+          $sig | Select-Object Status, SignerCertificate
 
       # 便携 zip：exe + wintun.dll + README（解压即用）
       - name: 打包便携 zip
