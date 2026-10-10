@@ -30,6 +30,7 @@ mod nodes;
 /// 视觉规范化第一步（UI 重设计第一批）：集中式色板 + 字号层级 + 延迟/状态色标。
 /// 全部 UI 用色只允许引用本模块常量，禁止在页面代码里再写散落的 from_rgb。
 mod palette;
+mod components;
 
 mod probe;
 mod proxy_control;
@@ -57,6 +58,17 @@ use config::GuiConfig;
 use nodes::{NodeStatusInfo, Tab};
 use speed_history::SpeedHistory;
 
+/// 运行日志级别（LG-01：结构化级别 + 着色 + 过滤）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// 日志容量（评审决策：100 行 → 1000，排障核心场景）
+pub(crate) const LOG_CAPACITY: usize = 1000;
+
 struct HydraApp {
     // 应用状态
     proxy_running: bool,
@@ -66,7 +78,13 @@ struct HydraApp {
     proxy_starting: bool,
     /// 代理监听地址（09-P1-6：TUN 失败降级回退系统代理时需要；就绪信号携带）
     proxy_bound_addr: Option<std::net::SocketAddr>,
-    logs: Vec<String>,
+    logs: Vec<(crate::LogLevel, String)>,
+    confirm_state: Option<crate::components::ConfirmAction>,
+    dialog_cancel_requested: bool,
+    /// 日志级别过滤（LG-01）
+    log_show_info: bool,
+    log_show_warn: bool,
+    log_show_error: bool,
     /// 持久化配置（配置文件 > 环境变量，见 config.rs）
     config: GuiConfig,
     /// 最近一次成功落盘的配置快照（用于差分 + 防抖保存）

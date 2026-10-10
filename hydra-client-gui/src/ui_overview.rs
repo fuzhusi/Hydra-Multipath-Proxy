@@ -25,6 +25,48 @@ impl HydraApp {
         );
         ui.add_space(palette::SPACING_XS);
 
+        // G-02：启动失败横幅（反馈通道不再只有日志页）——取最近一条启动失败日志
+        if !self.proxy_running && !self.proxy_starting {
+            if let Some((_, line)) = self
+                .logs
+                .iter()
+                .rev()
+                .find(|(_, l)| l.contains("启动失败") || l.contains("启动超时"))
+            {
+                crate::components::banner(
+                    ui,
+                    crate::components::BannerKind::Danger,
+                    line,
+                );
+                ui.add_space(palette::SPACING_XS);
+            }
+        }
+
+        // OV-06：未配置节点 → 引导卡（empty_state + 跳转动作）
+        if self.config.node_addrs.is_empty() {
+            crate::components::empty_state(
+                ui,
+                "还没有配置节点",
+                "从分享链接导入，或在「节点」页手动添加",
+                Some((
+                    "前往节点页",
+                    Box::new(|ui: &mut egui::Ui| {
+                        // 动作经 Tab 切换表达（闭包拿不到 self——用 egui 内存
+                        // 状态中转：点击后写入 ctx 数据由外层读取）
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(egui::Id::new("goto_nodes"), true);
+                        });
+                    }),
+                )),
+            );
+            if ui.ctx().data_mut(|d| d.get_temp::<bool>(egui::Id::new("goto_nodes")) == Some(true)) {
+                ui.ctx().data_mut(|d| {
+                    d.remove_temp::<bool>(egui::Id::new("goto_nodes"));
+                });
+                self.current_tab = crate::nodes::Tab::Nodes;
+            }
+        }
+
         // ── 帧首快照：流量统计缓存与历史序列一次性读出（锁内只做 clone）──
         let stats = self.traffic_stats_cache.lock().ok().and_then(|g| g.clone());
         let (up_series, down_series, daily_up, daily_down) = self
@@ -41,7 +83,15 @@ impl HydraApp {
         //    都完整可见；卡宽 = 可用宽度均分，钳制 130..=320，极窄窗口整行收缩）──
         ui.add_space(palette::SPACING_LG);
         let avail_w = ui.available_width();
-        let stat_cols = 2usize;
+        // 三档列数（G-11）：≥640 四卡一行 / ≥340 两列 / 极窄单列——400px 最小
+        // 窗口下不再水平溢出（企业级评审 P0 清单修正项）
+        let stat_cols = if avail_w >= 640.0 {
+            4usize
+        } else if avail_w >= 340.0 {
+            2usize
+        } else {
+            1usize
+        };
         let card_w = (avail_w - palette::SPACING_SM * (stat_cols + 1) as f32) / stat_cols as f32;
         let card_w = card_w.clamp(130.0, 320.0);
         // card_w 是含 Frame 边距的整卡宽度；内容区需再扣除 内边距MD×2 + 外边距XS×2 = 32px，
@@ -71,7 +121,7 @@ impl HydraApp {
                     };
                     ui.label(
                         egui::RichText::new(status_text)
-                            .size(palette::FONT_TITLE + 3.0)
+                            .size(palette::FONT_HEADING)
                             .color(status_color)
                             .strong(),
                     );
@@ -113,7 +163,7 @@ impl HydraApp {
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(self.config.node_display_name(addr))
-                                        .size(palette::FONT_TITLE + 3.0)
+                                        .size(palette::FONT_HEADING)
                                         .strong(),
                                 )
                                 .truncate(true),
@@ -128,7 +178,7 @@ impl HydraApp {
                         None => {
                             ui.label(
                                 egui::RichText::new("—")
-                                    .size(palette::FONT_TITLE + 3.0)
+                                    .size(palette::FONT_HEADING)
                                     .color(palette::TEXT_FAINT),
                             );
                             ui.add(
@@ -167,13 +217,13 @@ impl HydraApp {
                     );
                     ui.label(
                         egui::RichText::new(format!("⬇ {}", format_bytes(daily_down)))
-                            .size(palette::FONT_TITLE + 3.0)
+                            .size(palette::FONT_HEADING)
                             .color(palette::ACCENT)
                             .strong(),
                     );
                     ui.label(
                         egui::RichText::new(format!("⬆ {}", format_bytes(daily_up)))
-                            .size(palette::FONT_TITLE + 3.0)
+                            .size(palette::FONT_HEADING)
                             .color(palette::SUCCESS)
                             .strong(),
                     );
@@ -192,7 +242,7 @@ impl HydraApp {
                     );
                     ui.label(
                         egui::RichText::new(format!("{}/{}", online, total))
-                            .size(palette::FONT_TITLE + 3.0)
+                            .size(palette::FONT_HEADING)
                             .strong(),
                     );
                     ui.label(match median_latency {
@@ -372,7 +422,7 @@ impl HydraApp {
             if start == self.logs.len() {
                 ui.weak("暂无日志");
             }
-            for line in &self.logs[start..] {
+            for (_, line) in &self.logs[start..] {
                 ui.small(line);
             }
         });

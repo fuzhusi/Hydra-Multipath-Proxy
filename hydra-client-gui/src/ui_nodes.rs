@@ -61,7 +61,7 @@ impl HydraApp {
         if key_missing || cert_missing {
             egui::Frame::none()
                 .fill(palette::BG_CARD)
-                .rounding(egui::Rounding::same(8.0))
+                .rounding(egui::Rounding::same(palette::RADIUS_CARD))
                 .inner_margin(egui::Margin::symmetric(
                     palette::SPACING_MD,
                     palette::SPACING_XS + 2.0,
@@ -146,7 +146,7 @@ impl HydraApp {
         };
         egui::Frame::none()
             .fill(palette::BG_CARD)
-            .rounding(egui::Rounding::same(8.0))
+            .rounding(egui::Rounding::same(palette::RADIUS_CARD))
             .inner_margin(egui::Margin::symmetric(
                 palette::SPACING_MD,
                 palette::SPACING_XS + 2.0,
@@ -184,7 +184,7 @@ impl HydraApp {
         if self.config.node_addrs.is_empty() {
             egui::Frame::none()
                 .fill(palette::BG_CARD)
-                .rounding(egui::Rounding::same(8.0))
+                .rounding(egui::Rounding::same(palette::RADIUS_CARD))
                 .inner_margin(egui::Margin::same(palette::SPACING_MD))
                 .outer_margin(egui::Margin::symmetric(0.0_f32, palette::SPACING_XS))
                 .show(ui, |ui| {
@@ -199,9 +199,10 @@ impl HydraApp {
             ui.add_space(palette::SPACING_XS);
             ui.colored_label(palette::TEXT_WEAK, "（本组暂无节点）");
         }
-        let mut indices_to_remove = Vec::new();
         let mut edit_target: Option<String> = None;
         let mut manual_target: Option<String> = None;
+        // 破坏性操作确认载体（ND-03）：点击仅记录，统一确认后执行
+        let mut confirm_delete: Option<crate::components::ConfirmAction> = None;
         let node_addrs_clone = self.config.node_addrs.clone();
         // 组成员（按原列表顺序保留原始下标，供删除与操作定位）
         let entries: Vec<(usize, String)> = node_addrs_clone
@@ -223,7 +224,7 @@ impl HydraApp {
             .spacing([palette::SPACING_MD, palette::SPACING_SM])
             .show(ui, |ui| {
                 for chunk in entries.chunks(cols) {
-                    for (i, node_addr) in chunk {
+                    for (_i, node_addr) in chunk {
                         let node_addr = node_addr.as_str();
                         // 状态三态：绿=Online / 黄=Degraded（在线但延迟≥500ms）/
                         // 红=Offline / 灰=未验证
@@ -232,7 +233,9 @@ impl HydraApp {
                                 Some(s) => (s.connected, s.last_check.is_some(), s.latency_ms),
                                 None => (false, false, None),
                             };
-                        let dot = palette::status_color(connected, checked, latency);
+                        // v4 三通道编码（ND-01/02）：颜色 + 字形 + 文字，
+                        // 单点判定 palette::node_health（色盲可辨）
+                        let health = palette::node_health(connected, checked, latency);
                         let name = self.config.node_display_name(node_addr);
                         let source = self.config.node_source_label(node_addr);
                         let is_manual = source == config::NODE_SOURCE_MANUAL;
@@ -246,7 +249,7 @@ impl HydraApp {
                         // ── 紧凑节点卡片：圆角 + 统一内边距，宽度锁定为网格列宽 ──
                         egui::Frame::none()
                             .fill(palette::BG_CARD)
-                            .rounding(egui::Rounding::same(8.0))
+                            .rounding(egui::Rounding::same(palette::RADIUS_CARD))
                                                         .inner_margin(egui::Margin::same(palette::SPACING_MD))
                             .outer_margin(egui::Margin::same(2.0))
                             .stroke(egui::Stroke::new(1.0_f32, palette::BORDER))
@@ -254,12 +257,24 @@ impl HydraApp {
                                 ui.set_min_width(cell_width);
                                 // 第一行：状态色点 + 名称/地址 + 延迟色标（来源已由组标签表达）
                                 ui.horizontal(|ui| {
+                                    // 三通道徽标：字形 ●◐✕○（色盲通道）+ 色点
                                     let (rect, _) = ui
                                         .allocate_exact_size(
-                                            egui::vec2(10.0, 10.0),
+                                            egui::vec2(14.0, 12.0),
                                             egui::Sense::hover(),
                                         );
-                                    ui.painter().circle_filled(rect.center(), 5.0, dot);
+                                    ui.painter().circle_filled(
+                                        egui::pos2(rect.left() + 5.0, rect.center().y),
+                                        5.0,
+                                        palette::health_color(health),
+                                    );
+                                    ui.painter().text(
+                                        egui::pos2(rect.left() + 5.0, rect.center().y),
+                                        egui::Align2::CENTER_CENTER,
+                                        palette::health_symbol(health),
+                                        egui::FontId::proportional(9.0),
+                                        palette::BG_CARD,
+                                    );
                                     if name == node_addr {
                                         ui.label(
                                             egui::RichText::new(node_addr)
@@ -292,7 +307,7 @@ impl HydraApp {
                                             ui.label(
                                                 egui::RichText::new(latency_text.as_str())
                                                     .size(palette::FONT_BODY)
-                                                    .color(palette::latency_color(latency)),
+                                                    .color(palette::health_color(health)),
                                             );
                                         },
                                     );
@@ -327,7 +342,7 @@ impl HydraApp {
                                     {
                                         manual_target = Some(node_addr.to_string());
                                     }
-                                    // 破坏性操作用危险色文案（frontend-design 交互反馈约定）
+                                    // 破坏性操作（ND-03）：经确认对话框执行
                                     if ui
                                         .small_button(
                                             egui::RichText::new("🗑").color(palette::DANGER),
@@ -335,7 +350,10 @@ impl HydraApp {
                                         .on_hover_text("删除节点")
                                         .clicked()
                                     {
-                                        indices_to_remove.push(*i);
+                                        confirm_delete =
+                                            Some(crate::components::ConfirmAction::DeleteNode(
+                                                node_addr.to_string(),
+                                            ));
                                     }
                                 });
                             });
@@ -348,14 +366,11 @@ impl HydraApp {
                 }
             });
 
-        // 删除节点并添加日志
-        for &i in indices_to_remove.iter().rev() {
-            let removed = self.config.node_addrs.remove(i);
-            self.node_status.remove(&removed);
-            // 审查修复：备注名 + 独立证书路径一并清理（remove_node_state 收口），
-            // 防止同地址复用节点时旧证书静默生效
-            self.config.remove_node_state(&removed);
-            self.add_log(format!("已删除节点: {}", removed));
+        // 确认对话框（ND-03）：存入 app 状态，由 update 顶层统一绘制
+        if let Some(a) = confirm_delete {
+            if self.confirm_state.is_none() {
+                self.confirm_state = Some(a);
+            }
         }
         if let Some(addr) = edit_target {
             self.open_node_edit(&addr);

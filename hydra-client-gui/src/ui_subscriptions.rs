@@ -74,7 +74,6 @@ impl HydraApp {
 
         // 订阅列表：名称 / 来源 / 更新时间 / 节点数 + 立即更新 / 展开节点 / 编辑 / 删除
         let subs_clone = self.config.subscriptions.clone();
-        let mut subs_to_remove: Vec<usize> = Vec::new();
         for (i, sub) in subs_clone.iter().enumerate() {
             let updated = sub
                 .last_updated_secs
@@ -112,12 +111,25 @@ impl HydraApp {
                     self.sub_edit_name = sub.name.clone();
                     self.sub_edit_source = sub.source.clone();
                 }
-                // 破坏性操作用危险色文案
+                // 破坏性操作（SB-01）：级联删除经对话框确认（含独占节点数 +
+                // 本地文本不可重拉红字提示）
                 if ui
                     .small_button(egui::RichText::new("删除").color(palette::DANGER))
                     .clicked()
                 {
-                    subs_to_remove.push(i);
+                    let cascade = crate::groups::exclusive_node_count(
+                        &self.config,
+                        &self.config.subscriptions[i].name,
+                    );
+                    self.confirm_state =
+                        Some(crate::components::ConfirmAction::DeleteSubscription {
+                            idx: i,
+                            name: self.config.subscriptions[i].name.clone(),
+                            cascade,
+                            is_local_text: self.config.subscriptions[i]
+                                .source
+                                .starts_with("hydra-text://"),
+                        });
                 }
             });
             // 来源列只显示类型标签（本地导入/订阅·域名/文件·文件名），不外显原始长链接
@@ -173,9 +185,6 @@ impl HydraApp {
                     });
                 }
             }
-        }
-        for &i in subs_to_remove.iter().rev() {
-            self.delete_subscription(i);
         }
 
         // 订阅编辑对话框（名称重复校验与添加同一套规则）。

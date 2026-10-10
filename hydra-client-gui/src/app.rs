@@ -19,6 +19,11 @@ impl Default for HydraApp {
             proxy_bound_addr: None,
             proxy_starting: false,
             logs: Vec::new(),
+            confirm_state: None,
+            dialog_cancel_requested: false,
+            log_show_info: true,
+            log_show_warn: true,
+            log_show_error: true,
             config: GuiConfig::default(),
             saved_snapshot: GuiConfig::default(),
             last_config_save: None,
@@ -183,6 +188,11 @@ impl HydraApp {
             proxy_bound_addr: None,
             proxy_starting: false,
             logs: Vec::new(),
+            confirm_state: None,
+            dialog_cancel_requested: false,
+            log_show_info: true,
+            log_show_warn: true,
+            log_show_error: true,
             saved_snapshot: cfg.clone(),
             last_config_save: None,
             config: cfg,
@@ -317,19 +327,43 @@ impl HydraApp {
                 self.saved_snapshot = self.config.clone();
                 self.last_config_save = Some(std::time::Instant::now());
             }
-            Err(e) => self.add_log(format!("⚠️ 配置保存失败: {}", e)),
+            Err(e) => self.add_warn(format!("⚠️ 配置保存失败: {}", e)),
         }
     }
 
     pub(crate) fn add_log(&mut self, message: String) {
-        self.logs.push(format!(
-            "[{}] {}",
-            chrono::Local::now().format("%H:%M:%S"),
-            message
+        self.push_log(crate::LogLevel::Info, message);
+    }
+
+    pub(crate) fn add_warn(&mut self, message: String) {
+        self.push_log(crate::LogLevel::Warn, message);
+    }
+
+    pub(crate) fn add_error(&mut self, message: String) {
+        self.push_log(crate::LogLevel::Error, message);
+    }
+
+    fn push_log(&mut self, level: crate::LogLevel, message: String) {
+        self.logs.push((
+            level,
+            format!(
+                "[{}] {}",
+                chrono::Local::now().format("%H:%M:%S"),
+                message
+            ),
         ));
-        // 保持日志数量在合理范围
-        if self.logs.len() > 100 {
+        if self.logs.len() > crate::LOG_CAPACITY {
             self.logs.remove(0);
+        }
+    }
+
+    /// 确认对话框执行：删除节点（从 ui_nodes 迁入——确认后统一在此执行）
+    pub(crate) fn execute_delete_node(&mut self, addr: &str) {
+        if let Some(i) = self.config.node_addrs.iter().position(|a| a == addr) {
+            let removed = self.config.node_addrs.remove(i);
+            self.node_status.remove(&removed);
+            self.config.remove_node_state(&removed);
+            self.add_log(format!("已删除节点: {}", removed));
         }
     }
 }

@@ -20,6 +20,39 @@ impl eframe::App for HydraApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Esc 取消确认对话框（G-06 配套）；Ctrl+1..6 切页（G-05 键盘可达）
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let ctrl = ctx.input(|i| i.modifiers.ctrl);
+        let page_hotkey = if ctrl {
+            (1..=6).find(|n| {
+                ctx.input(|i| {
+                    i.key_pressed(match n {
+                        1 => egui::Key::Num1,
+                        2 => egui::Key::Num2,
+                        3 => egui::Key::Num3,
+                        4 => egui::Key::Num4,
+                        5 => egui::Key::Num5,
+                        _ => egui::Key::Num6,
+                    })
+                })
+            })
+        } else {
+            None
+        };
+        if esc && self.confirm_state.is_some() {
+            self.dialog_cancel_requested = true;
+        }
+        if let Some(n) = page_hotkey {
+            let tab = match n {
+                1 => Tab::Overview,
+                2 => Tab::Nodes,
+                3 => Tab::Subscriptions,
+                4 => Tab::Connections,
+                5 => Tab::Logs,
+                _ => Tab::Settings,
+            };
+            self.current_tab = tab;
+        }
         self.poll_start_receiver();
         // ── R-35：stop_proxy 后的非阻塞收敛 ──
         // 代理线程退出使 exit receiver 可读/断开时，在此清理 handle 与 receiver
@@ -53,7 +86,7 @@ impl eframe::App for HydraApp {
 
                         // 自动清除系统代理
                         Self::remove_system_proxy_static();
-                        self.add_log("⚠️ 代理异常退出，已自动清除系统代理设置".to_string());
+                        self.add_warn("⚠️ 代理异常退出，已自动清除系统代理设置".to_string());
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         // 代理还在运行
@@ -67,7 +100,7 @@ impl eframe::App for HydraApp {
 
                         // 自动清除系统代理
                         Self::remove_system_proxy_static();
-                        self.add_log("⚠️ 代理线程异常断开，已自动清除系统代理设置".to_string());
+                        self.add_warn("⚠️ 代理线程异常断开，已自动清除系统代理设置".to_string());
                     }
                 }
             }
@@ -263,34 +296,57 @@ impl eframe::App for HydraApp {
                 ui.add_space(palette::SPACING_SM);
                 ui.heading("Hydra");
                 ui.small("Multipath Proxy");
-                ui.add_space(6.0);
+                ui.add_space(palette::SPACING_SM);
                 ui.separator();
                 for tab in Tab::ALL {
                     let selected = self.current_tab == tab;
-                    // UI 重设计第三批：图标 + 标题统一用 palette 正文字号
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 26.0],
-                            egui::SelectableLabel::new(
-                                selected,
-                                egui::RichText::new(tab.label()).size(palette::FONT_BODY),
-                            ),
-                        )
-                        .clicked()
-                    {
-                        self.current_tab = tab;
-                    }
-                    ui.add_space(2.0);
+                    // TR-02：选中态左缘 3px 强调条（Frame 包装实现，颜色单通道
+                    // 之外的空间通道强化）
+                    egui::Frame::none()
+                        .fill(if selected {
+                            palette::ACCENT.gamma_multiply(0.15)
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        })
+                        .rounding(egui::Rounding::same(palette::RADIUS_CTRL))
+                        .inner_margin(egui::Margin::symmetric(4.0, 0.0))
+                        .show(ui, |ui| {
+                            // 左缘 3px 条（选中空间通道）
+                            let bar = if selected { 3.0 } else { 0.0 };
+                            ui.horizontal(|ui| {
+                                ui.allocate_exact_size(
+                                    egui::vec2(bar, 22.0),
+                                    egui::Sense::hover(),
+                                );
+                                if ui
+                                    .add_sized(
+                                        [ui.available_width(), 22.0],
+                                        egui::SelectableLabel::new(
+                                            selected,
+                                            egui::RichText::new(tab.label())
+                                                .size(palette::FONT_BODY),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    self.current_tab = tab;
+                                }
+                            });
+                        });
+                    ui.add_space(palette::SPACING_XS);
                 }
-                // 底部常驻：代理运行状态指示
+                // 底部常驻：代理运行状态三态徽章（TR-01：补「启动中」第三态；
+                // 三通道编码复用 components::status_pill）
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.add_space(6.0);
+                    ui.add_space(palette::SPACING_SM);
                     ui.separator();
-                    ui.label(if self.proxy_running {
-                        "🟢 代理运行中"
+                    if self.proxy_running {
+                        crate::components::status_pill(ui, palette::NodeHealth::Online, "代理运行中");
+                    } else if self.proxy_starting {
+                        crate::components::status_pill(ui, palette::NodeHealth::Testing, "代理启动中");
                     } else {
-                        "⚪ 代理已停止"
-                    });
+                        crate::components::status_pill(ui, palette::NodeHealth::Untested, "代理已停止");
+                    }
                 });
             });
 
@@ -319,6 +375,8 @@ impl eframe::App for HydraApp {
         // ── UI 重设计第二批：导入/手动添加/分享选择/添加订阅 对话框集中渲染 ──
         // （入口分布在订阅页「＋ 新建」下拉与节点页「🔗 分享节点」，跨页切换窗口不丢失）
         self.ui_nodes_dialogs(ctx);
+        // 确认对话框（ND-03/SB-01/LG-04/ST-06）：统一绘制与执行
+        crate::components::draw_confirm_dialog(self, ctx);
         if self.sub_add_open {
             self.ui_sub_add_dialog(ctx);
         }

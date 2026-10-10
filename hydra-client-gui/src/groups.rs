@@ -319,6 +319,25 @@ pub(crate) fn subscription_source_label(source: &str) -> String {
     }
 }
 
+/// 返回订阅独占节点数（级联删除确认文案用）：删该订阅会连带移除的节点数。
+/// 纯函数：只读配置、不修改状态（SB-01 确认对话框数据源）。
+#[allow(clippy::too_many_lines)]
+pub(crate) fn exclusive_node_count(cfg: &GuiConfig, sub_name: &str) -> usize {
+    let Some(sub) = cfg.subscriptions.iter().find(|s| s.name == sub_name) else {
+        return 0;
+    };
+    let others_owned: std::collections::HashSet<String> = cfg
+        .subscriptions
+        .iter()
+        .filter(|s| s.name != sub_name)
+        .flat_map(|s| s.nodes.iter().cloned())
+        .collect();
+    sub.nodes
+        .iter()
+        .filter(|a| !others_owned.contains(*a))
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
