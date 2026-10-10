@@ -34,7 +34,7 @@ hydra-protocol = { path = "../hydra-protocol" }
 # A1：Windows 系统代理（注册表写入 + WinINet 刷新），target-gated
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
-windows-sys = { version = "0.52", features = ["Win32_Networking_WinInet", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinInet", "Win32_Foundation"] }
 
 # Windows exe 资源图标（桌面快捷方式/任务栏/资源管理器）：build.rs 仅在 Windows 宿主编译时生效
 [target.'cfg(windows)'.build-dependencies]
