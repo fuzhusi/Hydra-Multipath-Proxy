@@ -119,12 +119,7 @@ pub(crate) async fn resolve_host_cached(host_with_port: &str) -> Option<Vec<Sock
         return Some(cached);
     }
     // 全局并发闸（排队 3s 超时——防解析器故障期间排队雪崩）
-    let _permit = match tokio::time::timeout(
-        QUEUE_TIMEOUT,
-        resolve_semaphore().acquire(),
-    )
-    .await
-    {
+    let _permit = match tokio::time::timeout(QUEUE_TIMEOUT, resolve_semaphore().acquire()).await {
         Ok(Ok(p)) => p,
         _ => {
             tracing::warn!("DNS 解析并发闸排队超时（{QUEUE_TIMEOUT:?}）");

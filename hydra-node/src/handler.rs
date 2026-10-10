@@ -303,13 +303,117 @@ impl ConnectionHandler {
 
         let connect_start = std::time::Instant::now();
 
-        // 逐候选建连（v4 优先）：15s 总预算摊给全部候选，单候选失败即时换下一个
-        // ——双栈节点单族路由故障不再致命；中间失败 debug 级（v4-only 节点的
-        // v6 候选秒败不再刷 error，降噪），仅最终失败 error 级。
+        // Happy Eyeballs（内核优化 #6③）：首两候选 250ms 错峰**并行竞速**
+        // （黑洞候选不再吃满串行预算——失败尾延迟 20s → ~2-3s），先到先用；
+        // 后续候选保持串行接力（15s 总预算语义不变）。
         const CONNECT_TOTAL: std::time::Duration = std::time::Duration::from_secs(15);
         const MIN_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(500);
+        const HE_STAGGER: std::time::Duration = std::time::Duration::from_millis(250);
+
+        async fn dial_candidate(
+            candidate: SocketAddr,
+            budget: std::time::Duration,
+        ) -> Result<TcpStream, HydraError> {
+            let stream = tokio::time::timeout(budget, TcpStream::connect(candidate))
+                .await
+                .map_err(|_| {
+                    HydraError::TargetUnreachable(format!(
+                        "Timeout connecting to {}",
+                        mask_target(&candidate.to_string())
+                    ))
+                })?
+                .map_err(|e| {
+                    HydraError::TargetUnreachable(format!(
+                        "Failed to connect to {}: {}",
+                        mask_target(&candidate.to_string()),
+                        e
+                    ))
+                })?;
+            // 禁 Nagle：目标侧交互式流量延迟敏感（审查 R-11）
+            let _ = stream.set_nodelay(true);
+            // 内核优化 #12：目标流 keepalive + TCP_USER_TIMEOUT
+            // （Linux）——死目标 ~90s 回收，不再等 300s idle 兜底
+            crate::tcp_server::enable_tcp_keepalive(&stream);
+            #[cfg(target_os = "linux")]
+            crate::tcp_server::set_tcp_user_timeout(stream.as_raw_fd(), 90_000);
+            Ok(stream)
+        }
+
         let mut last_err: Option<HydraError> = None;
-        for candidate in &candidates {
+        if candidates.len() >= 2 {
+            // ── 竞速段：候选 [0] 立即 + 候选 [1] 延迟 250ms，先到先用 ──
+            let remaining = CONNECT_TOTAL.saturating_sub(connect_start.elapsed());
+            let c0 = candidates[0];
+            let c1 = candidates[1];
+            let mut d0 = Box::pin(dial_candidate(c0, remaining));
+            let mut d1 = Box::pin(async {
+                tokio::time::sleep(HE_STAGGER).await;
+                dial_candidate(c1, remaining.saturating_sub(HE_STAGGER)).await
+            });
+            // 竞速：先到先用；败者的 future 仍存活（Pin<Box> 未被消费），
+            // 其失败后可继续 await 另一方（预算由各自内部 timeout 保证）
+            tokio::select! {
+                res = &mut d0 => match res {
+                    Ok(stream) => {
+                        crate::metrics::metrics().hs_target.observe(
+                            connect_start.elapsed().as_secs_f64(),
+                        );
+                        info!(
+                            "Connected to target via {} (Happy Eyeballs, took {}ms)",
+                            c0,
+                            connect_start.elapsed().as_millis()
+                        );
+                        return Ok(stream);
+                    }
+                    Err(e) => {
+                        // 竞速段失败不进 last_err（串行段会重试并自行收集）
+                        debug!("Happy Eyeballs candidate {} failed: {}", c0, e);
+                        match d1.as_mut().await {
+                            Ok(stream) => {
+                                crate::metrics::metrics().hs_target.observe(
+                                    connect_start.elapsed().as_secs_f64(),
+                                );
+                                info!(
+                                    "Connected to target via {} (fallback candidate)",
+                                    c1
+                                );
+                                return Ok(stream);
+                            }
+                            Err(e2) => last_err = Some(e2),
+                        }
+                    }
+                },
+                res = &mut d1 => match res {
+                    Ok(stream) => {
+                        crate::metrics::metrics().hs_target.observe(
+                            connect_start.elapsed().as_secs_f64(),
+                        );
+                        info!(
+                            "Connected to target via {} (Happy Eyeballs runner-up wins)",
+                            c1
+                        );
+                        return Ok(stream);
+                    }
+                    Err(e) => {
+                        debug!("Happy Eyeballs candidate {} failed: {}", c1, e);
+                        match d0.as_mut().await {
+                            Ok(stream) => {
+                                crate::metrics::metrics().hs_target.observe(
+                                    connect_start.elapsed().as_secs_f64(),
+                                );
+                                return Ok(stream);
+                            }
+                            Err(e2) => last_err = Some(e2),
+                        }
+                    }
+                },
+            }
+        }
+
+        // ── 串行段：竞速全败后的剩余候选；候选不足 2 个时竞速段未运行，
+        // 从头串行（修复：单候选目标此前被 skip(2) 跳过 → 无任何建连尝试）──
+        let raced = candidates.len() >= 2;
+        for candidate in candidates.iter().skip(if raced { 2 } else { 0 }) {
             let remaining = CONNECT_TOTAL.saturating_sub(connect_start.elapsed());
             if remaining < MIN_ATTEMPT {
                 break; // 预算耗尽：不再尝试（避免超时叠加突破客户端 20s 预算）
@@ -329,9 +433,9 @@ impl ConnectionHandler {
                     #[cfg(target_os = "linux")]
                     crate::tcp_server::set_tcp_user_timeout(stream.as_raw_fd(), 90_000);
                     // Metrics v2：目标建连延迟直方图
-                    crate::metrics::metrics().hs_target.observe(
-                        connect_start.elapsed().as_secs_f64(),
-                    );
+                    crate::metrics::metrics()
+                        .hs_target
+                        .observe(connect_start.elapsed().as_secs_f64());
                     info!(
                         "Connected to target: {} (took {}ms)",
                         mask_target(&candidate.to_string()),

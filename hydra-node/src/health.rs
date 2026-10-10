@@ -108,7 +108,11 @@ impl HealthServer {
         info!(
             "Health endpoint listening on http://{} (/health, /metrics){}",
             self.addr,
-            if loopback { "" } else { " [非回环绑定：HYDRA_HEALTH_PUBLIC=1]" }
+            if loopback {
+                ""
+            } else {
+                " [非回环绑定：HYDRA_HEALTH_PUBLIC=1]"
+            }
         );
         let sem = Arc::new(tokio::sync::Semaphore::new(HEALTH_MAX_CONCURRENT));
         tokio::spawn(async move {

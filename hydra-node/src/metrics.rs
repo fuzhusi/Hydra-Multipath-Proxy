@@ -19,9 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 /// 固定对数桶（秒）：10ms → 32s，11 桶 + Inf
-const HISTOGRAM_BUCKETS_SECS: [f64; 11] = [
-    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
-];
+const HISTOGRAM_BUCKETS_SECS: [f64; 11] =
+    [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
 
 /// 直方图（固定桶 + Inf；无 quantile —— Prometheus histogram 语义）
 #[derive(Default)]
@@ -57,9 +56,7 @@ impl Histogram {
         let mut cumulative = 0u64;
         for (i, b) in HISTOGRAM_BUCKETS_SECS.iter().enumerate() {
             cumulative += self.buckets[i].load(Ordering::Relaxed);
-            out.push_str(&format!(
-                "{name}_bucket{{le=\"{b}\"}} {cumulative}\n"
-            ));
+            out.push_str(&format!("{name}_bucket{{le=\"{b}\"}} {cumulative}\n"));
         }
         let count = self.count.load(Ordering::Relaxed);
         out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {count}\n"));
@@ -236,10 +233,10 @@ pub fn render(uptime_secs: u64) -> String {
         bytes_in = g(&m.bytes_in),
         bytes_out = g(&m.bytes_out),
     );
-    out.push_str(&m.hs_tls.render(
-        "hydra_handshake_tls_seconds",
-        "TLS handshake duration.",
-    ));
+    out.push_str(
+        &m.hs_tls
+            .render("hydra_handshake_tls_seconds", "TLS handshake duration."),
+    );
     out.push_str(&m.hs_noise.render(
         "hydra_handshake_noise_seconds",
         "Noise-PSK handshake duration.",
@@ -339,7 +336,6 @@ mod tests {
     fn metrics_response_get_only() {
         assert!(metrics_response("GET", 1).starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(metrics_response("POST", 1).starts_with("HTTP/1.1 405"));
-        assert!(metrics_response("GET", 1)
-            .contains("Content-Type: text/plain; version=0.0.4\r\n"));
+        assert!(metrics_response("GET", 1).contains("Content-Type: text/plain; version=0.0.4\r\n"));
     }
 }

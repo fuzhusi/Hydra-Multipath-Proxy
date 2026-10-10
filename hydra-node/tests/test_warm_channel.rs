@@ -63,8 +63,8 @@ async fn 温连接_超过节点等待窗口_拿不到成功应答() {
     if r.is_ok() {
         let reply = tokio::time::timeout(Duration::from_secs(5), read_reply(&mut rd)).await;
         let failed = match reply {
-            Err(_) => true,    // 超时 = 未在窗口内拿到应答
-            Ok(Err(_)) => true, // 连接关闭/读取错误/失败应答码
+            Err(_) => true,      // 超时 = 未在窗口内拿到应答
+            Ok(Err(_)) => true,  // 连接关闭/读取错误/失败应答码
             Ok(Ok(())) => false, // 拿到成功应答 = 违反窗口语义
         };
         assert!(failed, "超过节点等待窗口后不应拿到成功应答");

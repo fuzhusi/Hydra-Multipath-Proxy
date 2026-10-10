@@ -142,17 +142,36 @@ pub(crate) fn enable_tcp_keepalive(stream: &tokio::net::TcpStream) {
     }
 }
 
+/// 共享 setsockopt 声明（Linux；**单一声明**——模块内两处调用点
+/// （TFO listen / TCP_USER_TIMEOUT）签名曾不一致触发
+/// clashing-extern-declarations，统一为 c_void 后按调用点转型）
+#[cfg(target_os = "linux")]
+mod sockopt {
+    extern "C" {
+        pub fn setsockopt(
+            fd: i32,
+            level: i32,
+            optname: i32,
+            optval: *const core::ffi::c_void,
+            optlen: u32,
+        ) -> i32;
+    }
+}
+
 /// 内核优化 #12：TCP_USER_TIMEOUT（Linux 门控）——keepalive 探测失败后
 /// 强制断开的上限（毫秒）
 #[cfg(target_os = "linux")]
 pub(crate) fn set_tcp_user_timeout(fd: std::os::unix::io::RawFd, ms: u32) {
-    extern "C" {
-        fn setsockopt(fd: i32, level: i32, optname: i32, optval: *const u32, optlen: u32) -> i32;
-    }
     const TCP_USER_TIMEOUT: i32 = 18;
     const IPPROTO_TCP: i32 = 6;
     unsafe {
-        setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &ms, 4);
+        sockopt::setsockopt(
+            fd,
+            IPPROTO_TCP,
+            TCP_USER_TIMEOUT,
+            &ms as *const u32 as *const core::ffi::c_void,
+            4,
+        );
     }
 }
 
@@ -161,7 +180,9 @@ pub(crate) fn set_tcp_user_timeout(fd: std::os::unix::io::RawFd, ms: u32) {
 pub(crate) fn mono_ms() -> u64 {
     static ANCHOR: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let anchor = ANCHOR.get_or_init(std::time::Instant::now);
-    std::time::Instant::now().duration_since(*anchor).as_millis() as u64
+    std::time::Instant::now()
+        .duration_since(*anchor)
+        .as_millis() as u64
 }
 
 #[allow(clippy::too_many_arguments)] // 启动期一次性装配，均为独立配置维度
@@ -221,11 +242,11 @@ pub async fn spawn_tcp_listener(
         const IPPROTO_TCP: i32 = 6;
         let backlog: i32 = 256;
         let r = unsafe {
-            setsockopt(
+            sockopt::setsockopt(
                 listener.as_raw_fd(),
                 IPPROTO_TCP,
                 TCP_FASTOPEN,
-                &backlog as *const i32 as *const u8,
+                &backlog as *const i32 as *const core::ffi::c_void,
                 4,
             )
         };
@@ -299,9 +320,9 @@ pub async fn spawn_tcp_listener(
                             .await
                         {
                             Ok(Ok(tls)) => {
-                                crate::metrics::metrics().hs_tls.observe(
-                                    tls_hs_start.elapsed().as_secs_f64(),
-                                );
+                                crate::metrics::metrics()
+                                    .hs_tls
+                                    .observe(tls_hs_start.elapsed().as_secs_f64());
                                 handle_tls_stream(
                                     tls,
                                     handler,
@@ -422,9 +443,9 @@ async fn handle_tls_stream(
     .await;
     match hs {
         Ok(Ok(_)) => {
-            crate::metrics::metrics().hs_noise.observe(
-                noise_start.elapsed().as_secs_f64(),
-            );
+            crate::metrics::metrics()
+                .hs_noise
+                .observe(noise_start.elapsed().as_secs_f64());
         }
         Ok(Err(e)) => {
             // 审查 P2：握手失败点可能已写出部分 Noise 二进制消息（如 msg2 已发
@@ -579,8 +600,10 @@ async fn handle_tls_stream(
     let (up, down) = (c2t.unwrap_or(0), t2c.unwrap_or(0));
     // Metrics v2：字节汇入（热路径仅连接关闭时两次原子加）
     let m = crate::metrics::metrics();
-    m.bytes_in.fetch_add(up, std::sync::atomic::Ordering::Relaxed);
-    m.bytes_out.fetch_add(down, std::sync::atomic::Ordering::Relaxed);
+    m.bytes_in
+        .fetch_add(up, std::sync::atomic::Ordering::Relaxed);
+    m.bytes_out
+        .fetch_add(down, std::sync::atomic::Ordering::Relaxed);
     info!(
         "TCP connection to {} closed (Client->Target: {} bytes, Target->Client: {} bytes)",
         mask_target(&target),
@@ -673,17 +696,16 @@ where
         // 写超时（企业级评审 P2-1）：对端零窗口/半开时 write 可永久阻塞——
         // 循环顶部的空闲/寿命检查将失效，认证连接可无限钉住 permit+fd。
         // 60s 写不出去 = 对端不可达，按传输错误收尾（对侧泵经 peer 通知跟随）。
-        let write_res = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            w.write_all(&buf[..n]),
-        )
-        .await;
+        let write_res =
+            tokio::time::timeout(std::time::Duration::from_secs(60), w.write_all(&buf[..n])).await;
         if let Err(e) = match write_res {
             Ok(r) => r,
-            Err(_) => break Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "relay write timeout (60s)——对端零窗口或半开",
-            )),
+            Err(_) => {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "relay write timeout (60s)——对端零窗口或半开",
+                ))
+            }
         } {
             break Err(e); // 写错误（审查 06-P2-2）：不再直接 ? 跳过 shutdown
         }
@@ -819,15 +841,4 @@ mod tests {
             "寿命到期后 pump 应结束（即便持续活跃）"
         );
     }
-}
-
-#[cfg(target_os = "linux")]
-extern "C" {
-    fn setsockopt(
-        fd: i32,
-        level: i32,
-        optname: i32,
-        optval: *const u8,
-        optlen: u32,
-    ) -> i32;
 }
