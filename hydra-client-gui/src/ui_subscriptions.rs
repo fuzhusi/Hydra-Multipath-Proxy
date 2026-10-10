@@ -87,7 +87,7 @@ impl HydraApp {
             let expanded = self.expanded_sub.as_deref() == Some(sub.name.as_str());
             ui.horizontal(|ui| {
                 ui.strong(&sub.name);
-                ui.colored_label(palette::TEXT_WEAK, format!("{} 节点", sub.nodes.len()));
+                ui.colored_label(palette::text_weak(), format!("{} 节点", sub.nodes.len()));
                 ui.weak(format!("更新于 {}", updated));
                 if ui.small_button("立即更新").clicked() {
                     self.queue_subscription_update(sub.name.clone(), sub.source.clone());
@@ -114,7 +114,7 @@ impl HydraApp {
                 // 破坏性操作（SB-01）：级联删除经对话框确认（含独占节点数 +
                 // 本地文本不可重拉红字提示）
                 if ui
-                    .small_button(egui::RichText::new("删除").color(palette::DANGER))
+                    .small_button(egui::RichText::new("删除").color(palette::danger()))
                     .clicked()
                 {
                     let cascade = crate::groups::exclusive_node_count(
@@ -147,7 +147,7 @@ impl HydraApp {
                             ui.label(
                                 egui::RichText::new("[只读]")
                                     .size(palette::FONT_BADGE)
-                                    .color(palette::ACCENT),
+                                    .color(palette::accent()),
                             );
                             ui.label(addr);
                             // 测速中显示 spinner；结果进全局日志与调度器评分（与节点页一致）
@@ -156,7 +156,7 @@ impl HydraApp {
                                 ui.label(
                                     egui::RichText::new("测速中…")
                                         .size(palette::FONT_SECONDARY)
-                                        .color(palette::TEXT_WEAK),
+                                        .color(palette::text_weak()),
                                 );
                             }
                             // 紧凑操作行：分享 / 测速 / 另存为手动（原位）
@@ -222,7 +222,7 @@ impl HydraApp {
                             ui.end_row();
                         });
                     if self.sub_edit_source.trim().is_empty() {
-                        ui.colored_label(palette::DANGER, "✗ 来源不能为空");
+                        ui.colored_label(palette::danger(), "✗ 来源不能为空");
                     }
                     let name = self.sub_edit_name.trim();
                     let name_conflict = !name.is_empty()
@@ -234,7 +234,7 @@ impl HydraApp {
                             .any(|(j, s)| j != idx && s.name == name);
                     if name_conflict {
                         ui.colored_label(
-                            palette::DANGER,
+                            palette::danger(),
                             "✗ 订阅名称已存在（名称是来源标记与更新对号的键）",
                         );
                     }

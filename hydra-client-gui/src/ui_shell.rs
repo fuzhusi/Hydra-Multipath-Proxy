@@ -183,7 +183,7 @@ impl eframe::App for HydraApp {
                             });
                         }
                         None => {
-                            ui.colored_label(palette::DANGER, "✗ 二维码生成失败（链接过长？）");
+                            ui.colored_label(palette::danger(), "✗ 二维码生成失败（链接过长？）");
                         }
                     }
 
@@ -244,14 +244,14 @@ impl eframe::App for HydraApp {
                     ));
                     ui.label("传输模式: TCP/TLS（TLS 1.3 + Noise-PSK）".to_string());
 
-                    // 红字安全提示（危险语义色，收口 palette::DANGER）
+                    // 红字安全提示（危险语义色，收口 palette::danger()）
                     ui.separator();
                     ui.colored_label(
-                        palette::DANGER,
+                        palette::danger(),
                         "⚠ 完整链接 = 持有节点（含密钥与证书），仅限可信渠道分享！",
                     );
                     ui.colored_label(
-                        palette::DANGER,
+                        palette::danger(),
                         "  请勿粘贴到群聊/公开网页/明文 http；普通渠道请用「紧凑」模式。",
                     );
 
@@ -290,8 +290,14 @@ impl eframe::App for HydraApp {
         }
 
         // ── T2：左侧导航栏（六区：状态总览/节点管理/订阅/分享/设置/日志）──
+        // v4：侧栏底色取 bg_sidebar 令牌（比内容区更深一档，60-30-10 层次）
         egui::SidePanel::left("nav_panel")
             .exact_width(160.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(palette::bg_sidebar())
+                    .inner_margin(egui::Margin::same(palette::SPACING_SM)),
+            )
             .show(ctx, |ui| {
                 ui.add_space(palette::SPACING_SM);
                 ui.heading("Hydra");
@@ -304,7 +310,7 @@ impl eframe::App for HydraApp {
                     // 之外的空间通道强化）
                     egui::Frame::none()
                         .fill(if selected {
-                            palette::ACCENT.gamma_multiply(0.15)
+                            palette::accent().gamma_multiply(0.15)
                         } else {
                             egui::Color32::TRANSPARENT
                         })
@@ -346,6 +352,22 @@ impl eframe::App for HydraApp {
                         crate::components::status_pill(ui, palette::NodeHealth::Testing, "代理启动中");
                     } else {
                         crate::components::status_pill(ui, palette::NodeHealth::Untested, "代理已停止");
+                    }
+                    // ── v4.1（评审 D5/R12）：主题三态切换入口——点按循环
+                    //    Dark → Light → Abyss，tooltip 显示当前主题名；
+                    //    持久化走 switch_theme（与设置页卡片共享 ui_theme 字段）──
+                    let cur = palette::current_theme();
+                    let resp = ui
+                        .button(
+                            egui::RichText::new(format!("{} 主题：{}", cur.icon(), cur.label()))
+                                .size(palette::FONT_SECONDARY),
+                        )
+                        .on_hover_text(format!(
+                            "切换界面主题（当前：{}；点击循环 深⇄浅⇄深海）",
+                            cur.label()
+                        ));
+                    if resp.clicked() {
+                        self.switch_theme(ctx, cur.next());
                     }
                 });
             });

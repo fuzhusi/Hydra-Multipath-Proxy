@@ -407,6 +407,77 @@ async fn main() -> Result<()> {
     // 如实告警回退 tcp（兑现 README 行为；此前该函数零调用，告警不存在）
     let _transport = hydra_client::tcp_transport::transport_from_env();
 
+    // CLI 分享链接自动配置（v0.2.3 功能缺口补齐：此前分享链接只在 GUI/Android
+    // 实现——CLI 传 hydra:// 链接既不解析密钥也不解析证书，报"未设置
+    // HYDRA_AUTH_KEY"，与用户「链接给到即配好」的预期相悖）。
+    // 位置参数以 hydra:// 开头 → 解析 k=/cc= 自动注入 env（auth hex +
+    // 证书临时文件），参数本身替换为节点地址后照常走 parse_args。
+    let mut argv: Vec<String> = std::env::args().collect();
+    {
+        use hydra_client::ShareLink;
+        let mut changed = false;
+        for a in argv.iter_mut() {
+            if !a.starts_with("hydra://") {
+                continue;
+            }
+            let link = ShareLink::from_share_url(a).map_err(|e| {
+                hydra_protocol::HydraError::ProtocolError(format!("分享链接解析失败: {e}"))
+            })?;
+            let key = link
+                .auth_key_bytes()
+                .map_err(|e| {
+                    hydra_protocol::HydraError::ProtocolError(format!("分享链接密钥非法: {e}"))
+                })?
+                .ok_or_else(|| {
+                    hydra_protocol::HydraError::ProtocolError(
+                        "分享链接未携带认证密钥（k=）——CLI 无法无密钥连接".to_string(),
+                    )
+                })?;
+            let hex_key: String = key.iter().map(|b| format!("{b:02x}")).collect();
+            let cert = link
+                .cert_der_bytes()
+                .map_err(|e| {
+                    hydra_protocol::HydraError::ProtocolError(format!("分享链接证书非法: {e}"))
+                })?
+                .ok_or_else(|| {
+                    hydra_protocol::HydraError::ProtocolError(
+                        "分享链接未携带节点证书（cc=）——pin 模式必需".to_string(),
+                    )
+                })?;
+            let cert_path = std::env::temp_dir().join(format!(
+                "hydra-share-cert-{}.der",
+                std::process::id()
+            ));
+            std::fs::write(&cert_path, &cert).map_err(|e| {
+                hydra_protocol::HydraError::IoError(std::io::Error::new(
+                    e.kind(),
+                    format!("证书临时文件写入失败: {e}"),
+                ))
+            })?;
+            // 启动早期（任务线程 spawn 前）注入 env——下游 trust_from_env 与
+            // 认证密钥检查照常读取，零改动复用既有链路
+            std::env::set_var("HYDRA_AUTH_KEY", &hex_key);
+            std::env::set_var("HYDRA_NODE_CERT", &cert_path);
+            *a = format!("{}:{}", link.address, link.port);
+            changed = true;
+            info!(
+                "已从分享链接自动配置：节点 {}、密钥 ✓、证书 ✓（证书临时文件 {}）",
+                hydra_protocol::mask_target(&format!("{}:{}", link.address, link.port)),
+                cert_path.display()
+            );
+        }
+        if changed {
+            std::env::set_var("HYDRA_NODES", {
+                let nodes: Vec<String> = argv[1..]
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .cloned()
+                    .collect();
+                nodes.join(",")
+            });
+        }
+    }
+
     let (listen_arg, nodes, p2p) = parse_args();
 
     // 09-P3-5：TUN 模式双实例互斥——两个 TUN 实例会争抢同一 TUN 网卡与 /1

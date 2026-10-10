@@ -83,10 +83,10 @@ pub enum BannerKind {
 /// 应用内横幅（G-02：反馈通道不再只有日志页）
 pub fn banner(ui: &mut egui::Ui, kind: BannerKind, text: &str) {
     let (fg, bg) = match kind {
-        BannerKind::Danger => (palette::DANGER, palette::DANGER_BG),
-        BannerKind::Warning => (palette::WARNING, palette::WARNING_BG),
-        BannerKind::Success => (palette::SUCCESS, palette::SUCCESS_BG),
-        BannerKind::Info => (palette::INFO, palette::INFO_BG),
+        BannerKind::Danger => (palette::danger(), palette::danger_bg()),
+        BannerKind::Warning => (palette::warning(), palette::warning_bg()),
+        BannerKind::Success => (palette::success(), palette::success_bg()),
+        BannerKind::Info => (palette::info(), palette::info_bg()),
     };
     egui::Frame::none()
         .fill(bg)
@@ -98,9 +98,13 @@ pub fn banner(ui: &mut egui::Ui, kind: BannerKind, text: &str) {
 }
 
 /// 空态动作（标题 + 触发回调）
+/// （v4 预留：首页空态改为「当前节点」卡内引导占位；本组件留待其他页空态接入）
+#[allow(dead_code)]
 pub type EmptyAction<'a> = (&'a str, Box<dyn FnOnce(&mut egui::Ui) + 'a>);
 
 /// 空态：标题 + 提示 + 可选动作按钮（垂直居中三件套）
+/// （v4 预留：同上，公共组件库保留）
+#[allow(dead_code)]
 pub fn empty_state(
     ui: &mut egui::Ui,
     title: &str,
@@ -112,12 +116,12 @@ pub fn empty_state(
         ui.label(
             egui::RichText::new(title)
                 .size(palette::FONT_TITLE)
-                .color(palette::TEXT_WEAK),
+                .color(palette::text_weak()),
         );
         ui.label(
             egui::RichText::new(hint)
                 .size(palette::FONT_SECONDARY)
-                .color(palette::TEXT_FAINT),
+                .color(palette::text_faint()),
         );
         if let Some((label, on_click)) = action {
             ui.add_space(palette::SPACING_SM);
@@ -132,9 +136,9 @@ pub fn empty_state(
 /// 日志级别着色（LG-01：结构化级别 + 过滤）
 pub fn log_color(level: LogLevel) -> egui::Color32 {
     match level {
-        LogLevel::Info => palette::TEXT,
-        LogLevel::Warn => palette::WARNING,
-        LogLevel::Error => palette::DANGER,
+        LogLevel::Info => palette::text(),
+        LogLevel::Warn => palette::warning(),
+        LogLevel::Error => palette::danger(),
     }
 }
 
@@ -217,9 +221,9 @@ pub fn draw_confirm_dialog(app: &mut HydraApp, ctx: &egui::Context) {
     let mut dummy_open = true;
     egui::Window::new(
         egui::RichText::new(&title).color(if danger {
-            palette::DANGER
+            palette::danger()
         } else {
-            palette::TEXT
+            palette::text()
         }),
     )
     .open(&mut dummy_open)
@@ -234,9 +238,9 @@ pub fn draw_confirm_dialog(app: &mut HydraApp, ctx: &egui::Context) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .button(egui::RichText::new(&confirm_label).color(if danger {
-                    palette::DANGER
+                    palette::danger()
                 } else {
-                    palette::TEXT
+                    palette::text()
                 }))
                 .clicked()
             {

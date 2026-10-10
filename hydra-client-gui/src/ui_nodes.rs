@@ -60,7 +60,7 @@ impl HydraApp {
             self.config.cert_path.trim().is_empty() && self.config.cert_der_b64.trim().is_empty();
         if key_missing || cert_missing {
             egui::Frame::none()
-                .fill(palette::BG_CARD)
+                .fill(palette::bg_card())
                 .rounding(egui::Rounding::same(palette::RADIUS_CARD))
                 .inner_margin(egui::Margin::symmetric(
                     palette::SPACING_MD,
@@ -69,12 +69,12 @@ impl HydraApp {
                 .outer_margin(egui::Margin::symmetric(0.0_f32, palette::SPACING_XS))
                 .stroke(egui::Stroke::new(
                     1.0_f32,
-                    palette::WARNING.gamma_multiply(0.5),
+                    palette::warning().gamma_multiply(0.5),
                 ))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.colored_label(
-                            palette::WARNING,
+                            palette::warning(),
                             "⚠ 全局凭据未配置（认证密钥或节点证书缺失），代理无法启动",
                         );
                         if ui.small_button("前往设置 →").clicked() {
@@ -145,7 +145,7 @@ impl HydraApp {
             Some(name) => format!("📡 {}", name),
         };
         egui::Frame::none()
-            .fill(palette::BG_CARD)
+            .fill(palette::bg_card())
             .rounding(egui::Rounding::same(palette::RADIUS_CARD))
             .inner_margin(egui::Margin::symmetric(
                 palette::SPACING_MD,
@@ -160,7 +160,7 @@ impl HydraApp {
                             .strong(),
                     );
                     ui.colored_label(
-                        palette::TEXT_WEAK,
+                        palette::text_weak(),
                         format!(
                             "{} 节点 ｜ 在线 {} / 离线 {}",
                             members.len(),
@@ -183,7 +183,7 @@ impl HydraApp {
         // ── 组内节点卡片（紧凑双列/三列自适应网格，沿用第一批卡片元素）──
         if self.config.node_addrs.is_empty() {
             egui::Frame::none()
-                .fill(palette::BG_CARD)
+                .fill(palette::bg_card())
                 .rounding(egui::Rounding::same(palette::RADIUS_CARD))
                 .inner_margin(egui::Margin::same(palette::SPACING_MD))
                 .outer_margin(egui::Margin::symmetric(0.0_f32, palette::SPACING_XS))
@@ -191,13 +191,13 @@ impl HydraApp {
                     ui.label(
                         egui::RichText::new("还没有节点。")
                             .size(palette::FONT_BODY)
-                            .color(palette::TEXT_WEAK),
+                            .color(palette::text_weak()),
                     );
                     ui.small("多个节点自动更新 → 「📡 订阅」页右上「＋ 新建」添加订阅源；单个节点 → 从分享链接导入");
                 });
         } else if members.is_empty() {
             ui.add_space(palette::SPACING_XS);
-            ui.colored_label(palette::TEXT_WEAK, "（本组暂无节点）");
+            ui.colored_label(palette::text_weak(), "（本组暂无节点）");
         }
         let mut edit_target: Option<String> = None;
         let mut manual_target: Option<String> = None;
@@ -248,11 +248,11 @@ impl HydraApp {
                             self.node_testing_addr.as_deref() == Some(node_addr);
                         // ── 紧凑节点卡片：圆角 + 统一内边距，宽度锁定为网格列宽 ──
                         egui::Frame::none()
-                            .fill(palette::BG_CARD)
+                            .fill(palette::bg_card())
                             .rounding(egui::Rounding::same(palette::RADIUS_CARD))
                                                         .inner_margin(egui::Margin::same(palette::SPACING_MD))
                             .outer_margin(egui::Margin::same(2.0))
-                            .stroke(egui::Stroke::new(1.0_f32, palette::BORDER))
+                            .stroke(egui::Stroke::new(1.0_f32, palette::border()))
                             .show(ui, |ui| {
                                 ui.set_min_width(cell_width);
                                 // 第一行：状态色点 + 名称/地址 + 延迟色标（来源已由组标签表达）
@@ -273,7 +273,7 @@ impl HydraApp {
                                         egui::Align2::CENTER_CENTER,
                                         palette::health_symbol(health),
                                         egui::FontId::proportional(9.0),
-                                        palette::BG_CARD,
+                                        palette::bg_card(),
                                     );
                                     if name == node_addr {
                                         ui.label(
@@ -295,9 +295,9 @@ impl HydraApp {
                                             egui::RichText::new(format!("[{}]", source))
                                                 .size(palette::FONT_BADGE)
                                                 .color(if is_manual {
-                                                    palette::TEXT_FAINT
+                                                    palette::text_faint()
                                                 } else {
-                                                    palette::ACCENT
+                                                    palette::accent()
                                                 }),
                                         );
                                     }
@@ -319,7 +319,7 @@ impl HydraApp {
                                         ui.label(
                                             egui::RichText::new("测速中…")
                                                 .size(palette::FONT_SECONDARY)
-                                                .color(palette::TEXT_WEAK),
+                                                .color(palette::text_weak()),
                                         );
                                     } else if ui.small_button("⚡").on_hover_text("测速（完整握手）").clicked() {
                                         self.start_node_test(node_addr.to_string());
@@ -345,7 +345,7 @@ impl HydraApp {
                                     // 破坏性操作（ND-03）：经确认对话框执行
                                     if ui
                                         .small_button(
-                                            egui::RichText::new("🗑").color(palette::DANGER),
+                                            egui::RichText::new("🗑").color(palette::danger()),
                                         )
                                         .on_hover_text("删除节点")
                                         .clicked()
@@ -453,7 +453,7 @@ impl HydraApp {
                     });
                     if let Some((ok, msg)) = &self.import_status {
                         ui.colored_label(
-                            if *ok { palette::SUCCESS } else { palette::DANGER },
+                            if *ok { palette::success() } else { palette::danger() },
                             format!("{} {}", if *ok { "✓" } else { "✗" }, msg),
                         );
                     }
@@ -541,7 +541,7 @@ impl HydraApp {
                     });
                     if let Some((ok, msg)) = &self.manual_add_status {
                         ui.colored_label(
-                            if *ok { palette::SUCCESS } else { palette::DANGER },
+                            if *ok { palette::success() } else { palette::danger() },
                             format!("{} {}", if *ok { "✓" } else { "✗" }, msg),
                         );
                     }
@@ -562,7 +562,7 @@ impl HydraApp {
                     ui.label("选择要分享的节点：");
                     let addrs = self.config.node_addrs.clone();
                     if addrs.is_empty() {
-                        ui.colored_label(palette::TEXT_WEAK, "（暂无节点可分享）");
+                        ui.colored_label(palette::text_weak(), "（暂无节点可分享）");
                     }
                     for addr in &addrs {
                         ui.horizontal(|ui| {

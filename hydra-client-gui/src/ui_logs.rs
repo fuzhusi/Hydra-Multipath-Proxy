@@ -77,7 +77,7 @@ impl HydraApp {
                 }
             }
             if ui
-                .button(egui::RichText::new("清空日志").color(palette::DANGER))
+                .button(egui::RichText::new("清空日志").color(palette::danger()))
                 .clicked()
             {
                 // 两段式确认（LG-04）：经 ConfirmAction::ClearLogs 对话框

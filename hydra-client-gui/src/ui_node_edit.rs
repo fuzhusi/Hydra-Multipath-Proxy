@@ -154,7 +154,7 @@ impl HydraApp {
                     && self.edit_addr.trim().parse::<SocketAddr>().is_err()
                 {
                     ui.colored_label(
-                        palette::DANGER,
+                        palette::danger(),
                         "✗ 地址格式应为 host:port（示例 1.2.3.4:4433 / [::1]:4433）",
                     );
                 }
@@ -187,9 +187,9 @@ impl HydraApp {
                 });
                 if self.edit_show_auth && !self.edit_auth_key.trim().is_empty() {
                     match hydra_client::auth_key_from_hex(self.edit_auth_key.trim()) {
-                        Ok(_) => ui.colored_label(palette::SUCCESS, "✓ 密钥格式有效"),
+                        Ok(_) => ui.colored_label(palette::success(), "✓ 密钥格式有效"),
                         Err(e) => {
-                            ui.colored_label(palette::DANGER, format!("✗ {}", e))
+                            ui.colored_label(palette::danger(), format!("✗ {}", e))
                         }
                     };
                 }
@@ -222,7 +222,7 @@ impl HydraApp {
 
                 if self.proxy_running {
                     ui.separator();
-                    ui.colored_label(palette::WARNING, "⚠ 代理正在运行：保存后需停止并重新启动代理，修改才会生效");
+                    ui.colored_label(palette::warning(), "⚠ 代理正在运行：保存后需停止并重新启动代理，修改才会生效");
                 }
 
                 // 方案 §4：诚实提示——认证密钥为全局单值；证书已支持逐节点独立路径（上）

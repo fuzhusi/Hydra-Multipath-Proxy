@@ -29,11 +29,11 @@ impl HydraApp {
         .default_open(true)
         .show(ui, |ui| {
             ui.colored_label(
-                palette::TEXT_WEAK,
+                palette::text_weak(),
                 "说明：认证密钥与节点证书（全局回落）；逐节点独立证书在各节点的「编辑」对话框中设置",
             );
             ui.colored_label(
-                    palette::WARNING,
+                    palette::warning(),
                     "⚠ 当前 hydra-client 按全局凭据连接：以下配置对所有节点生效；节点级凭据将在后端改造后逐节点生效",
                 );
                 // 认证密钥：默认掩码显示（如 a1b2****8f90），点击「编辑/显示」查看并编辑明文
@@ -63,9 +63,9 @@ impl HydraApp {
                 if self.show_auth_key && !self.config.auth_key.trim().is_empty() {
                     match hydra_client::auth_key_from_hex(self.config.auth_key.trim()) {
                         Ok(_) => {
-                            ui.colored_label(palette::SUCCESS, "✓ 密钥格式有效")
+                            ui.colored_label(palette::success(), "✓ 密钥格式有效")
                         }
-                        Err(e) => ui.colored_label(palette::DANGER, format!("✗ {}", e)),
+                        Err(e) => ui.colored_label(palette::danger(), format!("✗ {}", e)),
                     };
                 }
 
@@ -94,7 +94,7 @@ impl HydraApp {
                 if !self.config.cert_path.trim().is_empty()
                     && !std::path::Path::new(self.config.cert_path.trim()).exists()
                 {
-                    ui.colored_label(palette::DANGER, "✗ 证书文件不存在，请检查路径");
+                    ui.colored_label(palette::danger(), "✗ 证书文件不存在，请检查路径");
                 }
 
                 // 传输为固定 TCP/TLS（TLS 1.3 + Noise-PSK）：Wave 3 起无其他模式
@@ -110,7 +110,7 @@ impl HydraApp {
         .default_open(true)
         .show(ui, |ui| {
             ui.colored_label(
-                palette::TEXT_WEAK,
+                palette::text_weak(),
                 "说明：本地 SOCKS5 监听地址与 Offline 节点自动恢复探测间隔",
             );
             ui.horizontal(|ui| {
@@ -154,7 +154,7 @@ impl HydraApp {
         .default_open(false)
         .show(ui, |ui| {
             ui.colored_label(
-                palette::TEXT_WEAK,
+                palette::text_weak(),
                 "说明：双信任模式——自签证书 pinning（默认） / 真证书 CA（可选叶证书硬 pin）",
             );
         // 拷贝为 String：后续要可变借用 self.config（pin 输入框），避免借用冲突
@@ -189,10 +189,10 @@ impl HydraApp {
             match config::validate_leaf_pin(&self.config.ca_leaf_pin) {
                 Ok(()) if self.config.ca_leaf_pin.trim().is_empty() => {}
                 Ok(()) => {
-                    ui.colored_label(palette::SUCCESS, "✓ 格式有效（64 hex）");
+                    ui.colored_label(palette::success(), "✓ 格式有效（64 hex）");
                 }
                 Err(e) => {
-                    ui.colored_label(palette::DANGER, format!("✗ {e}"));
+                    ui.colored_label(palette::danger(), format!("✗ {e}"));
                 }
             }
             ui.small("ca 模式不使用节点证书文件；节点侧用真证书（如 ACME）部署，SNI 须与证书 SAN 一致");
@@ -213,7 +213,7 @@ impl HydraApp {
         .default_open(false)
         .show(ui, |ui| {
             ui.colored_label(
-                palette::TEXT_WEAK,
+                palette::text_weak(),
                 "说明：全局透明接管 TCP 流量，应用无需配置代理；首页亦有快捷开关",
             );
         if ui
@@ -275,7 +275,7 @@ impl HydraApp {
             if let Some((_, sys_proxy_on)) = self.sys_proxy_check_cache {
                 if sys_proxy_on {
                     ui.colored_label(
-                        palette::WARNING,
+                        palette::warning(),
                         "⚠ 检测到 Windows 系统代理已开启：TUN 模式下经系统代理的流量会二次进入本代理形成环路，建议关闭系统代理",
                     );
                 }
@@ -292,7 +292,7 @@ impl HydraApp {
         .default_open(false)
         .show(ui, |ui| {
             ui.colored_label(
-                palette::TEXT_WEAK,
+                palette::text_weak(),
                 "说明：开机自启（规划中）、关窗隐藏到托盘与托盘菜单行为",
             );
             ui.add_enabled(false, egui::Checkbox::new(&mut false, "开机自启（规划中）"))
@@ -322,8 +322,8 @@ impl HydraApp {
         .default_open(false)
         .show(ui, |ui| {
             ui.colored_label(
-                palette::TEXT_WEAK,
-                "说明：主题（当前仅深色）与配置目录/配置文件位置",
+                palette::text_weak(),
+                "说明：主题（侧栏底部 ◐ 可循环切换 深色/浅色/深海）与配置目录/配置文件位置",
             );
             ui.horizontal(|ui| {
                 ui.label("主题:");
@@ -371,7 +371,7 @@ impl HydraApp {
         .default_open(false)
         .show(ui, |ui| {
             ui.colored_label(
-                palette::TEXT_WEAK,
+                palette::text_weak(),
                 "说明：版本信息、项目文档与程序退出入口（运行日志见「📜 日志」页）",
             );
             ui.label(format!(
@@ -390,7 +390,7 @@ impl HydraApp {
             if ui
                 .button(
                     egui::RichText::new("退出程序（停止代理并清理系统代理）")
-                        .color(palette::DANGER),
+                        .color(palette::danger()),
                 )
                 .clicked()
             {

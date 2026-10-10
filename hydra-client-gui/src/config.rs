@@ -112,6 +112,10 @@ pub struct GuiConfig {
     /// 缺项节点回落全局 cert_path / cert_der_b64 / HYDRA_NODE_CERT（三级回落不变）。
     #[serde(default)]
     pub node_cert_paths: HashMap<String, String>,
+    /// UI 重设计 v4.1（评审 R12）：主题持久化——"dark"/"light"/"abyss"；
+    /// None = 默认深色。侧栏切换入口与后续设置页卡片共享同一字段。
+    #[serde(default)]
+    pub ui_theme: Option<String>,
 }
 
 /// serde 默认值：true（关窗默认隐藏到托盘）
@@ -138,6 +142,7 @@ impl Default for GuiConfig {
             trust_mode: String::new(),
             ca_leaf_pin: String::new(),
             node_cert_paths: HashMap::new(),
+            ui_theme: None,
         }
     }
 }
@@ -1067,6 +1072,27 @@ mod tests {
         // 旧版本配置文件（无 node_names 字段）→ 空 map
         let old: GuiConfig = serde_json::from_str(r#"{"auth_key":"ff"}"#).unwrap();
         assert!(old.node_names.is_empty());
+    }
+
+    // ===================== UI 重设计 v4.1：主题持久化（R12） =====================
+
+    #[test]
+    fn test_ui_theme_serde_roundtrip_and_defaults() {
+        // 缺省 / 旧版本配置文件 → None（默认深色）
+        let none: GuiConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(none.ui_theme, None);
+
+        // 显式主题往返
+        let cfg = GuiConfig {
+            ui_theme: Some("abyss".into()),
+            ..Default::default()
+        };
+        let back: GuiConfig = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.ui_theme.as_deref(), Some("abyss"));
+
+        // 未知值不报错（解析在 palette::UiTheme::from_config_str 处回落默认）
+        let weird: GuiConfig = serde_json::from_str(r#"{"ui_theme":"bogus"}"#).unwrap();
+        assert_eq!(weird.ui_theme.as_deref(), Some("bogus"));
     }
 
     #[test]

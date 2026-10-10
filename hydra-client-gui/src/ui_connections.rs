@@ -81,9 +81,9 @@ impl HydraApp {
                     egui::RichText::new(format!("活跃连接 {active_n}"))
                         .size(palette::FONT_TITLE + 3.0)
                         .color(if active_n > 0 {
-                            palette::SUCCESS
+                            palette::success()
                         } else {
-                            palette::TEXT
+                            palette::text()
                         })
                         .strong(),
                 );
@@ -91,7 +91,7 @@ impl HydraApp {
                 ui.label(
                     egui::RichText::new(format!("最近关闭 {closed_n}"))
                         .size(palette::FONT_TITLE)
-                        .color(palette::TEXT_WEAK),
+                        .color(palette::text_weak()),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.small("每 500ms 自动刷新；已关闭条目保留 60s");
@@ -109,7 +109,7 @@ impl HydraApp {
                     ui.label(
                         egui::RichText::new("暂无连接")
                             .size(palette::FONT_TITLE)
-                            .color(palette::TEXT_WEAK),
+                            .color(palette::text_weak()),
                     );
                     ui.small(if self.proxy_running {
                         "代理运行中——经代理发起的连接将实时显示在这里"
@@ -166,13 +166,13 @@ impl HydraApp {
                             egui::RichText::new(format_speed(up))
                                 .monospace()
                                 .size(palette::FONT_BODY)
-                                .color(palette::SUCCESS),
+                                .color(palette::success()),
                         );
                         ui.label(
                             egui::RichText::new(format_speed(down))
                                 .monospace()
                                 .size(palette::FONT_BODY)
-                                .color(palette::ACCENT),
+                                .color(palette::accent()),
                         );
                         // 累计流量
                         ui.label(
@@ -198,11 +198,11 @@ impl HydraApp {
                         ui.label(if c.active {
                             egui::RichText::new("● 活跃")
                                 .size(palette::FONT_SECONDARY)
-                                .color(palette::SUCCESS)
+                                .color(palette::success())
                         } else {
                             egui::RichText::new("○ 已关闭")
                                 .size(palette::FONT_SECONDARY)
-                                .color(palette::TEXT_FAINT)
+                                .color(palette::text_faint())
                         });
                         ui.end_row();
                     }

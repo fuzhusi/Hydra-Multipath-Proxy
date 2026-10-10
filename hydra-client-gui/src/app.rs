@@ -4,8 +4,9 @@
 use crate::config;
 use crate::config::GuiConfig;
 use crate::nodes::{NodeStatusInfo, Tab};
+use crate::palette;
 use crate::speed_history::SpeedHistory;
-use crate::theme::{apply_dark_theme, setup_custom_fonts};
+use crate::theme::{apply_theme, setup_custom_fonts};
 use crate::tray;
 use crate::HydraApp;
 use std::collections::{HashMap, VecDeque};
@@ -129,8 +130,6 @@ impl HydraApp {
     pub(crate) fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // 设置自定义字体
         setup_custom_fonts(&cc.egui_ctx);
-        // T2：统一暗色主题（圆角 6 / 强调蓝 / 间距）
-        apply_dark_theme(&cc.egui_ctx);
         // T2：系统托盘（失败不阻断 GUI，仅记日志）
         let tray = match tray::create_tray(cc.egui_ctx.clone()) {
             Ok(t) => Some(t),
@@ -168,6 +167,12 @@ impl HydraApp {
         // 探测间隔：配置非空 → 覆盖 env（hydra-client 内部从 env 读取）。
         // 必须在任何工作线程 spawn 之前执行，避免 env 并发读写。
         config::apply_env_overrides(&cfg);
+
+        // ── v4.1（评审 R12）：启动首帧前恢复主题，避免冷启动闪一帧默认色 ──
+        if let Some(t) = cfg.ui_theme.as_deref().and_then(palette::UiTheme::from_config_str) {
+            palette::set_theme(t);
+        }
+        apply_theme(&cc.egui_ctx);
 
         // 节点状态表初始化
         let mut node_status = HashMap::new();
@@ -333,6 +338,17 @@ impl HydraApp {
 
     pub(crate) fn add_log(&mut self, message: String) {
         self.push_log(crate::LogLevel::Info, message);
+    }
+
+    /// v4.1（评审 R12/D5）：主题切换唯一入口——切内存全局主题 + 重写 egui
+    /// Visuals + 写入 config.ui_theme 并立即强制落盘（侧栏入口与后续设置页
+    /// 卡片共享同一持久化路径）。
+    pub(crate) fn switch_theme(&mut self, ctx: &egui::Context, t: palette::UiTheme) {
+        palette::set_theme(t);
+        crate::theme::apply_theme(ctx);
+        self.config.ui_theme = Some(t.as_config_str().to_string());
+        self.maybe_save_config(true);
+        self.add_log(format!("主题已切换：{}", t.label()));
     }
 
     pub(crate) fn add_warn(&mut self, message: String) {
