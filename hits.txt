@@ -1,0 +1,631 @@
+﻿dra-core\src\nat.rs:747: let v = parse_stun_addrs("127.0.0.1:3478, [::1]:3479").unwrap();
+dra-core\src\nat.rs:749: assert_eq!(v[0], "127.0.0.1:3478".parse::<SocketAddr>().unwrap());
+dra-core\src\nat.rs:750: assert_eq!(v[1], "[::1]:3479".parse::<SocketAddr>().unwrap());
+dra-core\src\nat.rs:757: .unwrap();
+dra-core\src\nat.rs:765: let v = resolve_stun_addrs("localhost:3478").await.unwrap();
+dra-core\src\nat.rs:774: let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+dra-core\src\nat.rs:775: let addr = listener.local_addr().unwrap();
+dra-core\src\nat.rs:777: let (s, _) = listener.accept().await.unwrap();
+dra-core\src\nat.rs:780: let (a, b) = (a.unwrap(), b);
+dra-core\src\nat.rs:796: let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+dra-core\src\nat.rs:797: let addr = listener.local_addr().unwrap();
+dra-core\src\nat.rs:799: let (s, _) = listener.accept().await.unwrap();
+dra-core\src\nat.rs:802: let (a, b) = (a.unwrap(), b);
+dra-core\src\nat.rs:816: let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+dra-core\src\nat.rs:817: let cand = live.local_addr().unwrap();
+dra-core\src\nat.rs:818: let bind: SocketAddr = "[2001:db8::1]:1".parse().unwrap();
+dra-core\src\pool.rs:113: format!("127.0.0.1:{a}").parse().unwrap()
+dra-core\src\pool.rs:162: let mut m = p.inner.lock().unwrap();
+dra-core\src\pool.rs:163: let slot = m.get_mut(&node(3)).unwrap();
+dra-core\src\pool.rs:175: let mut m = p.inner.lock().unwrap();
+dra-core\src\pool.rs:176: let slot = m.get_mut(&node(7)).unwrap();
+dra-core\src\pool.rs:192: let mut m = p.inner.lock().unwrap();
+dra-core\src\pool.rs:193: let slot = m.get_mut(&node(4)).unwrap();
+dra-core\src\proxy.rs:1598: .unwrap()
+dra-core\src\routing.rs:383: .unwrap();
+dra-core\src\routing.rs:384: let set = load_domain_file(path.to_str().unwrap()).unwrap();
+dra-core\src\scheduler.rs:141: format!("127.0.0.1:{}", port).parse().unwrap()
+dra-core\src\scheduler.rs:152: assert_eq!(s.get_best_node().await.unwrap().address, fast);
+dra-core\src\scheduler.rs:157: let fast_node = nodes.iter().find(|n| n.address == fast).unwrap();
+dra-core\src\scheduler.rs:169: assert_eq!(s.get_best_node().await.unwrap().address, a);
+dra-core\src\scheduler.rs:173: assert_eq!(s.get_best_node().await.unwrap().address, b);
+dra-core\src\scheduler.rs:177: assert_eq!(s.get_best_node().await.unwrap().address, a);
+dra-core\src\share_link.rs:516: String::from_utf8(out).expect("hex 鏌ヨ〃杈撳嚭鎭掍负 UTF-8")
+dra-core\src\share_link.rs:614: address: "127.0.0.1:8080".parse().unwrap(),
+dra-core\src\share_link.rs:624: let parsed = ShareLink::from_share_url(&url).unwrap();
+dra-core\src\share_link.rs:641: let links = parse_share_links(text).unwrap();
+dra-core\src\share_link.rs:650: address: "127.0.0.1:8080".parse().unwrap(),
+dra-core\src\share_link.rs:660: let parsed = ShareLink::from_base64(&base64).unwrap();
+dra-core\src\share_link.rs:675: let link = ShareLink::from_share_url(url).unwrap();
+dra-core\src\share_link.rs:678: link.transport_choice().unwrap(),
+dra-core\src\share_link.rs:682: // URL 寰€杩?        let rt = ShareLink::from_share_url(&link.to_share_url()).unwrap();
+dra-core\src\share_link.rs:685: // serde锛圙UI 鎸佷箙鍖栵級寰€杩?        let json = serde_json::to_string(&link).unwrap();
+dra-core\src\share_link.rs:686: let rt2: ShareLink = serde_json::from_str(&json).unwrap();
+dra-core\src\share_link.rs:690: let default = ShareLink::from_share_url("hydra://1.2.3.4:443?bandwidth=100").unwrap();
+dra-core\src\share_link.rs:693: default.transport_choice().unwrap(),
+dra-core\src\share_link.rs:700: let quic = ShareLink::from_share_url("hydra://1.2.3.4:443?tp=quic").unwrap();
+dra-core\src\share_link.rs:703: quic.transport_choice().unwrap(),
+dra-core\src\share_link.rs:713: address: "127.0.0.1:8080".parse().unwrap(),
+dra-core\src\share_link.rs:731: let parsed = ShareLink::from_share_url(&url).unwrap();
+dra-core\src\share_link.rs:736: ShareLink::from_share_url(legacy).unwrap().mode,
+dra-core\src\share_link.rs:751: // URL 寰€杩?        let parsed = ShareLink::from_share_url(&url).unwrap();
+dra-core\src\share_link.rs:756: // Base64 寰€杩?        let parsed = ShareLink::from_base64(&link.to_base64()).unwrap();
+dra-core\src\share_link.rs:759: // serde JSON 寰€杩?        let json = serde_json::to_string(&link).unwrap();
+dra-core\src\share_link.rs:761: let parsed: ShareLink = serde_json::from_str(&json).unwrap();
+dra-core\src\share_link.rs:778: .unwrap();
+dra-core\src\share_link.rs:792: .expect("32 瀛楄妭瀵嗛挜鍚堟硶")
+dra-core\src\share_link.rs:804: let parsed = ShareLink::from_share_url(&url).unwrap();
+dra-core\src\share_link.rs:813: // 瑙ｇ爜鍚庣殑瀛楄妭涓庤緭鍏ヤ竴鑷?        assert_eq!(parsed.auth_key_bytes().unwrap(), Some(auth_key));
+dra-core\src\share_link.rs:814: assert_eq!(parsed.cert_der_bytes().unwrap(), Some(cert_der));
+dra-core\src\share_link.rs:816: parsed.obfs_key_string().unwrap(),
+dra-core\src\share_link.rs:821: // serde JSON 寰€杩旓紙鏃х増 JSON 缂?v2 瀛楁 鈫?None锛?        let json = serde_json::to_string(&parsed).unwrap();
+dra-core\src\share_link.rs:822: let back: ShareLink = serde_json::from_str(&json).unwrap();
+dra-core\src\share_link.rs:835: .unwrap();
+dra-core\src\share_link.rs:841: let parsed = ShareLink::from_share_url(&url).unwrap();
+dra-core\src\share_link.rs:853: let parsed = ShareLink::from_share_url(legacy).unwrap();
+dra-core\src\share_link.rs:892: .expect("32 瀛楄妭瀵嗛挜鍚堟硶")
+dra-core\src\share_link.rs:894: let links = parse_share_links(&format!("# 娉ㄩ噴\n{}\n", url)).unwrap();
+dra-core\src\share_link.rs:896: assert_eq!(links[0].auth_key_bytes().unwrap(), Some(vec![9u8; 32]));
+dra-core\src\share_link.rs:913: let link = ShareLink::from_share_url(&format!("hydra://127.0.0.1:8080?k={bad_k}")).unwrap();
+dra-core\src\speedtest.rs:446: assert!((mbps.unwrap() - expect).abs() < 1e-9);
+dra-core\src\speedtest.rs:470: address: "127.0.0.1:1".parse().unwrap(),
+dra-core\src\tcp_transport.rs:463: TransportChoice::parse("quic").unwrap(),
+dra-core\src\tcp_transport.rs:466: assert_eq!(TransportChoice::parse("tcp").unwrap(), TransportChoice::Tcp);
+dra-core\src\tcp_transport.rs:480: let ca = build_tls_connector(&TlsTrust::public_ca(None)).unwrap();
+dra-core\src\tcp_transport.rs:481: let ca2 = build_tls_connector(&TlsTrust::public_ca(None)).unwrap();
+dra-core\src\tcp_transport.rs:484: // 鍙?pin 涓嶅悓 鈫?鎸囩汗涓嶅悓 鈫?鐙珛杩炴帴鍣?        let ca_pin = build_tls_connector(&TlsTrust::public_ca(Some("ab".repeat(32)))).unwrap();
+dra-core\src\tcp_transport.rs:535: let chrome = build_client_config(&trust, FingerprintMode::Chrome).unwrap();
+dra-core\src\tcp_transport.rs:544: let none = build_client_config(&trust, FingerprintMode::None).unwrap();
+dra-core\src\traffic.rs:63: let first = samples.first().expect("len >= 2");
+dra-core\src\traffic.rs:64: let newest = samples.last().expect("len >= 2");
+dra-core\src\traffic.rs:267: .expect("node_traffic mutex poisoned");
+dra-core\src\traffic.rs:275: .expect("node_traffic mutex poisoned");
+dra-core\src\traffic.rs:311: .expect("speed_history mutex poisoned");
+dra-core\src\traffic.rs:412: let entry = monitor.node_entry("127.0.0.1:10000".parse().unwrap());
+dra-core\src\traffic.rs:429: up.write_all(&payload).await.expect("write_all");
+dra-core\src\traffic.rs:430: up.shutdown().await.expect("shutdown");
+dra-core\src\traffic.rs:433: down.read_to_end(&mut got).await.expect("read_to_end");
+dra-core\src\traffic.rs:434: writer.await.unwrap();
+dra-core\src\traffic.rs:447: let node_entry = monitor.node_entry("127.0.0.1:10001".parse().unwrap());
+dra-core\src\traffic.rs:448: let other_entry = monitor.node_entry("127.0.0.1:10002".parse().unwrap());
+dra-core\src\traffic.rs:474: let entry = monitor.node_entry("127.0.0.1:10003".parse().unwrap());
+dra-core\src\udp_relay.rs:313: let frame = encode_udp_data(session_id, &target, &datagram).unwrap();
+dra-core\src\udp_relay.rs:357: ch.send_to("10.0.0.1:53", b"query").await.unwrap();
+dra-core\src\udp_relay.rs:358: let (target, data) = ch.recv_from().await.unwrap();
+dra-core\src\udp_relay.rs:363: ch.send_to("10.0.0.1:53", b"query2").await.unwrap();
+dra-core\src\udp_relay.rs:364: let (_, data) = ch.recv_from().await.unwrap();
+dra-core\src\udp_relay.rs:369: ch.send_to("10.0.0.2:53", b"x").await.unwrap();
+dra-core\src\udp_relay.rs:370: let _ = ch.recv_from().await.unwrap();
+dra-core\src\udp_relay.rs:381: ch.send_to("10.0.0.9:123", b"hi").await.unwrap();
+dra-core\src\udp_relay.rs:382: let _ = ch.recv_from().await.unwrap();
+dra-core\src\udp_relay.rs:383: assert!(ch.close_target("10.0.0.9:123").await.unwrap());
+dra-core\src\udp_relay.rs:385: assert!(!ch.close_target("10.0.0.9:123").await.unwrap());
+dra-core\src\udp_relay.rs:392: panic!("mock 鑺傜偣搴旀敹鍒?1 涓?close 甯?);
+dra-core\src\udp_relay.rs:400: let frame = read_udp_frame(&mut srv).await.unwrap();
+dra-core\src\udp_relay.rs:405: panic!("搴斾负鏁版嵁甯?);
+dra-core\src\udp_relay.rs:410: &encode_udp_data(session_id, &target, b"echo-1").unwrap(),
+dra-core\src\udp_relay.rs:413: .unwrap();
+dra-core\src\udp_relay.rs:416: .unwrap();
+dra-core\src\udp_relay.rs:419: &encode_udp_data(session_id, &target, b"late-after-close").unwrap(),
+dra-core\src\udp_relay.rs:422: .unwrap();
+dra-core\src\udp_relay.rs:424: let frame2 = read_udp_frame(&mut srv).await.unwrap();
+dra-core\src\udp_relay.rs:431: panic!("搴斾负鏁版嵁甯?);
+dra-core\src\udp_relay.rs:433: write_udp_frame(&mut srv, &encode_udp_data(s2, &t2, &d2).unwrap())
+dra-core\src\udp_relay.rs:435: .unwrap();
+dra-core\src\udp_relay.rs:440: ch.send_to("10.0.0.3:443", b"trigger").await.unwrap();
+dra-core\src\udp_relay.rs:441: let (target, data) = ch.recv_from().await.unwrap();
+dra-core\src\udp_relay.rs:444: // 绗簩涓洰鏍囷細鏂颁細璇濆洖鐜甯革紱绗竴涓洰鏍囩殑鏄犲皠宸茶 close 瑙ｉ櫎锛?        // 杩熷埌甯ц涓㈠純涓嶈鎶?        ch.send_to("10.0.0.4:443", b"second").await.unwrap();
+dra-core\src\udp_relay.rs:445: let (target, data) = ch.recv_from().await.unwrap();
+dra-core\src\udp_relay.rs:456: let frame = read_udp_frame(&mut srv).await.unwrap();
+dra-core\src\udp_relay.rs:461: panic!("搴斾负鏁版嵁甯?);
+dra-core\src\udp_relay.rs:466: &encode_udp_data(session_id + 100, &target, b"bad").unwrap(),
+dra-core\src\udp_relay.rs:469: .unwrap();
+dra-core\src\udp_relay.rs:472: &encode_udp_data(session_id, &target, b"good").unwrap(),
+dra-core\src\udp_relay.rs:475: .unwrap();
+dra-core\src\udp_relay.rs:479: ch.send_to("10.0.0.5:53", b"query").await.unwrap();
+dra-core\src\udp_relay.rs:480: let (target, data) = ch.recv_from().await.unwrap();
+dra-core\src\udp_relay.rs:500: let frame = encode_udp_data(session_id, &target, &datagram).unwrap();
+dra-core\src\udp_relay.rs:515: ch.send_to("10.0.0.1:53", b"a").await.unwrap();
+dra-core\src\udp_relay.rs:516: let _ = ch.recv_from().await.unwrap();
+dra-core\src\udp_relay.rs:517: // 鍒锋柊 10.0.0.1 鐨?LRU 鏃堕挓锛?0.0.0.2 鎴愪负鏈€鏃?        ch.send_to("10.0.0.1:53", b"a2").await.unwrap();
+dra-core\src\udp_relay.rs:518: let _ = ch.recv_from().await.unwrap();
+dra-core\src\udp_relay.rs:519: ch.send_to("10.0.0.2:53", b"b").await.unwrap();
+dra-core\src\udp_relay.rs:520: let _ = ch.recv_from().await.unwrap();
+dra-core\src\udp_relay.rs:524: ch.send_to("10.0.0.3:53", b"c").await.unwrap();
+dra-core\src\udp_relay.rs:525: let _ = ch.recv_from().await.unwrap();
+dra-core\src\udp_relay.rs:539: ch.send_to("10.0.0.2:53", b"again").await.unwrap();
+dra-core\src\udp_relay.rs:540: let (_, data) = ch.recv_from().await.unwrap();
+dra-core\src\udp_relay.rs:548: assert_eq!(ch.session_for("a:1").unwrap(), 1);
+dra-core\src\udp_relay.rs:549: assert_eq!(ch.session_for("b:2").unwrap(), 2);
+dra-core\src\udp_relay.rs:550: assert_eq!(ch.session_for("a:1").unwrap(), 1, "鍚岀洰鏍囧鐢ㄥ悓鍙?);
+dra-core\src\udp_relay.rs:566: let f = encode_udp_data(session_id, &target, &datagram).unwrap();
+dra-core\src\udp_relay.rs:578: .unwrap();
+dra-core\src\udp_relay.rs:582: .unwrap();
+dra-core\src\udp_relay.rs:588: .unwrap();
+dra-core\src\udp_relay.rs:592: let rx = ch.recv_from_ext().await.unwrap();
+dra-core\src\udp_relay.rs:603: other => panic!("鏈熸湜 Data锛屽疄闄?{other:?}"),
+dra-core\src\udp_relay.rs:605: let rx = ch.recv_from_ext().await.unwrap();
+dra-core\src\udp_relay.rs:611: other => panic!("鏈熸湜 Data锛屽疄闄?{other:?}"),
+dra-core\src\udp_relay.rs:614: // 鑺傜偣涓嬭 close锛歳ecv_from_ext 浠?Closed 鏆撮湶锛屾槧灏勮В闄?        // 锛堝€?mock锛氱洿鎺ュ瀹㈡埛绔崐娴佸啓 close 涓嶅彲琛屸€斺€攕rv 宸茶浠诲姟鎸佹湁锛?        //   閫氳繃 close_session_ext 楠岃瘉鏄犲皠瑙ｉ櫎璇箟鍗冲彲锛?        assert!(ch.close_session_ext("flowA", "10.0.0.7:53").await.unwrap());
+dra-core\src\udp_relay.rs:616: !ch.close_session_ext("flowA", "10.0.0.7:53").await.unwrap(),
+dra-core\src\udp_relay.rs:627: assert_eq!(ch.session_for("last:1").unwrap(), u16::MAX);
+dra-core\src\udp_relay.rs:629: assert_eq!(ch.session_for("next:1").unwrap(), u16::MAX);
+dra-node\src\cert.rs:145: rustls::pki_types::PrivateKeyDer::Pkcs8(key_der.into_iter().next().unwrap())
+dra-node\src\cert.rs:152: rustls::pki_types::PrivateKeyDer::Pkcs1(keys.into_iter().next().unwrap())
+dra-node\src\cert.rs:194: .expect("rcgen 鐢熸垚鑷璇佷功澶辫触");
+dra-node\src\cert.rs:199: parse_pem_pair(cert_pem.as_bytes(), key_pem.as_bytes()).expect("鍚堟硶 PEM 瀵瑰簲瑙ｆ瀽鎴愬姛");
+dra-node\src\cert.rs:214: let certified = rcgen::generate_simple_self_signed(vec!["hydra.node".into()]).unwrap();
+dra-node\src\config.rs:339: parse_u32_field(Some(&"  ".to_string()), None, "HYDRA_MAX_CONNECTIONS", 1000).unwrap(),
+dra-node\src\config.rs:350: .unwrap(),
+dra-node\src\config.rs:354: parse_u32_field(Some(&" 42 ".to_string()), Some(500), "X", 1000).unwrap(),
+dra-node\src\config.rs:360: assert_eq!(parse_u32_field(None, Some(7), "X", 1000).unwrap(), 7);
+dra-node\src\config.rs:361: assert_eq!(parse_u32_field(None, None, "X", 1000).unwrap(), 1000);
+dra-node\src\config.rs:382: // 榛樿鍏筹紙淇濆畧鍗囩骇锛?        assert!(!resolve(&cli, &env_of(None), None).unwrap().fallback_page);
+dra-node\src\config.rs:385: .unwrap()
+dra-node\src\config.rs:390: .unwrap()
+dra-node\src\config.rs:395: .unwrap()
+dra-node\src\config.rs:400: .unwrap()
+dra-node\src\config.rs:405: .unwrap()
+dra-node\src\dns_aaaa.rs:133: let end = aaaa_query_question_end(&q).expect("AAAA 鏌ヨ搴斿懡涓?);
+dra-node\src\dns_aaaa.rs:188: let end = aaaa_query_question_end(&q).unwrap();
+dra-node\src\fallback.rs:145: http_serve_fallback(&mut buf).await.unwrap();
+dra-node\src\fallback.rs:146: let text = String::from_utf8(buf.clone()).unwrap();
+dra-node\src\fallback.rs:159: .expect("蹇呴』鏈?Content-Length 澶?);
+dra-node\src\fallback.rs:162: .unwrap()
+dra-node\src\fallback.rs:165: .unwrap();
+dra-node\src\fallback.rs:167: // 澶翠笌 body 浠ョ┖琛屽垎闅旓紱body 瀹屾暣涓旈暱搴︿笌澹版槑涓€鑷?        let (head, body) = text.split_once("\r\n\r\n").expect("蹇呴』鏈夊ご/浣撶┖琛屽垎闅?);
+dra-node\src\fallback.rs:182: http_serve_fallback(&mut buf).await.unwrap();
+dra-node\src\handler.rs:339: classify_blocked_ip("127.0.0.1".parse().unwrap()),
+dra-node\src\handler.rs:344: classify_blocked_ip("127.9.9.9".parse().unwrap()),
+dra-node\src\handler.rs:348: classify_blocked_ip("::1".parse().unwrap()),
+dra-node\src\handler.rs:356: classify_blocked_ip("169.254.169.254".parse().unwrap()),
+dra-node\src\handler.rs:360: classify_blocked_ip("fe80::1".parse().unwrap()),
+dra-node\src\handler.rs:368: classify_blocked_ip("10.1.2.3".parse().unwrap()),
+dra-node\src\handler.rs:372: classify_blocked_ip("172.16.0.1".parse().unwrap()),
+dra-node\src\handler.rs:376: classify_blocked_ip("172.31.255.255".parse().unwrap()),
+dra-node\src\handler.rs:380: classify_blocked_ip("192.168.1.1".parse().unwrap()),
+dra-node\src\handler.rs:384: assert_eq!(classify_blocked_ip("172.32.0.1".parse().unwrap()), None);
+dra-node\src\handler.rs:390: classify_blocked_ip("0.0.0.0".parse().unwrap()),
+dra-node\src\handler.rs:394: classify_blocked_ip("::".parse().unwrap()),
+dra-node\src\handler.rs:402: classify_blocked_ip("fd00::1".parse().unwrap()),
+dra-node\src\handler.rs:406: classify_blocked_ip("fc00::1".parse().unwrap()),
+dra-node\src\handler.rs:414: classify_blocked_ip("::ffff:127.0.0.1".parse().unwrap()),
+dra-node\src\handler.rs:418: classify_blocked_ip("::ffff:169.254.169.254".parse().unwrap()),
+dra-node\src\handler.rs:423: classify_blocked_ip("64:ff9b::a00:1".parse().unwrap()),
+dra-node\src\handler.rs:428: classify_blocked_ip("::127.0.0.1".parse().unwrap()),
+dra-node\src\handler.rs:433: classify_blocked_ip("::10.0.0.1".parse().unwrap()),
+dra-node\src\handler.rs:438: classify_blocked_ip("::ffff:0:7f00:1".parse().unwrap()),
+dra-node\src\handler.rs:443: assert_eq!(classify_blocked_ip("::8.8.8.8".parse().unwrap()), None);
+dra-node\src\handler.rs:445: classify_blocked_ip("::ffff:0:808:808".parse().unwrap()),
+dra-node\src\handler.rs:449: classify_blocked_ip("::".parse().unwrap()),
+dra-node\src\handler.rs:453: assert_eq!(classify_blocked_ip("::ffff:8.8.8.8".parse().unwrap()), None);
+dra-node\src\handler.rs:460: classify_blocked_ip("100.64.0.1".parse().unwrap()),
+dra-node\src\handler.rs:464: classify_blocked_ip("100.127.255.254".parse().unwrap()),
+dra-node\src\handler.rs:467: // 100.64/10 杈圭晫澶栦笉璇激锛?00.128.0.0 灞炲叕缃戞锛?        assert_eq!(classify_blocked_ip("100.128.0.1".parse().unwrap()), None);
+dra-node\src\handler.rs:468: assert_eq!(classify_blocked_ip("100.63.255.254".parse().unwrap()), None);
+dra-node\src\handler.rs:470: classify_blocked_ip("198.18.0.1".parse().unwrap()),
+dra-node\src\handler.rs:474: classify_blocked_ip("198.19.255.255".parse().unwrap()),
+dra-node\src\handler.rs:477: assert_eq!(classify_blocked_ip("198.20.0.1".parse().unwrap()), None);
+dra-node\src\handler.rs:479: classify_blocked_ip("224.0.0.1".parse().unwrap()),
+dra-node\src\handler.rs:483: classify_blocked_ip("239.255.255.250".parse().unwrap()),
+dra-node\src\handler.rs:487: classify_blocked_ip("240.0.0.1".parse().unwrap()),
+dra-node\src\handler.rs:491: classify_blocked_ip("255.255.255.255".parse().unwrap()),
+dra-node\src\handler.rs:495: classify_blocked_ip("223.255.255.254".parse().unwrap()),
+dra-node\src\handler.rs:504: classify_blocked_ip("192.0.2.1".parse().unwrap()),
+dra-node\src\handler.rs:508: classify_blocked_ip("198.51.100.7".parse().unwrap()),
+dra-node\src\handler.rs:512: classify_blocked_ip("203.0.113.9".parse().unwrap()),
+dra-node\src\handler.rs:516: classify_blocked_ip("192.0.0.1".parse().unwrap()),
+dra-node\src\handler.rs:520: assert_eq!(classify_blocked_ip("198.51.101.1".parse().unwrap()), None);
+dra-node\src\handler.rs:521: assert_eq!(classify_blocked_ip("203.0.114.1".parse().unwrap()), None);
+dra-node\src\handler.rs:523: classify_blocked_ip("ff02::1".parse().unwrap()),
+dra-node\src\handler.rs:527: classify_blocked_ip("2001:db8::1".parse().unwrap()),
+dra-node\src\handler.rs:534: assert_eq!(classify_blocked_ip("8.8.8.8".parse().unwrap()), None);
+dra-node\src\handler.rs:535: assert_eq!(classify_blocked_ip("1.1.1.1".parse().unwrap()), None);
+dra-node\src\handler.rs:537: classify_blocked_ip("2606:4700::1111".parse().unwrap()),
+dra-node\src\handler.rs:544: let parse = |s: &str| s.parse::<SocketAddr>().unwrap();
+dra-node\src\health.rs:155: let (headers, body) = resp.split_once("\r\n\r\n").unwrap();
+dra-node\src\health.rs:167: .unwrap()
+dra-node\src\health.rs:170: .unwrap();
+dra-node\src\health.rs:197: let a = parse_health_addr("127.0.0.1:8081").unwrap();
+dra-node\src\signal.rs:92: let mut peers = self.peers.lock().unwrap();
+dra-node\src\signal.rs:114: let mut peers = self.peers.lock().unwrap();
+dra-node\src\signal.rs:125: if let Some(e) = self.peers.lock().unwrap().get_mut(peer_id) {
+dra-node\src\signal.rs:131: let mut peers = self.peers.lock().unwrap();
+dra-node\src\signal.rs:144: let peers = self.peers.lock().unwrap();
+dra-node\src\signal.rs:150: self.peers.lock().unwrap().len()
+dra-node\src\signal.rs:419: let line = helper(&serde_json::to_value(&up).unwrap());
+dra-node\src\signal.rs:421: assert_eq!(serde_json::from_str::<SignalMessage>(&line).unwrap(), up);
+dra-node\src\signal.rs:427: let line = serde_json::to_string(&invite).unwrap();
+dra-node\src\signal.rs:429: serde_json::from_str::<SignalMessage>(&line).unwrap(),
+dra-node\src\signal.rs:437: let line = serde_json::to_string(&accept).unwrap();
+dra-node\src\signal.rs:439: serde_json::from_str::<SignalMessage>(&line).unwrap(),
+dra-node\src\signal.rs:448: let line = serde_json::to_string(&incoming).unwrap();
+dra-node\src\signal.rs:451: serde_json::from_str::<SignalDownMessage>(&line).unwrap(),
+dra-node\src\signal.rs:470: // 姝ｅ父娉ㄥ唽 + touch锛坱ouch 鍒拌繎鏈熸椂鍒伙細璺?sweep 妫€鏌ョ偣浠?50s < ttl锛?        reg.register("a", "1.1.1.1:1".parse().unwrap(), &proof, now, tx.clone())
+dra-node\src\signal.rs:471: .unwrap();
+dra-node\src\signal.rs:474: assert_eq!(reg.get("a").unwrap().0, "1.1.1.1:1".parse().unwrap());
+dra-node\src\signal.rs:478: "2.2.2.2:2".parse().unwrap(),
+dra-node\src\signal.rs:483: .unwrap();
+dra-node\src\signal.rs:485: assert_eq!(reg.get("a").unwrap().0, "2.2.2.2:2".parse().unwrap());
+dra-node\src\signal.rs:491: .register("a", "6.6.6.6:6".parse().unwrap(), &forged, now, tx.clone())
+dra-node\src\signal.rs:493: assert_eq!(reg.get("a").unwrap().0, "2.2.2.2:2".parse().unwrap());
+dra-node\src\signal.rs:499: "3.3.3.3:3".parse().unwrap(),
+dra-node\src\signal.rs:504: .unwrap();
+dra-node\src\signal.rs:510: "3.3.3.3:3".parse().unwrap(),
+dra-node\src\signal.rs:548: c_wr.write_all(serde_json::to_string(&ok).unwrap().as_bytes())
+dra-node\src\signal.rs:550: .unwrap();
+dra-node\src\signal.rs:551: c_wr.write_all(b"\n").await.unwrap();
+dra-node\src\signal.rs:561: "6.6.6.6:6".parse().unwrap(),
+dra-node\src\signal.rs:586: d_wr.write_all(serde_json::to_string(&bad).unwrap().as_bytes())
+dra-node\src\signal.rs:588: .unwrap();
+dra-node\src\signal.rs:589: d_wr.write_all(b"\n").await.unwrap();
+dra-node\src\signal.rs:594: .expect("绛?error 鍥炴墽瓒呮椂")
+dra-node\src\signal.rs:595: .expect("璇诲け璐?);
+dra-node\src\signal.rs:597: let msg: SignalDownMessage = serde_json::from_str(&line).unwrap();
+dra-node\src\signal.rs:602: other => panic!("搴旀敹鍒?error(owner_proof_invalid)锛屽疄闄?{other:?}"),
+dra-node\src\signal.rs:619: reg.register("a", "1.1.1.1:1".parse().unwrap(), &proof, now, tx1.clone())
+dra-node\src\signal.rs:620: .unwrap();
+dra-node\src\signal.rs:622: reg.register("a", "1.1.1.1:1".parse().unwrap(), &proof, now, tx2.clone())
+dra-node\src\signal.rs:623: .unwrap();
+dra-node\src\signal.rs:664: b_wr.write_all(serde_json::to_string(&reg_b).unwrap().as_bytes())
+dra-node\src\signal.rs:666: .unwrap();
+dra-node\src\signal.rs:667: b_wr.write_all(b"\n").await.unwrap();
+dra-node\src\signal.rs:678: a_wr.write_all(serde_json::to_string(&reg_a).unwrap().as_bytes())
+dra-node\src\signal.rs:680: .unwrap();
+dra-node\src\signal.rs:681: a_wr.write_all(b"\n").await.unwrap();
+dra-node\src\signal.rs:686: a_wr.write_all(serde_json::to_string(&inv).unwrap().as_bytes())
+dra-node\src\signal.rs:688: .unwrap();
+dra-node\src\signal.rs:689: a_wr.write_all(b"\n").await.unwrap();
+dra-node\src\signal.rs:695: .expect("绛?incoming 瓒呮椂")
+dra-node\src\signal.rs:696: .expect("璇诲け璐?);
+dra-node\src\signal.rs:698: let msg: SignalDownMessage = serde_json::from_str(&line).unwrap();
+dra-node\src\signal.rs:704: other => panic!("搴旀敹鍒?incoming锛屽疄闄?{other:?}"),
+dra-node\src\tcp_server.rs:581: .expect("鍙屽悜闈欓粯杈惧埌 idle 鍚?pump 搴旂粨鏉?);
+dra-node\src\udp_relay.rs:354: let expired = table.lock().unwrap().reap_expired(idle);
+dra-node\src\udp_relay.rs:385: let removed = table.lock().unwrap().remove(sid).is_some();
+dra-node\src\udp_relay.rs:426: if table.lock().unwrap().remove(session_id).is_some() {
+dra-node\src\udp_relay.rs:459: let drops = table.lock().unwrap().overlimit_drops;
+dra-node\src\udp_relay.rs:516: let t = table.lock().unwrap();
+dra-node\src\udp_relay.rs:527: table.lock().unwrap().overlimit_drops += 1;
+dra-node\src\udp_relay.rs:536: let mut t = table.lock().unwrap();
+dra-node\src\udp_relay.rs:549: let mut t = table.lock().unwrap();
+dra-node\src\udp_relay.rs:574: // 閿佸 await 瀹屾垚鍚庨噸鏂颁笂閿佸洖濉紱浜屾鏌ユ弧锛堥攣閲婃斁绐楀彛鍙兘鏈?                // 骞跺彂鏂板缓锛?                let mut t = table.lock().unwrap();
+dra-node\src\udp_relay.rs:593: table.lock().unwrap().overlimit_drops += 1;
+dra-node\src\udp_relay.rs:602: .unwrap()
+dra-node\src\udp_relay.rs:610: // 闃熷垪鍙戦€佺宸插叧闂?= 浼氳瘽浠诲姟宸叉锛坰ocket/涓嬭鍐欓敊璇€€鍑猴級銆?                    // 09-P2-2锛氬垹琛ㄩ」 + 涓嬭 close锛岄槻銆屾瘡甯?touch 浣垮洖鏀朵换鍔?                    // 姘镐笉鍒ゅ畾杩囨湡銆嶇殑鍍靛案浼氳瘽榛戞礊銆?                    let removed = table.lock().unwrap().remove(session_id).is_some();
+dra-node\src\udp_relay.rs:625: table.lock().unwrap().overlimit_drops += 1;
+dra-node\src\udp_relay.rs:729: t.insert(1, _h_fresh).unwrap();
+dra-node\src\udp_relay.rs:730: t.insert(2, h_old).unwrap();
+dra-node\src\udp_relay.rs:744: t.insert(5, h).unwrap();
+dra-node\src\udp_relay.rs:754: let p = |s: &str| s.parse::<IpAddr>().unwrap();
+dra-node\src\udp_relay.rs:801: let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+dra-node\src\udp_relay.rs:802: let addr = sock.local_addr().unwrap().to_string();
+dra-node\src\udp_relay.rs:830: write_udp_frame(&mut cli, &encode_udp_data(sid, &echo, &payload).unwrap())
+dra-node\src\udp_relay.rs:832: .unwrap();
+dra-node\src\udp_relay.rs:833: match read_udp_frame(&mut cli).await.unwrap() {
+dra-node\src\udp_relay.rs:842: other => panic!("鏈熸湜鏁版嵁甯э紝瀹為檯 {other:?}"),
+dra-node\src\udp_relay.rs:848: .unwrap();
+dra-node\src\udp_relay.rs:849: write_udp_frame(&mut cli, &encode_udp_data(1, &echo, b"re-usable").unwrap())
+dra-node\src\udp_relay.rs:851: .unwrap();
+dra-node\src\udp_relay.rs:852: match read_udp_frame(&mut cli).await.unwrap() {
+dra-node\src\udp_relay.rs:854: other => panic!("鏈熸湜鏁版嵁甯э紝瀹為檯 {other:?}"),
+dra-node\src\udp_relay.rs:873: write_udp_frame(&mut cli, &encode_udp_data(7, &echo, b"first").unwrap())
+dra-node\src\udp_relay.rs:875: .unwrap();
+dra-node\src\udp_relay.rs:876: write_udp_frame(&mut cli, &encode_udp_data(7, &echo, b"second").unwrap())
+dra-node\src\udp_relay.rs:878: .unwrap();
+dra-node\src\udp_relay.rs:879: let d1 = match read_udp_frame(&mut cli).await.unwrap() {
+dra-node\src\udp_relay.rs:881: other => panic!("{other:?}"),
+dra-node\src\udp_relay.rs:883: let d2 = match read_udp_frame(&mut cli).await.unwrap() {
+dra-node\src\udp_relay.rs:885: other => panic!("{other:?}"),
+dra-node\src\udp_relay.rs:905: write_udp_frame(&mut cli, &encode_udp_data(3, &echo, b"go").unwrap())
+dra-node\src\udp_relay.rs:907: .unwrap();
+dra-node\src\udp_relay.rs:909: read_udp_frame(&mut cli).await.unwrap(),
+dra-node\src\udp_relay.rs:915: .expect("搴斿湪绌洪棽鍚庢敹鍒颁笅琛?close")
+dra-node\src\udp_relay.rs:916: .unwrap();
+dra-node\src\udp_relay.rs:939: &encode_udp_data(9, "240.0.0.1:5353", b"x").unwrap(),
+dra-node\src\udp_relay.rs:942: .unwrap();
+dra-node\src\udp_relay.rs:971: write_udp_frame(&mut cli, &encode_udp_data(11, "8.8.8.8:53", &q).unwrap())
+dra-node\src\udp_relay.rs:973: .unwrap();
+dra-node\src\udp_relay.rs:976: // AN=NS=AR=0 / 闂鑺傞€愬瓧鑺傚洖鏄?        match read_udp_frame(&mut cli).await.unwrap() {
+dra-node\src\udp_relay.rs:992: other => panic!("鏈熸湜 NODATA 鏁版嵁甯э紝瀹為檯 {other:?}"),
+dra-node\src\udp_relay.rs:999: // 杩囨护寮€鍚椂闈?DNS 娴侀噺涓嶅彈褰卞搷锛氭櫘閫?UDP 浠嶆甯歌浆鍙戝洖鐜?        write_udp_frame(&mut cli, &encode_udp_data(12, &echo, b"plain").unwrap())
+dra-node\src\udp_relay.rs:1001: .unwrap();
+dra-node\src\udp_relay.rs:1002: match read_udp_frame(&mut cli).await.unwrap() {
+dra-node\src\udp_relay.rs:1004: other => panic!("鏈熸湜鍥炵幆鏁版嵁甯э紝瀹為檯 {other:?}"),
+dra-node\src\udp_relay.rs:1025: std::fs::create_dir_all(&dir).unwrap();
+dra-node\src\udp_relay.rs:1034: crate::server::HydraServer::new("127.0.0.1:0".parse().unwrap(), auth_key.clone(), opts)
+dra-node\src\udp_relay.rs:1036: .expect("鑺傜偣鍚姩");
+dra-node\src\udp_relay.rs:1037: let node_addr = server.tcp_listen_addr.expect("TCP 鐩戝惉鍦板潃");
+dra-node\src\udp_relay.rs:1049: .expect("UDP 閫氶亾寤虹珛");
+dra-node\src\udp_relay.rs:1053: ch.send_to(&echo_addr, payload).await.expect("send_to");
+dra-node\src\udp_relay.rs:1056: .expect("瓒呮椂鏈敹鍒板洖鍖?)
+dra-node\src\udp_relay.rs:1057: .expect("recv_from");
+dra-node\src\udp_relay.rs:1064: ch.send_to(&echo2, b"second-session").await.unwrap();
+dra-node\src\udp_relay.rs:1067: .unwrap()
+dra-node\src\udp_relay.rs:1068: .unwrap();
+dra-node\src\udp_relay.rs:1073: // 涓诲姩 close 鍚庢槧灏勮В闄?        assert!(ch.close_target(&echo2).await.unwrap());
+dra-protocol\src\auth.rs:70: assert_eq!(hex_decode("").unwrap(), Vec::<u8>::new());
+dra-protocol\src\auth.rs:71: assert_eq!(hex_decode("00ff").unwrap(), vec![0x00, 0xff]);
+dra-protocol\src\auth.rs:72: assert_eq!(hex_decode("AbCd").unwrap(), vec![0xab, 0xcd]);
+dra-protocol\src\handshake.rs:279: s_recv.read_exact(&mut vb).await.unwrap(); // 娑堣垂鐗堟湰瀛楄妭锛堢敓浜т腑鐢?handler 娑堣垂锛?            server_side(&mut s_send, &mut s_recv, &PSK, &CERT_FP, &EXPORTER).await
+dra-protocol\src\handshake.rs:282: let hc = hc.unwrap().unwrap();
+dra-protocol\src\handshake.rs:283: let hs_ = hs_.unwrap().unwrap();
+dra-protocol\src\handshake.rs:300: assert!(c.unwrap().is_err(), "瀹㈡埛绔簲鍥?confirm_s 涓嶅尮閰嶈€屽け璐?);
+dra-protocol\src\handshake.rs:301: assert!(s.unwrap().is_err(), "鑺傜偣搴斿洜 confirm_c 涓嶅尮閰嶈€屽け璐?);
+dra-protocol\src\handshake.rs:314: s_recv.read_exact(&mut vb).await.unwrap(); // 娑堣垂鐗堟湰瀛楄妭锛堢敓浜т腑鐢?handler 娑堣垂锛?            server_side(&mut s_send, &mut s_recv, &PSK, &CERT_FP, &EXPORTER).await
+dra-protocol\src\handshake.rs:317: assert!(c.unwrap().is_err());
+dra-protocol\src\handshake.rs:318: assert!(s.unwrap().is_err());
+dra-protocol\src\handshake.rs:332: s_recv.read_exact(&mut vb).await.unwrap(); // 娑堣垂鐗堟湰瀛楄妭锛堢敓浜т腑鐢?handler 娑堣垂锛?            server_side(&mut s_send, &mut s_recv, &PSK, &CERT_FP, &EXPORTER).await
+dra-protocol\src\handshake.rs:335: assert!(c.unwrap().is_err());
+dra-protocol\src\handshake.rs:336: assert!(s.unwrap().is_err());
+dra-protocol\src\handshake.rs:353: self.recorded.lock().unwrap().extend_from_slice(buf);
+dra-protocol\src\handshake.rs:384: s_recv.read_exact(&mut vb).await.unwrap(); // 娑堣垂鐗堟湰瀛楄妭锛堢敓浜т腑鐢?handler 娑堣垂锛?            server_side(&mut s_send, &mut s_recv, &PSK, &CERT_FP, &EXPORTER).await
+dra-protocol\src\handshake.rs:388: let _confirm_c = c.expect("瀹㈡埛绔彙鎵嬪簲鎴愬姛");
+dra-protocol\src\handshake.rs:389: let _confirm_s = s.expect("鏈嶅姟绔彙鎵嬪簲鎴愬姛");
+dra-protocol\src\handshake.rs:392: // 鈥斺€旀柊鏈嶅姟绔?e 鏂伴矞 鈫?hash 涓嶅悓 鈫?閲嶆斁鐨?confirm_c 蹇呬笉鍖归厤 鈫?鎷掔粷銆?        // 娑堣垂绔粨鏋勪笌鐢熶骇 handler 涓€鑷达細鍏堣鐗堟湰瀛楄妭锛屽啀杩?server_side銆?        let transcript = recorded.lock().unwrap().clone();
+dra-protocol\src\handshake.rs:399: a_recv.read_exact(&mut ver).await.unwrap();
+dra-protocol\src\handshake.rs:404: a_send.write_all(&transcript).await.unwrap();
+dra-protocol\src\handshake.rs:406: let rejected = res_rx.await.unwrap();
+dra-protocol\src\stun.rs:39: .expect("SystemRandom 涓嶅彲鐢紙OS 鐔垫簮鏁呴殰锛夆€斺€旇繘绋嬬骇鑷村懡锛宲anic 鍚堢悊");
+dra-protocol\src\stun.rs:219: _ => unreachable!(),
+dra-protocol\src\stun.rs:254: let got = parse_binding_response(&resp, &tx_id).expect("瑙ｆ瀽搴旀垚鍔?);
+dra-protocol\src\stun.rs:274: let got = parse_binding_response(&resp, &tx_id).expect("瑙ｆ瀽搴旀垚鍔?);
+dra-protocol\src\stun.rs:296: let got = parse_binding_response(&resp, &tx_id).expect("瑙ｆ瀽搴旀垚鍔?);
+dra-protocol\src\stun.rs:308: let resp = build_response(&tx_id, "1.2.3.4:80".parse().unwrap());
+dra-protocol\src\stun.rs:318: let a: SocketAddr = "203.0.113.7:40000".parse().unwrap();
+dra-protocol\src\stun.rs:321: classify(a, "203.0.113.7:40000".parse().unwrap()),
+dra-protocol\src\stun.rs:325: classify(a, "203.0.113.9:40001".parse().unwrap()),
+dra-protocol\src\stun.rs:332: let rt = tokio::runtime::Runtime::new().unwrap();
+dra-protocol\src\stun.rs:348: let rt = tokio::runtime::Runtime::new().unwrap();
+dra-protocol\src\stun.rs:352: let got = read_stun_message(&mut cursor).await.unwrap();
+dra-protocol\src\stun.rs:360: let addr: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+dra-protocol\src\tcp_frame.rs:120: let frame = encode_target("example.com:443").unwrap();
+dra-protocol\src\tcp_frame.rs:137: write_target(&mut c, "203.0.113.7:8080").await.unwrap();
+dra-protocol\src\tcp_frame.rs:139: let t = read_target(&mut s).await.unwrap();
+dra-protocol\src\tcp_frame.rs:146: c.write_all(&[0x00, 0x00]).await.unwrap(); // 闀垮害 0
+dra-protocol\src\tcp_frame.rs:151: c.write_all(&[0xFF, 0xFF]).await.unwrap(); // 瓒呬笂闄?        drop(c);
+dra-protocol\src\tcp_frame.rs:155: c.write_all(&[0x00, 0x02, 0xFF, 0xFE]).await.unwrap(); // 闈?UTF-8
+dra-protocol\src\tcp_frame.rs:169: write_reply(&mut c, code).await.unwrap();
+dra-protocol\src\udp_frame.rs:183: let frame = encode_udp_data(0x0102, "example.com:443", b"ping").unwrap();
+dra-protocol\src\udp_frame.rs:190: match decode_udp_frame(&frame).unwrap() {
+dra-protocol\src\udp_frame.rs:200: other => panic!("搴斾负鏁版嵁甯э紝瀹為檯 {other:?}"),
+dra-protocol\src\udp_frame.rs:208: match decode_udp_frame(&frame).unwrap() {
+dra-protocol\src\udp_frame.rs:210: other => panic!("搴斾负 close 甯э紝瀹為檯 {other:?}"),
+dra-protocol\src\udp_frame.rs:217: let f = encode_udp_data(1, "1.2.3.4:53", b"").unwrap();
+dra-protocol\src\udp_frame.rs:219: decode_udp_frame(&f).unwrap(),
+dra-protocol\src\udp_frame.rs:226: let f = encode_udp_data(1, "1.2.3.4:53", b"payload").unwrap();
+dra-protocol\src\udp_frame.rs:271: *f.last_mut().unwrap() = 0x7F;
+dra-protocol\src\udp_frame.rs:285: &encode_udp_data(9, "10.0.0.1:5353", b"abc").unwrap(),
+dra-protocol\src\udp_frame.rs:288: .unwrap();
+dra-protocol\src\udp_frame.rs:289: write_udp_frame(&mut c, &encode_udp_close(9)).await.unwrap();
+dra-protocol\src\udp_frame.rs:291: match read_udp_frame(&mut s).await.unwrap() {
+dra-protocol\src\udp_frame.rs:301: other => panic!("{other:?}"),
+dra-protocol\src\udp_frame.rs:304: read_udp_frame(&mut s).await.unwrap(),
+dra-client\src\lib.rs:205: // 鍏?None 鈫?搴撻粯璁わ紙10.7.0.1/30 + 80,443,8080,8443锛?        let cfg = tun_config_from_settings(None, None, &[]).unwrap();
+dra-client\src\lib.rs:210: let cfg = tun_config_from_settings(Some("  "), Some("  "), &[]).unwrap();
+dra-client\src\lib.rs:217: let cfg = tun_config_from_settings(Some("10.9.9.1/24"), Some("80, 443"), &[]).unwrap();
+dra-client\src\lib.rs:222: let cfg = tun_config_from_settings(Some("10.9.9.1"), None, &[]).unwrap();
+dra-client\src\lib.rs:236: "1.2.3.4:443".parse::<SocketAddr>().unwrap(),
+dra-client\src\lib.rs:237: "[::1]:443".parse::<SocketAddr>().unwrap(),
+dra-client\src\lib.rs:239: let cfg = tun_config_from_settings(None, None, &nodes).unwrap();
+dra-client\src\main.rs:166: node: "127.0.0.1:0".parse().unwrap(),
+dra-client\src\main.rs:176: node: "127.0.0.1:0".parse().unwrap(),
+dra-client\src\main.rs:419: .unwrap_or_else(|| "127.0.0.1:1080".parse().unwrap());
+dra-client\src\tun.rs:432: self.commands.lock().unwrap().push(line);
+dra-client\src\tun.rs:441: self.commands.lock().unwrap().push(line);
+dra-client\src\tun.rs:802: self.inbound.lock().unwrap().push_back(pkt.to_vec());
+dra-client\src\tun.rs:806: self.outbound.lock().unwrap().drain(..).collect()
+dra-client\src\tun.rs:815: let frame = self.inbound.lock().unwrap().pop_front()?;
+dra-client\src\tun.rs:855: self.queue.lock().unwrap().push_back(buf);
+dra-client\src\tun.rs:875: .expect("IP 鍦板潃琛ㄥ凡婊?);
+dra-client\src\tun.rs:883: .expect("IP 鍦板潃琛ㄥ凡婊?);
+dra-client\src\tun.rs:890: .expect("IP 鍦板潃琛ㄥ凡婊?);
+dra-client\src\tun.rs:1815: //    寮曞搴旂敤鍥炶惤 TCP銆?                        let (src, dst, _off, _len) = parse_udp_v4(pkt).unwrap();
+dra-client\src\tun.rs:2138: let front = flow.pending.front().unwrap();
+dra-client\src\tun.rs:2145: let rest = flow.pending.front().unwrap()[n..].to_vec();
+dra-client\src\tun.rs:2393: let rst = build_tcp_rst_v6(&syn).expect("SYN 搴旀瀯閫犲嚭 RST");
+dra-client\src\tun.rs:2413: &rst[8..24].try_into().unwrap(),
+dra-client\src\tun.rs:2414: &rst[24..40].try_into().unwrap(),
+dra-client\src\tun.rs:2452: &icmp[8..24].try_into().unwrap(),
+dra-client\src\tun.rs:2453: &icmp[24..40].try_into().unwrap(),
+dra-client\src\tun.rs:2494: let icmp = build_icmpv4_port_unreachable(&udp).expect("UDP 鍖呭簲鏋勯€犲嚭 ICMP");
+dra-client\src\tun.rs:2532: let iface = build_interface(&cfg, &mut dev).unwrap();
+dra-client\src\tun.rs:2759: calls = exec.calls.lock().unwrap()
+dra-client\src\tun.rs:2762: let calls = exec.calls.lock().unwrap();
+dra-client\src\tun.rs:2775: assert_eq!(exec.calls.lock().unwrap().len(), 4);
+dra-client\src\tun.rs:2784: let cmds = exec.commands.lock().unwrap();
+dra-client\src\tun.rs:2822: apply_routes(&exec, &plan).unwrap();
+dra-client\src\tun.rs:2823: assert_eq!(exec.commands.lock().unwrap().len(), 9);
+dra-client\src\tun.rs:2825: assert_eq!(exec.commands.lock().unwrap().len(), 18);
+dra-client\src\tun.rs:2826: assert!(exec.commands.lock().unwrap()[0].starts_with("Add 0.0.0.0/1"));
+dra-client\src\tun.rs:2827: assert!(exec.commands.lock().unwrap()[9].starts_with("Delete 0.0.0.0/1"));
+dra-client\src\tun.rs:2841: .unwrap()
+dra-client\src\tun.rs:2848: self.calls.lock().unwrap().push(line);
+dra-client\src\tun.rs:2857: .unwrap()
+dra-client\src\tun.rs:2864: self.calls.lock().unwrap().push(line);
+dra-client\src\tun.rs:2878: let calls = exec.calls.lock().unwrap();
+dra-client\src\tun.rs:2894: assert_eq!(exec.calls.lock().unwrap().len(), 9);
+dra-client\src\tun.rs:2898: .unwrap()
+dra-client\src\tun.rs:2947: let frame = self.inbound.lock().unwrap().pop_front()?;
+dra-client\src\tun.rs:2976: recorded.lock().unwrap().push(target);
+dra-client\src\tun.rs:2996: .unwrap();
+dra-client\src\tun.rs:3002: .unwrap();
+dra-client\src\tun.rs:3007: .unwrap();
+dra-client\src\tun.rs:3011: .unwrap();
+dra-client\src\tun.rs:3067: .unwrap();
+dra-client\src\tun.rs:3078: cin.lock().unwrap().push_back(pkt);
+dra-client\src\tun.rs:3081: let out: Vec<Vec<u8>> = cout.lock().unwrap().drain(..).collect();
+dra-client\src\tun.rs:3107: let opened_target = recorded.lock().unwrap().last().cloned();
+dra-client\src\tun.rs:3112: recorded.lock().unwrap()
+dra-client\src\tun.rs:3159: .unwrap();
+dra-client\src\tun.rs:3170: cin.lock().unwrap().push_back(pkt);
+dra-client\src\tun.rs:3172: let out: Vec<Vec<u8>> = cout.lock().unwrap().drain(..).collect();
+dra-client\src\tun.rs:3188: cin.lock().unwrap().push_back(pkt);
+dra-client\src\tun.rs:3190: let out: Vec<Vec<u8>> = cout.lock().unwrap().drain(..).collect();
+dra-client\src\tun.rs:3201: assert_eq!(recorded.lock().unwrap().len(), 1, "opener 搴斿彧琚皟鐢ㄤ竴娆?);
+dra-client\src\tun.rs:3251: recorded.lock().unwrap().push(target.clone());
+dra-client\src\tun.rs:3320: .unwrap();
+dra-client\src\tun.rs:3333: cin.lock().unwrap().push_back(pkt);
+dra-client\src\tun.rs:3335: let out: Vec<Vec<u8>> = cout.lock().unwrap().drain(..).collect();
+dra-client\src\tun.rs:3430: .unwrap();
+dra-client\src\tun.rs:3438: cin.lock().unwrap().push_back(pkt);
+dra-client\src\tun.rs:3440: let out: Vec<Vec<u8>> = cout.lock().unwrap().drain(..).collect();
+dra-client\src\tun.rs:3462: recorded.lock().unwrap().last().map(String::as_str),
+dra-client\src\tun.rs:3465: recorded.lock().unwrap()
+dra-client\src\tun.rs:3518: .unwrap();
+dra-client\src\tun.rs:3526: cin.lock().unwrap().push_back(pkt);
+dra-client\src\tun.rs:3528: let out: Vec<Vec<u8>> = cout.lock().unwrap().drain(..).collect();
+dra-client\src\tun.rs:3555: !recorded.lock().unwrap().is_empty(),
+dra-client\src\tun.rs:3593: let cmds = exec.commands.lock().unwrap();
+dra-client\src\tun.rs:3640: let cmds = exec.commands.lock().unwrap();
+dra-client\src\tun.rs:3769: let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+dra-client\src\tun.rs:3770: let echo_addr = echo.local_addr().unwrap();
+dra-client\src\tun.rs:3785: .unwrap()
+dra-client\src\tun.rs:3788: std::fs::create_dir_all(&dir).unwrap();
+dra-client\src\tun.rs:3791: "127.0.0.1:0".parse().unwrap(),
+dra-client\src\tun.rs:3801: .expect("鑺傜偣鍚姩");
+dra-client\src\tun.rs:3802: let node_addr = server.tcp_listen_addr.expect("tcp 鐩戝惉鍦板潃");
+dra-client\src\tun.rs:3842: _ => panic!("娴嬭瘯鍥炴樉 socket 搴斾负 v4"),
+dra-client\src\tun.rs:3859: in_tx.send(pkt).unwrap();
+dra-client-gui\src\config.rs:426: let json = serde_json::to_string(&cfg).unwrap();
+dra-client-gui\src\config.rs:427: let back: GuiConfig = serde_json::from_str(&json).unwrap();
+dra-client-gui\src\config.rs:433: // 绌哄璞?鈫?鍏ㄩ粯璁?        let cfg: GuiConfig = serde_json::from_str("{}").unwrap();
+dra-client-gui\src\config.rs:439: let cfg: GuiConfig = serde_json::from_str(r#"{"auth_key":"ff"}"#).unwrap();
+dra-client-gui\src\config.rs:445: serde_json::from_str(r#"{"unknown_field": 1, "hydra_mode": "obfs"}"#).unwrap();
+dra-client-gui\src\config.rs:456: .unwrap()
+dra-client-gui\src\config.rs:477: save_to_file(&path, &cfg).expect("淇濆瓨搴旀垚鍔?);
+dra-client-gui\src\config.rs:479: .expect("鍔犺浇搴旀垚鍔?)
+dra-client-gui\src\config.rs:480: .expect("搴旀湁閰嶇疆");
+dra-client-gui\src\config.rs:487: let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+dra-client-gui\src\config.rs:491: // 鍧?JSON 鈫?Err锛堜笉闈欓粯鍚炴帀锛?        std::fs::write(&path, "{not json").unwrap();
+dra-client-gui\src\config.rs:505: .unwrap()
+dra-client-gui\src\config.rs:513: save_to_file(&path, &cfg).expect("棣栨淇濆瓨搴旀垚鍔?);
+dra-client-gui\src\config.rs:515: save_to_file(&path, &cfg).expect("瑕嗙洊淇濆瓨锛坮ename 鏇挎崲锛夊簲鎴愬姛");
+dra-client-gui\src\config.rs:521: .expect("鍔犺浇搴旀垚鍔?)
+dra-client-gui\src\config.rs:522: .expect("搴旀湁閰嶇疆");
+dra-client-gui\src\config.rs:545: let key = resolve_auth_key(&cfg).expect("閰嶇疆鍐呭悎娉?hex 搴旇В鏋愭垚鍔?);
+dra-client-gui\src\config.rs:569: .unwrap()
+dra-client-gui\src\config.rs:572: std::fs::create_dir_all(&dir).unwrap();
+dra-client-gui\src\config.rs:574: std::fs::write(&cert_path, [0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+dra-client-gui\src\config.rs:580: let certs = resolve_node_certs(&cfg).expect("搴旇鍙栨垚鍔?);
+dra-client-gui\src\config.rs:601: let certs = resolve_node_certs(&cfg).expect("鍐呭祵 DER 搴旇В鐮佹垚鍔?);
+dra-client-gui\src\config.rs:606: std::fs::create_dir_all(&dir).unwrap();
+dra-client-gui\src\config.rs:608: std::fs::write(&cert_path, [0x01]).unwrap();
+dra-client-gui\src\config.rs:614: assert_eq!(resolve_node_certs(&cfg).unwrap(), vec![vec![0x01]]);
+dra-client-gui\src\config.rs:632: .unwrap();
+dra-client-gui\src\config.rs:664: let json = serde_json::to_string(&cfg).unwrap();
+dra-client-gui\src\config.rs:665: let back: GuiConfig = serde_json::from_str(&json).unwrap();
+dra-client-gui\src\config.rs:671: // 鏃х増鏈厤缃枃浠讹紙鏃?subscriptions 瀛楁锛夆啋 绌哄垪琛紝涓嶆姤閿欙紙鍚戝悗鍏煎锛?        let old: GuiConfig = serde_json::from_str(r#"{"auth_key":"ff"}"#).unwrap();
+dra-client-gui\src\config.rs:676: serde_json::from_str(r#"{"subscriptions":[{"name":"a","source":"s.txt"}]}"#).unwrap();
+dra-client-gui\src\config.rs:683: let cfg: GuiConfig = serde_json::from_str(r#"{"subscriptions":[],"unknown":1}"#).unwrap();
+dra-client-gui\src\config.rs:723: let cfg: GuiConfig = serde_json::from_str("{}").unwrap();
+dra-client-gui\src\config.rs:725: let old: GuiConfig = serde_json::from_str(r#"{"auth_key":"ff"}"#).unwrap();
+dra-client-gui\src\config.rs:732: let json = serde_json::to_string(&cfg).unwrap();
+dra-client-gui\src\config.rs:733: let back: GuiConfig = serde_json::from_str(&json).unwrap();
+dra-client-gui\src\config.rs:747: let back: GuiConfig = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+dra-client-gui\src\config.rs:757: let old: GuiConfig = serde_json::from_str(r#"{"auth_key":"ff"}"#).unwrap();
+dra-client-gui\src\config.rs:798: std::fs::create_dir_all(&dir).unwrap();
+dra-client-gui\src\config.rs:801: std::fs::write(&a, [0xAA]).unwrap();
+dra-client-gui\src\config.rs:802: std::fs::write(&b, [0xBB]).unwrap();
+dra-client-gui\src\config.rs:820: // 鎸夎妭鐐归『搴忕嫭绔嬫敹闆?        let certs = resolve_node_certs_for_nodes(&cfg, &cfg.node_addrs).unwrap();
+dra-client-gui\src\config.rs:846: cfg3.node_cert_paths.get("10.0.0.9:9999").unwrap(),
+dra-client-gui\src\config.rs:851: // serde 寰€杩?        let back: GuiConfig = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+dra-client-gui\src\config.rs:860: std::fs::create_dir_all(&dir).unwrap();
+dra-client-gui\src\config.rs:862: std::fs::write(&p, [0x01]).unwrap();
+dra-client-gui\src\config.rs:942: assert_eq!(cfg.node_names.get("10.0.0.1:4433").unwrap(), "瀹堕噷鑺傜偣");
+dra-client-gui\src\config.rs:944: let json = serde_json::to_string(&cfg).unwrap();
+dra-client-gui\src\config.rs:945: let back: GuiConfig = serde_json::from_str(&json).unwrap();
+dra-client-gui\src\config.rs:949: let old: GuiConfig = serde_json::from_str(r#"{"auth_key":"ff"}"#).unwrap();
+dra-client-gui\src\config.rs:992: assert_eq!(cfg.node_names.get("10.0.0.9:9999").unwrap(), "鏃у悕");
+dra-client-gui\src\groups.rs:235: .expect("0.0.0.0:port 蹇呯劧鍙В鏋?),
+dra-client-gui\src\groups.rs:357: let result = import_share_links_as_group(&mut cfg, "鍒嗕韩瀵煎叆1", &text).unwrap();
+dra-client-gui\src\groups.rs:435: import_share_links_as_group(&mut cfg, "鍒嗕韩瀵煎叆1", &text).unwrap();
+dra-client-gui\src\groups.rs:442: .unwrap();
+dra-client-gui\src\groups.rs:460: let url = build_form_share_url("43.133.91.218", "443", "", "").unwrap();
+dra-client-gui\src\groups.rs:461: let parsed = ShareLink::from_share_url(&url).unwrap();
+dra-client-gui\src\groups.rs:473: // 鍩熷悕鍦板潃锛歋ocketAddr 瑙ｆ瀽涓嶈 鈫?鍩熷悕:port 褰㈠紡鐓у父杩涢摼鎺?        let url = build_form_share_url("  node.example.com ", "8443", "", "").unwrap();
+dra-client-gui\src\groups.rs:474: let parsed = ShareLink::from_share_url(&url).unwrap();
+dra-client-gui\src\groups.rs:495: let url = build_form_share_url("10.0.0.9", "443", &hex, "").unwrap();
+dra-client-gui\src\groups.rs:496: let parsed = ShareLink::from_share_url(&url).unwrap();
+dra-client-gui\src\groups.rs:497: assert_eq!(parsed.auth_key_bytes().unwrap().unwrap(), {
+dra-client-gui\src\groups.rs:500: v.push(u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap());
+dra-client-gui\src\groups.rs:513: std::fs::create_dir_all(&dir).unwrap();
+dra-client-gui\src\groups.rs:516: std::fs::write(&cert_path, &der).unwrap();
+dra-client-gui\src\groups.rs:518: build_form_share_url("10.0.0.9", "443", "", &cert_path.display().to_string()).unwrap();
+dra-client-gui\src\groups.rs:519: let parsed = ShareLink::from_share_url(&url).unwrap();
+dra-client-gui\src\groups.rs:520: assert_eq!(parsed.cert_der_bytes().unwrap().unwrap(), der);
+dra-client-gui\src\groups.rs:527: // 绔埌绔細琛ㄥ崟 鈫?鏋勯€犻摼鎺?鈫?import_share_links_as_group 鍒涘缓鍒嗙粍锛堝鐢ㄥ叏閮ㄥ垎缁勯€昏緫锛?        let url = build_form_share_url("10.4.0.7", "9443", "", "").unwrap();
+dra-client-gui\src\groups.rs:529: let result = import_share_links_as_group(&mut cfg, "鍒嗕韩瀵煎叆1", &url).unwrap();
+dra-client-gui\src\groups.rs:540: .unwrap();
+dra-client-gui\src\groups.rs:577: // 绔埌绔細琛ㄥ崟瀛楁 鈫?build_form_share_url 鏋勯€犻摼鎺?鈫?鍒涘缓鍛藉悕鍒嗙粍銆屾墜鍔ㄨ妭鐐?銆?        // 鈫?鑺傜偣杩涘垪琛?鈫?缁勮鍥惧彲鎸夎鍒嗙粍杩囨护锛堢粍鑳藉姏瀵硅〃鍗曞垱寤虹殑鍒嗙粍閫氱敤锛?        let url = build_form_share_url("10.5.0.9", "443", "", "").unwrap();
+dra-client-gui\src\groups.rs:579: let result = import_share_links_as_group(&mut cfg, "鎵嬪姩鑺傜偣1", &url).unwrap();
+dra-client-gui\src\groups.rs:625: let url = build_form_share_url("10.5.0.10", "443", "", "").unwrap();
+dra-client-gui\src\node_test.rs:217: let first = it.next().expect("闈炵┖闃熷垪蹇呮湁棣栧厓绱?);
+dra-client-gui\src\probe.rs:9: .expect("鍒涘缓鎺㈡祴 tokio 杩愯鏃跺け璐?)
+dra-client-gui\src\proxy_control.rs:243: let rt = tokio::runtime::Runtime::new().unwrap();
+dra-client-gui\src\proxy_control.rs:276: .expect("TUN 宸插惎鐢ㄦ椂鍋滄満浠ょ墝蹇呴』瀛樺湪");
+dra-client-gui\src\proxy_control.rs:328: // 07-P2-5锛氬繀椤诲尯鍒?Empty 涓?Disconnected鈥斺€擡mpty = 缁撴灉灏氭湭浜х敓锛屼繚鐣?        // receiver 涓嬪抚鍐嶆敹锛汥isconnected = 浠ｇ悊绾跨▼鍦ㄥ氨缁俊鍙峰彂鍑哄墠宸查€€鍑?        //锛堝 Runtime::new().unwrap() panic锛夛紝鑻ュ悶鎺夊垯 proxy_starting 鎭掍负 true锛?        // 銆屽惎鍔ㄤ唬鐞嗐€嶆寜閽粠姝ゆ案涔呭懡涓棭閫€鍒嗘敮锛屾棤娉曞啀娆″惎鍔ㄣ€?        // 瀹℃煡淇锛氭瘡杞竴娆℃€ф帓绌洪€氶亾鈥斺€旀鍓嶅彧娑堣垂涓€鏉″氨涓㈠純 receiver锛?        // 鍚屽抚鍐呴殢鍚庡埌杈剧殑娑堟伅锛堝吀鍨嬶細TUN 鍚姩澶辫触鏍瑰洜绱ц窡灏辩华/澶辫触淇″彿锛?        // 浼氳闈欓粯涓㈠純锛屾晠闅滃畾浣嶇嚎绱涪澶便€?        let mut messages: Vec<std::result::Result<std::net::SocketAddr, std::io::Error>> =
+dra-client-gui\src\proxy_control.rs:683: .expect("缁戝畾涓存椂绔彛澶辫触")
+dra-client-gui\src\proxy_control.rs:685: .expect("璇诲彇涓存椂绔彛澶辫触")
+dra-client-gui\src\proxy_control.rs:701: .expect("bound_addr 鏈湪 3s 鍐呭氨缁紙闂 2 鍥炲綊锛?)
+dra-client-gui\src\proxy_control.rs:702: .expect("闃诲鎺ユ敹浠诲姟澶辫触")
+dra-client-gui\src\proxy_control.rs:703: .expect("recv 澶辫触");
+dra-client-gui\src\proxy_control.rs:706: Err(e) => panic!("鍚姩澶辫触淇″彿: {e}"),
+dra-client-gui\src\proxy_control.rs:727: .unwrap_or_else(|_| panic!("绗?{round} 杞?bound_addr 鏈湪 3s 鍐呭氨缁?))
+dra-client-gui\src\proxy_control.rs:728: .expect("闃诲鎺ユ敹浠诲姟澶辫触")
+dra-client-gui\src\proxy_control.rs:729: .expect("recv 澶辫触");
+dra-client-gui\src\proxy_control.rs:732: Err(e) => panic!("绗?{round} 杞惎鍔ㄥけ璐ヤ俊鍙? {e}"),
+dra-client-gui\src\proxy_control.rs:764: .expect("骞跺彂璐熻浇涓?bound_addr 鏈湪 3s 鍐呭氨缁?)
+dra-client-gui\src\proxy_control.rs:765: .expect("闃诲鎺ユ敹浠诲姟澶辫触")
+dra-client-gui\src\proxy_control.rs:766: .expect("recv 澶辫触");
+dra-client-gui\src\qr.rs:81: let (cells, size) = qr_matrix(url).expect("鍚堟硶 URL 搴旂紪鐮佹垚鍔?);
+dra-client-gui\src\qr.rs:87: let img = qr_color_image(url).unwrap();
+dra-client-gui\src\qr.rs:101: let (cells, size) = qr_matrix(url).unwrap();
+dra-client-gui\src\qr.rs:129: .expect("PNG 缂栫爜搴旀垚鍔?);
+dra-client-gui\src\qr.rs:130: let decoded = decode_qr_from_bytes(png_buf.get_ref()).expect("搴斾粠 PNG 瑙ｇ爜鍑轰簩缁寸爜");
+dra-client-gui\src\qr.rs:137: let (cells, size) = qr_matrix(url).unwrap();
+dra-client-gui\src\qr.rs:166: .unwrap();
+dra-client-gui\src\qr.rs:167: let decoded = decode_qr_from_bytes(png_buf.get_ref()).expect("缂╁浘鍚庝粛搴旇В鐮佹垚鍔?);
+dra-client-gui\src\qr.rs:182: .unwrap();
+dra-client-gui\src\subscription.rs:121: .unwrap()
+dra-client-gui\src\subscription.rs:124: std::fs::create_dir_all(&dir).unwrap();
+dra-client-gui\src\subscription.rs:128: std::fs::write(&path, body).unwrap();
+dra-client-gui\src\subscription.rs:135: .unwrap();
+dra-client-gui\src\subscription.rs:163: .unwrap();
+dra-client-gui\src\subscription.rs:204: .unwrap()
+dra-client-gui\src\subscription.rs:207: std::fs::create_dir_all(&dir).unwrap();
+dra-client-gui\src\subscription.rs:210: std::fs::write(&path, body).unwrap();
+dra-client-gui\src\subscription.rs:214: fetch_subscription(path.to_str().unwrap(), SUBSCRIPTION_FETCH_TIMEOUT).unwrap();
+dra-client-gui\src\subscription.rs:222: .unwrap();
+dra-client-gui\src\subscription.rs:227: fetch_subscription(missing.to_str().unwrap(), SUBSCRIPTION_FETCH_TIMEOUT).unwrap_err();
+dra-android\src\lib.rs:340: // opener/udp 宸ュ巶锛氬鐢?ProxyServer 鐨勫嚟鎹笌璋冨害鍣紙涓?start鈥斺€斾笉鐩戝惉鏈湴绔彛锛?    let proxy = hydra_core::proxy::ProxyServer::new("127.0.0.1:0".parse().unwrap())
+dra-android\src\lib.rs:623: .unwrap()
+dra-android\src\lib.rs:633: .expect("鍚姩搴旀垚鍔燂紙缁戝畾 127.0.0.1 闅忔満绔彛锛?);
+dra-android\src\lib.rs:634: let bound = e.bound_addr().expect("鍚姩鍚庡簲鏈夌洃鍚湴鍧€");
+dra-android\src\lib.rs:638: let s = e.stats().expect("杩愯涓?stats 鍙煡");
+dra-fetch\src\download.rs:73: &mut self.state.lock().unwrap(),
+dra-fetch\src\download.rs:91: *self.fatal.lock().unwrap() = Some(msg);
+dra-fetch\src\download.rs:97: self.fatal.lock().unwrap().clone()
+dra-fetch\src\download.rs:140: let s = shared.state.lock().unwrap();
+dra-fetch\src\download.rs:441: st = shared.state.lock().unwrap().clone();
+dra-fetch\src\engine.rs:169: let (_, stream) = tunnel.as_mut().expect("涓婃柟宸插缓闅ч亾");
+dra-fetch\src\http.rs:296: let h = parse_response_head(raw).unwrap();
+dra-fetch\src\http.rs:307: parse_response_head(chunked).unwrap().body_kind,
+dra-fetch\src\http.rs:311: assert_eq!(parse_response_head(eof).unwrap().body_kind, BodyKind::Eof);
+dra-fetch\src\http.rs:332: let s = String::from_utf8(req).unwrap();
+dra-fetch\src\http.rs:339: .unwrap()
+dra-fetch\src\http.rs:347: let (head, prefix) = read_response_head(&mut stream).await.unwrap();
+dra-fetch\src\http.rs:357: let (head, prefix) = read_response_head(&mut stream).await.unwrap();
+dra-fetch\src\http.rs:364: let n = reader.read(&mut buf).await.unwrap();
+dra-fetch\src\http.rs:379: let (head, prefix) = read_response_head(&mut stream).await.unwrap();
+dra-fetch\src\http.rs:384: let n = reader.read(&mut buf).await.unwrap();
+dra-fetch\src\http.rs:397: let (head, prefix) = read_response_head(&mut stream).await.unwrap();
+dra-fetch\src\http.rs:402: let n = reader.read(&mut buf).await.unwrap();
+dra-fetch\src\sha256.rs:57: tokio::fs::create_dir_all(&dir).await.unwrap();
+dra-fetch\src\sha256.rs:59: tokio::fs::write(&p, b"abc").await.unwrap();
+dra-fetch\src\sha256.rs:60: assert_eq!(file_sha256_hex(&p).await.unwrap(), bytes_sha256_hex(b"abc"));
+dra-fetch\src\sha256.rs:61: tokio::fs::remove_dir_all(&dir).await.unwrap();
+dra-fetch\src\state.rs:130: tokio::fs::create_dir_all(&dir).await.unwrap();
+dra-fetch\src\state.rs:133: st.save(&path).await.unwrap();
+dra-fetch\src\state.rs:134: let loaded = FetchState::load(&path).await.unwrap().unwrap();
+dra-fetch\src\state.rs:137: tokio::fs::remove_dir_all(&dir).await.unwrap();

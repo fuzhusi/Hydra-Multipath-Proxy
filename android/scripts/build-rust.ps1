@@ -1,4 +1,4 @@
-﻿# 交叉编译 libhydra_android.so → android/app/src/main/jniLibs/{abi}/（Windows 版）
+# 交叉编译 libhydra_android.so → android/app/src/main/jniLibs/{abi}/（Windows 版）
 # 依赖：cargo-ndk（cargo install cargo-ndk）+ NDK。缺 cargo-ndk 时打印提示并以 0 退出。
 $ErrorActionPreference = "Stop"
 $root = Join-Path $PSScriptRoot "..\.."
@@ -24,7 +24,9 @@ if (-not $ndkDirs) {
     exit 0
 }
 
-$out = "android/app/src/main/jniLibs"
+# 输出必须用绝对路径（$root = 仓库根）：Gradle 调本脚本时 CWD 是 android/scripts/
+# 而非仓库根，相对路径会把 .so 写进 android/scripts/android/ 嵌套目录（审查修复）
+$out = Join-Path $root "android/app/src/main/jniLibs"
 New-Item -ItemType Directory -Force -Path "$out/arm64-v8a", "$out/x86_64" | Out-Null
 
 cargo ndk -t arm64-v8a -t x86_64 -o $out build -p hydra-android --release

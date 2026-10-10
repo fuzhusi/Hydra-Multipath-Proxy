@@ -43,7 +43,21 @@ import java.util.Base64
 object VpnProtectHolder {
     @Volatile
     var handler: ((Long) -> Boolean)? = null
-    fun protect(fd: Long): Boolean = handler?.invoke(fd) ?: false
+
+    /**
+     * 是否有活动 TUN（评审 SEC-01 修复）：VPN 建立后 true，销毁/停止后 false。
+     * Rust 钩子进程级 OnceLock 固化、永不撤销——本地代理模式（无 TUN）下复用
+     * 最后一次 VPN 会话的 handler 时，无 TUN 即无回环风险，protect 异常/失败
+     * 应**放行**（fail-open）；VPN 活动时 protect 失败才必须 fail-closed。
+     */
+    @Volatile
+    var vpnActive: Boolean = false
+
+    fun protect(fd: Long): Boolean {
+        val h = handler ?: return false
+        if (!vpnActive) return true // 无 TUN：零回环风险（SEC-01）
+        return runCatching { h(fd) }.getOrDefault(false)
+    }
 }
 
 class HydraVpnService : VpnService() {
@@ -101,6 +115,27 @@ class HydraVpnService : VpnService() {
                     }
                     stopVpnLocal()
                     return@launch
+                }
+                // 审查 SEC-02 修复：数据面死亡路径在 stopVpn() **之前**先建立
+                // 黑洞 TUN 维持阻断——否则 stopVpn 关闭 Rust runtime → TUN fd
+                // 释放 → 路由回落物理网卡，2-10s 退避窗口内真实 IP 明文直连
+                // （kill switch「防泄漏」承诺失效）。establish 是 Android 系统
+                // API 而非 Rust FFI，符合本回调「禁同步 FFI」硬约束。
+                if (!userStopRequested && generation.get() == startGen && holdTun == null) {
+                    val cfg = runCatching { SecureStore(this@HydraVpnService).load() }.getOrNull()
+                    if (cfg?.vpnKillSwitch == true) {
+                        var myHold = runCatching { establish(cfg) }.getOrNull()
+                        if (myHold == null && cfg.appFilterMode != SecureStore.APP_FILTER_ALL) {
+                            // 分应用过滤建立失败：回退全量阻断（防泄漏优先）
+                            myHold = runCatching {
+                                establish(cfg.copy(appFilterMode = SecureStore.APP_FILTER_ALL))
+                            }.getOrNull()
+                        }
+                        holdTun = myHold
+                        if (myHold != null) {
+                            EngineState.addLog("🛡 kill switch：数据面中断——已阻断流量防泄漏")
+                        }
+                    }
                 }
                 // 先清 Rust 死句柄（run_stack 已返回但 VPN_STATE 仍占位——
                 // 不清则 start_vpn 报"已在运行"永远失败）
@@ -224,9 +259,12 @@ class HydraVpnService : VpnService() {
                     if (pfd != null) {
                         val fd = pfd.detachFd() // 所有权移交 Rust（drop 时关闭）
                         // R4 防环回：每个出站 socket connect 前回调 protect(fd)，
-                        // 失败即中止该连接（放行 = 流量被自身 TUN 捕获回环）
+                        // 失败即中止该连接（放行 = 流量被自身 TUN 捕获回环）。
+                        // vpnActive 守卫见 VpnProtectHolder（SEC-01：无 TUN 放行）
+                        VpnProtectHolder.vpnActive = true
                         VpnProtectHolder.handler = { f ->
-                            runCatching { this@HydraVpnService.protect(f.toInt()) }.getOrDefault(false)
+                            runCatching { this@HydraVpnService.protect(f.toInt()) }
+                                .getOrDefault(false)
                         }
                         val protect = object : SocketProtect {
                             override fun protect(fd: Long): Boolean = VpnProtectHolder.protect(fd)
@@ -403,6 +441,7 @@ class HydraVpnService : VpnService() {
         userStopRequested = true
         retryJob?.cancel()           // 打断退避等待
         releaseHoldTun()             // 用户显式停止 = 恢复直连（kill switch 不拦用户）
+        VpnProtectHolder.vpnActive = false // SEC-01：无 TUN 后 protect 放行（本地模式不受残留钩子影响）
         scope.launch(Dispatchers.IO) {
             runCatching { stopVpn() }
             EngineState.addLog("■ 全局 VPN 已停止")
@@ -445,7 +484,11 @@ class HydraVpnService : VpnService() {
         retryJob?.cancel()
         releaseHoldTun()
         scope.cancel()
-        VpnProtectHolder.handler = null
+        // 审查 SEC-01 修复：handler 不置空——Rust 钩子进程级 OnceLock 固化，
+        // 置空后本地代理模式的出站连接仍命中钩子且 protect 恒 false = 全部
+        // 被中止（断网）。改为仅撤 active 标志：VpnProtectHolder.protect 在
+        // 无 TUN 时直接放行（零回环风险），VPN 重启时重装活实例 handler。
+        VpnProtectHolder.vpnActive = false
         EngineState.update {
             it.copy(running = false, transition = null, boundAddr = null,
                 sentBytes = 0, receivedBytes = 0, activeConns = 0,
