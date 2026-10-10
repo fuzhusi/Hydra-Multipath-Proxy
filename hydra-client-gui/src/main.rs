@@ -251,7 +251,13 @@ async fn main() -> eframe::Result<()> {
         match hydra_client::acquire_instance_guard(hydra_client::INSTANCE_PORT_GUI) {
             Ok(g) => Some(g),
             Err(e) => {
-                eprintln!("Hydra GUI 无法启动：{e}");
+                // 双击启动无控制台，stderr 不可见——弹对话框明示原因
+                // （rfd MessageDialog：同步阻塞直到用户点确定，随后退出）
+                rfd::MessageDialog::new()
+                    .set_title("Hydra 无法启动")
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_description(format!("Hydra GUI 无法启动：{e}"))
+                    .show();
                 std::process::exit(1);
             }
         };

@@ -430,10 +430,15 @@ impl HydraApp {
                 TrayCommand::StartProxy => self.start_proxy(),
                 TrayCommand::StopProxy => self.stop_proxy(),
                 TrayCommand::Quit => {
-                    // 真退出：停代理并带超时等待线程退出（含 TUN 停机 + 路由清理，
-                    // 见 shutdown_and_wait_for_exit）再关闭窗口；on_exit 兜底落盘
-                    self.shutdown_and_wait_for_exit();
+                    // 退出信号先发（UI 立即响应，不再阻塞 5s 等代理线程——
+                    // Windows 会把无重绘的窗口判为无响应）；代理停机/TUN 路由
+                    // 清理由 on_exit 的 shutdown_and_wait_for_exit 兜底完成
+                    // （run_native 退出时必调，进程在清理后才真正结束）
                     self.really_quit = true;
+                    self.stop_proxy();
+                    if let Some(token) = &self.tun_shutdown {
+                        token.cancel();
+                    }
                     self.add_log("正在退出 Hydra...".to_string());
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
