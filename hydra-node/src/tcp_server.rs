@@ -209,8 +209,11 @@ pub async fn spawn_tcp_listener(
                     let Some(ip_guard) = PerIpGuard::acquire(&per_ip_map, peer.ip(), per_ip_limit)
                     else {
                         debug!("per-IP connection limit reached for {}, dropping", peer);
-                        crate::metrics::metrics()
-                            .conn_rejected
+                        let m = crate::metrics::metrics();
+                        m.conn_rejected
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        m.rejected
+                            .per_ip
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     };
@@ -219,8 +222,11 @@ pub async fn spawn_tcp_listener(
                     let Ok(permit) = sem.clone().try_acquire_owned() else {
                         debug!("Connection limit reached, dropping incoming {}", peer);
                         drop(ip_guard);
-                        crate::metrics::metrics()
-                            .conn_rejected
+                        let m = crate::metrics::metrics();
+                        m.conn_rejected
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        m.rejected
+                            .capacity
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     };
@@ -234,10 +240,14 @@ pub async fn spawn_tcp_listener(
                         let _ip_guard = ip_guard; // 连接结束自动递减 per-IP 计数
                         let _permit = permit; // 连接结束自动归还
                                               // TLS 握手超时：认证前 slowloris 防护（超时静默 drop，语义不变）
+                        let tls_hs_start = std::time::Instant::now();
                         match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
                             .await
                         {
                             Ok(Ok(tls)) => {
+                                crate::metrics::metrics().hs_tls.observe(
+                                    tls_hs_start.elapsed().as_secs_f64(),
+                                );
                                 handle_tls_stream(
                                     tls,
                                     handler,
@@ -250,9 +260,23 @@ pub async fn spawn_tcp_listener(
                             }
                             Ok(Err(e)) => {
                                 // 握手失败（扫描/探测）不回显任何信息，仅 debug 记录
-                                debug!("TLS handshake from {} failed: {}", peer, e)
+                                debug!("TLS handshake from {} failed: {}", peer, e);
+                                let m = crate::metrics::metrics();
+                                m.conn_rejected
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                m.rejected
+                                    .tls
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
-                            Err(_) => debug!("TLS handshake from {} timed out", peer),
+                            Err(_) => {
+                                debug!("TLS handshake from {} timed out", peer);
+                                let m = crate::metrics::metrics();
+                                m.conn_rejected
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                m.rejected
+                                    .tls
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                     });
                 }
@@ -297,6 +321,10 @@ async fn handle_tls_stream(
         Ok(Ok(_)) if version[0] == TCP_VERSION_BYTE && handler.auth_mode().accepts_v3() => {}
         _ => {
             debug!("TCP stream bad version byte or v3 disabled");
+            crate::metrics::metrics()
+                .rejected
+                .auth
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // 反代静态页回退：任何非代理流量都得到同一页面（标准反代行为，
             // 不要求输入构成合法 HTTP 请求）。受 AUTH_TIMEOUT 读超时与连接
             // 额度保护；TLS 握手已建立故可承载响应。
@@ -326,6 +354,7 @@ async fn handle_tls_stream(
     let (mut rd, mut wr) = tokio::io::split(tls);
 
     // ── 第 3 步：Noise-PSK 握手（失败 = 静默关流，含重放/篡改/PSK 不一致）
+    let noise_start = std::time::Instant::now();
     let hs = tokio::time::timeout(
         AUTH_TIMEOUT,
         handshake::server_side(
@@ -338,12 +367,20 @@ async fn handle_tls_stream(
     )
     .await;
     match hs {
-        Ok(Ok(_)) => {}
+        Ok(Ok(_)) => {
+            crate::metrics::metrics().hs_noise.observe(
+                noise_start.elapsed().as_secs_f64(),
+            );
+        }
         Ok(Err(e)) => {
             // 审查 P2：握手失败点可能已写出部分 Noise 二进制消息（如 msg2 已发
             // 出后 msg3 校验失败）——此时回退 HTTP 页会拼成「二进制+HTTP」混合
             // 流，反而构成可区分指纹。故握手失败一律静默关流，不参与回退页。
             debug!("TCP Noise handshake failed: {}", e);
+            crate::metrics::metrics()
+                .rejected
+                .auth
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         Err(_) => {
@@ -486,6 +523,10 @@ async fn handle_tls_stream(
         )
     };
     let (up, down) = (c2t.unwrap_or(0), t2c.unwrap_or(0));
+    // Metrics v2：字节汇入（热路径仅连接关闭时两次原子加）
+    let m = crate::metrics::metrics();
+    m.bytes_in.fetch_add(up, std::sync::atomic::Ordering::Relaxed);
+    m.bytes_out.fetch_add(down, std::sync::atomic::Ordering::Relaxed);
     info!(
         "TCP connection to {} closed (Client->Target: {} bytes, Target->Client: {} bytes)",
         mask_target(&target),

@@ -199,6 +199,28 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    // 薄封装：无捎带载荷（nat.rs P2P 路径）；完整握手在 with_payload 内
+    client_side_with_payload(send, recv, psk, cert_fp, exporter, None).await
+}
+
+/// 带捎带载荷的握手变体（内核优化 #3，RTT 压缩）：`piggyback = Some(bytes)`
+/// 时 confirm_c 与载荷**合并一次写**——载荷（如目标地址帧）提前 1 RTT 到达
+/// 节点（节点在写完 confirm_s 后即读目标帧，TCP 字节流下合并写完全兼容）。
+/// 安全性不变：载荷只暴露给已通过 msg2 AEAD tag 认证（持 PSK）的对端；
+/// confirm_s 校验失败仍整体弃连（节点不会为未认证连接执行载荷）。
+/// `None` = 原行为（nat.rs P2P 路径无载荷可捎带）。
+pub async fn client_side_with_payload<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    psk: &[u8],
+    cert_fp: &[u8; 32],
+    exporter: &[u8; 32],
+    piggyback: Option<&[u8]>,
+) -> Result<[u8; 32]>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
     let mut hs = build(psk, true)?;
 
     // [0x03][msg1]
@@ -222,13 +244,26 @@ where
     hs.read_message(&msg2, &mut buf)
         .map_err(|e| err(&format!("read msg2: {e}")))?;
 
-    // confirm_c
+    // confirm_c（+ 可选捎带载荷，合并一次写省 1 RTT）
     let mut hh = [0u8; 32];
     hh.copy_from_slice(hs.get_handshake_hash());
     let confirm_c = derive_confirm(&hh, cert_fp, exporter, INFO_C2S)?;
-    send.write_all(&confirm_c)
-        .await
-        .map_err(|e| err(&format!("send confirm: {e}")))?;
+    match piggyback {
+        Some(payload) => {
+            let mut combined =
+                Vec::with_capacity(confirm_c.len() + payload.len());
+            combined.extend_from_slice(&confirm_c);
+            combined.extend_from_slice(payload);
+            send.write_all(&combined)
+                .await
+                .map_err(|e| err(&format!("send confirm+payload: {e}")))?;
+        }
+        None => {
+            send.write_all(&confirm_c)
+                .await
+                .map_err(|e| err(&format!("send confirm: {e}")))?;
+        }
+    }
 
     // confirm_s
     let mut confirm_s = [0u8; CONFIRM_LEN];

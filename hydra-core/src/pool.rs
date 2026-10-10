@@ -25,9 +25,13 @@ use std::time::{Duration, Instant};
 
 use crate::tcp_transport::TcpNodeStream;
 
-/// 每节点空闲温连接上限（浏览器对同一节点并发通常 ≤2；上限 2 平衡命中率和
-/// 节点侧闲置连接驻留）
-pub const IDLE_CAP_PER_NODE: usize = 2;
+/// 每节点空闲温连接基础上限（内核优化 #7 弹性化：实际 cap =
+/// clamp(BASE, 近期并发峰值 EWMA, MAX)——突发期自动抬升水位，静默期衰减回落）
+pub const IDLE_CAP_BASE: usize = 2;
+/// 弹性上限（突发命中需要；节点余量充足 per-IP 256/全局 1000，8/节点可忽略）
+pub const IDLE_CAP_MAX: usize = 8;
+/// 兼容别名（replenish 等调用点沿用）
+pub const IDLE_CAP_PER_NODE: usize = IDLE_CAP_BASE;
 /// 温连接空闲寿命：checkout 时惰性淘汰（节点侧连接空闲看门狗 300s，60s 内
 /// 复用不会撞上）
 pub const IDLE_TTL: Duration = Duration::from_secs(60);
@@ -41,6 +45,9 @@ struct Entry<S> {
 /// 泛型参数仅为可测试性（默认 [`TcpNodeStream`]，测试注入 Duplex 流）。
 pub struct ChannelPool<S = TcpNodeStream> {
     inner: Mutex<HashMap<SocketAddr, Vec<Entry<S>>>>,
+    /// 每节点近期并发需求（checkout 未命中次数的 60s 滑窗 EWMA）——
+    /// 弹性 cap 驱动（内核优化 #7）
+    peak: Mutex<HashMap<SocketAddr, f64>>,
 }
 
 impl<S> ChannelPool<S> {
@@ -50,14 +57,54 @@ impl<S> ChannelPool<S> {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            peak: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 节点当前弹性 cap：clamp(BASE, peak EWMA, MAX)。
+    /// peak 在 checkout 未命中时 +1（EWMA 抬升），checkin 命中时缓慢衰减。
+    fn cap_for(&self, node: SocketAddr) -> usize {
+        let peak = self
+            .peak
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&node)
+            .copied()
+            .unwrap_or(0.0);
+        (IDLE_CAP_BASE as f64)
+            .max(peak.ceil())
+            .min(IDLE_CAP_MAX as f64) as usize
+    }
+
+    /// 记录一次 checkout 未命中（需求信号）：EWMA 抬升
+    fn note_miss(&self, node: SocketAddr) {
+        let mut m = self.peak.lock().unwrap_or_else(|p| p.into_inner());
+        let cur = m.get(&node).copied().unwrap_or(0.0);
+        // EWMA α=0.5：突发快速抬升
+        m.insert(node, cur * 0.5 + (cur + 1.0) * 0.5);
+    }
+
+    /// 记录一次成功交付：缓慢衰减（静默期 cap 回落至 BASE）
+    fn note_hit(&self, node: SocketAddr) {
+        let mut m = self.peak.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(cur) = m.get_mut(&node) {
+            *cur = (*cur - IDLE_CAP_BASE as f64).max(0.0) * 0.95 + IDLE_CAP_BASE as f64;
+            if *cur <= IDLE_CAP_BASE as f64 + 0.1 {
+                m.remove(&node);
+            }
         }
     }
 
     /// 取出一根温连接：头部弹出，途中淘汰过期项（drop 即关闭）。
-    /// 池空/该节点无温连接 → None（调用方回退全新握手）。
+    /// 池空/该节点无温连接 → None（调用方回退全新握手；未命中记录进
+    /// 峰值 EWMA，弹性 cap 随需求抬升）。
     pub fn checkout(&self, node: SocketAddr) -> Option<S> {
         let mut m = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let mut slot = m.remove(&node)?;
+        let Some(mut slot) = m.remove(&node) else {
+            drop(m);
+            self.note_miss(node);
+            return None;
+        };
         let now = Instant::now();
         while let Some(e) = slot.first() {
             if now.duration_since(e.warmed_at) < IDLE_TTL {
@@ -73,14 +120,17 @@ impl<S> ChannelPool<S> {
         if !slot.is_empty() {
             m.insert(node, slot);
         }
+        drop(m);
+        self.note_hit(node);
         out
     }
 
-    /// 归还温连接；达上限即丢弃关闭（超出部分直接 drop）。
+    /// 归还温连接；达弹性上限即丢弃关闭（超出部分直接 drop）。
     pub fn checkin(&self, node: SocketAddr, stream: S) {
+        let cap = self.cap_for(node);
         let mut m = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let slot = m.entry(node).or_default();
-        if slot.len() >= IDLE_CAP_PER_NODE {
+        if slot.len() >= cap {
             return; // stream drop = 关闭
         }
         slot.push(Entry {
@@ -186,6 +236,44 @@ mod tests {
         }
         assert!(p.checkout(node(3)).is_none(), "过期条目应被淘汰而非交付");
         assert_eq!(p.idle_len(node(3)), 0, "淘汰后空槽位清理");
+    }
+
+    #[test]
+    fn 弹性cap_未命中抬升_命中衰减_上限封顶() {
+        let p = ChannelPool::<DuplexStream>::new();
+        let n = node(11);
+        // 连续未命中 → peak 抬升 → cap 增大（封顶 MAX）
+        for _ in 0..20 {
+            assert!(p.checkout(n).is_none()); // 每次未命中 note_miss
+        }
+        let cap = p.cap_for(n);
+        assert!(cap > IDLE_CAP_BASE, "未命中后 cap 应抬升（实际 {cap}）");
+        assert!(cap <= IDLE_CAP_MAX);
+        // 大量命中 → peak 衰减回落至 BASE 附近
+        for _ in 0..50 {
+            p.checkin(n, chan());
+            let _ = p.checkout(n); // hit → note_hit 衰减
+        }
+        let cap_after = p.cap_for(n);
+        assert!(cap_after <= cap, "命中衰减后 cap 应回落（{cap} → {cap_after}）");
+    }
+
+    #[test]
+    fn 弹性cap_checkin_按弹性水位收容() {
+        let p = ChannelPool::<DuplexStream>::new();
+        let n = node(12);
+        // 未命中抬升 cap 后，checkin 应能收容超过 BASE 的条目
+        for _ in 0..10 {
+            assert!(p.checkout(n).is_none());
+        }
+        let cap = p.cap_for(n);
+        for _ in 0..cap {
+            p.checkin(n, chan());
+        }
+        assert_eq!(p.idle_len(n), cap);
+        // 超出弹性 cap 的丢弃
+        p.checkin(n, chan());
+        assert_eq!(p.idle_len(n), cap);
     }
 
     #[test]

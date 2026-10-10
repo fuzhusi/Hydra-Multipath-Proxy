@@ -23,7 +23,7 @@
 
 use crate::transport::DEFAULT_SNI;
 use hydra_protocol::handshake;
-use hydra_protocol::tcp_frame::{read_reply, write_target};
+use hydra_protocol::tcp_frame::{read_reply, write_target, MAX_TARGET_LEN};
 use hydra_protocol::{mask_target, HydraError, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -378,8 +378,140 @@ pub async fn connect_target(
     auth_key: &[u8],
     target: &str,
 ) -> Result<TcpNodeStream> {
-    let channel = connect_channel(node_addr, sni, trust, auth_key).await?;
-    request_target(channel, target).await
+    // RTT 压缩（内核优化 #3）：冷路径握手与地址帧合并——confirm_c 与地址帧
+    // 一次写（5RTT→4RTT，100ms RTT 下 500ms→400ms）；节点侧零改动兼容
+    // （写完 confirm_s 后即读目标帧，TCP 字节流下捎带字节已在缓冲）。
+    // TLS 连接（与 connect_channel 前半段一致——捎带版不复用它：其刻意停在
+    // 发帧前，与握手捎带互斥）
+    let tls = tls_connect_for_node(node_addr, sni, trust).await?;
+
+    // TLS exporter 通道绑定材料（两端同 label/context 即同值）
+    let mut exporter = [0u8; handshake::EXPORTER_LEN];
+    tls.get_ref()
+        .1
+        .export_keying_material(&mut exporter, handshake::EXPORTER_LABEL, Some(b""))
+        .map_err(|_| {
+            HydraError::ConnectionError("TLS exporter 不可用，无法完成 v3 通道绑定".to_string())
+        })?;
+    let peer_leaf = peer_leaf_cert(&tls)?;
+    if let Some(pin_hex) = &trust.leaf_pin_sha256_hex {
+        use ring::digest::{digest, SHA256};
+        let fp = crate::share_link::hex_encode_lower(digest(&SHA256, &peer_leaf).as_ref());
+        if !fp.eq_ignore_ascii_case(pin_hex.trim()) {
+            return Err(HydraError::ConnectionError(
+                "对端叶证书指纹与 HYDRA_CERT_SHA256 不匹配（防 CA 误签发硬 pin 生效）".to_string(),
+            ));
+        }
+    }
+    let cert_fp = handshake::cert_fingerprint(&peer_leaf);
+    let (mut rd, mut wr) = tokio::io::split(tls);
+    let mut frame = Vec::with_capacity(2 + MAX_TARGET_LEN);
+    write_target_into(&mut frame, target)
+        .map_err(|e| HydraError::ConnectionError(format!("目标帧编码失败: {e}")))?;
+    tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        handshake::client_side_with_payload(
+            &mut wr,
+            &mut rd,
+            auth_key,
+            &cert_fp,
+            &exporter,
+            Some(&frame),
+        ),
+    )
+    .await
+    .map_err(|_| HydraError::ConnectionError(format!("Noise 握手超时: {}", node_addr)))?
+    .map_err(|e| HydraError::ConnectionError(format!("Noise 握手失败: {}", e)))?;
+
+    // 目标帧已随 confirm_c 捎带：此处只读 2B 应答
+    match tokio::time::timeout(RESPONSE_TIMEOUT, read_reply(&mut rd)).await {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(HydraError::ConnectionError(
+                "Node response timeout".to_string(),
+            ))
+        }
+    }
+    let tls = rd.unsplit(wr);
+    info!("✓ TCP/TLS target {} opened", mask_target(target));
+    Ok(tls)
+}
+
+/// 目标帧编码到缓冲（RTT 压缩捎带用；与 write_target 同格式）
+fn write_target_into(buf: &mut Vec<u8>, target: &str) -> std::result::Result<(), std::io::Error> {
+    let bytes = target.as_bytes();
+    if bytes.len() > MAX_TARGET_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("目标地址超长（>{MAX_TARGET_LEN}B）"),
+        ));
+    }
+    buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    buf.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// TCP + TLS 连接节点（捎带版冷路径专用：与 connect_channel 前半段一致——
+/// SNI 回退/连接器缓存/keepalive/nodelay）
+async fn tls_connect_for_node(
+    node_addr: SocketAddr,
+    sni: &str,
+    trust: &TlsTrust,
+) -> Result<TcpNodeStream> {
+    let sni = if sni.is_empty() {
+        tracing::warn!(
+            "SNI 未配置，回退默认 {}（CA 模式下证书 SAN 必须包含该域名）",
+            DEFAULT_SNI
+        );
+        DEFAULT_SNI
+    } else {
+        sni
+    };
+    let connector = build_tls_connector(trust)?;
+    let server_name = rustls::pki_types::ServerName::try_from(sni.to_owned())
+        .map_err(|e| HydraError::ProtocolError(format!("Invalid SNI '{}': {:?}", sni, e)))?;
+    debug!("Attempting TCP/TLS connection to {} (sni={})...", node_addr, sni);
+    let tcp = match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        crate::socket_protect::connect_tcp_protected(node_addr),
+    )
+    .await
+    {
+        Ok(Ok(s)) => {
+            enable_tcp_keepalive(&s);
+            s
+        }
+        Ok(Err(e)) => {
+            return Err(HydraError::ConnectionError(format!(
+                "TCP connect to {} failed: {}",
+                node_addr, e
+            )))
+        }
+        Err(_) => {
+            return Err(HydraError::ConnectionError(format!(
+                "TCP connect to {} timed out",
+                node_addr
+            )))
+        }
+    };
+    let tls = match tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp)).await
+    {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => {
+            return Err(HydraError::ConnectionError(format!(
+                "TLS handshake with {} failed: {}",
+                node_addr, e
+            )))
+        }
+        Err(_) => {
+            return Err(HydraError::ConnectionError(format!(
+                "TLS handshake with {} timed out",
+                node_addr
+            )))
+        }
+    };
+    let _ = tls.get_ref().0.set_nodelay(true);
+    Ok(tls)
 }
 
 /// 温连接（channel）建立：完整 TCP + TLS + Noise-PSK 握手，**停在发送目标帧

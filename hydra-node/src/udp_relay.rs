@@ -761,16 +761,28 @@ async fn session_task<W>(
 ) where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    // Metrics v2：活跃会话 gauge（任务生命周期 = 会话生命周期）
+    let _session_guard = crate::metrics::UdpSessionGuard::enter();
     let mut buf = vec![0u8; MAX_DATAGRAM_LEN];
     loop {
         // 不用 biased：持续高速上行不应饥饿下行回包（审查批次 P3）
         tokio::select! {
             cmd = rx.recv() => match cmd {
                 Some(datagram) => {
-                    if socket.send(&datagram).await.is_err() {
-                        debug!("UDP 会话 {session_id} socket 发送失败，会话结束");
-                        let _ = dead_tx.send(session_id);
-                        break;
+                    match socket.send(&datagram).await {
+                        Ok(_) => {
+                            crate::metrics::metrics()
+                                .udp_datagrams_fwd
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            debug!("UDP 会话 {session_id} socket 发送失败，会话结束");
+                            crate::metrics::metrics()
+                                .udp_datagrams_drop
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = dead_tx.send(session_id);
+                            break;
+                        }
                     }
                 }
                 None => break, // 表移除/连接结束：会话任务自退出

@@ -335,6 +335,10 @@ impl ConnectionHandler {
                 Ok(Ok(stream)) => {
                     // 禁 Nagle：目标侧交互式流量延迟敏感（审查 R-11）
                     let _ = stream.set_nodelay(true);
+                    // Metrics v2：目标建连延迟直方图
+                    crate::metrics::metrics().hs_target.observe(
+                        connect_start.elapsed().as_secs_f64(),
+                    );
                     info!(
                         "Connected to target: {} (took {}ms)",
                         mask_target(&candidate.to_string()),
