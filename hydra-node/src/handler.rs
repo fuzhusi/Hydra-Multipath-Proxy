@@ -213,11 +213,9 @@ impl ConnectionHandler {
             // 解析超时/负缓存归入既有 ERR_DNS_FAIL(0x02) 路径，维持
             // DNS 5s < connect 15s < 20s 层次。
             let dns_start = std::time::Instant::now();
-            let host = target_addr_str
-                .rsplit_once(':')
-                .map(|(h, _)| h)
-                .unwrap_or(target_addr_str);
-            match crate::dns_cache::resolve_host_cached(host).await {
+            // 缓存键/解析输入都用完整 host:port（std ToSocketAddrs 强制
+            // host:port 格式——纯 host 会立即 Err 且被负缓存放大，评审 P0）
+            match crate::dns_cache::resolve_host_cached(target_addr_str).await {
                 None => {
                     error!(
                         "DNS resolution failed (timeout/negative cache) for {}",
@@ -325,6 +323,11 @@ impl ConnectionHandler {
                 Ok(Ok(stream)) => {
                     // 禁 Nagle：目标侧交互式流量延迟敏感（审查 R-11）
                     let _ = stream.set_nodelay(true);
+                    // 内核优化 #12：目标流 keepalive + TCP_USER_TIMEOUT
+                    // （Linux）——死目标 ~90s 回收，不再等 300s idle 兜底
+                    crate::tcp_server::enable_tcp_keepalive(&stream);
+                    #[cfg(target_os = "linux")]
+                    crate::tcp_server::set_tcp_user_timeout(stream.as_raw_fd(), 90_000);
                     // Metrics v2：目标建连延迟直方图
                     crate::metrics::metrics().hs_target.observe(
                         connect_start.elapsed().as_secs_f64(),

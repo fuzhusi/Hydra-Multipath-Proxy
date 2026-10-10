@@ -228,29 +228,38 @@ struct FdTransport {
     read_join: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
-/// 停机原语（评审 P0 修正）：读线程阻塞在 tun fd `read()` 上，直接 join
-/// 会死锁——**先 close fd 副本解除阻塞，再 join**；fd 所有权与 JoinHandle
-/// 分离。否则 stop_vpn 的 3s shutdown_timeout 必然超时，逐次泄漏 fd+线程。
+/// 停机原语（code review P0 修正版）：**dup 的 fd 共享同一 open file
+/// description，close 一个副本不会唤醒阻塞在另一副本上的 read()**——
+/// "先 close 再 join"不成立。改用 poll(2) 超时轮询：读线程每 100ms 醒来
+/// 检查停止位，join 上限一个周期；写线程 recv_timeout 同理。
 struct FdStop {
-    /// fd 的独立 dup 副本：close 专用（读线程的 File 持另一副本，各自有效）
+    /// 停止位（AtomicBool：读/写线程每周期检查）
+    stopped: std::sync::atomic::AtomicBool,
+    /// tun fd 副本：poll 监听用
     raw_fd: std::sync::atomic::AtomicI32,
-    /// 写端 File：置 None drop 解除写线程阻塞
+    /// 写端 File：drop 解除写线程的潜在阻塞写
     w_file: std::sync::Mutex<Option<std::fs::File>>,
 }
 
 impl FdStop {
-    /// 关闭 fd 副本：阻塞中的 read() 立即返回 EBADF/EOF
-    fn close_fd(&self) {
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 停机：置停止位 + 关 tun fd 副本（poll 立即返回 POLLNVAL 退出）+
+    /// drop 写端（潜在阻塞写解除）。之后调用方 join（上限 ~100ms）。
+    fn trigger(&self) {
+        self.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
         let fd = self.raw_fd.swap(-1, std::sync::atomic::Ordering::SeqCst);
         if fd >= 0 {
             extern "C" {
                 fn close(fd: i32) -> i32;
             }
-            // Safety：swap 拿到唯一关闭权（读线程 File 持 dup，独立有效）
+            // Safety：swap 拿到唯一关闭权；poll 循环对 POLLNVAL 退出
             unsafe { close(fd) };
         }
         if let Ok(mut w) = self.w_file.lock() {
-            *w = None; // drop 写端 File 解除写线程阻塞
+            *w = None; // drop 写端 File
         }
     }
 }
@@ -286,51 +295,74 @@ impl FdTransport {
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(CHAN_CAP);
 
             let stop = Arc::new(FdStop {
+                stopped: std::sync::atomic::AtomicBool::new(false),
                 raw_fd: std::sync::atomic::AtomicI32::new(fd_dup),
                 w_file: std::sync::Mutex::new(Some(w)),
             });
 
-            // 读线程：阻塞 read 直达自有缓冲 → tokio 有界通道（1 次拷贝）；
-            // 停机由 stop.close_fd 关 fd 副本使 read 返回 EBADF/0 解除阻塞
+            // 读线程（code review P0 修正版）：poll(2) 100ms 超时轮询——
+            // 不再依赖"close 唤醒阻塞 read"（dup fd 共享 open file
+            // description，close 一个副本不唤醒另一副本上的阻塞 read）；
+            // 每 100ms 检查停止位，join 上限一个周期
             let stop_r = Arc::clone(&stop);
             let read_join = std::thread::Builder::new()
                 .name("hydra-fd-read".into())
                 .spawn(move || {
                     use std::io::Read;
                     let mut buf = vec![0u8; MTU_MAX];
+                    #[repr(C)]
+                    struct PollFd { fd: i32, events: i16, revents: i16 }
+                    extern "C" { fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32; }
+                    const POLLIN: i16 = 0x0001;
+                    const POLLNVAL: i16 = 0x0020;
                     loop {
+                        if stop_r.is_stopped() { break; }
+                        let fd_cur = stop_r.raw_fd.load(std::sync::atomic::Ordering::SeqCst);
+                        if fd_cur < 0 { break; }
+                        let mut fds = PollFd { fd: fd_cur, events: POLLIN, revents: 0 };
+                        let pr = unsafe { poll(&mut fds as *mut PollFd, 1, 100) };
+                        if stop_r.is_stopped() { break; }
+                        if pr < 0 {
+                            if std::io::Error::last_os_error().kind()
+                                == std::io::ErrorKind::Interrupted { continue; }
+                            break;
+                        }
+                        if (fds.revents & POLLNVAL) != 0 { break; }
+                        if (fds.revents & POLLIN) == 0 { continue; }
                         match f.read(&mut buf) {
-                            Ok(0) => break,       // fd 关闭（停机）EOF
+                            Ok(0) => break,
                             Ok(n) => {
-                                // 通道满 = 栈忙：blocking_send 阻塞等待 =
-                                // 读线程自然背压（内核 TUN 队列承担窗口语义）
                                 if in_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                                    break; // 栈侧已关（停机）
+                                    break;
                                 }
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                            Err(_) => break, // EBADF（停机关 fd）或真错误
+                            Err(_) => break,
                         }
                     }
-                    drop(stop_r); // 标记性消费（读线程退出）
+                    drop(stop_r);
                 })?;
 
-            // 写线程：阻塞收 → write；停机由 drop 写端 File（FdStop::close_fd
-            // 中 w_file=None）使 recv 后 write 路径退出
+            // 写线程（code review P0 修正版）：recv_timeout(100ms) 轮询停止
+            // 位——不再依赖"w_file drop 解除阻塞"（原设计 w_file 在 spawn 时
+            // 已被 take，close_fd 的置 None 是死代码）
             let stop_w = Arc::clone(&stop);
             let mut w_file = stop.w_file.lock().unwrap().take();
             let write_join = std::thread::Builder::new()
                 .name("hydra-fd-write".into())
                 .spawn(move || {
                     use std::io::Write;
-                    while let Ok(pkt) = out_rx.recv() {
-                        match w_file.as_mut() {
-                            Some(f) => {
-                                if f.write_all(&pkt).is_err() {
-                                    break;
+                    loop {
+                        if stop_w.is_stopped() { break; }
+                        match out_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                            Ok(pkt) => match w_file.as_mut() {
+                                Some(f) => {
+                                    if f.write_all(&pkt).is_err() { break; }
                                 }
-                            }
-                            None => break, // 停机（写端已 drop）
+                                None => break,
+                            },
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                         }
                     }
                     drop(stop_w);
@@ -354,10 +386,11 @@ impl FdTransport {
         }
     }
 
-    /// 停机（评审 P0 顺序）：**先关 fd 解除阻塞，再 join 两线程**。
+    /// 停机（code review P0 修正版）：置停止位 + 关 fd 副本 + drop 写端，
+    /// 然后 join——两线程均为 100ms 轮询循环，join 上限一个周期，永不挂死。
     /// 由 Drop（stop_vpn drop VpnHandle → transport drop）触发。
     fn shutdown(&self) {
-        self.stop.close_fd();
+        self.stop.trigger();
         if let Ok(mut j) = self.read_join.lock() {
             if let Some(h) = j.take() {
                 let _ = h.join();

@@ -221,7 +221,7 @@ pub async fn spawn_tcp_listener(
         const IPPROTO_TCP: i32 = 6;
         let backlog: i32 = 256;
         let r = unsafe {
-            libc_setsockopt(
+            setsockopt(
                 listener.as_raw_fd(),
                 IPPROTO_TCP,
                 TCP_FASTOPEN,
@@ -827,7 +827,7 @@ extern "C" {
         fd: i32,
         level: i32,
         optname: i32,
-        optval: *const i32,
+        optval: *const u8,
         optlen: u32,
     ) -> i32;
 }

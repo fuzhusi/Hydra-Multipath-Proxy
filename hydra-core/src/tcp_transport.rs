@@ -440,6 +440,12 @@ pub async fn connect_target(
 /// 目标帧编码到缓冲（RTT 压缩捎带用；与 write_target 同格式）
 fn write_target_into(buf: &mut Vec<u8>, target: &str) -> std::result::Result<(), std::io::Error> {
     let bytes = target.as_bytes();
+    if bytes.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "目标地址为空",
+        ));
+    }
     if bytes.len() > MAX_TARGET_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

@@ -107,10 +107,12 @@ fn put_cache(host: &str, addrs: Vec<SocketAddr>, negative: bool) {
     );
 }
 
-/// 带缓存 + 并发闸的域名解析（DNS 宽松匹配 target 域名；IP 字面量由调用方
-/// 在进入本函数前拦截）。返回 None = 负缓存/解析失败（调用方按 DNS 错误处理）。
-pub(crate) async fn resolve_host_cached(host: &str) -> Option<Vec<SocketAddr>> {
-    if let Some(cached) = lookup_cached(host) {
+/// 带缓存 + 并发闸的域名解析。**`host_with_port` 必须是完整 `host:port`**——
+/// std 的 str ToSocketAddrs 强制 host:port 格式（纯 host 会立即 Err 并被
+/// 负缓存放大，评审 P0）；缓存键用传入串原样（含端口），解析出的候选地址
+/// 由 getaddrinfo 自带端口。返回 None = 负缓存/解析失败。
+pub(crate) async fn resolve_host_cached(host_with_port: &str) -> Option<Vec<SocketAddr>> {
+    if let Some(cached) = lookup_cached(host_with_port) {
         if cached.is_empty() {
             return None; // 负缓存命中
         }
@@ -125,31 +127,31 @@ pub(crate) async fn resolve_host_cached(host: &str) -> Option<Vec<SocketAddr>> {
     {
         Ok(Ok(p)) => p,
         _ => {
-            tracing::warn!("DNS 解析并发闸排队超时（{QUEUE_TIMEOUT:?}）: {host}");
+            tracing::warn!("DNS 解析并发闸排队超时（{QUEUE_TIMEOUT:?}）");
             return None;
         }
     };
     match tokio::time::timeout(
         Duration::from_secs(5),
-        tokio::net::lookup_host(host.to_string()),
+        tokio::net::lookup_host(host_with_port.to_string()),
     )
     .await
     {
         Ok(Ok(addrs)) => {
             let v: Vec<SocketAddr> = addrs.collect();
             if v.is_empty() {
-                put_cache(host, Vec::new(), true);
+                put_cache(host_with_port, Vec::new(), true);
                 return None;
             }
-            put_cache(host, v.clone(), false);
+            put_cache(host_with_port, v.clone(), false);
             Some(v)
         }
         Ok(Err(_)) => {
-            put_cache(host, Vec::new(), true); // 负缓存
+            put_cache(host_with_port, Vec::new(), true); // 负缓存
             None
         }
         Err(_) => {
-            put_cache(host, Vec::new(), true); // 5s 超时也负缓存
+            put_cache(host_with_port, Vec::new(), true); // 5s 超时也负缓存
             None
         }
     }

@@ -51,22 +51,19 @@ pub fn protect_outbound_fd(fd: i64) -> std::io::Result<()> {
 
 /// 受保护的家庭化出站 TCP 建连：新建 socket（拿到 fd）→ 保护回调 → connect。
 /// protect 失败时 socket 随 TcpSocket drop 关闭，连接不发出。
+/// 内核优化 #10 备注：客户端侧 TFO（TCP_FASTOPEN_CONNECT）已撤下——
+/// 内核在有缓存 cookie 时 connect(2) 置 DEFER_CONNECT 不发 SYN 即返回
+/// EINPROGRESS，tokio TcpSocket::connect 的 poll_writable 对
+/// TCP_SYN_SENT+无 fastopen_req 不报就绪 → await 永久挂起（首次连接后
+/// 到 TFO 节点的所有连接全部 5s 超时，code review P0）。仅保留节点侧
+/// listen socket 的 TCP_FASTOPEN（tcp_server.rs）。若未来重开客户端 TFO，
+/// 需绕开 tokio connect 的就绪等待语义。
 pub async fn connect_tcp_protected(addr: SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
     let sock = if addr.is_ipv4() {
         tokio::net::TcpSocket::new_v4()?
     } else {
         tokio::net::TcpSocket::new_v6()?
     };
-    // 内核优化 #10：TCP Fast Open（TCP_FASTOPEN_CONNECT，Linux 内核 4.11+）。
-    // 客户端侧需配合节点 listen socket 的 TCP_FASTOPEN + sysctl
-    // net.ipv4.tcp_fastopen>=2（部署文档）；未启用节点透明回退（cookie
-    // 请求路径），env HYDRA_TFO=0 关闭。仅 Linux/Android 门控（Windows/
-    // macOS 无此选项 API——回退普通建连）。
-    #[cfg(target_os = "linux")]
-    if tfo_enabled() && addr.is_ipv4() {
-        use std::os::unix::io::AsRawFd;
-        set_tfo_connect(sock.as_raw_fd());
-    }
     // Android（unix）为真 fd（i32）；Windows 为 SOCKET 句柄——钩子仅在
     // Android 场景安装，桌面平台此调用为零开销直通
     #[cfg(unix)]
@@ -82,37 +79,7 @@ pub async fn connect_tcp_protected(addr: SocketAddr) -> std::io::Result<tokio::n
     sock.connect(addr).await
 }
 
-/// TFO 开关（env HYDRA_TFO=0 关闭；默认开，Linux/Android）
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn tfo_enabled() -> bool {
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("HYDRA_TFO").as_deref() != Ok("0"))
-}
 
-/// raw setsockopt(TCP_FASTOPEN_CONNECT=30)：socket2 0.6 无此 API（评审修正）。
-/// 失败静默（内核不支持/未配置时回退普通建连——透明降级）。
-#[cfg(target_os = "linux")]
-fn set_tfo_connect(fd: std::os::unix::io::RawFd) {
-    // TCP_FASTOPEN_CONNECT = 30（linux/tcp.h）
-    const TCP_FASTOPEN_CONNECT: i32 = 30;
-    const optval: i32 = 1;
-    // setsockopt(2)：level=IPPROTO_TCP(6)
-    let r = unsafe { setsockopt(fd, 6, TCP_FASTOPEN_CONNECT, &optval as *const i32 as *const u8, 4) };
-    if r != 0 {
-        tracing::debug!("TCP_FASTOPEN_CONNECT 设置失败（回退普通建连）: errno={}", std::io::Error::last_os_error());
-    }
-}
-
-#[cfg(target_os = "linux")]
-extern "C" {
-    fn setsockopt(
-        fd: i32,
-        level: i32,
-        optname: i32,
-        optval: *const u8,
-        optlen: u32,
-    ) -> i32;
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +117,3 @@ mod tests {
         }
     }
 }
-
-
