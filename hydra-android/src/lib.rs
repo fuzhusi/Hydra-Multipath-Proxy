@@ -242,6 +242,7 @@ struct FdStop {
 }
 
 impl FdStop {
+    #[cfg(unix)] // 调用点在读/写线程（unix 专属分支）
     fn is_stopped(&self) -> bool {
         self.stopped.load(std::sync::atomic::Ordering::Relaxed)
     }
