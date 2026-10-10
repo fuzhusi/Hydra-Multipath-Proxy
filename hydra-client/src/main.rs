@@ -145,8 +145,7 @@ fn warn_system_proxy_loop() {
     }
 }
 
-fn parse_args() -> (Option<SocketAddr>, Vec<SocketAddr>, Option<P2pArgs>) {
-    let args: Vec<String> = std::env::args().collect();
+fn parse_args(args: &[String]) -> (Option<SocketAddr>, Vec<SocketAddr>, Option<P2pArgs>) {
     let mut listen: Option<SocketAddr> = None;
     let mut nodes: Vec<SocketAddr> = Vec::new();
     let mut p2p: Option<P2pArgs> = None;
@@ -466,19 +465,10 @@ async fn main() -> Result<()> {
                 cert_path.display()
             );
         }
-        if changed {
-            std::env::set_var("HYDRA_NODES", {
-                let nodes: Vec<String> = argv[1..]
-                    .iter()
-                    .filter(|a| !a.starts_with('-'))
-                    .cloned()
-                    .collect();
-                nodes.join(",")
-            });
-        }
+        let _ = changed;
     }
 
-    let (listen_arg, nodes, p2p) = parse_args();
+    let (listen_arg, nodes, p2p) = parse_args(&argv);
 
     // 09-P3-5：TUN 模式双实例互斥——两个 TUN 实例会争抢同一 TUN 网卡与 /1
     // 接管路由。守卫存到 main 作用域直至退出（进程死自动释放端口）。
