@@ -220,10 +220,15 @@ pub async fn serve_signal_stream<R, W>(
     // 心跳 60s 一条 + 打洞握手期几条，正常流量远低于此）。
     let mut tokens: u32 = SIGNAL_BURST;
     let mut last_refill = Instant::now();
+    // 整行 deadline（企业级评审 P2-3 慢滴防护）：从行首字节起算，整行必须在
+    // SIGNAL_READ_TIMEOUT 内完成——逐字节+每字节重置的老写法允许 1B/89s 慢滴
+    // 拖 4096×90s≈4.3 天/连接。行完成时重置 deadline（心跳 60s 一条不受影响）
+    let mut line_deadline = Instant::now() + SIGNAL_READ_TIMEOUT;
     loop {
         // 逐字节读行（信令量极小；天然解决「行中间跨包」与长度上限）
-        // 读超时 = 空闲看门狗：90s 无任何数据（含心跳）即断开
-        let n = match tokio::time::timeout(SIGNAL_READ_TIMEOUT, rd.read(&mut byte)).await {
+        // 读超时 = 整行 deadline 到期（企业级评审 P2-3 慢滴防护）
+        let budget = line_deadline.saturating_duration_since(Instant::now());
+        let n = match tokio::time::timeout(budget, rd.read(&mut byte)).await {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {
                 debug!("信令会话 {my_peer_id} 读错误: {e}");
@@ -246,6 +251,8 @@ pub async fn serve_signal_stream<R, W>(
             let elapsed = last_refill.elapsed().as_secs_f64();
             last_refill = Instant::now();
             tokens = refill_tokens(tokens, elapsed);
+            // 行完成：重置整行 deadline（心跳 60s < 90s 预算，不受影响；评审 P2-3 慢滴防护）
+            line_deadline = Instant::now() + SIGNAL_READ_TIMEOUT;
             if tokens == 0 {
                 warn!("信令会话 {my_peer_id} 消息速率超限（>{SIGNAL_RATE}/s），断开");
                 break;

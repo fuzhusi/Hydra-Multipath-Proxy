@@ -163,26 +163,29 @@ pub async fn fetch_chunk(
     job_end_excl: u64,
 ) -> Result<(), ChunkError> {
     let expect = job_end_excl - job_start;
-    let mut attempts = 0usize;
-    loop {
-        attempts += 1;
-        // 1. 隧道（复用或新建）
-        if tunnel.is_none() {
-            let (node, stream) = ctx
-                .factory
-                .open(ctx.host, ctx.port)
-                .await
-                .map_err(ChunkError::Retryable)?;
-            let tls_stream = ctx
-                .tls
-                .connect(ctx.host, stream)
-                .await
-                .map_err(|e| ChunkError::Retryable(format!("目标站 TLS 握手失败: {e}")))?;
-            *tunnel = Some((node, tls_stream));
-        }
-        let (_, stream) = tunnel.as_mut().expect("上方已建隧道");
 
-        // 2. 请求
+    // 1. 隧道（复用或新建）。**单发语义**：任何失败立即返回 Retryable 并丢弃
+    // 隧道——重试预算由 worker 层统一（MAX_ATTEMPTS 次/块/轮，消除此前
+    // worker 3 次 × 本函数 3 次的双层相乘，单块单轮最坏 9 次握手）
+    if tunnel.is_none() {
+        let (node, stream) = ctx
+            .factory
+            .open(ctx.host, ctx.port)
+            .await
+            .map_err(ChunkError::Retryable)?;
+        let tls_stream = ctx
+            .tls
+            .connect(ctx.host, stream)
+            .await
+            .map_err(|e| ChunkError::Retryable(format!("目标站 TLS 握手失败: {e}")))?;
+        *tunnel = Some((node, tls_stream));
+    }
+    let (_, stream) = tunnel.as_mut().expect("上方已建隧道");
+
+    // 2~5. 单次尝试（请求 → 响应头 → 状态分派 → 流式写 body）。
+    // 包进内部 async 块统一收口：**任何 Err（含 RangeIgnored/Fatal）都丢弃
+    // 隧道**——失步流的复用是 pipelining 注入面（企业级评审 P2）。
+    let res = async {
         let req = http::build_request(
             "GET",
             ctx.host,
@@ -190,60 +193,37 @@ pub async fn fetch_chunk(
             Some((job_start, Some(job_end_excl - 1))),
             ctx.if_range,
         );
-        if let Err(e) = stream.write_all(&req).await {
-            *tunnel = None;
-            if attempts >= MAX_ATTEMPTS {
-                return Err(ChunkError::Retryable(format!("请求写入失败: {e}")));
-            }
-            continue;
-        }
+        stream
+            .write_all(&req)
+            .await
+            .map_err(|e| ChunkError::Retryable(format!("请求写入失败: {e}")))?;
 
-        // 3. 响应头
-        let (head, prefix) = match http::read_response_head(stream).await {
-            Ok(x) => x,
-            Err(e) => {
-                *tunnel = None;
-                if attempts >= MAX_ATTEMPTS {
-                    return Err(ChunkError::Retryable(format!("响应头读取失败: {e}")));
-                }
-                continue;
-            }
-        };
+        let (head, prefix) = http::read_response_head(stream)
+            .await
+            .map_err(|e| ChunkError::Retryable(format!("响应头读取失败: {e}")))?;
 
-        // 4. 状态分派
         match head.status {
             206 => {}
             200 => {
-                // Range 被忽略（If-Range 不匹配/服务器不支持）：按字节读只会拼脏
-                return Err(ChunkError::ContentChanged);
+                // 服务器无视 Range（探测声明支持但响应 200）：可恢复——回落单流
+                return Err(ChunkError::RangeIgnored);
             }
             416 => return Err(ChunkError::ContentChanged),
             408 | 429 | 500..=599 => {
-                *tunnel = None;
-                if attempts >= MAX_ATTEMPTS {
-                    return Err(ChunkError::Retryable(format!("HTTP {}", head.status)));
-                }
-                continue;
+                return Err(ChunkError::Retryable(format!("HTTP {}", head.status)));
             }
             code => return Err(ChunkError::Fatal(format!("HTTP {code}"))),
         }
 
-        // 5. body：流式写文件（256KB 缓冲；16MB 块不整读进内存）。
-        //    每次尝试先 seek 回块起点——中途失败重试时文件位置必须复位。
-        //    响应头读取带出的 body 前缀经 BodyReader 统一交付（不重复写入）
+        // body：流式写文件（256KB 缓冲；16MB 块不整读进内存）。
+        // chunked/EOF 帧式无法界定块边界且连接不可复用——返回 Retryable
+        // （罕见：Range 206 几乎恒带 Content-Length）。
         let expect_len = match head.body_kind {
             BodyKind::Length(n) => n,
             _ => {
-                // chunked/EOF 帧式无法界定块边界且连接不可复用——该块换新隧道
-                // 重试；若服务器恒定如此，轮次耗尽后整体失败（罕见：Range 206
-                // 几乎恒带 Content-Length）
-                *tunnel = None;
-                if attempts >= MAX_ATTEMPTS {
-                    return Err(ChunkError::Retryable(
-                        "206 响应无 Content-Length（chunked/EOF），无法定界块".to_string(),
-                    ));
-                }
-                continue;
+                return Err(ChunkError::Retryable(
+                    "206 响应无 Content-Length（chunked/EOF），无法定界块".to_string(),
+                ));
             }
         };
         if expect_len != expect {
@@ -260,37 +240,33 @@ pub async fn fetch_chunk(
                 break;
             }
             let want = buf.len().min((expect_len - written) as usize);
-            let n = match reader.read(&mut buf[..want]).await {
-                Ok(n) => n,
-                Err(e) => {
-                    *tunnel = None;
-                    if attempts >= MAX_ATTEMPTS {
-                        return Err(ChunkError::Retryable(format!("body 读取失败: {e}")));
-                    }
-                    break; // 换新隧道重试本块（从头重下该块）
-                }
-            };
+            let n = reader.read(&mut buf[..want]).await.map_err(|e| {
+                ChunkError::Retryable(format!("body 读取失败: {e}"))
+            })?;
             if n == 0 {
-                *tunnel = None;
-                if attempts >= MAX_ATTEMPTS {
-                    return Err(ChunkError::Retryable("body 提前结束".to_string()));
-                }
-                break;
+                return Err(ChunkError::Retryable("body 提前结束".to_string()));
             }
-            if let Err(e) = file.write_all(&buf[..n]).await {
-                return Err(ChunkError::Retryable(format!("文件写入失败: {e}")));
-            }
+            file.write_all(&buf[..n])
+                .await
+                .map_err(|e| ChunkError::Retryable(format!("文件写入失败: {e}")))?;
             written += n as u64;
         }
         if written == expect_len {
-            return Ok(());
-        }
-        if attempts >= MAX_ATTEMPTS {
-            return Err(ChunkError::Retryable(format!(
+            Ok(())
+        } else {
+            Err(ChunkError::Retryable(format!(
                 "块读取不完整（{written}/{expect_len}）"
-            )));
+            )))
         }
-        // 未满 attempts：continue 重试（从头重下该块）
+    }
+    .await;
+    // 统一收口：任何 Err 都丢弃隧道（失步流不得复用）
+    match res {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            *tunnel = None;
+            Err(e)
+        }
     }
 }
 

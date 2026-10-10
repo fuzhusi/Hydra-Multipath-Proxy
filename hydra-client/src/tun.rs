@@ -2520,6 +2520,23 @@ pub async fn run_tun(
     udp_factory: Option<UdpChannelFactory>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    // 0. 跨形态 TUN 互斥（企业级评审 P3-9）：CLI(52810)/GUI(52811) 各自的单
+    // 实例互斥不设防"GUI(TUN) 与 CLI(--tun) 并发"——两实例争抢同一 TUN 网卡
+    // 与 /1 接管路由。此处置以 CLI-TUN 端口为共享 TUN 互斥，守卫**故意泄漏**
+    // （进程生命周期 = TUN 生命周期；run_tun 是 TUN 的唯一入口，CLI 与 GUI
+    // 两条路径都经过此处）。
+    static TUN_MUTEX: std::sync::OnceLock<crate::InstanceGuard> = std::sync::OnceLock::new();
+    if TUN_MUTEX.get().is_none() {
+        // 竞态时双赢家之一 bind 失败 → Err 传播给该次 run_tun 调用方
+        let guard = crate::acquire_instance_guard(crate::INSTANCE_PORT_CLI_TUN)
+            .map_err(|msg| {
+                HydraError::ConnectionError(format!(
+                    "另一 TUN 实例已在运行（共享 TUN 互斥被占用）：{msg}"
+                ))
+            })?;
+        let _ = TUN_MUTEX.set(guard);
+    }
+
     // 1. 物理 gw 探测 + 路由方案（豁免失败只是告警，见 compute_routes）
     let gw = detect_physical_gateway();
     let plan = compute_routes(&cfg, gw);

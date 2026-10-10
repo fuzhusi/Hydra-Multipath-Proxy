@@ -348,8 +348,12 @@ impl HydraApp {
                     };
                 run_proxy_until_stopped(proxy, tx, stop_flag_clone, tun_task).await;
             });
+            // block_on 返回 = 主控 future 完成；spawn 的任务（TUN RouteGuard
+            // 清理）在下方显式 drop(rt) 时同步收敛——之后才发退出信号
+            // （企业级评审 P2-5：此前 send 早于 RouteGuard 清理，快速重启时
+            // 旧 guard 会删掉新实例的接管路由）
+            drop(rt);
             println!("[Proxy Thread] Thread exiting...");
-            // 代理线程退出时发送通知
             let _ = exit_tx.send(());
         });
 

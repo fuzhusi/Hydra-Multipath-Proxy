@@ -86,7 +86,14 @@ impl HydraApp {
         // 证书：完整模式带 DER 本体，紧凑模式只带 SHA-256 指纹
         let cert_der = std::fs::read(self.config.cert_path.trim()).ok();
         match cert_der {
-            Some(der) if compact => link = link.with_cert_fp(sha256_hex(&der)),
+            Some(der) if compact => {
+                // 指纹非法（理论不可达——sha256_hex 恒 64hex）：退化为仅地址信息
+                // （clone 保底回退，与上方 with_auth_key_bytes 同款写法）
+                link = link
+                    .clone()
+                    .with_cert_fp(sha256_hex(&der))
+                    .unwrap_or_else(|_| link.clone());
+            }
             Some(der) => link = link.with_cert_der(&der),
             None => {}
         }

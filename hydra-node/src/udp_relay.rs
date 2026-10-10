@@ -293,6 +293,9 @@ async fn resolve_udp_target(target: &str) -> Option<SocketAddr> {
         match tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host(target.to_string())).await {
             Err(_) => {
                 warn!("UDP 目标 DNS 解析超时: {}", mask_target(target));
+                crate::metrics::metrics()
+                    .target_fail
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return None;
             }
             Ok(r) => match r {
@@ -314,6 +317,9 @@ async fn resolve_udp_target(target: &str) -> Option<SocketAddr> {
                 }
                 Err(e) => {
                     warn!("UDP 目标 DNS 解析失败: {} ({e})", mask_target(target));
+                    crate::metrics::metrics()
+                        .target_fail
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return None;
                 }
             },
@@ -326,9 +332,15 @@ async fn resolve_udp_target(target: &str) -> Option<SocketAddr> {
                 reason,
                 mask_target(&addr.to_string())
             );
+            crate::metrics::metrics()
+                .target_fail
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         }
     }
+    crate::metrics::metrics()
+        .target_ok
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(addr)
 }
 

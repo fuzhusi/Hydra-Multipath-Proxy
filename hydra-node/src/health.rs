@@ -13,6 +13,7 @@
 //! - 独立 listener + 独立 task，不阻塞主监听循环。
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
 
@@ -77,6 +78,10 @@ pub struct HealthServer {
     started: Instant,
 }
 
+/// 并发服务上限（企业级评审 P2-2）：端点无认证，误绑非回环时未认证攻击者
+/// 可无限续接耗尽 fd 波及主监听——32 并发 + 每连接 5s 读超时把最坏面封顶
+const HEALTH_MAX_CONCURRENT: usize = 32;
+
 impl HealthServer {
     pub fn new(addr: SocketAddr) -> Self {
         Self {
@@ -88,18 +93,35 @@ impl HealthServer {
     /// 绑定并 spawn 独立 accept 循环（主 TCP 监听循环不受影响）。
     /// 绑定失败返回 Err（调用方应显式退出：显式配置的地址起不来，
     /// 静默吞掉会让运维以为拨测已接入）。
+    /// **非 loopback 绑定默认拒绝**（企业级评审 P2-2：端点无认证，公网暴露
+    /// = 未认证可扫描面 + fd 耗尽通道）；确需暴露时显式
+    /// `HYDRA_HEALTH_PUBLIC=1` 放行并自担风险。
     pub async fn spawn(self) -> std::io::Result<()> {
+        let loopback = self.addr.ip().is_loopback();
+        if !loopback && std::env::var("HYDRA_HEALTH_PUBLIC").as_deref() != Ok("1") {
+            return Err(std::io::Error::other(format!(
+                "健康端点地址 {} 非回环——无认证端点默认拒绝公网暴露。                 确需暴露请设 HYDRA_HEALTH_PUBLIC=1（自担风险）",
+                self.addr
+            )));
+        }
         let listener = tokio::net::TcpListener::bind(self.addr).await?;
         info!(
-            "Health endpoint listening on http://{} (/health)",
-            self.addr
+            "Health endpoint listening on http://{} (/health, /metrics){}",
+            self.addr,
+            if loopback { "" } else { " [非回环绑定：HYDRA_HEALTH_PUBLIC=1]" }
         );
+        let sem = Arc::new(tokio::sync::Semaphore::new(HEALTH_MAX_CONCURRENT));
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _peer)) => {
                         let started = self.started;
-                        tokio::spawn(Self::serve_one(stream, started));
+                        // 并发上限：满时立即拒绝（HTTP 503 由 serve_one 写出——
+                        // 此处直接关流，语义同"过载"）
+                        let Ok(permit) = sem.clone().try_acquire_owned() else {
+                            continue; // 过载：直接关流（最坏面封顶）
+                        };
+                        tokio::spawn(Self::serve_one(stream, started, permit));
                     }
                     Err(e) => {
                         // 瞬时错误（如 fd 耗尽）：记日志稍后重试，不让健康检查循环死掉
@@ -113,7 +135,11 @@ impl HealthServer {
     }
 
     /// 处理单个连接：只读首行请求行，写响应即关闭（不处理 body/keep-alive）
-    async fn serve_one(mut stream: tokio::net::TcpStream, started: Instant) {
+    async fn serve_one(
+        mut stream: tokio::net::TcpStream,
+        started: Instant,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         // 首行足够；上限 1KB 防御异常客户端
         let mut buf = vec![0u8; 1024];

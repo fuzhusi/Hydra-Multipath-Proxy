@@ -145,16 +145,19 @@ impl ShareLink {
     /// 仅携带证书指纹（紧凑模式：对方需另行导入证书并核对指纹）。
     /// 输入归一化为小写；与解析侧同规则校验 64 hex（09-P3-3）——builder 误用
     /// 会在生成期立即报错而非产出对端无法导入的坏链接。
-    pub fn with_cert_fp(mut self, fp: String) -> Self {
+    /// 设置证书指纹（校验 64 位 hex）。改 Result（企业级评审 P3）：builder
+    /// 接受任意 String，GUI 新调用点传用户输入可致进程 panic——与
+    /// `with_auth_key_bytes` 的 Result 化原则对齐。
+    pub fn with_cert_fp(mut self, fp: String) -> Result<Self> {
         let fp = fp.trim().to_ascii_lowercase();
         if fp.len() != 64 || !fp.bytes().all(|b| b.is_ascii_hexdigit()) {
-            panic!(
-                "with_cert_fp: 证书指纹必须为 64 位 hex（当前 {} 字符）；请传 sha256_hex 的输出",
+            return Err(HydraError::ProtocolError(format!(
+                "证书指纹必须为 64 位 hex（当前 {} 字符）；请传 sha256_hex 的输出",
                 fp.len()
-            );
+            )));
         }
         self.cert_fp = Some(fp);
-        self
+        Ok(self)
     }
 
     /// 携带 obfs 独立第二密码（仅 obfs 模式）
@@ -898,7 +901,9 @@ hydra://192.168.1.100:8080?bandwidth=80&latency=15&loss_rate=0.02&status=online
 
     #[test]
     fn tq_v2_compact_link_only_carries_fingerprint() {
-        let link = ShareLink::from_node_info(&sample_node()).with_cert_fp(sha256_hex(b"fake cert"));
+        let link = ShareLink::from_node_info(&sample_node())
+            .with_cert_fp(sha256_hex(b"fake cert"))
+            .unwrap();
         let url = link.to_share_url();
         assert!(url.contains("&cf="));
         assert!(!url.contains("&cc="), "紧凑模式不带证书本体: {url}");

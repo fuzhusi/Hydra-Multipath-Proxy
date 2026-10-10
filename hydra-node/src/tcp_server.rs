@@ -130,6 +130,15 @@ fn validate_peer_id(peer_id: &str) -> bool {
 /// 后的认证失败路径回复内置静态页而非静默关流（默认 false = 行为零变化；
 /// 权衡见 [`crate::fallback`] 模块文档）。
 #[allow(clippy::too_many_arguments)]
+/// 进程启动锚点（单调钟毫秒时间戳的公共基准——pump 共享时间戳用；
+/// 企业级评审 P3：SystemTime 墙钟受 NTP 步进影响，统一为单调钟）
+fn mono_ms() -> u64 {
+    static ANCHOR: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let anchor = ANCHOR.get_or_init(std::time::Instant::now);
+    std::time::Instant::now().duration_since(*anchor).as_millis() as u64
+}
+
+#[allow(clippy::too_many_arguments)] // 启动期一次性装配，均为独立配置维度
 pub async fn spawn_tcp_listener(
     addr: SocketAddr,
     cert_chain: Vec<CertificateDer<'static>>,
@@ -447,12 +456,7 @@ async fn handle_tls_stream(
     // 双向共享的最后活跃时间戳（AtomicU64 毫秒）：任一方向读到数据即刷新，
     // 空闲判定看「连接整体」而非单方向——否则长下载/长上传（单方向连续数百秒
     // 纯接收）会在 idle 处被误杀。
-    let last_active = Arc::new(std::sync::atomic::AtomicU64::new(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
-    ));
+    let last_active = Arc::new(std::sync::atomic::AtomicU64::new(mono_ms()));
     let (c2t, t2c) = {
         let (t_rd, t_wr) = tokio::io::split(target_stream);
         // 审查 06-P2-2：两泵共享退出通知——任一泵结束（EOF/错误/idle）即唤醒对侧，
@@ -532,10 +536,9 @@ where
                 break Ok(total);
             }
         }
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        // 单调钟（企业级评审 P3：SystemTime 墙钟受 NTP 步进影响——前跳会把
+        // 全部活跃 pump 一次性误判为全局空闲；统一为进程启动锚点的单调毫秒）
+        let now_ms = mono_ms();
         let last = last_active.load(Ordering::Relaxed);
         let idle_ms = idle.as_millis() as u64;
         if now_ms.saturating_sub(last) >= idle_ms {
@@ -578,14 +581,22 @@ where
             break Ok(total); // 源 EOF → 半关闭：shutdown 写端
         }
         // 任一方向读到数据：刷新共享时间戳（另一方向的空闲计时随之重置）
-        last_active.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
-            Ordering::Relaxed,
-        );
-        if let Err(e) = w.write_all(&buf[..n]).await {
+        last_active.store(mono_ms(), Ordering::Relaxed);
+        // 写超时（企业级评审 P2-1）：对端零窗口/半开时 write 可永久阻塞——
+        // 循环顶部的空闲/寿命检查将失效，认证连接可无限钉住 permit+fd。
+        // 60s 写不出去 = 对端不可达，按传输错误收尾（对侧泵经 peer 通知跟随）。
+        let write_res = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            w.write_all(&buf[..n]),
+        )
+        .await;
+        if let Err(e) = match write_res {
+            Ok(r) => r,
+            Err(_) => break Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "relay write timeout (60s)——对端零窗口或半开",
+            )),
+        } {
             break Err(e); // 写错误（审查 06-P2-2）：不再直接 ? 跳过 shutdown
         }
         total += n as u64;
@@ -616,10 +627,7 @@ mod tests {
         use tokio::io::duplex;
 
         fn now_ms() -> u64 {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
+            mono_ms() // 与 pump 同一单调锚点（墙钟会被 NTP 步进干扰）
         }
 
         let last_active = Arc::new(AtomicU64::new(now_ms()));
@@ -685,10 +693,7 @@ mod tests {
         use tokio::io::duplex;
 
         fn now_ms() -> u64 {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
+            mono_ms() // 与 pump 同一单调锚点（墙钟会被 NTP 步进干扰）
         }
 
         let last_active = Arc::new(AtomicU64::new(now_ms()));
