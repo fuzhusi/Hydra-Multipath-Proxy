@@ -396,6 +396,9 @@ pub fn start_vpn(
             Ok(o) => o,
             Err(e) => {
                 tracing::error!("VPN opener 构建失败: {e}");
+                // 死亡感知全覆盖：早退也通知 Kotlin（当前因 auth_key 已校验
+                // 而不可达——防未来静默死亡面）
+                on_exit.on_stack_exit(format!("opener 构建失败: {e}"));
                 return;
             }
         };

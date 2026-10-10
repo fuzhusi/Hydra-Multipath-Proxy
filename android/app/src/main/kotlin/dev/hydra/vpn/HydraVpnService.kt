@@ -94,7 +94,7 @@ class HydraVpnService : VpnService() {
                 if (now - lastStartAt > 60_000) restartCount = 0 // 健康运行重置连退
                 restartCount++
                 EngineState.addLog("✗ 数据面退出（$reason）——自动重连（第 $restartCount 次）")
-                if (restartCount > 5) {
+                if (restartCount >= 5) {
                     EngineState.addLog("✗ 连续 5 次数据面退出——停止自动重连，请检查网络/节点后手动重试")
                     EngineState.update {
                         it.copy(running = false, transition = "启动失败：数据面反复退出（$reason）")
@@ -130,6 +130,9 @@ class HydraVpnService : VpnService() {
             // 忽略。此前 else 兜底把任何非 STOP action 都当启动：停止按钮发错
             // action 常量即触发"伪启动 → VPN 已在运行 → 启动失败"且引擎不停
             ACTION_START, null -> {
+                // 用户显式启动：重置数据面自动重连连退计数（give-up 后手动
+                // 重试应恢复完整的 5 次自动重连预算）
+                restartCount = 0
                 startVpnFromStore()
                 return START_NOT_STICKY
             }

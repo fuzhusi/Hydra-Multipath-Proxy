@@ -18,7 +18,9 @@ use std::time::Duration;
 async fn 温连接_闲置超过旧auth窗口_仍可交付目标() {
     // 回环目标默认被 SSRF 拒绝：本测试放开（与其他 e2e 同款；OnceLock 进程内生效）
     std::env::set_var("HYDRA_ALLOW_PRIVATE_TARGETS", "1");
-    let node = spawn_node_with_idle(Some(Duration::from_secs(14))).await;
+    // idle=30s：窗口 30s 远大于旧 10s（守护语义不变），给 CI 定时器过冲留
+    // 充足裕度（闲置 11.5s 恒 < 30s）
+    let node = spawn_node_with_idle(Some(Duration::from_secs(30))).await;
     let echo_port = spawn_echo_server().await;
     let key = test_auth_key();
 
