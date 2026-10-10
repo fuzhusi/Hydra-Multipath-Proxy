@@ -220,8 +220,9 @@ fn parse_args(args: &[String]) -> (Option<SocketAddr>, Vec<SocketAddr>, Option<P
             }
             "--help" | "-h" => {
                 println!(
-                    "用法: hydra-client [--listen <监听地址:端口>] [--tun] <节点地址:端口> [更多节点...]"
+                    "用法: hydra-client [--listen <监听地址:端口>] [--tun] <节点地址:端口 | hydra://分享链接> [更多...]"
                 );
+                println!("分享链接: 位置参数给 hydra:// 链接即自动配置密钥/证书（与 GUI/Android 一致）");
                 println!("TUN 透明代理模式（免配置全局代理，仅 TCP；需管理员/root）:");
                 println!(
                     "  --tun                在 SOCKS 监听之外叠加启动 TUN 虚拟网卡接管系统流量\n                       （Windows 需管理员运行且 wintun.dll 可用；Linux 需 root）"
