@@ -561,7 +561,16 @@ impl ProxyServer {
             // **弃连**落回下方全新握手路径——温连接失败不参与节点评分与故障切换
             // 判定（那些语义由全新路径的既有逻辑负责），池子因此是纯优化层。
             if let Some(warm) = creds.pool.checkout(node.address) {
-                match tcp_transport::request_target(warm, target).await {
+                // 内核优化 #1：池化分支专用短超时——半开死温连接不再挂满
+                // 20s（最坏尾延迟放大 40-200 倍），8s 内判定弃连落回下方
+                // 冷握手路径（env HYDRA_WARM_TIMEOUT_SECS 可调）
+                match tcp_transport::request_target_with_timeout(
+                    warm,
+                    target,
+                    tcp_transport::warm_response_timeout(),
+                )
+                .await
+                {
                     Ok(tls) => {
                         clear_target_unreachable(target);
                         info!(

@@ -1979,8 +1979,19 @@ pub async fn run_stack<T: PacketTransport>(
                             // 地址被误淘汰（重传才恢复）。遍历 SocketSet 覆盖
                             // SynReceived/Established/CloseWait 全部状态；监听
                             // socket 的 local 地址未指定，被 filter_map 自然过滤。
-                            let protected: std::collections::HashSet<std::net::Ipv6Addr> =
-                                sockets
+                            // 内核优化 #5（① 短路）：地址已在接口上时
+                            // ensure_v6_dst 首行命中即返回，protected 不会被用
+                            // ——先查接口跳过整个 O(SocketSet) 重建（≥99% 的包
+                            // 是已建立流的数据/ACK，此前全在白做）
+                            let mut dst = [0u8; 16];
+                            dst.copy_from_slice(&pkt[24..40]);
+                            let dst_v6 = std::net::Ipv6Addr::from(dst);
+                            if !iface.has_ip_addr(IpAddress::Ipv6(
+                                smoltcp::wire::Ipv6Address(dst),
+                            )) {
+                                let protected: std::collections::HashSet<
+                                    std::net::Ipv6Addr,
+                                > = sockets
                                     .iter()
                                     .filter_map(|(_h, socket)| match socket {
                                         smoltcp::socket::Socket::Tcp(s) => s.local_endpoint(),
@@ -1992,14 +2003,13 @@ pub async fn run_stack<T: PacketTransport>(
                                         _ => None,
                                     })
                                     .collect();
-                            let mut dst = [0u8; 16];
-                            dst.copy_from_slice(&pkt[24..40]);
-                            ensure_v6_dst(
-                                &mut iface,
-                                std::net::Ipv6Addr::from(dst),
-                                &mut v6_pool,
+                                ensure_v6_dst(
+                                    &mut iface,
+                                    dst_v6,
+                                    &mut v6_pool,
                                 &protected,
                             );
+                            }
                             device.push_inbound(pkt);
                             } else if !v6_drop {
                                 if !warned_v6 {
@@ -2528,12 +2538,11 @@ pub async fn run_tun(
     static TUN_MUTEX: std::sync::OnceLock<crate::InstanceGuard> = std::sync::OnceLock::new();
     if TUN_MUTEX.get().is_none() {
         // 竞态时双赢家之一 bind 失败 → Err 传播给该次 run_tun 调用方
-        let guard = crate::acquire_instance_guard(crate::INSTANCE_PORT_CLI_TUN)
-            .map_err(|msg| {
-                HydraError::ConnectionError(format!(
-                    "另一 TUN 实例已在运行（共享 TUN 互斥被占用）：{msg}"
-                ))
-            })?;
+        let guard = crate::acquire_instance_guard(crate::INSTANCE_PORT_CLI_TUN).map_err(|msg| {
+            HydraError::ConnectionError(format!(
+                "另一 TUN 实例已在运行（共享 TUN 互斥被占用）：{msg}"
+            ))
+        })?;
         let _ = TUN_MUTEX.set(guard);
     }
 

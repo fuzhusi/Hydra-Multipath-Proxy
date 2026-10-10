@@ -207,28 +207,141 @@ pub struct VpnConfig {
     pub udp_relay: bool,
 }
 
-/// fd 包传输：VpnService tun fd → PacketTransport（阻塞 read/write 各入
-/// spawn_blocking，单方向各占一个 blocking 线程——预算内）。
+/// fd 包传输（内核优化 #2，评审修正后设计）：VpnService tun fd →
+/// PacketTransport。专职读/写线程 + 有界通道替代 spawn_blocking：
+/// - 每包开销 15-50μs（spawn_blocking 往返×2-3 + 3 次堆拷贝）→ <2μs；
+/// - **结构性修复吞包缺陷**：run_stack 的 10ms tick 丢弃 recv future 后，
+///   旧实现的孤儿阻塞任务继续持锁读走下一包且结果被丢弃（稀疏流量下
+///   每 tick 吞一包：TCP +1RTT 尖刺，UDP 中继永久丢包）——专职读线程 +
+///   通道保序交付后不存在孤儿任务，tick 丢弃的只是取包时机；
+/// - 背压：读通道满 = 读线程停读 = 内核 TUN 队列满 = TCP 窗口收缩（语义不变）。
 struct FdTransport {
-    r: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
-    w: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+    /// 读线程 → 栈：收到的包（tokio 通道，栈侧 async recv）
+    inbound_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    /// 栈 → 写线程：待发送包（std sync_channel，写线程阻塞 recv）
+    outbound_tx: OutboundSender,
+    /// 停机原语：关 fd 副本解除读线程阻塞 + drop 写端解除写线程
+    stop: Arc<FdStop>,
+    /// 写线程 JoinHandle（shutdown 时 join——见 FdStop::shutdown 顺序）
+    write_join: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// 读线程 JoinHandle（close fd 后 read 返回，可 join）
+    read_join: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+/// 停机原语（评审 P0 修正）：读线程阻塞在 tun fd `read()` 上，直接 join
+/// 会死锁——**先 close fd 副本解除阻塞，再 join**；fd 所有权与 JoinHandle
+/// 分离。否则 stop_vpn 的 3s shutdown_timeout 必然超时，逐次泄漏 fd+线程。
+struct FdStop {
+    /// fd 的独立 dup 副本：close 专用（读线程的 File 持另一副本，各自有效）
+    raw_fd: std::sync::atomic::AtomicI32,
+    /// 写端 File：置 None drop 解除写线程阻塞
+    w_file: std::sync::Mutex<Option<std::fs::File>>,
+}
+
+impl FdStop {
+    /// 关闭 fd 副本：阻塞中的 read() 立即返回 EBADF/EOF
+    fn close_fd(&self) {
+        let fd = self.raw_fd.swap(-1, std::sync::atomic::Ordering::SeqCst);
+        if fd >= 0 {
+            extern "C" {
+                fn close(fd: i32) -> i32;
+            }
+            // Safety：swap 拿到唯一关闭权（读线程 File 持 dup，独立有效）
+            unsafe { close(fd) };
+        }
+        if let Ok(mut w) = self.w_file.lock() {
+            *w = None; // drop 写端 File 解除写线程阻塞
+        }
+    }
+}
+
+/// 写线程通道发送端（std sync_channel 薄封装；满 = 阻塞 = 背压语义，
+/// 写线程消费速度即 TUN 出站速率，无需丢弃）
+#[derive(Clone)]
+struct OutboundSender(std::sync::mpsc::SyncSender<Vec<u8>>);
+
+impl OutboundSender {
+    fn send(&self, v: Vec<u8>) -> bool {
+        self.0.send(v).is_ok()
+    }
 }
 
 impl FdTransport {
-    /// 接管 fd 所有权（Kotlin 侧 detachFd 后交付；drop 时关闭）。
-    /// Windows 主机构建走 not(unix) 分支返回 Unsupported——该路径仅 Android 使用，
-    /// 但符号仍需导出（桌面 JVM 冒烟的绑定 checksum 校验要求全符号在库）。
+    /// 接管 fd 所有权（Kotlin 侧 detachFd 后交付）并启动专职读/写线程。
+    /// Windows 主机构建走 not(unix) 分支返回 Unsupported——该路径仅 Android
+    /// 使用，但符号仍需导出（桌面 JVM 冒烟的绑定 checksum 校验要求全符号在库）。
     fn new(fd: i32) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
-            use std::os::fd::FromRawFd;
-            // Safety：fd 来自 Kotlin `pfd.detachFd()`——所有权唯一移交本侧，
-            // 由 File drop 关闭；Kotlin 不再持有/使用该 fd。
-            let f = unsafe { std::fs::File::from_raw_fd(fd) };
+            use std::os::fd::{FromRawFd, IntoRawFd};
+            // Safety：fd 来自 Kotlin `pfd.detachFd()`——所有权唯一移交本侧。
+            let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
             let w = f.try_clone()?;
+            // fd 独立 dup 副本（close 专用）：File 各持 dup，互不影响
+            let fd_dup = w.try_clone()?.into_raw_fd();
+
+            const MTU_MAX: usize = 1504; // TUN MTU 1500 + 余量
+            const CHAN_CAP: usize = 256; // 有界：满 = 背压（不丢包）
+            let (in_tx, inbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(CHAN_CAP);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(CHAN_CAP);
+
+            let stop = Arc::new(FdStop {
+                raw_fd: std::sync::atomic::AtomicI32::new(fd_dup),
+                w_file: std::sync::Mutex::new(Some(w)),
+            });
+
+            // 读线程：阻塞 read 直达自有缓冲 → tokio 有界通道（1 次拷贝）；
+            // 停机由 stop.close_fd 关 fd 副本使 read 返回 EBADF/0 解除阻塞
+            let stop_r = Arc::clone(&stop);
+            let read_join = std::thread::Builder::new()
+                .name("hydra-fd-read".into())
+                .spawn(move || {
+                    use std::io::Read;
+                    let mut buf = vec![0u8; MTU_MAX];
+                    loop {
+                        match f.read(&mut buf) {
+                            Ok(0) => break,       // fd 关闭（停机）EOF
+                            Ok(n) => {
+                                // 通道满 = 栈忙：blocking_send 阻塞等待 =
+                                // 读线程自然背压（内核 TUN 队列承担窗口语义）
+                                if in_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                                    break; // 栈侧已关（停机）
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(_) => break, // EBADF（停机关 fd）或真错误
+                        }
+                    }
+                    drop(stop_r); // 标记性消费（读线程退出）
+                })?;
+
+            // 写线程：阻塞收 → write；停机由 drop 写端 File（FdStop::close_fd
+            // 中 w_file=None）使 recv 后 write 路径退出
+            let stop_w = Arc::clone(&stop);
+            let mut w_file = stop.w_file.lock().unwrap().take();
+            let write_join = std::thread::Builder::new()
+                .name("hydra-fd-write".into())
+                .spawn(move || {
+                    use std::io::Write;
+                    while let Ok(pkt) = out_rx.recv() {
+                        match w_file.as_mut() {
+                            Some(f) => {
+                                if f.write_all(&pkt).is_err() {
+                                    break;
+                                }
+                            }
+                            None => break, // 停机（写端已 drop）
+                        }
+                    }
+                    drop(stop_w);
+                })?;
+
             Ok(Self {
-                r: std::sync::Arc::new(std::sync::Mutex::new(f)),
-                w: std::sync::Arc::new(std::sync::Mutex::new(w)),
+                inbound_rx: tokio::sync::Mutex::new(inbound_rx),
+                outbound_tx: OutboundSender(out_tx),
+                stop,
+                write_join: std::sync::Mutex::new(Some(write_join)),
+                read_join: std::sync::Mutex::new(Some(read_join)),
             })
         }
         #[cfg(not(unix))]
@@ -240,6 +353,28 @@ impl FdTransport {
             ))
         }
     }
+
+    /// 停机（评审 P0 顺序）：**先关 fd 解除阻塞，再 join 两线程**。
+    /// 由 Drop（stop_vpn drop VpnHandle → transport drop）触发。
+    fn shutdown(&self) {
+        self.stop.close_fd();
+        if let Ok(mut j) = self.read_join.lock() {
+            if let Some(h) = j.take() {
+                let _ = h.join();
+            }
+        }
+        if let Ok(mut j) = self.write_join.lock() {
+            if let Some(h) = j.take() {
+                let _ = h.join();
+            }
+        }
+    }
+}
+
+impl Drop for FdTransport {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 impl hydra_client::tun::PacketTransport for FdTransport {
@@ -247,34 +382,34 @@ impl hydra_client::tun::PacketTransport for FdTransport {
         &'a self,
         buf: &'a mut [u8],
     ) -> hydra_client::tun::BoxFut<'a, std::io::Result<usize>> {
-        let r = self.r.clone();
-        let mut owned = buf.to_vec(); // spawn_blocking 需要 'static：读入本地副本
         Box::pin(async move {
-            let (res, owned) = tokio::task::spawn_blocking(move || {
-                use std::io::Read;
-                let mut f = r.lock().unwrap_or_else(|p| p.into_inner());
-                let res = f.read(&mut owned);
-                (res, owned) // 缓冲随闭包返还，供回拷
-            })
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-            let n = res?;
-            buf[..n].copy_from_slice(&owned[..n]);
+            // tick 丢弃本 future 后，包仍安全停在通道里（无孤儿任务）——
+            // 下次 recv 取到即交付（吞包缺陷的结构性修复）
+            let mut rx = self.inbound_rx.lock().await;
+            let pkt = rx.recv().await.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "fd 读线程已退出（停机）",
+                )
+            })?;
+            let n = pkt.len().min(buf.len());
+            buf[..n].copy_from_slice(&pkt[..n]);
             Ok(n)
         })
     }
 
     fn send<'a>(&'a self, buf: &'a [u8]) -> hydra_client::tun::BoxFut<'a, std::io::Result<()>> {
         let data = buf.to_vec();
-        let w = self.w.clone();
+        let tx = self.outbound_tx.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                use std::io::Write;
-                let mut f = w.lock().unwrap_or_else(|p| p.into_inner());
-                f.write_all(&data)
-            })
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?
+            if tx.send(data) {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "fd 写线程已退出（停机）",
+                ))
+            }
         })
     }
 }

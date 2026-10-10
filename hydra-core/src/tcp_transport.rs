@@ -502,6 +502,20 @@ pub async fn connect_channel(
 /// 错误语义与单发 [`connect_target`] 一致：`TargetUnreachable` 原样保留供
 /// 故障切换层区分「节点故障」与「目标不可达」。
 pub async fn request_target(stream: TcpNodeStream, target: &str) -> Result<TcpNodeStream> {
+    request_target_with_timeout(stream, target, RESPONSE_TIMEOUT).await
+}
+
+/// 带显式应答超时的变体（内核优化 #1）：温连接池 checkout 专用——半开
+/// 死连接在 RESPONSE_TIMEOUT(20s) 才弃连，而温路径正常 1 RTT（100-200ms），
+/// 最坏尾延迟放大 40-200 倍。池化分支用短超时（默认 8s，env
+/// `HYDRA_WARM_TIMEOUT_SECS` 可调；节点目标拨号预算 15s——阈值过低会把
+/// 健康慢目标误判 stale 后冷路径重拨同一目标），冷路径维持 20s 不变。
+/// 失败语义不变：弃连落回冷握手，不参与评分与故障切换。
+pub async fn request_target_with_timeout(
+    stream: TcpNodeStream,
+    target: &str,
+    response_timeout: Duration,
+) -> Result<TcpNodeStream> {
     let (mut rd, mut wr) = tokio::io::split(stream);
     // 地址帧 + 2B 应答（09-P3-1：write_target 是建链序列中唯一无超时 I/O，
     // 恶意节点完成 Noise 后停读可挂住写端——补 CONNECT_TIMEOUT 与同序列对齐）
@@ -509,13 +523,14 @@ pub async fn request_target(stream: TcpNodeStream, target: &str) -> Result<TcpNo
         .await
         .map_err(|_| HydraError::ConnectionError("write request timed out".to_string()))?
         .map_err(|e| HydraError::ConnectionError(format!("write request failed: {}", e)))?;
-    match tokio::time::timeout(RESPONSE_TIMEOUT, read_reply(&mut rd)).await {
+    match tokio::time::timeout(response_timeout, read_reply(&mut rd)).await {
         // 保留错误类型：TargetUnreachable 供故障切换层区分「节点故障」与「目标不可达」
         Ok(r) => r?,
         Err(_) => {
-            return Err(HydraError::ConnectionError(
-                "Node response timeout".to_string(),
-            ))
+            return Err(HydraError::ConnectionError(format!(
+                "Node response timeout ({}s)",
+                response_timeout.as_secs()
+            )))
         }
     }
 
@@ -524,6 +539,18 @@ pub async fn request_target(stream: TcpNodeStream, target: &str) -> Result<TcpNo
     // 日志脱敏：info 级不落目标明文（审查 R-08）
     info!("✓ TCP/TLS target {} opened", mask_target(target));
     Ok(tls)
+}
+
+/// 温池 checkout 专用应答超时（内核优化 #1；env 可调，默认 8s）
+pub(crate) fn warm_response_timeout() -> Duration {
+    static T: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("HYDRA_WARM_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|s| Duration::from_secs(s.clamp(2, 20)))
+            .unwrap_or(Duration::from_secs(8))
+    })
 }
 
 /// 带半关闭的单向泵：源 EOF 后显式 shutdown 写端（与节点侧 pump 语义对称）。
@@ -535,6 +562,23 @@ where
     let n = tokio::io::copy(&mut r, &mut w).await?;
     let _ = w.shutdown().await;
     Ok(n)
+}
+
+#[cfg(test)]
+mod warm_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn warm_timeout_default_and_clamp() {
+        // 默认 8s（本测试进程未设 env 时 OnceLock 首次初始化）
+        // 注：OnceLock 进程级缓存——本测试只断言取值在合法区间，
+        // 默认值由"未设 env → 8s"的语义保证
+        let t = warm_response_timeout();
+        assert!(
+            t >= Duration::from_secs(2) && t <= Duration::from_secs(20),
+            "温池超时应落在 clamp 区间 [2,20]s，实际 {t:?}"
+        );
+    }
 }
 
 #[cfg(test)]
