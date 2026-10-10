@@ -1,4 +1,4 @@
-# 交叉编译 libhydra_android.so → android/app/src/main/jniLibs/{abi}/（Windows 版）
+﻿# 交叉编译 libhydra_android.so → android/app/src/main/jniLibs/{abi}/（Windows 版）
 # 依赖：cargo-ndk（cargo install cargo-ndk）+ NDK。缺 cargo-ndk 时打印提示并以 0 退出。
 $ErrorActionPreference = "Stop"
 $root = Join-Path $PSScriptRoot "..\.."

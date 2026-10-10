@@ -226,10 +226,38 @@ impl HydraApp {
                 for a in &result.removed {
                     self.node_status.remove(a);
                 }
+                // 凭据落全局配置（评审修复：粘贴导入此前丢弃链接中的 k=/cc=，
+                // 启动代理报"未设置 HYDRA_AUTH_KEY"）。留痕语义与
+                // apply_imported_link（二维码路径）一致
+                if let Some(hex) = &result.auth_key_hex {
+                    if self.config.auth_key.trim().is_empty() {
+                        self.add_log("已导入链接携带的认证密钥".to_string());
+                    } else if self.config.auth_key.trim() != hex {
+                        self.add_log(
+                            "⚠ 导入链接覆盖了原有认证密钥；原密钥对应的节点将无法连接，如非预期请撤销导入"
+                                .to_string(),
+                        );
+                    }
+                    self.config.auth_key = hex.clone();
+                }
+                if let Some(b64) = &result.cert_der_b64 {
+                    self.config.cert_der_b64 = b64.clone();
+                    if !self.config.cert_path.trim().is_empty() {
+                        self.add_log(
+                            "提示：已存在证书文件路径，链接携带的证书仅在清空证书路径后生效"
+                                .to_string(),
+                        );
+                    }
+                }
                 let mut msg = format!(
-                    "已导入分组「{}」：{} 个节点",
+                    "已导入分组「{}」：{} 个节点{}",
                     name.trim(),
-                    result.node_count
+                    result.node_count,
+                    if result.auth_key_hex.is_some() {
+                        "（密钥/证书已自动配置）"
+                    } else {
+                        ""
+                    }
                 );
                 if result.bad_lines > 0 {
                     msg.push_str(&format!("（坏行 {} 条已跳过）", result.bad_lines));
@@ -307,6 +335,18 @@ impl HydraApp {
                 // 证书路径按节点落库（manual_form_cert 留空 = 不写，回落全局证书）
                 let node_addr = format!("{}:{}", addr.trim(), port.trim());
                 self.config.set_node_cert_path(&node_addr, cert.trim());
+                // 表单链接若携带密钥/证书（用户填了密钥或证书文件）同样落全局
+                if let Some(hex) = &result.auth_key_hex {
+                    if self.config.auth_key.trim() != hex {
+                        self.config.auth_key = hex.clone();
+                        self.add_log("已应用表单携带的认证密钥".to_string());
+                    }
+                }
+                if let Some(b64) = &result.cert_der_b64 {
+                    if self.config.cert_der_b64.trim().is_empty() {
+                        self.config.cert_der_b64 = b64.clone();
+                    }
+                }
                 let msg = format!(
                     "已创建分组「{}」：{} 个节点（地址 {}）",
                     name.trim(),

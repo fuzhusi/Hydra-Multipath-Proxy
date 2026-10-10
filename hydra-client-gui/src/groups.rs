@@ -133,6 +133,12 @@ pub(crate) struct GroupImportResult {
     pub(crate) node_count: usize,
     /// 解析失败的坏行数（不致命，日志展示）
     pub(crate) bad_lines: usize,
+    /// 链接携带的认证密钥（hex，取第一条携带者；None = 链接均未携带）
+    /// ——调用方负责写入全局配置（修复：粘贴导入此前丢弃凭据，
+    /// 启动代理报"未设置 HYDRA_AUTH_KEY"）
+    pub(crate) auth_key_hex: Option<String>,
+    /// 链接携带的节点证书 DER（base64 标准，取第一条携带者）
+    pub(crate) cert_der_b64: Option<String>,
 }
 
 /// 从粘贴文本创建**命名分组**（纯逻辑，UI 与单测共用）：
@@ -197,11 +203,32 @@ pub(crate) fn import_share_links_as_group(
         ));
     }
 
+    // 凭据提取（评审修复 SB-G-1）：粘贴导入此前只取地址、丢弃链接里的
+    // k=/cc=，导致"导入成功但启动报未设置认证密钥"。取第一条携带者的
+    // 密钥/证书交给调用方落全局配置（与二维码导入 apply_imported_link 同语义）
+    let auth_key_hex = parsed.links.iter().find_map(|l| {
+        l.auth_key_bytes()
+            .ok()
+            .flatten()
+            .map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>())
+    });
+    let cert_der_b64 = parsed.links.iter().find_map(|l| {
+        l.cert_der_bytes()
+            .ok()
+            .flatten()
+            .map(|der| {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode(&der)
+            })
+    });
+
     Ok(GroupImportResult {
         added,
         removed,
         node_count,
         bad_lines: parsed.errors.len(),
+        auth_key_hex,
+        cert_der_b64,
     })
 }
 
@@ -355,6 +382,31 @@ mod tests {
         )
     }
 
+    /// 构造携带凭据的分享链接（k=/cc=，与节点导出格式一致）
+    fn cred_link_line(addr: &str, port: u16, key_b64: &str, cert_b64: &str) -> String {
+        format!(
+            "hydra://{}:{}?bandwidth=100&latency=10&loss_rate=0.01&status=online&v=3             &k={}&cc={}",
+            addr, port, key_b64, cert_b64
+        )
+    }
+
+    /// 评审修复回归：粘贴导入必须提取链接携带的密钥/证书（此前丢弃 →
+    /// 启动代理报"未设置 HYDRA_AUTH_KEY"）
+    #[test]
+    fn import_extracts_credentials_from_links() {
+        let mut cfg = GuiConfig::default();
+        let key = b"0123456789abcdef0123456789abcdef"; // 32B
+        use base64::Engine as _;
+        let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+        let cert = b"test-cert-der-bytes";
+        let cert_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cert);
+        let text = cred_link_line("10.2.0.1", 1001, &key_b64, &cert_b64);
+        let result = import_share_links_as_group(&mut cfg, "分享导入1", &text).unwrap();
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(result.auth_key_hex.as_deref(), Some(hex.as_str()));
+        assert!(result.cert_der_b64.is_some());
+    }
+
     #[test]
     fn next_import_group_name_skips_existing_subscription_names() {
         // 空列表 → 分享导入1
@@ -399,6 +451,9 @@ mod tests {
         assert!(cfg.subscriptions[0]
             .source
             .starts_with(LOCAL_TEXT_SOURCE_PREFIX));
+        // 无凭据链接（测试构造器不带 k=/cc=）：导入结果凭据应为 None
+        assert!(result.auth_key_hex.is_none());
+        assert!(result.cert_der_b64.is_none());
         assert!(cfg.subscriptions[0]
             .source
             .contains(&share_link_line("10.1.0.1", 1001)));
