@@ -16,7 +16,15 @@
 | P1 | 温命中 e2e 回归测试 | 守住节点侧"地址帧等待 10s→300s"与客户端池 60s TTL 的耦合（hydra-client/tests 既有 spawn_node 基建，闲置 11-12s 后 checkout 仍成功） | — |
 | P2 | **eframe/egui 升级（0.27 → 0.33+）** | 根治 RUSTSEC-2026-0257（webbrowser Unix 参数注入，当前已评估豁免：发布产物为 Windows GUI，不含漏洞路径）+ 清除 unmaintained 传递依赖群（instant/derivative 等）；21 文件 GUI 需适配 API 变更 | 专门会话，升级后逐页目检 |
 | P2 | VPN 数据面死亡感知 | run_stack 罕见路径中途退出时经回调通知 Kotlin 触发 kill switch 重连（当前 UI 停留"运行中"） | Rust→Kotlin 回调 FFI |
-| P3 | 连接池周期清扫 | 永不 checkout 的节点温连接条目滞留客户端（≤2×节点数，节点侧 300s 自行释放） | — |
+| P2 | pump 写阻塞 + 节点 TCP keepalive | write_all 无超时（对端零窗口钉住 permit/fd）+ 节点出站无 keepalive（企业级评审 P2-1） | socket2 已在依赖树 |
+| P2 | health/metrics 端点并发上限 | accept 无 Semaphore/per-IP（误绑非回环时未认证耗尽 fd）+ 拒绝非 loopback 绑定选项 | — |
+| P2 | 信令慢滴防护 | 逐字节读每字节重置 90s——改整行 deadline 或连接寿命上限（慢滴 4.3 天/连接） | — |
+| P3 | pump 双时钟统一 | 空闲看门狗 SystemTime 墙钟 vs 寿命 Instant 单调钟（NTP 前跳误杀） | — |
+| P3 | UDP 中继 target 维度 metrics | UDP 路径不产 target_ok/fail（TCP 有） | — |
+| P3 | hydra-fetch 重试预算合并 | worker 3 次 × fetch_chunk 内 3 次 = 单块最坏 9 次握手 | — |
+| P3 | with_cert_fp 改 Result | 非法输入 panic（GUI 用户输入可达） | — |
+| P3 | CLI/GUI TUN 互斥跨形态 | 52810/52811 分端口——GUI(TUN) 与 CLI(--tun) 可并发抢 /1 路由 | — |
+| P3 | GUI 代理退出信号时序 | exit_tx 在 runtime drop 前发出，快速重启新旧路由竞态 | — |
 | P3 | Windows 开机自启 + TUN | 注册表自启 + UAC 免提示 | — |
 | P4 | 多节点并行下载 | **需产品决策**：独立下载器形态（CLI/GUI、断点续传）——CONNECT 隧道字节不透明，代理内无法实现 | 产品决策 |
 | P4 | rekey 密钥轮换 | V3.3；TLS 1.3 每连接独立密钥已绑住单连接暴露面 | 随多路径协议恢复设计 |
@@ -30,6 +38,31 @@
 - **方案 B（应用层）**：连接时长/流量超阈值时透明重建（断旧连新 + 应用层重连协议）——TCP 序列号不连续，对应用不透明
 - **方案 C（会话层）**：多连接聚合协议（V3.4 恢复）内做 key rotation——依赖多路径协议恢复
 - **结论**：短期维持现状（每连接独立密钥已足够）；V3.3 多路径恢复时一并设计 C 方案
+
+## [Unreleased] - 企业级全量代码评审（三路并行，~25k 行）
+
+### 结论
+
+三路评审（协议+节点 / 核心库+下载器 / 客户端+Android+GUI）合计 **0 P0 / 2 P1 / 9 P2 / 若干 P3**——P1 与高危 P2 全部修复，其余入待开发计划。
+
+### 修复（本批）
+
+- **[P1] hydra-fetch 状态文件并发"原子写"失效**：多 worker 共享同一 `.json.tmp`，并发 save 交错写/丢更新——临时名加进程内唯一序号（残余边界如实标注：rename 顺序不受限，丢的只是已完成位，续传多重下已完成的块，数据不会错）
+- **[P1] TUN UDP 中继 UdpCmd 无界通道**：重连退避窗口无人排空，QUIC/DNS 重负载可积压数百 MB——改有界 1024 + try_send Full 即丢包（UDP 语义）
+- **[P2] TUN 网关未知仍继续接管**：豁免路由（含节点 IP /32）缺失 = 出站被自身 TUN 捕获的递归自环直至流表打满（fail-broken）——RoutePlan 增加 `gateway_resolved` 标记，run_tun fail-fast 拒绝启动
+- **[P2] hydra-fetch worker 文件打开失败误用 content_changed**：会误删断点状态文件且文案误导——改走 fatal 终态（保留状态）
+- **[P2] 服务器 200 响应（无视 Range）被判终态**：可恢复场景——新增 `RangeIgnored` 类别，编排层自动回落单流重跑
+- **[P2] 温池 reaper 守卫固化缺陷**：无 runtime 的空尝试被 OnceLock 固化为已初始化——改 AtomicBool（空尝试不置位，可重试）
+- **[P2] onRevoke/onDestroy 主线程同步 stopVpn**：FFI 持锁 shutdown 最长 3s 阻塞主线程——移独立守护线程
+- **[P2] 分应用白名单全失效静默反转为全量接管**：establish 侧显式告警
+
+### 记录入待开发计划（评审发现，未阻塞）
+
+pump 写阻塞绕过空闲看门狗 + 节点无 TCP keepalive；health 端点无并发上限；信令逐字节慢滴（4.3 天/连接）；pump 双时钟（SystemTime/Instant）；UDP 中继无 target 维度 metrics；UDP 会话队列无字节预算；hydra-fetch 重试预算双层相乘；with_cert_fp panic；GUI 代理线程退出信号时序；CLI/GUI TUN 互斥跨形态缺口等——见待开发计划表新增行。
+
+### 评审确认的既有强项
+
+Noise-PSK 常时比较/通道绑定/重放防护、SSRF 解析后过滤+单源黑名单、UDP 会话表竞态处理、证书 0600 原子创建、信令属主证明+限速、VpnExitCallback 绑定字节级一致（本机重建 .so 再生 diff 为空）、TUN 路由回滚/崩溃清理、kill switch 跨代竞态处理。
 
 ## [Unreleased] - hydra-fetch 多节点下载器 + rekey Tier1（连接最长寿命）
 

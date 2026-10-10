@@ -188,6 +188,9 @@ pub struct RoutePlan {
     pub add: Vec<RouteCmd>,
     /// 与 `add` 同序的删除命令（退出/崩溃后幂等清理用）
     pub remove: Vec<RouteCmd>,
+    /// 物理网关是否成功解析：false = 豁免路由（含节点 IP /32）未生成——
+    /// 继续接管会形成自环，调用方必须拒绝启动（企业级评审 P2）
+    pub gateway_resolved: bool,
 }
 
 /// 计算路由豁免清单（纯函数）。
@@ -252,14 +255,21 @@ pub fn compute_routes_for(
             });
         }
     } else if !tun.exclude_routes.is_empty() {
+        // 企业级评审 P2：网关未知时豁免路由（含节点 IP /32）不生成——继续
+        // 接管会形成自环（客户端到节点的出站被自身 TUN 捕获）直至流表打满。
+        // gateway_resolved=false 由调用方 fail-fast 拒绝启动。
         warn!(
-            "物理网关未知，{} 条豁免路由未能生成——代理到节点的流量可能形成环路！\
+            "物理网关未知，{} 条豁免路由未能生成——调用方必须拒绝启动 TUN。
              请设置 HYDRA_TUN_GW 或确认默认网关可解析",
             tun.exclude_routes.len()
         );
     }
     let remove = add.to_vec();
-    RoutePlan { add, remove }
+    RoutePlan {
+        add,
+        remove,
+        gateway_resolved: physical_gw.is_some(),
+    }
 }
 
 /// 私网段豁免路由（09-P2-1）：RFC1918 全部三段 + CGNAT 100.64/10
@@ -1462,7 +1472,7 @@ impl UdpFlowTable {
 /// 通道断开自动重连（指数退避封顶 10s）；每次重连按当前最优节点建连。
 async fn udp_relay_task(
     factory: UdpChannelFactory,
-    mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<UdpCmd>,
+    mut cmd_rx: tokio::sync::mpsc::Receiver<UdpCmd>,
     transport: Arc<dyn PacketTransport>,
     shutdown: CancellationToken,
 ) {
@@ -1728,7 +1738,7 @@ fn private_targets_allowed() -> bool {
 
 /// 分发入口（run_stack 调用）：解析 + 私网/组播过滤 + 转交中继任务。
 /// 返回 true = 已接管（转发中）；false = 未接管（调用方按旧行为处理）。
-fn try_forward_udp(pkt: &[u8], cmd_tx: &tokio::sync::mpsc::UnboundedSender<UdpCmd>) -> bool {
+fn try_forward_udp(pkt: &[u8], cmd_tx: &tokio::sync::mpsc::Sender<UdpCmd>) -> bool {
     let parsed = parse_udp_v4(pkt).or_else(|| parse_udp_v6(pkt));
     let Some((src, dst, off, len)) = parsed else {
         return false;
@@ -1765,8 +1775,10 @@ fn try_forward_udp(pkt: &[u8], cmd_tx: &tokio::sync::mpsc::UnboundedSender<UdpCm
         return false;
     }
     let flow = format!("{src}|{dst}");
+    // 有界通道 try_send：Full = 重连退避/下游过载——静默丢弃（UDP 语义，
+    // 企业级评审 P1-1 修复：原无界通道在退避窗口无人排空，可积压数百 MB）
     cmd_tx
-        .send(UdpCmd::Send {
+        .try_send(UdpCmd::Send {
             flow,
             dst,
             src,
@@ -1870,7 +1882,9 @@ pub async fn run_stack<T: PacketTransport>(
     let udp_tx = if cfg.udp_relay {
         match udp_factory {
             Some(factory) => {
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UdpCmd>();
+                // 有界（1024）：重连退避窗口内无人排空，无界通道会随 QUIC/DNS
+                // 重负载积压数百 MB（企业级评审 P1-1）；Full 即丢包（UDP 语义）
+                let (tx, rx) = tokio::sync::mpsc::channel::<UdpCmd>(1024);
                 tokio::spawn(udp_relay_task(
                     factory,
                     rx,
@@ -2509,6 +2523,14 @@ pub async fn run_tun(
     // 1. 物理 gw 探测 + 路由方案（豁免失败只是告警，见 compute_routes）
     let gw = detect_physical_gateway();
     let plan = compute_routes(&cfg, gw);
+    // 企业级评审 P2：网关未解析 + 存在豁免需求（含节点 IP）→ 豁免路由缺失，
+    // 继续接管会形成"出站被自身 TUN 捕获"的自环——fail-fast 拒绝启动
+    if !plan.gateway_resolved && !cfg.exclude_routes.is_empty() {
+        return Err(HydraError::ConnectionError(
+            "物理网关无法解析，豁免路由（含节点 IP）未能生成——继续接管会形成自环。             请设置 HYDRA_TUN_GW=<网关IP> 或修复默认网关解析后重试"
+                .to_string(),
+        ));
+    }
     info!(
         // 07-P2-3：不再做平台相关的硬编码减法（`len() - 3` 在 Linux + 物理网关
         // 探测失败时 usize 下溢 panic）——直接输出总数与豁免数，与平台解耦
@@ -3861,6 +3883,7 @@ mod tests {
     fn cleanup_routes_接管路由先删() {
         // 构造「豁免在前、接管在后」的乱序方案（调用方理论上可任意排序）
         let plan = RoutePlan {
+            gateway_resolved: true,
             add: vec![
                 RouteCmd {
                     dest: Ipv4Addr::new(203, 0, 113, 7),

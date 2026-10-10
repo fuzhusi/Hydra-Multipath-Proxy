@@ -129,8 +129,10 @@ impl TunnelFactory {
 
 /// 单块取回错误分类
 pub enum ChunkError {
-    /// 内容变更（If-Range 不匹配 / Range 被忽略 / 416）——终止并行，重下
+    /// 内容变更（If-Range 不匹配 / 416）——终止并行，整文件重下
     ContentChanged,
+    /// 服务器无视 Range（响应 200）：可恢复——编排层回落单流
+    RangeIgnored,
     /// 可重试（传输故障/5xx/超时）；隧道已丢弃
     Retryable(String),
     /// 致命（如 403 拒绝）——终止整个下载

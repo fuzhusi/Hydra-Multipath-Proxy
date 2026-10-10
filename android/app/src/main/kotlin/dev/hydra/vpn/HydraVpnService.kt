@@ -348,6 +348,10 @@ class HydraVpnService : VpnService() {
                 .map { it.trim() }
                 .filter { it.isNotEmpty() }
                 .filter { p -> runCatching { pm.getPackageInfo(p, 0) }.isSuccess }
+            // 白名单过滤后为空（全失效/全卸载）：语义反转为全量接管——显式告警
+            if (cfg.appFilterMode == SecureStore.APP_FILTER_ALLOW && pkgs.isEmpty()) {
+                EngineState.addLog("⚠ 分应用白名单全部失效——本连接将接管全部应用流量")
+            }
             when (cfg.appFilterMode) {
                 SecureStore.APP_FILTER_ALLOW -> pkgs.forEach { b.addAllowedApplication(it) }
                 SecureStore.APP_FILTER_DISALLOW -> pkgs.forEach { b.addDisallowedApplication(it) }
@@ -422,7 +426,8 @@ class HydraVpnService : VpnService() {
         userStopRequested = true
         retryJob?.cancel()
         releaseHoldTun()
-        runCatching { stopVpn() }
+        // stop_vpn FFI 持 VPN_STATE 锁 shutdown（最长 3s）——移出主线程
+        Thread { runCatching { stopVpn() } }.apply { isDaemon = true; start() }
         EngineState.update {
             it.copy(running = false, transition = null, boundAddr = null,
                 sentBytes = 0, receivedBytes = 0, activeConns = 0,
@@ -434,7 +439,9 @@ class HydraVpnService : VpnService() {
     }
 
     override fun onDestroy() {
-        runCatching { stopVpn() }
+        // stop_vpn FFI 持锁 shutdown（最长 3s）——移出主线程；独立守护线程
+        // （scope 即将 cancel，不能挂在其上）
+        Thread { runCatching { stopVpn() } }.apply { isDaemon = true; start() }
         retryJob?.cancel()
         releaseHoldTun()
         scope.cancel()

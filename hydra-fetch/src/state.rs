@@ -74,9 +74,14 @@ impl FetchState {
             .sum()
     }
 
-    /// 原子写（临时文件 + rename）
+    /// 原子写（临时文件 + rename）。临时名带进程内唯一序号——多 worker 并发
+    /// save 不共写同一 tmp（评审企业级 P1：共享 tmp 会交错写/丢更新）。
+    /// 残余边界（如实）：rename 顺序不受限，后完成者的旧快照可能覆盖新快照
+    /// ——丢的只是"已完成位"（续传时多重下已完成的块），数据不会错。
     pub async fn save(&self, state_path: &Path) -> std::io::Result<()> {
-        let tmp = state_path.with_extension("json.tmp");
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = state_path.with_extension(format!("json.tmp{}", seq));
         let json = serde_json::to_vec(self).map_err(std::io::Error::other)?;
         tokio::fs::write(&tmp, &json).await?;
         tokio::fs::rename(&tmp, state_path).await

@@ -54,11 +54,25 @@ struct Shared {
     path: String,
     /// 内容变更终止（If-Range 不匹配等）：停止一切重试，要求整文件重下
     content_changed: std::sync::atomic::AtomicBool,
+    /// 服务器无视 Range（探测声明支持但响应 200）：可恢复——回落单流
+    range_ignored: std::sync::atomic::AtomicBool,
     /// 致命错误（如 403）：同样终止一切重试，但保留状态文件且错误文案独立
     fatal: std::sync::Mutex<Option<String>>,
 }
 
 impl Shared {
+    fn flag_range_ignored(&self) {
+        self.range_ignored
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.content_changed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn range_ignored(&self) -> bool {
+        self.range_ignored
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn complete(&self, job: &ChunkJob) {
         mark_done(
             &mut self.state.lock().unwrap(),
@@ -138,8 +152,16 @@ async fn worker(id: usize, shared: Arc<Shared>, fail_tx: mpsc::UnboundedSender<C
                     }
                     break;
                 }
+                Err(ChunkError::RangeIgnored) => {
+                    eprintln!(
+                        "[worker-{id}] 块 {} 服务器未按 Range 响应（200）——回落单流下载",
+                        job.index
+                    );
+                    shared.flag_range_ignored();
+                    return;
+                }
                 Err(ChunkError::ContentChanged) => {
-                    eprintln!("[worker-{id}] 块 {} 内容变更（If-Range 不匹配/Range 被忽略）——终止并行重下", job.index);
+                    eprintln!("[worker-{id}] 块 {} 内容变更（If-Range 不匹配）——终止并行重下", job.index);
                     shared.flag_content_changed();
                     let _ = fail_tx.send(job.clone());
                     return;
@@ -233,17 +255,26 @@ pub async fn run(cfg: FetchConfig) -> Result<(), String> {
         let _ = tokio::fs::remove_file(&state_path).await;
         single_stream(&factory, &tls, &pr, &part_path).await?;
     } else {
-        parallel_download(
+        match parallel_download(
             cfg.clone(),
-            factory,
-            tls,
-            pr,
+            factory.clone(),
+            tls.clone(),
+            pr.clone(),
             total,
             &part_path,
             &state_path,
             if_range,
         )
-        .await?;
+        .await?
+        {
+            ParallelOutcome::Complete => {}
+            ParallelOutcome::RangeIgnored => {
+                // 探测头声明支持 Range 但实际响应 200：可恢复——回落单流
+                println!("服务器未按 Range 响应——回落单流下载");
+                let _ = tokio::fs::remove_file(&state_path).await;
+                single_stream(&factory, &tls, &pr, &part_path).await?;
+            }
+        }
     }
 
     // ── 统一就位尾段：SHA-256 校验 → rename → 删状态文件 ──
@@ -279,7 +310,7 @@ async fn parallel_download(
     part_path: &PathBuf,
     state_path: &PathBuf,
     if_range: Option<String>,
-) -> Result<(), String> {
+) -> Result<ParallelOutcome, String> {
     // 3. 状态恢复（评审 P0：URL/总长/块大小任一漂移即失效重下）
     let chunk_size = cfg.chunk_size.max(1);
     let mut st = match FetchState::load(&state_path.clone()).await {
@@ -402,6 +433,7 @@ async fn parallel_download(
             port: pr.port,
             path: pr.path.clone(),
             content_changed: std::sync::atomic::AtomicBool::new(false),
+            range_ignored: std::sync::atomic::AtomicBool::new(false),
             fatal: std::sync::Mutex::new(None),
         });
         let (fail_tx, mut fail_rx) = mpsc::unbounded_channel::<ChunkJob>();
@@ -419,6 +451,9 @@ async fn parallel_download(
             let _ = h.await;
         }
         st = shared.state.lock().unwrap().clone();
+        if shared.range_ignored() {
+            break; // 服务器无视 Range：出循环走单流回落（outcome 在循环后判定）
+        }
         if let Some(msg) = shared.fatal_msg() {
             reporter.abort();
             // 致命错误：保留状态文件（配置修复后续传）
@@ -453,7 +488,15 @@ async fn parallel_download(
     }
 
     // 6. 就位尾段（校验/rename/删状态）由 run() 统一执行
-    Ok(())
+    Ok(ParallelOutcome::Complete)
+}
+
+/// 并行下载结果：Complete = 全部块完成；RangeIgnored = 服务器无视 Range
+///（探测头声明与实际行为不符）——编排层回落单流重跑一次
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParallelOutcome {
+    Complete,
+    RangeIgnored,
 }
 
 /// 单流回落：全量 GET（BodyReader 兼容三种帧式），不支持断点续传

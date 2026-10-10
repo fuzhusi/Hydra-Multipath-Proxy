@@ -159,7 +159,10 @@ pub struct ProxyServer {
     scheduler: Arc<Scheduler>,
     /// 温连接池（实例级单池，三处凭据构建点共享 + reaper 周期清扫）
     pool: Arc<crate::pool::ChannelPool>,
-    pool_reaper_started: std::sync::OnceLock<()>,
+    /// reaper 已 spawn 标记（AtomicBool 而非 OnceLock——无 runtime 上下文的
+    /// 空尝试**不置位**，下次 runtime 内调用再试；OnceLock 会把空尝试固化
+    /// 为"已初始化"，此后真正需要时也永不挂 reaper，企业级评审 P2）
+    pool_reaper_started: std::sync::atomic::AtomicBool,
     nodes: Vec<SocketAddr>,
     traffic_monitor: Option<Arc<TrafficMonitor>>,
     auth_key: Vec<u8>,
@@ -175,7 +178,7 @@ impl ProxyServer {
             listen_addr,
             scheduler: Arc::new(Scheduler::new()),
             pool: Arc::new(crate::pool::ChannelPool::new()),
-            pool_reaper_started: std::sync::OnceLock::new(),
+            pool_reaper_started: std::sync::atomic::AtomicBool::new(false),
             nodes: Vec::new(),
             traffic_monitor: None,
             auth_key: Vec::new(),
@@ -227,21 +230,29 @@ impl ProxyServer {
     /// 的节点条目驻留 fd）。容忍无运行时上下文（TUN opener 可能在
     /// runtime 外构建——此时不挂 reaper，池仍由 checkout 惰性淘汰兜底）。
     fn start_pool_reaper(&self) {
-        self.pool_reaper_started.get_or_init(|| {
-            if tokio::runtime::Handle::try_current().is_err() {
-                return;
-            }
-            let pool = Arc::clone(&self.pool);
-            tokio::spawn(async move {
-                let mut iv = tokio::time::interval(std::time::Duration::from_secs(60));
-                loop {
-                    iv.tick().await;
-                    let n = pool.evict_expired();
-                    if n > 0 {
-                        tracing::debug!("Pool: evicted {} expired warm channels", n);
-                    }
+        if self.pool_reaper_started.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        // 无运行时上下文：不置位（下次 runtime 内调用再试）
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        if self
+            .pool_reaper_started
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let pool = Arc::clone(&self.pool);
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                iv.tick().await;
+                let n = pool.evict_expired();
+                if n > 0 {
+                    tracing::debug!("Pool: evicted {} expired warm channels", n);
                 }
-            });
+            }
         });
     }
 
