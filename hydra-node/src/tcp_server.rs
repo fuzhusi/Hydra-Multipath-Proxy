@@ -130,6 +130,32 @@ fn validate_peer_id(peer_id: &str) -> bool {
 /// 后的认证失败路径回复内置静态页而非静默关流（默认 false = 行为零变化；
 /// 权衡见 [`crate::fallback`] 模块文档）。
 #[allow(clippy::too_many_arguments)]
+/// 出站/入站 TCP keepalive（企业级评审 P2-1 + 内核优化 #12）：静默半开
+/// 连接 60s 起探、10s 间隔
+pub(crate) fn enable_tcp_keepalive(stream: &tokio::net::TcpStream) {
+    use socket2::{SockRef, TcpKeepalive};
+    let ka = TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(10));
+    if let Err(e) = SockRef::from(stream).set_tcp_keepalive(&ka) {
+        tracing::debug!("TCP keepalive 设置失败（忽略）: {}", e);
+    }
+}
+
+/// 内核优化 #12：TCP_USER_TIMEOUT（Linux 门控）——keepalive 探测失败后
+/// 强制断开的上限（毫秒）
+#[cfg(target_os = "linux")]
+pub(crate) fn set_tcp_user_timeout(fd: std::os::unix::io::RawFd, ms: u32) {
+    extern "C" {
+        fn setsockopt(fd: i32, level: i32, optname: i32, optval: *const u32, optlen: u32) -> i32;
+    }
+    const TCP_USER_TIMEOUT: i32 = 18;
+    const IPPROTO_TCP: i32 = 6;
+    unsafe {
+        setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &ms, 4);
+    }
+}
+
 /// 进程启动锚点（单调钟毫秒时间戳的公共基准——pump 共享时间戳用；
 /// 企业级评审 P3：SystemTime 墙钟受 NTP 步进影响，统一为单调钟）
 pub(crate) fn mono_ms() -> u64 {
@@ -186,6 +212,32 @@ pub async fn spawn_tcp_listener(
     };
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    // 内核优化 #10：listen socket TCP_FASTOPEN（Linux；需 sysctl
+    // net.ipv4.tcp_fastopen>=2——部署文档）。未配置时静默回退。
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        const TCP_FASTOPEN: i32 = 23; // linux/tcp.h
+        const IPPROTO_TCP: i32 = 6;
+        let backlog: i32 = 256;
+        let r = unsafe {
+            libc_setsockopt(
+                listener.as_raw_fd(),
+                IPPROTO_TCP,
+                TCP_FASTOPEN,
+                &backlog as *const i32 as *const u8,
+                4,
+            )
+        };
+        if r != 0 {
+            debug!(
+                "TCP_FASTOPEN 设置失败（sysctl net.ipv4.tcp_fastopen 未启用？）: {}",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            info!("TCP Fast Open 已启用（节点侧）");
+        }
+    }
     let local = listener.local_addr()?;
     info!("Hydra TCP/TLS transport (Noise-PSK) listening on {}", local);
 
@@ -204,6 +256,8 @@ pub async fn spawn_tcp_listener(
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // 禁 Nagle：握手与交互式流量的小包延迟敏感
                     let _ = stream.set_nodelay(true);
+                    // keepalive（企业级评审 P2-1）：静默半开由内核探测收尾
+                    enable_tcp_keepalive(&stream);
                     // per-IP 限额（09-P2-6）：单源并发超限立即丢弃（与额度满
                     // shedding 同语义；permit 未占用）
                     let Some(ip_guard) = PerIpGuard::acquire(&per_ip_map, peer.ip(), per_ip_limit)
@@ -765,4 +819,15 @@ mod tests {
             "寿命到期后 pump 应结束（即便持续活跃）"
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn setsockopt(
+        fd: i32,
+        level: i32,
+        optname: i32,
+        optval: *const i32,
+        optlen: u32,
+    ) -> i32;
 }

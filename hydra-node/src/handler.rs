@@ -12,6 +12,8 @@
 use hydra_protocol::handshake::AuthMode;
 use hydra_protocol::{mask_target, HydraError};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 

@@ -57,6 +57,16 @@ pub async fn connect_tcp_protected(addr: SocketAddr) -> std::io::Result<tokio::n
     } else {
         tokio::net::TcpSocket::new_v6()?
     };
+    // 内核优化 #10：TCP Fast Open（TCP_FASTOPEN_CONNECT，Linux 内核 4.11+）。
+    // 客户端侧需配合节点 listen socket 的 TCP_FASTOPEN + sysctl
+    // net.ipv4.tcp_fastopen>=2（部署文档）；未启用节点透明回退（cookie
+    // 请求路径），env HYDRA_TFO=0 关闭。仅 Linux/Android 门控（Windows/
+    // macOS 无此选项 API——回退普通建连）。
+    #[cfg(target_os = "linux")]
+    if tfo_enabled() && addr.is_ipv4() {
+        use std::os::unix::io::AsRawFd;
+        set_tfo_connect(sock.as_raw_fd());
+    }
     // Android（unix）为真 fd（i32）；Windows 为 SOCKET 句柄——钩子仅在
     // Android 场景安装，桌面平台此调用为零开销直通
     #[cfg(unix)]
@@ -72,6 +82,37 @@ pub async fn connect_tcp_protected(addr: SocketAddr) -> std::io::Result<tokio::n
     sock.connect(addr).await
 }
 
+/// TFO 开关（env HYDRA_TFO=0 关闭；默认开，Linux/Android）
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn tfo_enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("HYDRA_TFO").as_deref() != Ok("0"))
+}
+
+/// raw setsockopt(TCP_FASTOPEN_CONNECT=30)：socket2 0.6 无此 API（评审修正）。
+/// 失败静默（内核不支持/未配置时回退普通建连——透明降级）。
+#[cfg(target_os = "linux")]
+fn set_tfo_connect(fd: std::os::unix::io::RawFd) {
+    // TCP_FASTOPEN_CONNECT = 30（linux/tcp.h）
+    const TCP_FASTOPEN_CONNECT: i32 = 30;
+    const optval: i32 = 1;
+    // setsockopt(2)：level=IPPROTO_TCP(6)
+    let r = unsafe { setsockopt(fd, 6, TCP_FASTOPEN_CONNECT, &optval as *const i32 as *const u8, 4) };
+    if r != 0 {
+        tracing::debug!("TCP_FASTOPEN_CONNECT 设置失败（回退普通建连）: errno={}", std::io::Error::last_os_error());
+    }
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn setsockopt(
+        fd: i32,
+        level: i32,
+        optname: i32,
+        optval: *const u8,
+        optlen: u32,
+    ) -> i32;
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,3 +150,5 @@ mod tests {
         }
     }
 }
+
+
