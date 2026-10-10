@@ -45,3 +45,6 @@ hydra-android-m1-debug.apk
 *.so
 android/.gradle/
 *.tmp
+
+# 本地构建产物（本地 UI 测试包）
+local-dist/
