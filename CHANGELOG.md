@@ -39,7 +39,34 @@
 - **方案 C（会话层）**：多连接聚合协议（V3.4 恢复）内做 key rotation——依赖多路径协议恢复
 - **结论**：短期维持现状（每连接独立密钥已足够）；V3.3 多路径恢复时一并设计 C 方案
 
-## [Unreleased] - 企业级全量代码评审（三路并行，~25k 行）
+## [0.2.3] - 2026-10-09
+
+### 批次：UI v4 企业级批次（P0）+ 设计方案评审入库
+
+### 新增
+
+- **设计团队方案**（docs/design/UI设计方案-v4-企业级.md）：55 条启发式审计
+  （2P0/13P1/23P2/17P3，全部带代码证据）+ Design Tokens v4（对比度 42 项
+  WCAG 实测）+ 六页规格 + egui 实现映射（A/B/C 难度）；经方案评审 10 项
+  修正后执行（NodeHealth 枚举签名、G-04 API、统计卡三档、虚拟表格移入
+  不做清单）
+- **状态三通道编码**（颜色+字形+文字，ND-01 P0 根治）：palette 新增
+  NodeHealth 五态枚举 + health_color/symbol/label 单点判定
+- **公共组件库 components.rs**：status_pill/banner/empty_state/
+  ConfirmAction+draw_confirm_dialog（Esc 取消、级联删除红字说明）
+- **破坏性操作全部确认**：删节点/删订阅（级联计数+本地文本提示）/清空日志
+- **日志结构化**（LG-01/02 + 评审决策）：级别枚举着色/过滤/等宽 + 容量
+  100→1000 + 导出到文件；⚠️/✗ 调用点迁移 add_warn/add_error
+- **首页**：启动失败 DANGER 横幅（G-02）+ 无配置引导卡（OV-06）+ 统计卡
+  三档列数（G-11 400px 溢出修复）+ 字号 token 化
+- **侧栏**：三态状态徽章含「启动中」（TR-01）+ 选中左缘条（TR-02）+
+  Ctrl+1..6 切页（G-05）+ 间距 token 清理（G-07）
+
+### 批次：企业级全量代码评审（三路并行，~25k 行）
+
+#### 结论
+
+0P0 / 2P1 / 9P2 / 若干 P3——P1 与高危 P2 本版修复，其余入待开发计划。
 
 ### 结论
 
@@ -64,7 +91,7 @@ pump 写阻塞绕过空闲看门狗 + 节点无 TCP keepalive；health 端点无
 
 Noise-PSK 常时比较/通道绑定/重放防护、SSRF 解析后过滤+单源黑名单、UDP 会话表竞态处理、证书 0600 原子创建、信令属主证明+限速、VpnExitCallback 绑定字节级一致（本机重建 .so 再生 diff 为空）、TUN 路由回滚/崩溃清理、kill switch 跨代竞态处理。
 
-## [Unreleased] - hydra-fetch 多节点下载器 + rekey Tier1（连接最长寿命）
+### 批次：hydra-fetch 多节点下载器 + rekey Tier1
 
 ### 新增
 
@@ -102,7 +129,7 @@ Noise-PSK 常时比较/通道绑定/重放防护、SSRF 解析后过滤+单源�
   边界、状态文件校验/原子写、SHA-256 已知向量）；hydra-node 新增 pump 寿命
   deadline 单测（活跃也关闭）。
 
-## [Unreleased] - 性能与运维批次（温连接池 + 托盘禁用态 + 节点 /metrics）
+### 批次：性能与运维（温连接池 + 托盘禁用态 + 节点 /metrics）
 
 ### 新增
 
@@ -143,7 +170,7 @@ Noise-PSK 常时比较/通道绑定/重放防护、SSRF 解析后过滤+单源�
   启动横幅（版本 + 日志级别）。GUI 同款初始化。info 级安全：目标地址已在
   日志层脱敏。
 
-## [Unreleased] - Android 启停修复（真机实测 bug）
+### 批次：Android 启停修复（真机实测 bug）
 
 ### 修复
 
@@ -160,7 +187,7 @@ Noise-PSK 常时比较/通道绑定/重放防护、SSRF 解析后过滤+单源�
     刚启动的引擎立即终止（防"UI 显示已停止而引擎仍在跑"的僵尸态；
     EngineService 的阻塞握手 `eng.start()` 返回后二次校验 generation）。
 
-## [Unreleased] - Android VPN 保护（kill switch + 开机自启 + 分应用代理）
+### 批次：Android VPN 保护（kill switch + 开机自启 + 分应用代理）
 
 ### 新增
 

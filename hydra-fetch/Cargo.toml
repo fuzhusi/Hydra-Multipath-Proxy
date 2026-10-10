@@ -1,6 +1,6 @@
 [package]
 name = "hydra-fetch"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Hydra 多节点并行下载器：HTTP Range 分块 + 按节点评分加权 + 断点续传（经 hydra 加密隧道）"
 license = "PolyForm-Noncommercial-1.0.0"
