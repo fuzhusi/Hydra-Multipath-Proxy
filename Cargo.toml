@@ -20,7 +20,7 @@ resolver = "2"
 # 不依赖进程级默认（避免 ureq 等经特性统一启用 aws_lc_rs 后多 provider 歧义）。
 [workspace.dependencies]
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 ring = "0.17"
 # TCP keepalive 参数化设置（09-P1-2）：与 tokio 1.53 依赖同源的 0.6 单版本
