@@ -74,7 +74,7 @@
 | accent | #4C8DFF | #2563EB | #2DD4BF |
 | accent2 | — | — | #8B5CF6 |
 | success | #34D399 | #059669 | #34D399 |
-| warning | #FBBF24 | #D97706 | #FBBF24 |
+| warning | #FBBF24 | #B45309（R2 修正；Android 评审复核 4.65:1 达标，旧表值 #D97706 仅 2.95 不达标） | #FBBF24 |
 | danger | #F87171 | #DC2626 | #F87171 |
 | chart_grid | #232736 | #ECEDF3 | #16233C |
 

@@ -1,0 +1,55 @@
+package dev.hydra.vpn.ui
+
+import android.content.Context
+import dev.hydra.vpn.EngineState
+import dev.hydra.vpn.SecureStore
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.withContext
+import uniffi.hydra_android.parseShareText
+
+/*
+ * 分享导入（R11 拆分去处）：Activity 深链与 Compose 粘贴/扫码共用。
+ * 目录 ui/import/（Kotlin 包名不能含硬关键字 `import`，故包名取 dev.hydra.vpn.ui）。
+ */
+
+/** 导入成功反馈总线（R5 深链导入动线）：首页 Snackbar + 节点 Tab 徽标同源。 */
+object ImportFeedback {
+    /** 最近一次成功导入的节点数；消费方展示后置 null 防重复。 */
+    val importedNodes = MutableStateFlow<Int?>(null)
+}
+
+/** 导入逻辑唯一实现：深链（hydra://）与节点页粘贴/扫码共用。 */
+object ShareImporter {
+    suspend fun import(context: Context, text: String): String =
+        withContext(Dispatchers.IO) {
+            try {
+                val p = parseShareText(text.trim())
+                val store = SecureStore(context)
+                val cur = store.load()
+                // 合并而非替换：手动添加的节点不因导入丢失；链接节点去重后追加
+                val existing = cur.nodesText.lines().map { it.trim() }.filter { it.isNotEmpty() }
+                val mergedNodes = (existing + p.nodes.filter { it !in existing })
+                    .joinToString("\n")
+                val merged = cur.copy(
+                    nodesText = mergedNodes,
+                    authKeyHex = p.authKeyHex.ifEmpty { cur.authKeyHex },
+                    certDerB64 = p.certDerB64.ifEmpty { cur.certDerB64 },
+                )
+                store.save(merged)
+                val extra = buildString {
+                    if (p.authKeyHex.isNotEmpty()) append("，密钥✓")
+                    if (p.certDerB64.isNotEmpty()) append("，证书✓")
+                    if (p.skipped > 0u) append("（跳过 ${p.skipped} 条：域名节点/坏行）")
+                }
+                if (p.nodes.isNotEmpty()) {
+                    ImportFeedback.importedNodes.value = p.nodes.size
+                }
+                EngineState.addLog("导入成功：${p.nodes.size} 个节点$extra")
+                "导入成功：${p.nodes.size} 个节点$extra"
+            } catch (e: Exception) {
+                EngineState.addLog("导入失败：${e.message}")
+                "导入失败：${e.message}"
+            }
+        }
+}
