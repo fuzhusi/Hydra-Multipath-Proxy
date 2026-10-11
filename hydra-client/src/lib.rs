@@ -147,12 +147,16 @@ pub fn tun_config_from_settings(
         tracing::info!(
             "TUN 规则分流：DNS 联动强制直连解析（等效 HYDRA_TUN_DNS_DIRECT=1）"
         );
-        // R4：物理网卡源 IP 探测（UDP connect+getsockname，不发包）；评审 P2-6：
-        // 传入解析后的 TUN 地址，探测排除 TUN 自身地址//30 网段（防残留 /1
+        // R4：物理网卡源 IP 探测（UDP connect+getsockname，不发包）；评审 P2-6 +
+        // 二轮 P2-1：传入解析后的 TUN 地址与**实际前缀**（builder 接受 8-32），
+        // v4 按 `cfg.prefix` 网段排除、v6 与 `cfg.addr6` 精确比较排除（防残留 /1
         // 路由/VPN 下选中 TUN 地址 → bind 直连回环）。
         // 双族皆失败 → 规则模式退化为全局代理（run_stack 内再告警一次）
-        let (v4, v6) =
-            crate::tun::detect_physical_source_ips(Some(std::net::IpAddr::V4(cfg.addr)));
+        let (v4, v6) = crate::tun::detect_physical_source_ips(
+            Some(cfg.addr),
+            cfg.prefix,
+            Some(cfg.addr6),
+        );
         if v4.is_none() && v6.is_none() {
             tracing::warn!(
                 "TUN 规则分流：物理网卡源 IP 探测失败（v4/v6 均无）——\
@@ -181,6 +185,14 @@ pub fn tun_config_from_settings(
                         engine.skipped_lines,
                         if engine.geoip_enabled() { "启用" } else { "关闭" }
                     );
+                    // 二轮 P3-3：53 强制直连（R2 联动）与用户显式 PROXY 规则
+                    // 冲突时如实告警——DNS 直连联动优先，该规则对 UDP 53 不生效
+                    if engine.port53_proxy_rule_exists() {
+                        tracing::warn!(
+                            "规则文件含端口 53 的 PROXY 规则，但 DNS 直连联动会优先强制 \
+                             53 直连（该规则对 UDP 53 不生效）"
+                        );
+                    }
                     std::sync::Arc::new(engine)
                 }
                 Err(e) => {

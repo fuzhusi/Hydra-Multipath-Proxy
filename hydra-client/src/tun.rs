@@ -773,9 +773,12 @@ pub fn detect_physical_gateway_v6() -> Option<Ipv6Addr> {
 /// 返回 `(v4 源 IP, v6 源 IP)`；任一地址族失败 → None（该族直连不可用，
 /// 规则模式该族全走节点——R4 语义，须告警可见）。
 pub fn detect_physical_source_ips(
-    tun_addr: Option<std::net::IpAddr>,
+    tun_v4: Option<std::net::Ipv4Addr>,
+    prefix: u8,
+    tun_v6: Option<std::net::Ipv6Addr>,
 ) -> (Option<std::net::IpAddr>, Option<std::net::IpAddr>) {
-    // 候选有效性：排除回环/链路本地/未指定 + TUN 自身地址 / /30 网段
+    // 候选有效性：排除回环/链路本地/未指定 + TUN 自身地址 / 实际前缀网段
+    // （二轮 P2-1：v4 按 builder 实际前缀比较，v6 与 TUN v6 地址精确比较）
     let valid = |ip: std::net::IpAddr| -> bool {
         let basic_ok = match ip {
             std::net::IpAddr::V4(v4) => {
@@ -785,7 +788,7 @@ pub fn detect_physical_source_ips(
                 !(v6.is_loopback() || v6.is_unicast_link_local() || v6.is_unspecified())
             }
         };
-        basic_ok && !candidate_in_tun_subnet(ip, tun_addr)
+        basic_ok && !candidate_in_tun_subnet(ip, tun_v4, prefix, tun_v6)
     };
     let v4 = (|| {
         for target in ["8.8.8.8:80", "223.5.5.5:80", "1.1.1.1:80"] {
@@ -818,17 +821,26 @@ pub fn detect_physical_source_ips(
     (v4, v6)
 }
 
-/// 候选 IP 是否落在 TUN 自身网段内（评审 P2-6 排除集）：v4 按 /30 网段比较
-/// （与默认 TUN 前缀一致），v6 仅精确比较（TUN v6 无 /30 语义）。
-/// `tun_addr` 为 None（调用方未解析出 TUN 地址）时不排除任何候选。
-fn candidate_in_tun_subnet(cand: std::net::IpAddr, tun_addr: Option<std::net::IpAddr>) -> bool {
-    match (cand, tun_addr) {
-        (std::net::IpAddr::V4(c), Some(std::net::IpAddr::V4(t))) => {
-            // /30 掩码：主机位 = 低 2 位
-            (u32::from(c) & !3) == (u32::from(t) & !3)
+/// 候选 IP 是否落在 TUN 自身网段内（评审 P2-6 排除集；二轮 P2-1 精确化）：
+/// v4 按**实际前缀**网段比较（掩码由 `prefix` 计算，builder 接受 8-32，
+/// 不再硬编码 /30），v6 与 TUN v6 地址**精确比较**（TUN v6 无网段语义）。
+/// v4/v6 均为 None（调用方未解析出对应族 TUN 地址）时不排除该族候选。
+fn candidate_in_tun_subnet(
+    cand: std::net::IpAddr,
+    tun_v4: Option<std::net::Ipv4Addr>,
+    prefix: u8,
+    tun_v6: Option<std::net::Ipv6Addr>,
+) -> bool {
+    match cand {
+        std::net::IpAddr::V4(c) => {
+            let Some(t) = tun_v4 else { return false };
+            // 前缀掩码：prefix=0 时移位 32 会溢出，用 saturating 归零
+            // （/0 = 全网段命中；builder 实际接受 8-32，此处防御）
+            let shift = 32u32.saturating_sub(u32::from(prefix));
+            let mask = if shift >= 32 { 0 } else { u32::MAX << shift };
+            (u32::from(c) & mask) == (u32::from(t) & mask)
         }
-        (std::net::IpAddr::V6(c), Some(std::net::IpAddr::V6(t))) => c == t,
-        _ => false,
+        std::net::IpAddr::V6(c) => tun_v6.is_some_and(|t| c == t),
     }
 }
 
@@ -1567,20 +1579,37 @@ struct DirectUdpSession {
     /// 回收时显式 abort 才能真正释放）
     pump: tokio::task::JoinHandle<()>,
     /// 评审 P3-7 回包来源校验：已直发目的地集合（上限 [`DST_ALLOW_CAP`]，
-    /// FIFO 淘汰最旧）。回包泵注入前校验 remote ∈ 集合，不在集合内丢弃——
-    /// 收敛全锥 NAT（socket 未 connect），防第三方向本机端口注入伪造回包。
+    /// LRU 淘汰最久未活跃）。回包泵注入前校验 remote ∈ 集合（命中即刷新
+    /// 活跃度，二轮 P3-2），不在集合内丢弃——收敛全锥 NAT（socket 未
+    /// connect），防第三方向本机端口注入伪造回包。
     dst_allow: Arc<Mutex<Vec<SocketAddr>>>,
 }
 
-/// 评审 P3-7：回包来源是否在已直发目的地集合内
+/// 评审 P3-7：回包来源是否在已直发目的地集合内；二轮 P3-2：命中即把该
+/// 目的地移到集合尾部（LRU 活跃刷新），淘汰仍从头部（最久未活跃）
 fn dst_allowed(allow: &Mutex<Vec<SocketAddr>>, remote: SocketAddr) -> bool {
-    allow.lock().map(|a| a.contains(&remote)).unwrap_or(false)
+    let Ok(mut a) = allow.lock() else {
+        return false;
+    };
+    if let Some(pos) = a.iter().position(|x| *x == remote) {
+        // 命中：移到尾部刷新活跃度（避免 remove+push 分配；单元素旋转）
+        let hit = a.remove(pos);
+        a.push(hit);
+        true
+    } else {
+        false
+    }
 }
 
-/// 评审 P3-7：直发成功后记录目的地（去重；上限 [`DST_ALLOW_CAP`]，FIFO 淘汰最旧）
+/// 评审 P3-7：直发后记录目的地（去重；上限 [`DST_ALLOW_CAP`]，LRU 淘汰
+/// 最久未活跃）。二轮 P3-1：调用时机改为 send_to **之前**（见 forward）
 fn record_dst(allow: &Mutex<Vec<SocketAddr>>, dst: SocketAddr) {
     if let Ok(mut a) = allow.lock() {
-        if !a.contains(&dst) {
+        if let Some(pos) = a.iter().position(|x| *x == dst) {
+            // 已在集合内：仅刷新活跃度（移尾），不淘汰
+            let hit = a.remove(pos);
+            a.push(hit);
+        } else {
             if a.len() >= DST_ALLOW_CAP {
                 a.remove(0);
             }
@@ -1644,12 +1673,10 @@ impl UdpDirectNat {
         });
         match sess {
             Some((sk, allow)) => {
-                let ok = sk.send_to(payload, dst).await.is_ok();
-                if ok {
-                    // 评审 P3-7：直发成功才记录目的地（回包白名单）
-                    record_dst(&allow, dst);
-                }
-                ok
+                // 二轮 P3-1：先记录后发送——send_to 失败无实害（会话随空闲
+                // 回收），但直发成功后忘记记录会导致首个回包被白名单误丢
+                record_dst(&allow, dst);
+                sk.send_to(payload, dst).await.is_ok()
             }
             None => false,
         }
@@ -1667,8 +1694,44 @@ impl UdpDirectNat {
                 "无该地址族的物理源 IP（R4 探测缺失）",
             ));
         };
+        // 二轮 P1-1：平台守卫（与 proxy.rs:512 附近 TCP 守卫完全同口径）——
+        // 非 Windows（Linux 弱主机模型）下 bind 源 IP 不约束出接口，UDP 直发
+        // 同样可能命中 /1 接管路由把包送回自身 TUN 回环；无 protect 钩子
+        // （非 Android）时一律 Err 回落中继。Windows 强主机模型 + bind 已
+        // 保证出接口，行为不变。AtomicBool 去重告警一次防刷屏。
+        #[cfg(not(windows))]
+        {
+            if !hydra_core::socket_protect::socket_protect_installed() {
+                static NON_WIN_UDP_DIRECT_WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !NON_WIN_UDP_DIRECT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    warn!(
+                        "TUN UDP 直连在非 Windows 平台已禁用：Linux 弱主机模型下 \
+                         bind 源 IP 不约束出接口，直发可能回环——全部回落中继"
+                    );
+                }
+                return Err(std::io::Error::other(
+                    "非 Windows 平台无 protect 钩子，UDP 直发禁用（回落中继）",
+                ));
+            }
+        }
         let std_sock = std::net::UdpSocket::bind(SocketAddr::new(bind, 0))?;
         std_sock.set_nonblocking(true)?;
+        // 二轮 P1-1：protect 钩子覆盖 UDP——Android（钩子已安装）场景下，
+        // 直发 socket 若不经 VpnService.protect(fd) 标记会被本应用 TUN 捕获
+        // 回环。在 bind 之后、from_std 之前对 std socket 的 fd 调用保护回调；
+        // 失败 → Err 回落中继（宁可单包走节点，不静默放行进回环）。Windows
+        // 无此需求（钩子未安装，零开销直通）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            hydra_core::socket_protect::protect_outbound_fd(std_sock.as_raw_fd() as i64)?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::os::windows::io::AsRawSocket;
+            hydra_core::socket_protect::protect_outbound_fd(std_sock.as_raw_socket() as i64)?;
+        }
         let sock = Arc::new(tokio::net::UdpSocket::from_std(std_sock)?);
         // 评审 P3-7：回包来源白名单（与泵共享；forward 直发成功后记录目的地）
         let dst_allow: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(Vec::new()));
@@ -4798,13 +4861,14 @@ mod tests {
         for i in 0..8u16 {
             record_dst(&allow, mk(1000 + i));
         }
-        // 8 个目的地全部在白名单内
+        // 8 个目的地全部在白名单内（直查集合，不经 dst_allowed——后者命中
+        // 会移尾刷新活跃度，改变后续淘汰顺序）
         for i in 0..8u16 {
-            assert!(dst_allowed(&allow, mk(1000 + i)));
+            assert!(allow.lock().unwrap().contains(&mk(1000 + i)));
         }
-        // 第 9 个目的地：FIFO 淘汰最旧（1000）
+        // 第 9 个目的地：LRU 淘汰最久未活跃（此前无命中 → 1000 仍最旧）
         record_dst(&allow, mk(2000));
-        assert!(!dst_allowed(&allow, mk(1000)), "超上限应 FIFO 淘汰最旧目的地");
+        assert!(!dst_allowed(&allow, mk(1000)), "超上限应淘汰最久未活跃目的地");
         assert_eq!(allow.lock().unwrap().len(), DST_ALLOW_CAP, "白名单长度应有界");
         assert!(dst_allowed(&allow, mk(2000)));
         // 未直发过的来源不得注入（防全锥 NAT 第三方伪造回包）
@@ -4812,6 +4876,100 @@ mod tests {
         // 重复直发同一目的地不重复记录、不淘汰
         record_dst(&allow, mk(2000));
         assert_eq!(allow.lock().unwrap().len(), DST_ALLOW_CAP);
+    }
+
+    // ── 二轮 P3-2：dst_allow LRU 活跃刷新 ──
+    #[test]
+    fn udp_direct_dst_allow_lru_活跃目的地不被淘汰() {
+        let allow: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(Vec::new()));
+        let mk = |p: u16| -> SocketAddr { format!("93.184.216.34:{p}").parse().unwrap() };
+        // 填满 8 个目的地
+        for i in 0..8u16 {
+            record_dst(&allow, mk(1000 + i));
+        }
+        // 「最新」的 1007 静置，「最旧」的 1000 活跃刷新（命中校验移尾）
+        assert!(dst_allowed(&allow, mk(1000)), "命中校验应返回 true");
+        // 加入第 9 个：淘汰的必须是最久未活跃的 1001，而非刚刷新过的 1000/1007
+        record_dst(&allow, mk(2000));
+        assert!(dst_allowed(&allow, mk(1000)), "活跃目的地刷新后不得被淘汰");
+        assert!(!dst_allowed(&allow, mk(1001)), "最久未活跃者应被淘汰");
+        assert!(dst_allowed(&allow, mk(1007)), "静置的新目的地应保留");
+        assert!(dst_allowed(&allow, mk(2000)));
+        assert_eq!(allow.lock().unwrap().len(), DST_ALLOW_CAP, "白名单长度应有界");
+        // record_dst 命中已存在目的地同样刷新活跃度（去重不移除）
+        assert!(dst_allowed(&allow, mk(1002)));
+        record_dst(&allow, mk(1002));
+        record_dst(&allow, mk(3000));
+        assert!(dst_allowed(&allow, mk(1002)), "record_dst 命中亦应刷新活跃度");
+        assert!(!dst_allowed(&allow, mk(1003)));
+    }
+
+    // ── 二轮 P1-1：UDP 直发平台守卫（非 Windows 无 protect 钩子 → Err 回落）──
+    // Windows 强主机模型无此守卫（编译期裁剪）；本测试仅在非 Windows 编译。
+    #[cfg(not(windows))]
+    #[test]
+    fn udp_direct_非windows无protect钩子_建会话被守卫拒绝() {
+        if hydra_core::socket_protect::socket_protect_installed() {
+            // Android 等已安装钩子的进程不适用（守卫放行），跳过
+            return;
+        }
+        let (_in_tx, in_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let transport = Arc::new(TestTransport {
+            inbound: tokio::sync::Mutex::new(in_rx),
+            outbound: out_tx,
+        });
+        let nat = UdpDirectNat::new(
+            Arc::new(hydra_core::routing_rules::RuleEngine::builtin_cn()),
+            Some("127.0.0.1".parse().unwrap()),
+            None,
+            transport,
+        );
+        let src: SocketAddr = "10.7.0.1:50001".parse().unwrap();
+        let err = nat.ensure_session(src).expect_err("无 protect 钩子应被守卫拒绝");
+        assert_eq!(nat.session_count(), 0, "守卫拒绝后不得残留会话");
+        assert!(!err.to_string().is_empty());
+    }
+
+    // ── 二轮 P2-1：探测排除集前缀精确化 ──
+    #[test]
+    fn candidate_in_tun_subnet_按实际前缀排除() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let tun: Ipv4Addr = "10.7.0.1".parse().unwrap();
+        let cand = |s: &str| IpAddr::V4(s.parse().unwrap());
+        // /30：10.7.0.0-3 同段排除（旧行为）
+        assert!(candidate_in_tun_subnet(cand("10.7.0.2"), Some(tun), 30, None));
+        // /28：10.7.0.0-15 同段排除；10.7.0.16 起「/30 视角不同段、/28 视角同段」
+        // —— 精确化后必须按 /28 排除（硬编码 &!3 会漏）
+        assert!(candidate_in_tun_subnet(cand("10.7.0.14"), Some(tun), 28, None));
+        assert!(!candidate_in_tun_subnet(cand("10.7.0.16"), Some(tun), 28, None));
+        assert!(candidate_in_tun_subnet(cand("10.7.0.16"), Some(tun), 27, None));
+        // /8：整个 10/8 网段排除，网外不排除
+        assert!(candidate_in_tun_subnet(cand("10.200.1.1"), Some(tun), 8, None));
+        assert!(!candidate_in_tun_subnet(cand("11.0.0.1"), Some(tun), 8, None));
+        // /32：仅 TUN 地址本身
+        assert!(candidate_in_tun_subnet(cand("10.7.0.1"), Some(tun), 32, None));
+        assert!(!candidate_in_tun_subnet(cand("10.7.0.2"), Some(tun), 32, None));
+        // 防御：prefix=0 掩码归零（saturating 移位），不 panic
+        assert!(candidate_in_tun_subnet(cand("1.2.3.4"), Some(tun), 0, None));
+        // v6 精确比较：同址排除、异址不排除；v4 候选不受 v6 排除影响
+        let tun6: Ipv6Addr = "fd07::1".parse().unwrap();
+        assert!(candidate_in_tun_subnet(
+            IpAddr::V6("fd07::1".parse().unwrap()),
+            Some(tun),
+            30,
+            Some(tun6)
+        ));
+        assert!(!candidate_in_tun_subnet(
+            IpAddr::V6("fd07::2".parse().unwrap()),
+            Some(tun),
+            30,
+            Some(tun6)
+        ));
+        // v4 候选不受 v6 排除影响：网段外 v4 候选即使 v6 排除集在场也不排除
+        assert!(!candidate_in_tun_subnet(cand("10.7.0.16"), Some(tun), 30, Some(tun6)));
+        // 无 TUN 地址时不排除任何候选
+        assert!(!candidate_in_tun_subnet(cand("10.7.0.1"), None, 30, None));
     }
 
     // ── 评审 P3-8 ②：sweep 后泵任务结束 ──

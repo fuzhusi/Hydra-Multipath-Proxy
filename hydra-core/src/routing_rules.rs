@@ -11,8 +11,11 @@
 //! 4. GeoIP-CN 表：构建期由 `scripts/gen-geoip.ps1` 生成的
 //!    `assets/geoip_cn.dat`（v4 + v6 段，评审 R6），`include_bytes!` 嵌入 +
 //!    懒解析 OnceLock，查询为排序段二分 O(log n)；
-//! 5. 自定义 CIDR 规则 ≥50 条时构建「排序合并段 + 二分」（R10 性能注记），
-//!    合并保持先出现规则优先语义（跨动作重叠裁剪后段）。
+//! 5. 自定义 CIDR 规则 ≥16 条时构建「排序合并段 + 二分」（R10 性能注记）。
+//!    **两种路径语义如实声明（二轮 P2-2，已知取舍）**：阈值内（≤16 条）按
+//!    文件序首中；超过阈值合并后按「start 小者优先，同 start 文件序优先」
+//!    ——左延伸重叠形态下两种路径结论可能不同（不做每连接双路径对齐，
+//!    成本不值）。排序稳定性（同 start 并列）由原始序号 tiebreak 保证（P3-2）。
 //!
 //! 与既有 SOCKS 路径 Exec2 域名分流（`routing::is_direct_target`）的关系
 //! （评审 §2.1）：两套 v1 允许并存——SOCKS 按域名表、TUN 按目的 IP GeoIP，
@@ -416,6 +419,15 @@ impl RuleEngine {
     /// 是否启用 GeoIP-CN（观测用）
     pub fn geoip_enabled(&self) -> bool {
         self.geoip_enabled
+    }
+
+    /// 规则文件是否含端口 53 的 PROXY 规则（二轮 P3-3，只读观测）：
+    /// 规则模式的 DNS 直连联动（R2）会先于自定义规则强制 UDP 53 直连，
+    /// 与此类规则冲突——builder 构建引擎后据此 warn 一次
+    pub fn port53_proxy_rule_exists(&self) -> bool {
+        self.port_rules
+            .iter()
+            .any(|(p, a)| *p == 53 && *a == Action::Proxy)
     }
 
     /// 自定义端口规则数（日志/观测）
