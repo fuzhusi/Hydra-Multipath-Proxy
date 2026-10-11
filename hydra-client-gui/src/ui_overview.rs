@@ -101,7 +101,19 @@ impl HydraApp {
                             self.start_proxy();
                         }
                     }
-                    // 右：监听摘要小字（长地址截断 + hover 全量）
+                    // 右：TUN 规则模式状态位（R9：挂在 TUN 状态位，不覆盖监听地址小字）
+                    // 仅代理运行中且 TUN + 规则分流生效时显示；监听地址小字原样保留
+                    if self.proxy_running
+                        && self.config.tun_enabled
+                        && self.config.tun_rule_mode
+                    {
+                        ui.label(
+                            egui::RichText::new("规则分流 · CN 直连 · 其余经节点")
+                                .size(palette::FONT_SECONDARY)
+                                .color(palette::info())
+                                .strong(),
+                        );
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add(
                             egui::Label::new(

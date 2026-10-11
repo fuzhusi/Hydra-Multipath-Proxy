@@ -235,6 +235,73 @@ impl HydraApp {
             }
         }
         let tun_on = self.config.tun_enabled;
+        // ── 分流模式（智能分流 v1.1 §4.2）：TUN 开关下方的两个单选卡 ──
+        // 全局接管 = 既有行为（默认，行为兼容）；规则分流 = 按规则文件决定 CN 直连/走节点。
+        ui.add_space(palette::SPACING_XS);
+        ui.horizontal(|ui| {
+            ui.label("分流模式:");
+            if ui
+                .add_enabled(
+                    tun_on,
+                    egui::RadioButton::new(!self.config.tun_rule_mode, "全局接管（默认）"),
+                )
+                .clicked()
+            {
+                self.config.tun_rule_mode = false;
+                self.maybe_save_config(true);
+                self.add_log("分流模式：全局接管（默认；重启代理后生效）".to_string());
+            }
+            if ui
+                .add_enabled(
+                    tun_on,
+                    egui::RadioButton::new(
+                        self.config.tun_rule_mode,
+                        "规则分流（CN 直连 · 其余经节点）",
+                    ),
+                )
+                .clicked()
+            {
+                // 写入 cfg.tun_rule_mode 并立即持久化（force=true 跳过防抖）
+                self.config.tun_rule_mode = true;
+                self.maybe_save_config(true);
+                self.add_log("分流模式：规则分流（CN 直连 · 其余经节点；重启代理后生效）".to_string());
+            }
+        });
+        // 规则分流子区：规则文件路径 + 打开按钮 + DNS 联动提示 + 重启生效提示
+        if tun_on && self.config.tun_rule_mode {
+            // 规则文件路径：用户未自定义时显示默认路径（%APPDATA%\hydra\rules.txt）
+            let (rule_path_display, rule_path) = Self::rule_file_path(&self.config);
+            ui.horizontal(|ui| {
+                ui.label("规则文件:");
+                ui.monospace(rule_path_display);
+            });
+            ui.horizontal(|ui| {
+                if ui.button("打开规则文件").clicked() {
+                    // 文件不存在则先创建带注释的模板（UTF-8），再用系统默认程序打开
+                    if !rule_path.exists() {
+                        if let Some(dir) = rule_path.parent() {
+                            let _ = std::fs::create_dir_all(dir);
+                        }
+                        match std::fs::write(&rule_path, Self::RULE_FILE_TEMPLATE) {
+                            Ok(()) => self.add_log(format!("已创建规则模板: {}", rule_path.display())),
+                            Err(e) => self.add_warn(format!("规则模板创建失败: {e}")),
+                        }
+                    }
+                    Self::open_rule_file(&rule_path);
+                }
+                ui.small("（UTF-8，# 注释；语法见文件内模板）");
+            });
+            // DNS 直连解析联动提示（R2）：仅文案——逻辑由后端 HYDRA_TUN_DNS_DIRECT=1 联动
+            crate::components::banner(
+                ui,
+                crate::components::BannerKind::Info,
+                "ℹ 规则分流模式下 DNS 自动改为直连解析：国内域名由本地 DNS 解析出近端 CDN IP，GeoIP 才能判准并直连（否则经节点解析会拿到海外边缘 IP）",
+            );
+            ui.colored_label(
+                palette::text_faint(),
+                "重启代理后生效（规则文件修改亦需重启代理；未命中规则 → 走节点）",
+            );
+        }
         ui.add_enabled(
             tun_on,
             egui::TextEdit::singleline(&mut self.config.tun_addr)
@@ -401,5 +468,94 @@ impl HydraApp {
             }
         });
         ui.add_space(palette::SPACING_XL);
+    }
+
+    // ── 智能分流（规则模式）辅助 ──────────────────────────────
+
+    /// 规则文件模板：不存在时「打开规则文件」按钮以此初始化（R10：端口规则为例外形态）
+    const RULE_FILE_TEMPLATE: &str = "# Hydra 分流规则\n\
+# 语法：IP-CIDR,1.2.3.0/24,DIRECT\n\
+#       GEOIP,CN,DIRECT\n\
+#       DST-PORT,8080,DIRECT\n\
+# 默认策略：未命中 → 走节点\n";
+
+    /// 规则文件路径解析：cfg.tun_rule_file 非空用之；空则用默认 %APPDATA%\hydra\rules.txt。
+    /// 返回 (显示文本, 实际路径)；配置目录不可用时回退相对路径 rules.txt（仅显示降级）。
+    fn rule_file_path(cfg: &config::GuiConfig) -> (String, std::path::PathBuf) {
+        if !cfg.tun_rule_file.trim().is_empty() {
+            let p = std::path::PathBuf::from(cfg.tun_rule_file.trim());
+            (p.display().to_string(), p)
+        } else if let Some(dir) = config::config_dir() {
+            let p = dir.join("rules.txt");
+            (p.display().to_string(), p)
+        } else {
+            // 极端场景（无 APPDATA/HOME）：显示默认形态，打开按钮按相对路径兜底
+            ("rules.txt（配置目录不可用）".to_string(), "rules.txt".into())
+        }
+    }
+
+    /// 用系统默认程序打开规则文件（Windows 不闪控制台；失败仅记日志不阻断）
+    fn open_rule_file(path: &std::path::Path) {
+        #[cfg(windows)]
+        {
+            let mut c = std::process::Command::new("explorer");
+            c.arg(path);
+            let _ = hydra_client::hide_console_window(&mut c).spawn();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 新增字段默认值：tun_rule_mode=false（全局接管，行为兼容）、tun_rule_file 为空串
+    #[test]
+    fn test_tun_rule_mode_defaults() {
+        let cfg = config::GuiConfig::default();
+        assert!(!cfg.tun_rule_mode);
+        assert!(cfg.tun_rule_file.is_empty());
+    }
+
+    /// 持久化往返：规则模式与规则文件路径经 serde 存取后保持一致
+    #[test]
+    fn test_tun_rule_mode_serde_roundtrip() {
+        let cfg = config::GuiConfig {
+            tun_rule_mode: true,
+            tun_rule_file: "D:\\rules\\my-rules.txt".to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).expect("序列化");
+        let back: config::GuiConfig = serde_json::from_str(&json).expect("反序列化");
+        assert!(back.tun_rule_mode);
+        assert_eq!(back.tun_rule_file, "D:\\rules\\my-rules.txt");
+        // 缺失字段（旧配置）反序列化 → 默认值（向后兼容）
+        let old: config::GuiConfig = serde_json::from_str("{}").expect("旧配置反序列化");
+        assert!(!old.tun_rule_mode);
+        assert!(old.tun_rule_file.is_empty());
+    }
+
+    /// 规则文件路径解析：空 tun_rule_file → 默认路径；非空 → 用户自定义路径
+    #[test]
+    fn test_rule_file_path_resolution() {
+        let cfg = config::GuiConfig {
+            tun_rule_mode: false,
+            tun_rule_file: String::new(),
+            ..Default::default()
+        };
+        let (display, path) = HydraApp::rule_file_path(&cfg);
+        assert!(display.ends_with("rules.txt"));
+        assert!(path.to_string_lossy().ends_with("rules.txt"));
+        let cfg = config::GuiConfig {
+            tun_rule_file: "C:\\temp\\custom.txt".to_string(),
+            ..Default::default()
+        };
+        let (display, path) = HydraApp::rule_file_path(&cfg);
+        assert_eq!(display, "C:\\temp\\custom.txt");
+        assert_eq!(path, std::path::PathBuf::from("C:\\temp\\custom.txt"));
     }
 }

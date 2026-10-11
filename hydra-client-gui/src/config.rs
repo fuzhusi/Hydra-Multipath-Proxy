@@ -99,6 +99,13 @@ pub struct GuiConfig {
     /// TUN 虚拟网卡地址（形如 "10.7.0.1/30"）；空串 = 用库默认 10.7.0.1/30
     #[serde(default)]
     pub tun_addr: String,
+    /// TUN 分流模式：false = 全局接管（默认，行为兼容）；true = 规则分流
+    /// （GeoIP-CN + 自定义规则直连，其余走节点；配合 DNS 直连联动，见智能分流方案 v1.1）
+    #[serde(default)]
+    pub tun_rule_mode: bool,
+    /// 分流规则文件路径；空串 = 用默认 %APPDATA%\hydra\rules.txt
+    #[serde(default)]
+    pub tun_rule_file: String,
     /// TUN 拦截端口列表（逗号分隔）；空串 = 用库默认 80,443,8080,8443
     #[serde(default)]
     pub tun_ports: String,
@@ -137,6 +144,8 @@ impl Default for GuiConfig {
             close_to_tray: true,
             node_names: HashMap::new(),
             tun_enabled: false,
+            tun_rule_mode: false,
+            tun_rule_file: String::new(),
             tun_addr: String::new(),
             tun_ports: String::new(),
             trust_mode: String::new(),
@@ -513,6 +522,8 @@ mod tests {
             close_to_tray: true,
             node_names: Default::default(),
             tun_enabled: false,
+            tun_rule_mode: false,
+            tun_rule_file: String::new(),
             ..Default::default()
         };
         let json = serde_json::to_string(&cfg).unwrap();
@@ -566,6 +577,8 @@ mod tests {
             close_to_tray: true,
             node_names: Default::default(),
             tun_enabled: false,
+            tun_rule_mode: false,
+            tun_rule_file: String::new(),
             ..Default::default()
         };
         save_to_file(&path, &cfg).expect("保存应成功");
