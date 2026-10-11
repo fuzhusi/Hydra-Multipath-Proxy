@@ -190,7 +190,6 @@ impl HydraApp {
         // ── ③ 三数据卡（22px 数值主角，标签 12px 上置）：
         //    宽窗口三卡一行，窄窗口纵向堆叠（确定性布局不溢出）──
         ui.add_space(palette::SPACING_LG);
-        let avail_w = ui.available_width();
         // 数据卡渲染体（含 hover 描边反馈的可点卡处理在外层做）
         let flow_card = |ui: &mut egui::Ui| {
             stat_label(ui, "今日流量");
@@ -284,52 +283,51 @@ impl HydraApp {
         };
 
         let mut goto_nodes = false;
-        // 三数据卡：始终横排三列等宽（审美验收第 1 条——去掉宽窄分支与一切
-        // 宽度钳制残留；每卡宽度 = (可用宽 − 2×间距)/3，窄窗口靠 truncate 收缩）
-        let gap = palette::SPACING_SM;
-        let card_w = (avail_w - gap * 4.0) / 3.0;
-        // 卡内容区宽度 = 整卡宽 − 内边距 MD×2 − 外边距 XS×2
-        let inner_w = (card_w - (palette::SPACING_MD + palette::SPACING_XS) * 2.0).max(1.0);
-        egui::Grid::new("overview_stat_cards")
-            .num_columns(3)
-            .spacing([gap, gap])
-            .show(ui, |ui| {
-                card_frame(ui).show(ui, |ui| {
-                    ui.set_min_width(inner_w);
-                    ui.set_max_width(inner_w);
-                    flow_card(ui);
-                });
-                card_frame(ui).show(ui, |ui| {
-                    ui.set_min_width(inner_w);
-                    ui.set_max_width(inner_w);
-                    active_card(ui);
-                });
-                // 当前节点卡：整卡可点跳节点页（R8），hover 描边 accent
-                let node_frame = card_frame(ui).show(ui, |ui| {
-                    ui.set_min_width(inner_w);
-                    ui.set_max_width(inner_w);
-                    node_card(ui);
-                });
-                let resp = ui
-                    .interact(
-                        node_frame.response.rect,
-                        egui::Id::new("overview_node_card"),
-                        egui::Sense::click(),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                if node_clickable && resp.hovered() {
-                    // hover 反馈：accent 描边覆盖在 Frame 之上（R8）
-                    ui.painter().rect_stroke(
-                        resp.rect,
-                        egui::Rounding::same(palette::RADIUS_CARD),
-                        egui::Stroke::new(1.5_f32, palette::accent()),
-                    );
-                }
-                if resp.clicked() && node_clickable {
-                    goto_nodes = true;
-                }
-                ui.end_row();
+        // 三数据卡：ui.columns(3) **构造级等宽**（实测修复：egui Grid 列宽随
+        // 内容最小宽度浮动——三列实测 232/240/271px，第三列被撑出窗口右缘；
+        // columns 恒为可用宽/3，从根上消灭不等宽）。卡内容宽 = 列宽 − Frame
+        // 边距（内 MD×2 + 外 XS×2 = 32px），窄窗口靠 truncate 收缩。
+        let frame_pad = (palette::SPACING_MD + palette::SPACING_XS) * 2.0;
+        ui.columns(3, |cols| {
+            let fit_inner = |ui: &mut egui::Ui| {
+                let w = (ui.available_width() - frame_pad).max(1.0);
+                ui.set_min_width(w);
+                ui.set_max_width(w);
+            };
+            // 列 0：今日流量
+            card_frame(&cols[0]).show(&mut cols[0], |ui| {
+                fit_inner(ui);
+                flow_card(ui);
             });
+            // 列 1：活跃节点
+            card_frame(&cols[1]).show(&mut cols[1], |ui| {
+                fit_inner(ui);
+                active_card(ui);
+            });
+            // 列 2：当前节点（整卡可点跳节点页，R8）
+            let node_resp = card_frame(&cols[2]).show(&mut cols[2], |ui| {
+                fit_inner(ui);
+                node_card(ui);
+            });
+            let resp = cols[2]
+                .interact(
+                    node_resp.response.rect,
+                    egui::Id::new("overview_node_card"),
+                    egui::Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if node_clickable && resp.hovered() {
+                // hover 反馈：accent 描边覆盖在 Frame 之上（R8）
+                cols[2].painter().rect_stroke(
+                    resp.rect,
+                    egui::Rounding::same(palette::RADIUS_CARD),
+                    egui::Stroke::new(1.5_f32, palette::accent()),
+                );
+            }
+            if resp.clicked() && node_clickable {
+                goto_nodes = true;
+            }
+        });
         // 引导卡按钮经 ctx 内存中转切页（闭包拿不到 self）
         if ui.ctx().data_mut(|d| d.get_temp::<bool>(egui::Id::new("goto_nodes")) == Some(true)) {
             ui.ctx().data_mut(|d| {
@@ -464,6 +462,12 @@ impl HydraApp {
                             egui_plot::Corner::RightBottom,
                             egui_plot::CoordinatesFormatter::new(|_pt, _bounds| String::new()),
                         )
+                        // 悬停网速读数（用户反馈）：默认标签是「系列名 + 原始
+                        // x/y 坐标」（x=采样序号无意义、y=原始字节流）——自定义
+                        // 为按系列名格式化的速率（上行：1.2 MB/s）
+                        .label_formatter(|name, value| {
+                            format!("{name}：{}/s", format_speed(value.y))
+                        })
                         // R6：背景透明（同卡底）；网格/坐标轴取 Visuals + chart_grid
                         .show_background(false)
                         .show_grid(true)
