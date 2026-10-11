@@ -20,6 +20,10 @@ impl eframe::App for HydraApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // WM_ENDSESSION 钩子（系统关机/注销时恢复系统代理）：窗口已创建，幂等安装
+        // （内部原子闸，实际只装一次；Linux 无此模块，cfg 门控）
+        #[cfg(windows)]
+        crate::windows_proxy::install_endsession_restore_hook();
         // Esc 取消确认对话框（G-06 配套）；Ctrl+1..6 切页（G-05 键盘可达）
         let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         let ctrl = ctx.input(|i| i.modifiers.ctrl);

@@ -264,6 +264,12 @@ async fn main() -> eframe::Result<()> {
             }
         };
 
+    // 启动自愈（先于一切 UI）：上次异常退出（强杀/断电——Windows 无回调）可能
+    // 残留系统代理指向死端口 → 浏览器断网。双实例守卫之后执行：本进程是唯一
+    // Hydra，判定不与他实例竞态；"端口无监听"校验保证不误伤他软件活代理
+    #[cfg(windows)]
+    crate::windows_proxy::cleanup_stale_system_proxy();
+
     // 设置 panic hook，确保代理异常时清除系统代理
     let main_thread_id = std::thread::current().id();
     let original_hook = std::panic::take_hook();
@@ -294,6 +300,16 @@ async fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Hydra Multipath Proxy",
         options,
-        Box::new(|cc| Box::new(HydraApp::new(cc))),
+        Box::new(|cc| {
+            let mut app = HydraApp::new(cc);
+            // 启动自愈命中时在应用日志里留痕（用户可见，不必弹窗）
+            #[cfg(windows)]
+            if crate::windows_proxy::STALE_PROXY_CLEANED.load(std::sync::atomic::Ordering::SeqCst) {
+                app.add_log(
+                    "启动自愈：检测到上次异常退出残留的系统代理（指向死端口），已自动清除".to_string(),
+                );
+            }
+            Box::new(app)
+        }),
     )
 }
