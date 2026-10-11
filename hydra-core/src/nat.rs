@@ -404,10 +404,23 @@ fn random_nonce() -> [u8; 32] {
     rand::random()
 }
 
+/// 握手角色分配：按本端 stream 的地址序，低者做 client（`initiator=true`）。
+/// local/peer 不可得或相等（自连）时退回连接方向默认（出站=client）——自连
+/// 随后由 nonce 相同判定拒绝，角色不参与结论。
+fn role_by_addr(s: &tokio::net::TcpStream, outbound_default: bool) -> bool {
+    match (s.local_addr(), s.peer_addr()) {
+        (Ok(l), Ok(p)) if l != p => l < p,
+        _ => outbound_default,
+    }
+}
+
 /// P2P 对等端间握手 + nonce 回显校验。
 ///
-/// - `initiator` = true 表示本端是该 TCP 连接的拨号方：先跑 Noise-PSK
-///   `client_side`；拨号方/接听方角色在单条连接上天然对偶，两端一致。
+/// - `initiator` = true 先跑 Noise-PSK `client_side`。**角色由调用方按地址序
+///   分配**（[`role_by_addr`]：本端地址低者做 client）——不能绑死"拨号方=
+///   client"：真·同时打开时连接两端都是出站 socket，按方向分配会两端同为
+///   client、互相等对方的 msg2 而全败（Windows CI 实测 flake）；地址序对
+///   任意连接形态（交叉经 listener / 同时打开）两端都得出相反且一致的角色。
 /// - 证书指纹/exporter 用全零占位（原始 TCP 无 TLS exporter；两端同为占位即可
 ///   通过，认证由 PSK 承担——文档化决定，见模块头注释）。
 /// - 握手后互发 32B 随机 nonce：**对端 nonce 与自己相同 → 判为自连**（nonce 由
@@ -565,7 +578,9 @@ pub async fn punch_open_and_verify(
 
     // 主循环：来源连接交给并发验证任务；任一验证通过立即返回，窗口耗尽 → 放弃。
     // （不能在循环内联 await 验证：同时打开产生的两条连接，两端各自先拿到哪条
-    // 是随机的，串行验证会互相等待对方的握手字节而双死锁——必须并发握手。）
+    // 是随机的，串行验证会互相等待对方的握手字节而双死锁——必须并发握手。
+    // 握手角色按地址序分配（见 [`role_by_addr`]），不绑死连接方向——真·同时
+    // 打开时两端都是出站 socket，按方向分配会双双沦为 client 而握手全败。）
     let spawn_verify = |initiator: bool,
                         s: tokio::net::TcpStream,
                         tx: mpsc::Sender<tokio::net::TcpStream>,
@@ -598,7 +613,8 @@ pub async fn punch_open_and_verify(
             r = accept_rx.recv(), if !accept_closed => match r {
                 Some((s, peer)) => {
                     debug!("打洞 accept 来自 {peer}，开始握手校验");
-                    spawn_verify(false, s, verified_tx.clone(), auth_key.clone(), mine, remain);
+                    let initiator = role_by_addr(&s, false);
+                    spawn_verify(initiator, s, verified_tx.clone(), auth_key.clone(), mine, remain);
                 }
                 None => accept_closed = true, // listener 任务结束：不再等 accept 侧
             },
@@ -606,7 +622,8 @@ pub async fn punch_open_and_verify(
                 Some(s) => {
                     let peer = s.peer_addr().ok();
                     debug!("打洞 connect 建成（peer={peer:?}），开始握手校验");
-                    spawn_verify(true, s, verified_tx.clone(), auth_key.clone(), mine, remain);
+                    let initiator = role_by_addr(&s, true);
+                    spawn_verify(initiator, s, verified_tx.clone(), auth_key.clone(), mine, remain);
                 }
                 None => conn_closed = true, // 全部 connect 任务结束：不再等出站侧
             },
@@ -907,6 +924,42 @@ mod tests {
         );
         assert!(ra.is_ok(), "不同 nonce 应校验通过: {ra:?}");
         assert!(rb.is_ok(), "不同 nonce 应校验通过: {rb:?}");
+    }
+
+    /// 同时打开角色回归（Windows CI flake 实测）：真·同时打开时连接两端都是
+    /// 出站 socket，角色若绑死"拨号方=client"会两端同为 client、互相等对方的
+    /// msg2 而全败 → 10s 窗口耗尽回落中继。修复后角色按地址序分配（低=client），
+    /// 对任意连接形态两端都得出相反且一致的角色——本测试模拟该分配方式，
+    /// 断言角色必然对偶且握手 + nonce 校验仍成功。
+    #[tokio::test]
+    async fn verify_stream_角色按地址序对偶_同时打开语义() {
+        // Noise-PSK 要求恰好 32 字节
+        let key = [11u8; 32].to_vec();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (a, b) = tokio::join!(tokio::net::TcpStream::connect(addr), async {
+            let (s, _) = listener.accept().await.unwrap();
+            s
+        });
+        let (a, b) = (a.unwrap(), b);
+        // 两端都只按地址序取角色（与谁是拨号方无关——同时打开时无方向可依）
+        let role = |s: &tokio::net::TcpStream| {
+            let (l, p) = (s.local_addr().unwrap(), s.peer_addr().unwrap());
+            assert_ne!(l, p, "测试连接不应是自连");
+            l < p
+        };
+        assert_ne!(
+            role(&a),
+            role(&b),
+            "地址序必须给同一连接的两端分配相反角色"
+        );
+        // 两端各生成一次 nonce（模拟跨进程随机必不同）
+        let (ra, rb) = tokio::join!(
+            verify_stream(role(&a), a, &key, random_nonce()),
+            verify_stream(role(&b), b, &key, random_nonce())
+        );
+        assert!(ra.is_ok(), "地址序角色配对应握手成功: {ra:?}");
+        assert!(rb.is_ok(), "地址序角色配对应握手成功: {rb:?}");
     }
 
     /// 热自旋回归（审查 P1-3）：conn/accept 两通道都关闭后主循环必须提前退出，
