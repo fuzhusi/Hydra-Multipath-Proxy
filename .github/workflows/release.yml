@@ -217,8 +217,29 @@ jobs:
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018" > /dev/null
 
+      # 签名准备（v0.2.6 实测修复）：优先用 Secrets 注入的正式 keystore；
+      # 未配置时生成临时 debug keystore——否则 gradle 回退链指向的
+      # ~/.config/.android/debug.keystore 在全新 runner 上不存在，构建直接失败。
+      # 注意：临时 key 签出的 APK 与本地正式签名 APK 签名不同（换装需先卸载）
+      # ——正式分发请配置 HYDRA_KEYSTORE_B64 / HYDRA_KEYSTORE_PASSWORD Secrets。
+      - name: 准备签名 keystore
+        run: |
+          if [ -n "${{ secrets.HYDRA_KEYSTORE_B64 }}" ]; then
+            echo "${{ secrets.HYDRA_KEYSTORE_B64 }}" | base64 -d > android-release.keystore
+            echo "HYDRA_KEYSTORE_PATH=$PWD/android-release.keystore" >> $GITHUB_ENV
+            echo "HYDRA_KEYSTORE_PASSWORD=${{ secrets.HYDRA_KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
+            echo '[sign] 使用 Secrets 注入的正式 keystore'
+          else
+            mkdir -p "$HOME/.config/.android"
+            keytool -genkeypair -keystore "$HOME/.config/.android/debug.keystore" \
+              -alias androiddebugkey -storepass android -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+            echo '[sign] 未配置正式 keystore——已生成临时 debug keystore（侧载可用）'
+          fi
+
       # preBuild 钩子自动调 scripts/build-rust.sh 交叉编译 libhydra_android.so
-      - name: gradle assembleDebug（含 Rust 交叉编译）
+      - name: gradle assembleRelease（含 Rust 交叉编译）
         working-directory: android
         run: bash ./gradlew assembleRelease --console=plain --no-daemon
 
