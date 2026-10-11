@@ -18,8 +18,12 @@
 //!    成本不值）。排序稳定性（同 start 并列）由原始序号 tiebreak 保证（P3-2）。
 //!
 //! 与既有 SOCKS 路径 Exec2 域名分流（`routing::is_direct_target`）的关系
-//! （评审 §2.1）：两套 v1 允许并存——SOCKS 按域名表、TUN 按目的 IP GeoIP，
-//! 口径不一属已知现状，v1.1 候选统一。
+//! （评审 §2.1）：**统一路由层（v1.1 技术债闭环）已落地**——本引擎升级为
+//! 双模判定：`decide(SocketAddr)`（IP 目标，TUN 用）+ `decide_domain(host,
+//! port)`（域名目标，SOCKS/HTTP 用，内置 CN 域名直连层引用 `routing` 模块
+//! 数据）。GUI 分流开关 ON 时同一引擎实例同时挂 TUN 与 ProxyServer 两条
+//! 路径，口径合一；未挂引擎的调用方仍走 `routing::is_direct_target`
+//! （零行为变更兼容）。
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -201,6 +205,12 @@ pub struct RuleEngine {
     cidr6_sorted: Option<Vec<(u128, u128, Action)>>,
     /// 是否启用内置 GeoIP-CN 表（`GEOIP,CN,DIRECT` 规则出现，或 builtin 构造）
     geoip_enabled: bool,
+    /// 用户域名规则（统一路由层 v1.1）：DOMAIN 全等（文件序）
+    domain_full: Vec<(String, Action)>,
+    /// 用户域名规则：DOMAIN-SUFFIX 完整标签后缀（文件序）
+    domain_suffix: Vec<(String, Action)>,
+    /// 用户域名规则：DOMAIN-KEYWORD 包含（文件序）
+    domain_keyword: Vec<(String, Action)>,
     /// 解析统计：跳过的非法/不可解析行数（观测用）
     pub skipped_lines: usize,
 }
@@ -215,9 +225,24 @@ impl std::fmt::Debug for RuleEngine {
             .field("cidr4_sorted", &self.cidr4_sorted.is_some())
             .field("cidr6_sorted", &self.cidr6_sorted.is_some())
             .field("geoip_enabled", &self.geoip_enabled)
+            .field("domain_rules", &self.domain_rule_count())
             .field("skipped_lines", &self.skipped_lines)
             .finish()
     }
+}
+
+/// 域名规则参数归一化：去首尾空白、小写、去结尾点、容忍 `*.example.com`
+/// 通配写法（与 `routing` 模块 normalize_domain 同口径；该函数私有故此处
+/// 独立实现，口径由单测对齐保证）
+fn normalize_rule_domain(d: &str) -> String {
+    let mut s = d.trim().to_ascii_lowercase();
+    while s.ends_with('.') {
+        s.pop();
+    }
+    if let Some(rest) = s.strip_prefix("*.") {
+        s = rest.to_string();
+    }
+    s
 }
 
 impl RuleEngine {
@@ -248,6 +273,9 @@ impl RuleEngine {
             // 之上」，不是替换。此前默认 false 且仅显式 GEOIP 行才启用，导致
             // 用户写一条 DST-PORT/IP-CIDR 规则就静默丢掉全部 CN 直连（分流形同虚设）
             geoip_enabled: true,
+            domain_full: Vec::new(),
+            domain_suffix: Vec::new(),
+            domain_keyword: Vec::new(),
             skipped_lines: 0,
         };
         let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes);
@@ -284,11 +312,19 @@ impl RuleEngine {
             cidr4_sorted: None,
             cidr6_sorted: None,
             geoip_enabled: true,
+            domain_full: Vec::new(),
+            domain_suffix: Vec::new(),
+            domain_keyword: Vec::new(),
             skipped_lines: 0,
         }
     }
 
-    /// 单行语法：`TYPE,参数…,ACTION`（类型/动作大小写不敏感）
+    /// 单行语法：`TYPE,参数…,ACTION`（类型/动作大小写不敏感）：
+    /// - `IP-CIDR,1.2.3.0/24,DIRECT` / `GEOIP,CN,DIRECT` / `DST-PORT,53,DIRECT`；
+    /// - 域名三类（统一路由层 v1.1）：`DOMAIN,api.example.com,DIRECT`（全等）、
+    ///   `DOMAIN-SUFFIX,example.com,DIRECT`（完整标签后缀）、
+    ///   `DOMAIN-KEYWORD,google,PROXY`（包含）；仅对域名判定
+    ///   [`RuleEngine::decide_domain`] 生效
     fn parse_line(&mut self, line: &str) -> bool {
         let parts: Vec<&str> = line.split(',').map(str::trim).collect();
         if parts.len() < 2 {
@@ -353,6 +389,24 @@ impl RuleEngine {
                     }
                 }
             }
+            // 统一路由层 v1.1：域名规则三类（大小写不敏感；DOMAIN-SUFFIX 容忍
+            // `*.example.com` 通配写法——剥前缀后按完整标签后缀匹配）
+            "DOMAIN" | "DOMAIN-SUFFIX" | "DOMAIN-KEYWORD" => {
+                if parts.len() != 3 {
+                    return false;
+                }
+                let d = normalize_rule_domain(parts[1]);
+                if d.is_empty() {
+                    tracing::warn!("规则文件域名参数为空，跳过: {line}");
+                    return false;
+                }
+                match kind.as_str() {
+                    "DOMAIN" => self.domain_full.push((d, action)),
+                    "DOMAIN-SUFFIX" => self.domain_suffix.push((d, action)),
+                    _ => self.domain_keyword.push((d, action)),
+                }
+                true
+            }
             _ => {
                 tracing::warn!("规则文件类型未支持（{kind}），跳过: {line}");
                 false
@@ -416,6 +470,57 @@ impl RuleEngine {
         Decision::Proxy
     }
 
+    /// 域名形态目标的统一判定（统一路由层 v1.1：SOCKS/HTTP 域名分流接入
+    /// 同一引擎，与 TUN 侧 [`Self::decide`] 共用规则面）。**不含 IP 规则**
+    /// （域名目标无目的 IP，不查 CIDR/GeoIP；IP 字面量目标由调用方
+    /// 走 [`Self::decide`]——见 proxy.rs `engine_wants_direct`）。
+    ///
+    /// 判定顺序：
+    /// 1. 用户域名规则（文件序：DOMAIN 全等 → DOMAIN-SUFFIX 完整标签后缀 →
+    ///    DOMAIN-KEYWORD 包含；大小写不敏感）；
+    /// 2. DST-PORT 规则（与 [`Self::decide`] 同层，端口例外语义一致）；
+    /// 3. 内置 CN 域名直连层（`routing::is_direct`：内置 CN 后缀表 + `.cn`
+    ///    顶级域通配 + 回环名 + `HYDRA_DIRECT_DOMAIN_FILE` 用户扩展——地位
+    ///    等同 GeoIP 内置表：默认启用，用户规则叠加其上）；
+    /// 4. 默认 Proxy。
+    pub fn decide_domain(&self, host: &str, port: u16) -> Decision {
+        let h = normalize_rule_domain(host);
+        // 1. 用户域名规则（full → suffix → keyword）
+        for (d, a) in &self.domain_full {
+            if *d == h {
+                return a.decision();
+            }
+        }
+        for (sfx, a) in &self.domain_suffix {
+            // 完整标签边界：`evil-baidu.com` 不得命中 `baidu.com`（与
+            // routing::suffix_match 同口径）
+            if *sfx == h
+                || (h.len() > sfx.len()
+                    && h.ends_with(sfx.as_str())
+                    && h.as_bytes()[h.len() - sfx.len() - 1] == b'.')
+            {
+                return a.decision();
+            }
+        }
+        for (kw, a) in &self.domain_keyword {
+            if h.contains(kw.as_str()) {
+                return a.decision();
+            }
+        }
+        // 2. DST-PORT 规则（线性，数量小）
+        for (p, a) in &self.port_rules {
+            if *p == port {
+                return a.decision();
+            }
+        }
+        // 3. 内置 CN 域名直连层（引用 routing 模块数据，不复制表）
+        if crate::routing::is_direct(host) {
+            return Decision::Direct;
+        }
+        // 4. 默认策略 → PROXY
+        Decision::Proxy
+    }
+
     /// 是否启用 GeoIP-CN（观测用）
     pub fn geoip_enabled(&self) -> bool {
         self.geoip_enabled
@@ -443,6 +548,11 @@ impl RuleEngine {
     /// 自定义 IPv6 CIDR 规则数（日志/观测）
     pub fn cidr6_count(&self) -> usize {
         self.cidr6.len()
+    }
+
+    /// 自定义域名规则总数（DOMAIN + DOMAIN-SUFFIX + DOMAIN-KEYWORD，日志/观测）
+    pub fn domain_rule_count(&self) -> usize {
+        self.domain_full.len() + self.domain_suffix.len() + self.domain_keyword.len()
     }
 }
 
@@ -852,5 +962,113 @@ mod tests {
         assert_eq!(hit(35), Some(Action::Direct));
         assert_eq!(hit(26), None);
         assert_eq!(hit(5), None);
+    }
+
+    // ── 统一路由层 v1.1：decide_domain（域名双模判定）────────────────────────
+    fn domain_str(eng: &RuleEngine, target: &str) -> Decision {
+        let (h, p) = target.rsplit_once(':').unwrap();
+        eng.decide_domain(h, p.parse().unwrap())
+    }
+
+    #[test]
+    fn 域名规则_suffix_full_keyword三类生效() {
+        let eng = RuleEngine::from_bytes(
+            b"DOMAIN-SUFFIX,example.com,DIRECT\nDOMAIN,api.foo.com,PROXY\nDOMAIN-KEYWORD,google,PROXY\n",
+        );
+        // suffix：完整标签边界命中（含根域自身）
+        assert_eq!(domain_str(&eng, "www.example.com:443"), Decision::Direct);
+        assert_eq!(domain_str(&eng, "example.com:80"), Decision::Direct);
+        // 边界不误命中（evil-baidu 反例同口径）
+        assert_eq!(domain_str(&eng, "evil-example.com:443"), Decision::Proxy);
+        // full：精确全等，子域不命中
+        assert_eq!(domain_str(&eng, "api.foo.com:443"), Decision::Proxy);
+        assert_eq!(domain_str(&eng, "api.foo.com:443"), Decision::Proxy);
+        assert_eq!(domain_str(&eng, "x.api.foo.com:443"), Decision::Proxy);
+        // keyword：包含即命中
+        assert_eq!(domain_str(&eng, "www.google.com:443"), Decision::Proxy);
+        assert_eq!(domain_str(&eng, "googleanalytics.com:80"), Decision::Proxy);
+        // 未命中 → 内置 CN 层之外默认 Proxy
+        assert_eq!(domain_str(&eng, "unknown.test:443"), Decision::Proxy);
+    }
+
+    #[test]
+    fn 域名规则_大小写不敏感与通配写法() {
+        let eng = RuleEngine::from_bytes(
+            b"DOMAIN-SUFFIX,BAIDU.COM,direct\nDOMAIN,API.Taobao.Com,direct\nDOMAIN-KEYWORD, GitHub,proxy\n",
+        );
+        // 规则参数与目标 host 双向大小写不敏感；结尾点容忍
+        assert_eq!(domain_str(&eng, "WWW.Baidu.Com.:443"), Decision::Direct);
+        assert_eq!(domain_str(&eng, "api.taobao.com:443"), Decision::Direct);
+        assert_eq!(domain_str(&eng, "www.GitHub.com:443"), Decision::Proxy);
+        // *.example.com 通配写法等价 example.com 后缀
+        let eng2 = RuleEngine::from_bytes(b"DOMAIN-SUFFIX,*.Example.com,DIRECT\n");
+        assert_eq!(domain_str(&eng2, "a.example.com:80"), Decision::Direct);
+    }
+
+    #[test]
+    fn 域名规则_优先级_full先于suffix先于keyword_端口夹层() {
+        // 同一目标多类规则同时命中：full → suffix → keyword 文件序优先
+        let eng = RuleEngine::from_bytes(
+            b"DOMAIN-SUFFIX,x.com,PROXY\nDOMAIN-KEYWORD,ad,DIRECT\nDOMAIN,ad.x.com,PROXY\n",
+        );
+        // full 先于 keyword：ad.x.com 命中 DOMAIN 规则（PROXY）
+        assert_eq!(domain_str(&eng, "ad.x.com:443"), Decision::Proxy);
+        // suffix 先于 keyword：a.x.com 命中 DOMAIN-SUFFIX（PROXY），keyword 不再看
+        assert_eq!(domain_str(&eng, "a.x.com:443"), Decision::Proxy);
+        // 仅 keyword 命中：非 x.com 后缀的 ad 域 → DIRECT
+        assert_eq!(domain_str(&eng, "adsite.test:443"), Decision::Direct);
+        // DST-PORT 夹在用户域名规则之后、内置 CN 层之前：
+        // 域名规则未命中 + 端口命中 → 端口例外生效
+        let eng2 = RuleEngine::from_bytes(b"DST-PORT,53,DIRECT\n");
+        assert_eq!(domain_str(&eng2, "dns.example.net:53"), Decision::Direct);
+        assert_eq!(domain_str(&eng2, "dns.example.net:443"), Decision::Proxy);
+        // 端口规则不得越过用户域名规则（PROXY 域名 53 端口仍 PROXY）
+        let eng3 = RuleEngine::from_bytes(b"DST-PORT,53,DIRECT\nDOMAIN,p.example.com,PROXY\n");
+        assert_eq!(domain_str(&eng3, "p.example.com:53"), Decision::Proxy);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn 域名规则_内置CN层默认生效且用户规则可叠加覆盖() {
+        // 内置 CN 域名直连层默认启用（地位等同 GeoIP 内置表）
+        let eng = RuleEngine::builtin_cn();
+        assert_eq!(domain_str(&eng, "www.taobao.com:443"), Decision::Direct);
+        assert_eq!(domain_str(&eng, "bilibili.com:443"), Decision::Direct);
+        assert_eq!(domain_str(&eng, "localhost:8080"), Decision::Direct);
+        // 非 CN → 默认 Proxy
+        assert_eq!(domain_str(&eng, "www.wikipedia.org:443"), Decision::Proxy);
+        // 用户规则叠加其上：CN 域名显式 PROXY（用户规则先于内置层）
+        let eng2 = RuleEngine::from_bytes(b"DOMAIN-SUFFIX,taobao.com,PROXY\n");
+        assert_eq!(domain_str(&eng2, "www.taobao.com:443"), Decision::Proxy);
+        // 未命中用户规则的 CN 域名仍走内置直连层
+        assert_eq!(domain_str(&eng2, "www.jd.com:443"), Decision::Direct);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn 域名规则_与TUN_decide统一口径样例() {
+        // 统一路由层一致性样例：IP 形态目标 TUN decide 与 SOCKS 路径
+        // （proxy.rs engine_wants_direct 内部转 decide）决策一致
+        let eng = RuleEngine::builtin_cn();
+        // IP 形态目标：TUN 侧 decide 判定（SOCKS 侧由 proxy.rs
+        // engine_wants_direct 对 IP 字面量转 decide，同一入口）
+        let addr: SocketAddr = "114.114.114.114:53".parse().unwrap();
+        assert_eq!(eng.decide(addr), Decision::Direct);
+        let addr2: SocketAddr = "8.8.8.8:443".parse().unwrap();
+        assert_eq!(eng.decide(addr2), Decision::Proxy);
+        // 域名规则同样进入 IP 侧引擎（from_bytes 单一规则面）
+        let eng2 = RuleEngine::from_bytes(b"DOMAIN-SUFFIX,corp.internal,DIRECT\nIP-CIDR,9.9.9.0/24,DIRECT\n");
+        assert_eq!(domain_str(&eng2, "nas.corp.internal:5001"), Decision::Direct);
+        assert_eq!(eng2.decide("9.9.9.9:443".parse().unwrap()), Decision::Direct);
+    }
+
+    #[test]
+    fn 域名规则_非法行跳过计数() {
+        let eng = RuleEngine::from_bytes(
+            b"DOMAIN,a.com\nDOMAIN-SUFFIX,DIRECT\nDOMAIN-KEYWORD,,DIRECT\nDOMAIN,b.com,DIRECT\n",
+        );
+        assert_eq!(eng.skipped_lines, 3);
+        assert_eq!(eng.domain_rule_count(), 1);
+        assert_eq!(domain_str(&eng, "b.com:443"), Decision::Direct);
     }
 }

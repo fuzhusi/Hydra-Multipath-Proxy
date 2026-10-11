@@ -154,6 +154,31 @@ fn record_and_should_failover(target: &str) -> bool {
 /// 国内直连分流的直连建连超时（超时后回退节点路径，不让浏览器干等）
 const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// 统一路由层的 `host:port` 目标判定（SOCKS/HTTP 三调用点共用）：
+/// - IP 字面量目标 → [`RuleEngine::decide`]（统一 IP 规则口径，与 TUN 一致：
+///   内置私网直连 / 自定义 CIDR / GeoIP-CN / 默认 Proxy）；
+/// - 域名目标 → [`RuleEngine::decide_domain`]（用户域名规则 → DST-PORT →
+///   内置 CN 域名层 → 默认 Proxy）。
+///
+/// 解析失败（非法端口 / 裸 v6 无括号无端口等）一律不直连（走节点，与未命中
+/// 同等保守）；Direct → true，Proxy → false。
+fn engine_wants_direct(eng: &crate::routing_rules::RuleEngine, target: &str) -> bool {
+    use crate::routing_rules::Decision;
+    let (host, port) = match target.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() => match p.parse::<u16>() {
+            Ok(p) => (h, p),
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let decision = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => eng.decide(SocketAddr::new(ip, port)),
+        Err(_) => eng.decide_domain(host, port),
+    };
+    decision == Decision::Direct
+}
+
 pub struct ProxyServer {
     listen_addr: SocketAddr,
     scheduler: Arc<Scheduler>,
@@ -170,6 +195,11 @@ pub struct ProxyServer {
     trust: Option<tcp_transport::TlsTrust>,
     sni: String,
     bound_addr: Arc<std::sync::OnceLock<SocketAddr>>,
+    /// 统一路由层引擎（v1.1 技术债闭环）：Some 时 SOCKS/HTTP 的域名/IP 分流
+    /// 判定走 `decide_domain` / `decide`（与 TUN 共用同一规则面与引擎实例）；
+    /// None（默认）保持既有 `routing::is_direct_target`（HYDRA_SPLIT + 内置
+    /// CN 域名表）行为——CLI/未接线路径零行为变更
+    routing_engine: Option<Arc<crate::routing_rules::RuleEngine>>,
 }
 
 impl ProxyServer {
@@ -186,6 +216,7 @@ impl ProxyServer {
             trust: None,
             sni: DEFAULT_SNI.to_string(),
             bound_addr: Arc::new(std::sync::OnceLock::new()),
+            routing_engine: None,
         }
     }
 
@@ -217,6 +248,17 @@ impl ProxyServer {
     /// 覆盖 SNI 伪装域名（默认 hydra.node）
     pub fn with_sni(mut self, sni: String) -> Self {
         self.sni = sni;
+        self
+    }
+
+    /// 挂载统一路由层引擎（None = 不挂，走既有内置域名表行为）。GUI 分流开关
+    /// ON 时与 TUN 侧传入**同一引擎实例**（同一规则文件 + 内置表，口径合一）；
+    /// 引擎构建失败由调用方决定降级（GUI：不挂 + 告警）。
+    pub fn with_routing_engine(
+        mut self,
+        engine: Option<Arc<crate::routing_rules::RuleEngine>>,
+    ) -> Self {
+        self.routing_engine = engine;
         self
     }
 
@@ -329,9 +371,12 @@ impl ProxyServer {
                     let scheduler = self.scheduler.clone();
                     let traffic = traffic.clone();
                     let creds = creds.clone();
+                    let routing_engine = self.routing_engine.clone();
                     tokio::spawn(async move {
                         // 包装错误处理，确保发送 SOCKS5 错误响应
-                        match Self::handle_connection(stream, scheduler, traffic, creds).await {
+                        match Self::handle_connection(stream, scheduler, traffic, creds, routing_engine)
+                            .await
+                        {
                             Ok(()) => {
                                 info!("━━━ Connection from {} completed successfully ━━━", addr);
                             }
@@ -650,6 +695,7 @@ impl ProxyServer {
         scheduler: Arc<Scheduler>,
         traffic: Arc<TrafficMonitor>,
         creds: TcpCreds,
+        routing_engine: Option<Arc<crate::routing_rules::RuleEngine>>,
     ) -> Result<()> {
         let mut buf = [0u8; 4096];
         let peer_addr = stream
@@ -680,11 +726,11 @@ impl ProxyServer {
         if buf[0] == 0x05 {
             // SOCKS5 协议
             info!("[{}] Detected SOCKS5 protocol", peer_addr);
-            Self::handle_socks5(stream, &buf, n, scheduler, traffic, creds).await
+            Self::handle_socks5(stream, &buf, n, scheduler, traffic, creds, routing_engine).await
         } else if buf[0] >= b'A' && buf[0] <= b'Z' {
             // HTTP 协议 (CONNECT, GET, POST 等)
             info!("[{}] Detected HTTP protocol", peer_addr);
-            Self::handle_http(stream, &buf, n, scheduler, traffic, creds).await
+            Self::handle_http(stream, &buf, n, scheduler, traffic, creds, routing_engine).await
         } else {
             error!(
                 "[{}] Unknown protocol, first byte: 0x{:02x}",
@@ -862,6 +908,7 @@ impl ProxyServer {
         scheduler: Arc<Scheduler>,
         traffic: Arc<TrafficMonitor>,
         creds: TcpCreds,
+        routing_engine: Option<Arc<crate::routing_rules::RuleEngine>>,
     ) -> Result<()> {
         let peer_addr = stream
             .peer_addr()
@@ -965,7 +1012,8 @@ impl ProxyServer {
                 "[{}] >>> HTTP CONNECT request (plaintext): {}",
                 peer_addr, target_str
             );
-            return Self::handle_http_connect(stream, target_str, scheduler, traffic, creds).await;
+            return Self::handle_http_connect(stream, target_str, scheduler, traffic, creds, routing_engine)
+                .await;
         }
 
         // 普通 HTTP 请求 (GET, POST etc.)
@@ -1061,9 +1109,12 @@ impl ProxyServer {
         // 发送目标地址到服务器（包含端口）
         let target_with_port = format!("{}:{}", target_addr_str, default_port);
 
-        // Exec2：国内直连分流——命中 CN 域名表时本机 TCP 直连（HTTP 直接转发原始字节），
-        // 未开启/未命中/直连失败 → 走既有 open_target 节点路径
-        let link = match Self::try_direct(&target_with_port, peer_addr).await {
+        // Exec2 / 统一路由层：国内直连分流——引擎挂载时按统一规则面判定
+        // （Direct → 本机 TCP 直连，HTTP 直接转发原始字节），未挂载/未命中/
+        // 直连失败 → 走既有 open_target 节点路径
+        let link = match Self::try_direct(routing_engine.as_deref(), &target_with_port, peer_addr)
+            .await
+        {
             Some(mut tcp) => {
                 // A6 语义保持：原始字节转发（含二进制 body），不经 lossy 字符串
                 info!(
@@ -1128,13 +1179,15 @@ impl ProxyServer {
         scheduler: Arc<Scheduler>,
         traffic: Arc<TrafficMonitor>,
         creds: TcpCreds,
+        routing_engine: Option<Arc<crate::routing_rules::RuleEngine>>,
     ) -> Result<()> {
         let peer_addr = stream
             .peer_addr()
             .unwrap_or_else(|_| SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0));
 
-        // 连接到节点（带故障切换）；Exec2：命中 CN 域名表时本机 TCP 直连
-        let link = match Self::try_direct(&target_str, peer_addr).await {
+        // 连接到节点（带故障切换）；统一路由层/内置 CN 域名表命中时本机 TCP 直连
+        let link = match Self::try_direct(routing_engine.as_deref(), &target_str, peer_addr).await
+        {
             Some(tcp) => RemoteLink::Direct(tcp),
             None => {
                 let node_link =
@@ -1200,6 +1253,7 @@ impl ProxyServer {
         scheduler: Arc<Scheduler>,
         traffic: Arc<TrafficMonitor>,
         creds: TcpCreds,
+        routing_engine: Option<Arc<crate::routing_rules::RuleEngine>>,
     ) -> Result<()> {
         let peer_addr = stream
             .peer_addr()
@@ -1454,11 +1508,13 @@ impl ProxyServer {
             peer_addr, target_str
         );
 
-        // Exec2：国内直连分流——HYDRA_SPLIT=cn 且目标为域名形态并命中 CN 域名表时，
-        // 客户端本机 TCP 直连目标（SOCKS5 直接回成功后走既有双向转发）。
-        // IP 形态目标（atyp 0x01/0x04）由 routing 内部一律拒绝（无 GeoIP，如实不支持），
-        // 未开启/未命中/直连失败 → 走既有 open_target 节点路径，行为与分流前完全一致。
-        let link = match Self::try_direct(&target_str, peer_addr).await {
+        // Exec2 / 统一路由层：国内直连分流——引擎挂载时按统一规则面判定
+        // （域名 decide_domain / IP decide，与 TUN 同口径），未挂载走既有
+        // HYDRA_SPLIT + 内置 CN 域名表（零行为变更）。IP 形态目标在未挂载时
+        // 由 routing 内部一律拒绝（无 GeoIP，如实不支持），未命中/直连失败 →
+        // 走既有 open_target 节点路径，行为与分流前完全一致。
+        let link = match Self::try_direct(routing_engine.as_deref(), &target_str, peer_addr).await
+        {
             Some(tcp) => RemoteLink::Direct(tcp),
             None => {
                 // 连接到节点（带故障切换）
@@ -1491,10 +1547,26 @@ impl ProxyServer {
         Self::relay_bidirectional(stream, link, peer_addr, &target_str, &pending_up, traffic).await
     }
 
-    /// Exec2：国内直连分流建连。命中 CN 域名表（且 HYDRA_SPLIT=cn）时客户端本机
-    /// TCP 直连目标；直连失败/超时回退节点路径（返回 None），不改变既有可用性。
-    async fn try_direct(target: &str, peer_addr: SocketAddr) -> Option<TcpStream> {
-        if !routing::is_direct_target(target) {
+    /// Exec2 / 统一路由层：国内直连分流建连。判定口径二选一：
+    /// - 引擎挂载（`engine = Some`，GUI 分流开关 ON）：IP 字面量目标走
+    ///   [`crate::routing_rules::RuleEngine::decide`]（统一 IP 规则口径——内置
+    ///   私网直连/CIDR/GeoIP 与 TUN 完全一致），域名目标走 `decide_domain`
+    ///   （用户域名规则 + 端口 + 内置 CN 域名层，与 TUN 同一引擎实例）；
+    /// - 未挂载（`None`）：既有 `routing::is_direct_target`（HYDRA_SPLIT=cn +
+    ///   内置 CN 域名表）——CLI/未接线路径零行为变更。
+    ///
+    /// 命中时客户端本机 TCP 直连目标；直连失败/超时回退节点路径（返回 None），
+    /// 不改变既有可用性。
+    async fn try_direct(
+        engine: Option<&crate::routing_rules::RuleEngine>,
+        target: &str,
+        peer_addr: SocketAddr,
+    ) -> Option<TcpStream> {
+        let should_direct = match engine {
+            Some(eng) => engine_wants_direct(eng, target),
+            None => routing::is_direct_target(target),
+        };
+        if !should_direct {
             return None;
         }
         debug!(
@@ -2052,5 +2124,121 @@ mod tun_rule_opener_tests {
             [target.as_str()],
             "直连失败应回退代理 opener"
         );
+    }
+}
+
+// ── 统一路由层（v1.1）：SOCKS/HTTP 域名判定接入引擎 ─────────────────────────
+#[cfg(test)]
+mod unified_routing_tests {
+    use super::*;
+    use crate::routing_rules::RuleEngine;
+
+    fn pseudo_peer() -> SocketAddr {
+        "127.0.0.1:65000".parse().unwrap()
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn 引擎判定_域名与IP双口径() {
+        let eng = RuleEngine::builtin_cn();
+        // 域名口径：内置 CN 层命中 → 直连；非 CN → 节点
+        assert!(engine_wants_direct(&eng, "www.taobao.com:443"));
+        assert!(engine_wants_direct(&eng, "bilibili.com:80"));
+        assert!(!engine_wants_direct(&eng, "www.wikipedia.org:443"));
+        // IP 口径（统一 IP 规则）：内置私网直连 / 非 CN 段走节点
+        assert!(engine_wants_direct(&eng, "127.0.0.1:8080"));
+        assert!(engine_wants_direct(&eng, "192.168.1.1:80"));
+        assert!(engine_wants_direct(&eng, "[::1]:443"));
+        assert!(!engine_wants_direct(&eng, "8.8.8.8:443"));
+        // 用户规则叠加：域名规则 + IP 规则同一引擎
+        let eng2 =
+            RuleEngine::from_bytes(b"DOMAIN-SUFFIX,internal.test,DIRECT\nIP-CIDR,9.9.9.0/24,DIRECT\n");
+        assert!(engine_wants_direct(&eng2, "nas.internal.test:5001"));
+        assert!(engine_wants_direct(&eng2, "9.9.9.9:443"));
+        assert!(!engine_wants_direct(&eng2, "9.10.0.1:443"));
+        // 解析失败保守走节点（非法端口 / 裸 v6 无端口）
+        assert!(!engine_wants_direct(&eng, "host.example:443x"));
+        assert!(!engine_wants_direct(&eng, "::1"));
+    }
+
+    #[tokio::test]
+    async fn try_direct_引擎挂载_命中本地直连() {
+        // 本地回环 echo：判定 Direct 后 try_direct 完成真实本机 TCP 直连
+        // （不经任何节点 opener——直连路径与 TUN R5 口径一致）
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((s, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let (mut r, mut w) = tokio::io::split(s);
+                        let _ = tokio::io::copy(&mut r, &mut w).await;
+                    });
+                }
+            }
+        });
+        let eng = RuleEngine::builtin_cn();
+        let mut tcp = ProxyServer::try_direct(
+            Some(&eng),
+            &format!("localhost:{}", addr.port()),
+            pseudo_peer(),
+        )
+        .await
+        .expect("引擎判定 localhost 直连应建连成功");
+        tcp.write_all(b"ping").await.unwrap();
+        tcp.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(3), tcp.read_exact(&mut buf))
+            .await
+            .expect("回读超时")
+            .unwrap();
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn try_direct_引擎挂载_未知域名不建连() {
+        // 判定 Proxy → try_direct 立即返回 None（不发起任何直连/节点请求）
+        let eng = RuleEngine::builtin_cn();
+        let r = ProxyServer::try_direct(
+            Some(&eng),
+            "nonexistent-intl.invalid:443",
+            pseudo_peer(),
+        )
+        .await;
+        assert!(r.is_none(), "未命中应返回 None 交由节点路径");
+    }
+
+    #[tokio::test]
+    async fn try_direct_引擎未挂载_基线行为不变() {
+        // engine = None：判定完全交给既有 routing::is_direct_target
+        // （HYDRA_SPLIT 未开启 → 一律 None，与基线 2be66e8 零行为变更）
+        assert!(ProxyServer::try_direct(None, "www.taobao.com:443", pseudo_peer())
+            .await
+            .is_none());
+        assert!(ProxyServer::try_direct(None, "8.8.8.8:443", pseudo_peer())
+            .await
+            .is_none());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn 统一口径_TUN_decide与SOCKS判定一致() {
+        // 同一引擎实例下：IP 目标 TUN decide 与 SOCKS engine_wants_direct
+        // （内部转 decide）决策逐条一致；域名目标为 SOCKS 侧独立判定面
+        let eng = RuleEngine::from_bytes(b"IP-CIDR,9.9.9.0/24,DIRECT\nDOMAIN-SUFFIX,corp.test,DIRECT\n");
+        let consistent = |target: &str| {
+            let addr: SocketAddr = target.parse().unwrap();
+            let tun = eng.decide(addr) == crate::routing_rules::Decision::Direct;
+            let socks = engine_wants_direct(&eng, target);
+            assert_eq!(tun, socks, "IP 目标 {target} 双路径决策应一致");
+            tun
+        };
+        assert!(consistent("9.9.9.9:443"));
+        assert!(consistent("9.9.9.0:80"));
+        assert!(!consistent("9.10.0.1:443"));
+        assert!(!consistent("8.8.8.8:53"));
+        // 域名目标（SOCKS 侧 decide_domain；TUN 侧无域名输入，不参与一致性样例）
+        assert!(engine_wants_direct(&eng, "nas.corp.test:5001"));
+        assert!(!engine_wants_direct(&eng, "evil-corp.test:443"));
     }
 }

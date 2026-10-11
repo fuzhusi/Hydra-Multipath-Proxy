@@ -205,6 +205,50 @@ impl HydraApp {
             None
         };
 
+        // ── 统一路由层（v1.1 技术债闭环）：分流开关 ON 时引擎同时挂 SOCKS/HTTP 路径 ──
+        // 优先复用 tun_config_from_settings 已构建的**同一引擎实例**（TUN 与
+        // SOCKS/HTTP 共用同一规则文件 + 内置表，口径合一）。TUN 未构建（未开
+        // TUN 但分流开关 ON 的配置遗留形态）时按同口径单独构建；构建失败
+        // （文件不存在等）→ ProxyServer 不挂引擎 + warn（TUN 侧既有 builtin_cn
+        // 降级逻辑不动）——SOCKS/HTTP 回退既有 HYDRA_SPLIT 内置行为。
+        let routing_engine = match tun_cfg.as_ref().and_then(|c| c.rule_engine.clone()) {
+            Some(engine) => Some(engine),
+            None if self.config.tun_rule_mode => {
+                // 规则文件为空 = 默认 %APPDATA%\hydra\rules.txt（与
+                // tun_config_from_settings 同口径）
+                let rule_path = if self.config.tun_rule_file.trim().is_empty() {
+                    hydra_client::tun::default_rule_file_path()
+                } else {
+                    std::path::PathBuf::from(self.config.tun_rule_file.trim())
+                };
+                match hydra_client::routing_rules::RuleEngine::from_rule_file(&rule_path) {
+                    Ok(engine) => {
+                        self.add_log(format!(
+                            "分流引擎已挂载 SOCKS/HTTP 路径：规则文件 {}（端口 {} 条 / 域名 {} 条 / \
+                             CIDR v4 {} 条 / v6 {} 条）",
+                            rule_path.display(),
+                            engine.port_rule_count(),
+                            engine.domain_rule_count(),
+                            engine.cidr4_count(),
+                            engine.cidr6_count()
+                        ));
+                        Some(Arc::new(engine))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "分流规则文件 {} 不可用（{e}）：SOCKS/HTTP 不挂引擎，走既有内置行为",
+                            rule_path.display()
+                        );
+                        self.add_log(format!(
+                            "⚠ 规则文件不可用（{e}）：SOCKS/HTTP 分流降级为既有内置域名表"
+                        ));
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         // 创建流量统计器
         let traffic_monitor = Arc::new(TrafficMonitor::new());
         self.traffic_monitor = Some(traffic_monitor.clone());
@@ -279,6 +323,9 @@ impl HydraApp {
         };
         self.tun_shutdown = tun_shutdown_token.clone();
         let mut tun_token_for_thread = tun_shutdown_token.clone();
+        // 统一路由层：引擎随代理线程移交 ProxyServer（None = 分流开关 OFF /
+        // 构建失败，走既有内置行为）
+        let routing_engine_for_thread = routing_engine;
 
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -289,7 +336,8 @@ impl HydraApp {
                         .with_nodes(nodes_clone)
                         .with_traffic_monitor(traffic_monitor_clone)
                         .with_auth_key(auth_key)
-                        .with_trust(trust_for_proxy),
+                        .with_trust(trust_for_proxy)
+                        .with_routing_engine(routing_engine_for_thread),
                 );
                 println!("[Proxy Thread] Starting proxy server...");
                 // ── TUN 叠加（已交付）：与 SOCKS 监听并存。register_nodes 需在

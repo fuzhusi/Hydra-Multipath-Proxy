@@ -16,6 +16,7 @@ pub use hydra_core::{
     node_certs_from_paths,
     proxy::*,
     routing::*,
+    routing_rules::*,
     scheduler::*,
     share_link::*,
     speedtest::*,
@@ -26,8 +27,8 @@ pub use hydra_core::{
 };
 // 模块路径同样保留（`hydra_client::proxy::ProxyServer` 等既有引用）
 pub use hydra_core::{
-    channel, connections, nat, proxy, routing, scheduler, share_link, speedtest, subscription,
-    tcp_transport, traffic, transport, udp_relay,
+    channel, connections, nat, proxy, routing, routing_rules, scheduler, share_link, speedtest,
+    subscription, tcp_transport, traffic, transport, udp_relay,
 };
 
 // TUN 透明代理模式（feature = "tun"，见 tun.rs 模块文档；Android 不复用本模块，

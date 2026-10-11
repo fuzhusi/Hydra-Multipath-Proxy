@@ -41,6 +41,26 @@
 
 ## [Unreleased]
 
+### 统一路由层：TUN 规则引擎与 SOCKS/HTTP 域名分流两套机制合一（技术债闭环）
+
+- **RuleEngine 双模判定**（hydra-core/routing_rules.rs）：新增
+  `DOMAIN` / `DOMAIN-SUFFIX` / `DOMAIN-KEYWORD` 三类域名规则（大小写不敏感，
+  容忍 `*.example.com` 写法）与 `decide_domain(host, port)`——顺序：用户域名
+  规则（full→suffix→keyword）→ DST-PORT → 内置 CN 域名直连层（引用 routing
+  模块既有表，默认启用、用户规则可覆盖）→ 默认 Proxy；`decide(SocketAddr)`
+  不变（TUN 用）
+- **ProxyServer 接入**（hydra-core/proxy.rs）：新增 `with_routing_engine`；
+  SOCKS5 CONNECT / HTTP CONNECT / HTTP 代理三个分流判定点改为——引擎挂载时
+  IP 目标走 `decide`（与 TUN 统一 IP 口径，含私网直连）、域名走
+  `decide_domain`；未挂载走既有 `HYDRA_SPLIT` 内置域名表（CLI/未接线路径
+  **零行为变更**）；直连失败回退节点语义不变
+- **GUI 接线**（hydra-client-gui/proxy_control.rs）：分流开关 ON 时与 TUN
+  **共用同一引擎实例**（同一规则文件 + 内置表，两条入口口径合一）；规则文件
+  不可用时不挂引擎并告警（TUN 侧 builtin_cn 降级不变）
+- 测试 +11（decide_domain 三类/优先级/内置层/非法行、try_direct 引擎挂载
+  直连/未命中/未挂载基线、TUN 与 SOCKS 统一口径样例）；workspace 406 全绿，
+  clippy 零告警；设计文档新增 §八「统一路由层」
+
 ### 修复：系统代理残留治理（用户实测"关闭代理后浏览器断网"根治）
 
 - **根因**：GUI 非正常死亡（强杀/断电）后注册表残留 `ProxyEnable=1 →

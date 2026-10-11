@@ -474,11 +474,16 @@ impl HydraApp {
 
     // ── 智能分流（规则模式）辅助 ──────────────────────────────
 
-    /// 规则文件模板：不存在时「打开规则文件」按钮以此初始化（R10：端口规则为例外形态）
+    /// 规则文件模板：不存在时「打开规则文件」按钮以此初始化（R10：端口规则为例外形态）。
+    /// 统一路由层：域名规则同时驱动 SOCKS/HTTP 路径（TUN 侧仅 IP 规则可判）
     const RULE_FILE_TEMPLATE: &str = "# Hydra 分流规则\n\
 # 语法：IP-CIDR,1.2.3.0/24,DIRECT\n\
 #       GEOIP,CN,DIRECT\n\
 #       DST-PORT,8080,DIRECT\n\
+#       DOMAIN-SUFFIX,example.com,DIRECT（域名后缀；本地代理模式下生效）\n\
+#       DOMAIN,api.example.com,DIRECT（域名全等）\n\
+#       DOMAIN-KEYWORD,google,PROXY（域名包含）\n\
+# 匹配顺序：域名规则 → 端口 → CN 表 → 默认走节点\n\
 # 默认策略：未命中 → 走节点\n";
 
     /// 规则文件路径解析：cfg.tun_rule_file 非空用之；空则用默认 %APPDATA%\hydra\rules.txt。
