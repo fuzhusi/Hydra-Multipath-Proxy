@@ -3,7 +3,7 @@
 # - Windows 安装包: Hydra-Setup-<版本>-x64.exe（NSIS，自动包含官方签名 wintun.dll）
 # - Windows 便携包: hydra-windows-x64.zip（已内置 wintun.dll，解压即用）
 # - Linux:   hydra-node 打 tar.gz
-# - Android: hydra-android-<版本>-debug.apk（debug 签名供侧载；正式签名待 keystore 密钥）
+# - Android: hydra-android-<版本>.apk（release 构建、R8 优化；签名优先级：`n#   HYDRA_KEYSTORE_PATH/PASSWORD Secrets → 仓库 keystore（本地）→ debug 签名回退）
 # 注意：wintun.dll 从官方 https://www.wintun.net/ 下载（0.14.1，WireGuard LLC 签名），
 #       不进仓库（体积）；amd64 架构随包分发。
 name: Release
@@ -175,7 +175,7 @@ jobs:
           if-no-files-found: error
 
   build-android:
-    name: Android 产物（debug APK）
+    name: Android 产物（release APK，R8 优化 + 签名回退链）
     # 固定 24.04（同 build-linux）；runner 预装 Android SDK（ANDROID_HOME）。
     # APK 为 debug 签名（与本地 gradlew assembleDebug 一致，供侧载）——正式
     # release 签名需 keystore 仓库密钥，未配置前不冒充（如实标注）。
@@ -220,26 +220,26 @@ jobs:
       # preBuild 钩子自动调 scripts/build-rust.sh 交叉编译 libhydra_android.so
       - name: gradle assembleDebug（含 Rust 交叉编译）
         working-directory: android
-        run: bash ./gradlew assembleDebug --console=plain --no-daemon
+        run: bash ./gradlew assembleRelease --console=plain --no-daemon
 
       # 门禁：build-rust.sh 缺 cargo-ndk/NDK 时静默跳过仍退出 0——
       # 无此检查会发出无原生库的空壳 APK
       - name: 校验 APK 内嵌原生库（双 ABI）
         run: |
           for abi in arm64-v8a x86_64; do
-            unzip -l android/app/build/outputs/apk/debug/app-debug.apk \
+            unzip -l android/app/build/outputs/apk/release/app-release.apk \
               | grep -q "lib/$abi/libhydra_android.so" \
               || { echo "APK 缺少 lib/$abi/libhydra_android.so——Rust 交叉编译被跳过？"; exit 1; }
           done
 
       - name: 重命名 APK（带 tag 版本）
-        run: cp android/app/build/outputs/apk/debug/app-debug.apk "hydra-android-${{ github.ref_name }}-debug.apk"
+        run: cp android/app/build/outputs/apk/release/app-release.apk "hydra-android-${{ github.ref_name }}.apk"
 
       - name: 上传到 GitHub Release（tag 触发时）
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
-          files: hydra-android-*-debug.apk
+          files: hydra-android-*.apk
           generate_release_notes: true
 
       - name: 上传构建产物（手动触发时）
@@ -247,5 +247,5 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: hydra-android-dist
-          path: hydra-android-*-debug.apk
+          path: hydra-android-*.apk
           if-no-files-found: error
