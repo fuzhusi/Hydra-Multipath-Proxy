@@ -225,12 +225,12 @@ fn parse_args(args: &[String]) -> (Option<SocketAddr>, Vec<SocketAddr>, Option<P
                 println!(
                     "分享链接: 位置参数给 hydra:// 链接即自动配置密钥/证书（与 GUI/Android 一致）"
                 );
-                println!("TUN 透明代理模式（免配置全局代理，仅 TCP；需管理员/root）:");
+                println!("TUN 透明代理模式（免配置全局代理：TCP 全端口动态接流 + UDP/DNS 经隧道加密转发；需管理员/root）:");
                 println!(
                     "  --tun                在 SOCKS 监听之外叠加启动 TUN 虚拟网卡接管系统流量\n                       （Windows 需管理员运行且 wintun.dll 可用；Linux 需 root）"
                 );
                 println!(
-                    "  HYDRA_TUN=1          同 --tun；HYDRA_TUN_ADDR 覆盖 TUN 地址（默认 10.7.0.1/30）\n                       HYDRA_TUN_EXCLUDE 额外豁免 IP（逗号分隔，/32 回物理网关）\n                       HYDRA_TUN_PORTS 覆盖拦截端口列表（默认 80,443,8080,8443；\n                       smoltcp 无通配监听，v1 已知限制）\n                       HYDRA_TUN_DNS/HYDRA_TUN_GW 手动指定 DNS/物理网关（默认自动探测）\n                       HYDRA_TUN_IPV6=0 关闭 IPv6 接管（默认开：v6 TCP 经动态 AnyIP\n                       代理转发，v6 非 TCP 回 ICMPv6 不可达回落 IPv4）\n                       HYDRA_TUN_GW6 手动指定物理网关 IPv6；HYDRA_TUN_IF Windows 下\n                       netsh v6 路由所需的 TUN 适配器名"
+                    "  HYDRA_TUN=1          同 --tun；HYDRA_TUN_ADDR 覆盖 TUN 地址（默认 10.7.0.1/30）\n                       HYDRA_TUN_EXCLUDE 额外豁免 IP（逗号分隔，/32 回物理网关）\n                       HYDRA_TUN_PORTS 覆盖固定基础端口列表（默认 80,443,8080,8443；\n                       其余端口由首连 SYN 驱动动态补挂监听，上限 256 端口）\n                       HYDRA_TUN_UDP=0 关闭 UDP 接管（默认开：公网 UDP/QUIC/DNS 经\n                       节点中继加密转发；关闭时代答 ICMP port unreachable 引导回落 TCP）\n                       HYDRA_TUN_DNS_DIRECT=1 系统 DNS 直连物理网卡（默认经隧道加密）\n                       HYDRA_TUN_DNS/HYDRA_TUN_GW 手动指定 DNS/物理网关（默认自动探测）\n                       HYDRA_TUN_IPV6=0 关闭 IPv6 接管（默认开：v6 TCP 经动态 AnyIP\n                       代理转发，v6 非 TCP 回 ICMPv6 不可达回落 IPv4）\n                       HYDRA_TUN_GW6 手动指定物理网关 IPv6；HYDRA_TUN_IF Windows 下\n                       netsh v6 路由所需的 TUN 适配器名"
                 );
                 println!("P2P 打洞实验（NAT 穿透 §3.3，本轮仅验证输出，不接入代理热路径）:");
                 println!(
