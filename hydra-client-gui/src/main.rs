@@ -297,19 +297,28 @@ async fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    // 双 cfg 函数而非闭包内直接写：`mut` 仅 Windows 侧需要（add_log），
+    // Linux 下无 cfg(windows) 块会触发 unused_mut → clippy -D warnings 阻断
+    #[cfg(windows)]
+    fn build_app(cc: &eframe::CreationContext<'_>) -> HydraApp {
+        let mut app = HydraApp::new(cc);
+        // 启动自愈命中时在应用日志里留痕（用户可见，不必弹窗）
+        if crate::windows_proxy::STALE_PROXY_CLEANED.load(std::sync::atomic::Ordering::SeqCst) {
+            app.add_log(
+                "启动自愈：检测到上次异常退出残留的系统代理（指向死端口），已自动清除".to_string(),
+            );
+        }
+        app
+    }
+
+    #[cfg(not(windows))]
+    fn build_app(cc: &eframe::CreationContext<'_>) -> HydraApp {
+        HydraApp::new(cc)
+    }
+
     eframe::run_native(
         "Hydra Multipath Proxy",
         options,
-        Box::new(|cc| {
-            let mut app = HydraApp::new(cc);
-            // 启动自愈命中时在应用日志里留痕（用户可见，不必弹窗）
-            #[cfg(windows)]
-            if crate::windows_proxy::STALE_PROXY_CLEANED.load(std::sync::atomic::Ordering::SeqCst) {
-                app.add_log(
-                    "启动自愈：检测到上次异常退出残留的系统代理（指向死端口），已自动清除".to_string(),
-                );
-            }
-            Box::new(app)
-        }),
+        Box::new(|cc| Box::new(build_app(cc))),
     )
 }
