@@ -237,8 +237,10 @@ impl HydraApp {
         let tun_on = self.config.tun_enabled;
         // ── 分流模式（智能分流 v1.1 §4.2）：TUN 开关下方的两个单选卡 ──
         // 全局接管 = 既有行为（默认，行为兼容）；规则分流 = 按规则文件决定 CN 直连/走节点。
+        // horizontal_wrapped：窄窗口下自动换行——此前固定单行在 ~650px 窗口
+        // 会把第二个单选裁剪出右缘（用户实测「看不见规则分流」的根因）
         ui.add_space(palette::SPACING_XS);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("分流模式:");
             if ui
                 .add_enabled(
@@ -256,7 +258,7 @@ impl HydraApp {
                     tun_on,
                     egui::RadioButton::new(
                         self.config.tun_rule_mode,
-                        "规则分流（CN 直连 · 其余经节点）",
+                        "规则分流（CN 直连 · 其余走节点）",
                     ),
                 )
                 .clicked()

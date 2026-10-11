@@ -417,6 +417,30 @@ impl HydraApp {
                     }
                     // 系统代理快捷开关：代理运行且未开 TUN 时可手动开/关
                     let tun_on = self.config.tun_enabled;
+                    // 分流模式快捷开关（用户需求：与 TUN 模式并排，首页一键切换；
+                    // 与设置页同一字段 tun_rule_mode，重启代理生效）。
+                    // TUN 关闭时禁用（分流仅 TUN 模式下有意义，语义同设置页）
+                    let rule_resp = ui
+                        .add_enabled(
+                            tun_on,
+                            egui::Checkbox::new(
+                                &mut self.config.tun_rule_mode,
+                                egui::RichText::new("分流：CN 直连")
+                                    .size(palette::FONT_BODY),
+                            ),
+                        )
+                        .on_hover_text(match tun_on {
+                            false => "先开启 TUN 模式后可用",
+                            true => "规则分流：命中 CN/自定义规则直连，其余走节点（重启代理生效；规则文件见「⚙ 设置」页）",
+                        });
+                    if rule_resp.changed() {
+                        self.maybe_save_config(true);
+                        self.add_log(if self.config.tun_rule_mode {
+                            "分流模式：规则分流（CN 直连 · 其余经节点；重启代理后生效）".to_string()
+                        } else {
+                            "分流模式：全局接管（重启代理后生效）".to_string()
+                        });
+                    }
                     let sys_on = self.system_proxy_on_cached();
                     let toggle_text = if sys_on {
                         "系统代理：开 ✓"
