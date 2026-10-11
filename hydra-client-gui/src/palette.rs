@@ -548,6 +548,13 @@ mod tests {
     /// set_theme 是全局态：串行化涉及切主题的测试，避免并行互踩
     static THEME_LOCK: Mutex<()> = Mutex::new(());
 
+    /// 防毒化取锁：任一持锁测试 panic 会毒化 Mutex，连锁打死其余持锁测试
+    /// （CI ubuntu 实测：撕裂断言 panic → 另两测试 PoisonError）。恢复继续，
+    /// 让每个测试独立报告真实结果。
+    fn test_theme_lock() -> std::sync::MutexGuard<'static, ()> {
+        THEME_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// WCAG 2.x 相对亮度
     fn rel_lum(c: Color32) -> f64 {
         let lin = |v: u8| -> f64 {
@@ -575,7 +582,7 @@ mod tests {
     fn latency_color_thresholds() {
         // 延迟色标：None=灰 / <200 绿 / 200-500 黄 / ≥500 红（v4 原有回归项）
         // （取值函数走全局主题，需与切主题测试串行）
-        let _g = THEME_LOCK.lock().unwrap();
+        let _g = test_theme_lock();
         assert_eq!(latency_color(None), text_faint());
         assert_eq!(latency_color(Some(0)), success());
         assert_eq!(latency_color(Some(199)), success());
@@ -588,7 +595,7 @@ mod tests {
     #[test]
     fn node_status_color_states() {
         // 节点状态三通道判定（v4 原有回归项，经 node_health + health_color 通路）
-        let _g = THEME_LOCK.lock().unwrap();
+        let _g = test_theme_lock();
         assert_eq!(health_color(node_health(false, false, None)), text_faint());
         assert_eq!(health_color(node_health(true, true, Some(45))), success());
         assert_eq!(health_color(node_health(true, true, Some(800))), warning());
@@ -597,7 +604,7 @@ mod tests {
 
     #[test]
     fn theme_switch_changes_values() {
-        let _g = THEME_LOCK.lock().unwrap();
+        let _g = test_theme_lock();
         // 三主题切换后取值随动（零锁查表通路验证）
         set_theme(UiTheme::Dark);
         assert_eq!(bg_panel(), DARK.bg_panel);
@@ -616,6 +623,9 @@ mod tests {
     fn contrast_key_pairs_all_themes() {
         // R1：三主题 text/text_faint 对 bg_card 达标；R2：Light warning on bg_panel ≥3
         // R4：text_on_accent 对 accent ≥3
+        // （本测试循环 set_theme 翻全局主题，必须持锁——缺锁曾与并行测试撕裂
+        // 互相的成对读值，CI ubuntu 实测 flake + 锁毒化连锁）
+        let _g = test_theme_lock();
         for t in UiTheme::ALL {
             set_theme(t);
             let p = current();
@@ -690,6 +700,7 @@ mod tests {
     #[test]
     fn all_tokens_have_accessors() {
         // 全部 30 个取值函数与当前预设字段一一对应（机械替换正确性的兜底断言）
+        let _g = test_theme_lock();
         let p = current();
         assert_eq!(bg_panel(), p.bg_panel);
         assert_eq!(bg_card(), p.bg_card);
