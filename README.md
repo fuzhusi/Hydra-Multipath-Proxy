@@ -8,6 +8,7 @@
 
 > **交付状态：v1.0 可交付产品**（2026-10）。三档如实划分：
 > - **已交付**：TCP/TLS + Noise-PSK 隧道、自签 pinning 与 ACME 真证书双路线、多节点加权分发与故障自愈、测速动态调度、**温连接池**（预热复用，每请求省一次节点握手）、TUN 透明代理完整版（IPv6 双栈 + **UDP-over-proxy 接管** + **DNS 经隧道** + **TCP 任意端口动态接流**）、**节点侧 v4-only 降噪**（DNS AAAA 本地过滤 + 目标建连 v4 优先）、NAT 穿透 v1（TCP STUN 分类 + 同时打开打洞 + 中继兜底；真实 NAT 组合环境需人工实网验证）、反代静态页回退、ClientHello 指纹模仿（最大近似方案，见 docs/design/ClientHello指纹模仿方案与实施.md）、UI 重设计 v3 全部批次（含连接页）+ **GUI 模块化拆分**（21 文件）、GUI 全功能（托盘/分享/订阅/连接页/配置持久化/CA 信任模式/**托盘菜单禁用态**）、**节点 /metrics（Prometheus）**、CI 与 Release 安装包、**Android M1 本地代理 + M2 全局 VPN**（VpnService 全接管 + TCP 任意端口 + DNS 经隧道）+ **M2.1 VPN 保护**（kill switch 断线阻断自动重连 / 开机自启 / 分应用代理白黑名单）。
+> - **v0.2.4 增量**（2026-10-10）：**内核优化 13 项**——节点 DNS 共享缓存（正向 60s/负 10s/1024 LRU）、Happy Eyeballs 目标并行建连（首两候选 250ms 错峰竞速）、冷连接握手捎带（5→4 RTT）、弹性温池（cap 按 peak EWMA clamp 2..8）、温连接 stale 8s 短超时、Metrics v2（17 指标族 + 四段握手直方图）、UDP 中继分层缓冲 + 单调钟、节点侧 TCP Fast Open + keepalive + TCP_USER_TIMEOUT、评分归一化；**UI v4.1 三主题**（Dark/Light/Abyss 运行时切换）+ 首页重排；**CLI 分享链接直传**（`hydra://` 给 CLI 即全配好）；P2P 打洞同时打开握手角色修复（按地址序分配）。
 > - **规划中**：eframe/egui 升级 0.27→0.33+（根治 webbrowser 漏洞告警与 unmaintained 依赖群，当前已评估豁免）、多节点并行下载 GUI 前端（CLI 已交付）、rekey Tier2（并入 v4 帧化协议——snow 0.9.6 具备 rekey API 但现协议 Noise 仅认证、数据面为 TLS 1.3，对现协议无效果）。
 
 > **项目性质**：个人自用工具，AI 辅助开发。经多轮独立代码审查（[docs/review/](docs/review/)），本 README 与代码逐项核对——未列出的能力即为未实现，不做夸大宣传。
@@ -30,7 +31,11 @@
 - **节点故障切换 + 自愈**：传输失败自动标记 Offline、切换下一节点（最多 3 候选）；后台探测器周期**完整握手探测**（TCP + TLS + Noise-PSK，认证面故障可在探测复现），Offline 节点恢复自动重新上线、Online 节点连续失败自动降级 Degraded——死节点不再"恒被选中靠每连接失败兜底"
 - **连接级多节点加权分发**：多节点按评分承接新连接，杀节点不中断
 - **测速动态调度**：主动探测 RTT + 被动吞吐差分（按节点字节计数）+ 故障衰减，实测写回节点评分
-- **温连接池（pre-warm）**：节点握手在上一请求转发期间后台完成（每节点 ≤2 根温连接、60s TTL），请求到达复用现成通道直发目标帧——浏览器式短请求**每请求省一次 TCP+TLS+Noise 握手（300–500ms → ~0）**；零协议变更，温连接失败自动回退全新握手（纯优化层，不碰评分/故障切换语义）
+- **温连接池（pre-warm）**：节点握手在上一请求转发期间后台完成（**弹性 cap**：按峰值负载 EWMA 在 2..8 间自适应、60s TTL + 周期清扫），请求到达复用现成通道直发目标帧——浏览器式短请求**每请求省一次 TCP+TLS+Noise 握手（300–500ms → ~0）**；复用陈旧温连接走 **8s 短超时**快速失败重建（`HYDRA_WARM_TIMEOUT_SECS` 可调），零协议变更，温连接失败自动回退全新握手（纯优化层，不碰评分/故障切换语义）
+- **冷连接握手捎带**：目标地址帧并入握手尾包发送，冷连接建达目标 **5→4 RTT**（线缆兼容，老客户端无感知）
+- **Happy Eyeballs 目标建连**（节点侧）：目标多候选（双栈域名常见）首两个 **250ms 错峰并行竞速**先到先用，黑洞候选不再吃满串行预算（失败尾延迟 20s → ~2-3s）；剩余候选串行接力（15s 总预算语义不变）
+- **节点 DNS 共享缓存**：多客户端并发解析共享进程级缓存（正向 60s/负缓存 10s/1024 LRU/并发 64 闸），并发解析不再放大上游 DNS 压力；`HYDRA_DNS_CACHE=0` 关闭
+- **目标流存活防护**：节点侧目标连接启用 keepalive + `TCP_USER_TIMEOUT`（Linux，90s）——死目标 ~90s 回收，不再等 300s idle 兜底；节点监听侧可选 **TCP Fast Open**（Linux 门控，sysctl `tcp_fastopen≥2`）
 - **v4-only 节点降噪**（节点侧）：无 IPv6 出口的节点对 DNS AAAA 查询直接合成 NODATA 应答（客户端回落 A，v6 目标从源头消失）+ 目标建连 v4 优先逐候选回落——消除 v4-only VPS 的 ENETUNREACH 错误噪音（实测单节点单日 1.5 万条 → 0）
 - **多节点并行下载器**（`hydra-fetch` CLI）：HTTP Range 分块按节点评分加权分散到多节点并行拉取 + 断点续传（状态文件 ETag/Last-Modified 强校验）+ 单流回落 + 可选 SHA-256 校验；worker 持久隧道复用（keep-alive），经加密隧道端到端 TLS
 - **连接最长寿命**（V3.3 Tier1，可选）：`HYDRA_MAX_CONN_AGE_SECS` 超龄强制关闭（默认关，推荐 24h）——会话寿命/资源边界的防御纵深；数据面 TLS 流量密钥 rustls 本已按套件约束自动刷新，此项关闭"单连接挂一周"类极端暴露窗
@@ -65,8 +70,8 @@
 - CLI：`hydra-client --p2p <我的id> --peer <对方id> --node <节点>`；方案与实现记录见 [docs/design/NAT穿透方案.md](docs/design/NAT穿透方案.md)
 
 ### 便捷性
-- **桌面 GUI**（egui，中文）：六页导航（状态总览/节点/订阅/**连接**/日志/设置）、状态卡实时速率、**连接页**（活跃连接实时表格：目标脱敏/节点归属/上下行计数/最近关闭）、**系统托盘**（关窗到托盘、托盘菜单启停/退出）、配置持久化 + 首启向导、Windows 系统代理一键设置（注册表+WinINet，崩溃自动恢复）、真证书 CA 信任模式（设置页可配 + 可选叶证书硬 pin）
-- **分享体系**：`hydra://` 链接可携带完整凭据（认证密钥**强制恰好 32 字节**，生成/导入双层校验），**二维码生成 + 图片识别导入 + 粘贴/文件导入**；带"完整链接=持有节点"安全提示
+- **桌面 GUI**（egui，中文）：六页导航（状态总览/节点/订阅/**连接**/日志/设置）、状态卡实时速率、**连接页**（活跃连接实时表格：目标脱敏/节点归属/上下行计数/最近关闭）、**系统托盘**（关窗到托盘、托盘菜单启停/退出/禁用态）、配置持久化 + 首启向导、Windows 系统代理一键设置（注册表+WinINet，崩溃自动恢复）、真证书 CA 信任模式（设置页可配 + 可选叶证书硬 pin）、**三主题运行时切换**（Dark / Light / Abyss，零锁取色；Abyss 双 accent）+ 首页重排（Hero 状态条/三数据卡/快捷操作/速率图表重构）、破坏性操作全部确认对话框、日志分级过滤 + 导出（容量 1000）
+- **分享体系**：`hydra://` 链接可携带完整凭据（认证密钥**强制恰好 32 字节**，生成/导入双层校验），**二维码生成 + 图片识别导入 + 粘贴/文件导入**；**CLI 直传**：`hydra-client "hydra://..."` 自动配置密钥/证书（与 GUI/Android 一致，不再需要手动 env）；带"完整链接=持有节点"安全提示
 - **订阅**：自有格式（多行/逐行 base64/整体 base64），URL 或本地文件，自动合并节点
 - **国内直连分流**（`HYDRA_SPLIT=cn`）：内置 CN 域名后缀表 + 用户扩展文件，默认关闭（隐私优先）
 
@@ -81,9 +86,56 @@
 - 分发：GitHub Release 附 APK（或本地 `android/gradlew assembleDebug`）；真机回归清单见 CHANGELOG
 
 ### 节点运维
-- **健康检查 + 指标**：`HYDRA_HEALTH_ADDR` 开启独立 HTTP 端点（建议只绑回环/内网）——`GET /health` 运行状态 JSON，`GET /metrics` **Prometheus 文本格式**（连接总数/活跃/拒入、目标建连成败、UDP 中继连接数、uptime/版本），Grafana 直接抓取
-- **BBR 一键启用**：`deploy/99-hydra-bbr.conf`
+- **健康检查 + Metrics v2（Prometheus，17 指标族）**：`HYDRA_HEALTH_ADDR` 开启独立 HTTP 端点（默认拒绝非回环绑定，确需暴露设 `HYDRA_HEALTH_PUBLIC=1` 自担风险）——`GET /health` 运行状态 JSON；`GET /metrics` Prometheus 文本格式，Grafana 直接抓取：
+  - **连接面**：`hydra_connections_total`（受理）/ `active`（活跃）/ `rejected_total` + `rejected_reason_total`（拒入**四因分解**：per_ip / capacity / tls / auth）
+  - **目标面**：`target_connect_ok/fail_total`；**字节面**：`bytes_total`（client↔target 双向分侧）
+  - **UDP 中继面**：`udp_relay_connections_total` / `udp_sessions_active` / `udp_datagrams_total`（转发/丢弃）
+  - **握手延迟直方图**：`hs_tls` / `hs_noise` / `hs_dns` / `hs_target`（四段各桶 P50/P90 可算）
+  - **进程面**：`hydra_up` / `uptime_seconds` / `build_info`
+- **BBR 一键启用**：`deploy/99-hydra-bbr.conf`；TFO 需 `net.ipv4.tcp_fastopen ≥ 2`（sysctl）
 - systemd unit / Docker / install.sh 见 [deploy/](deploy/)
+
+---
+
+## 架构总览
+
+```
+┌───────────────────────── 客户端设备 ─────────────────────────┐
+│  浏览器 / 应用程序                                            │
+│    │ ① SOCKS5/HTTP 127.0.0.1:1080（显式代理）                 │
+│    │ ② TUN 虚拟网卡全局接管（无需配置应用，含 UDP/DNS）        │
+│    ▼                                                         │
+│  hydra-client（CLI）/ hydra-client-gui（GUI）/ Android 引擎    │
+│   · 多节点评分调度（测速 RTT + 被动吞吐 + 故障衰减）           │
+│   · 温连接池（弹性 2..8，请求前预热，省 300-500ms 握手）       │
+│   · 故障自愈（Offline 探测恢复 / Degraded 降级）              │
+│   · 分享/订阅/分流 · 连接页实时统计 · 三主题                   │
+└─────────────────────────────┬───────────────────────────────┘
+                              │ TCP 443：TLS 1.3（Chrome 近似指纹，
+                              │ 无 ALPN）+ Noise-PSK 握手 + 私有地址帧
+                              │ （域名明文不出本机，节点侧解析）
+                              ▼
+┌───────────────────────── 节点（VPS）─────────────────────────┐
+│  hydra-node                                                  │
+│   · TLS 终结 + Noise-PSK 认证（失败静默关流/反代静态页回退）   │
+│   · SSRF 私网过滤 · 并发/单 IP 上限 · 慢速认证超时             │
+│   · DNS 共享缓存（1024 LRU）+ AAAA 本地过滤（v4-only 降噪）    │
+│   · Happy Eyeballs 并行建连 · keepalive + USER_TIMEOUT        │
+│   · UDP 中继（TUN 的 UDP/QUIC/DNS 经此加密转发）              │
+│   · /health + /metrics（Prometheus 17 指标族）                │
+└─────────────────────────────┬───────────────────────────────┘
+                              ▼
+                          互联网目标
+```
+
+**四个二进制**：
+
+| 二进制 | 角色 | 一句话用法 |
+|---|---|---|
+| `hydra-node` | 节点（VPS） | `hydra-node 0.0.0.0:443`（env 配密钥/证书） |
+| `hydra-client` | CLI 客户端 | `hydra-client "hydra://..."` 或 `--listen 127.0.0.1:1080 节点:443`；`--tun` 全局接管 |
+| `hydra-client-gui` | 桌面 GUI | 双击即用，六页导航 + 托盘 |
+| `hydra-fetch` | 多节点并行下载器 | `hydra-fetch <URL> 节点1:443 节点2:443`（或 `HYDRA_NODES`） |
 
 ---
 
@@ -91,11 +143,23 @@
 
 ### Windows 安装包（推荐普通用户）
 
-到 [Releases](https://github.com/fuzhusi/Hydra-Multipath-Proxy/releases) 下载 `Hydra-Setup-<版本>-x64.exe`：
+到 [Releases](https://github.com/fuzhusi/Hydra-Multipath-Proxy/releases) 下载（v0.2.4 起三产物）：
+
+| 产物 | 适用 | 内容 |
+|---|---|---|
+| `Hydra-Setup-v0.2.4-x64.exe` | Windows 普通用户 | 安装器：程序 + 官方签名 wintun.dll + 快捷方式 + 卸载器 |
+| `hydra-windows-x64.zip` | Windows 便携党 | 解压即用（GUI/CLI/hydra-fetch + wintun.dll + README） |
+| `hydra-linux-x64.tar.gz` | Linux x64 | GUI/CLI/hydra-fetch 三二进制（GUI 需 GTK 运行库） |
 
 - **双击安装**：自动复制程序与官方签名 `wintun.dll` 到 Program Files，创建开始菜单/桌面快捷方式，自带卸载器
 - **TUN 模式开箱即用**：安装版 GUI 快捷方式默认请求管理员权限（UAC），无需手动处理 wintun.dll
 - 配置保存在 `%APPDATA%\hydra`，卸载重装不丢失
+
+### 0. 最快路径（GUI，两分钟）
+
+1. 节点侧起一个 `hydra-node`（见第 3 步）
+2. 客户端装 GUI，首启向导：粘贴认证密钥 → 选节点证书 → 填节点地址 → 启动
+3. 之后节点页"分享"出 `hydra://` 链接/二维码，其他设备扫码或粘贴即用（CLI 也认：`hydra-client "hydra://..."`）
 
 ### 1. 编译（便携方式 / 从源码）
 
@@ -219,8 +283,10 @@ curl -x socks5h://127.0.0.1:1080 https://www.google.com
 | `HYDRA_CERT_DOMAINS` | 自签证书 SAN（默认 `hydra.node,localhost`） |
 | `HYDRA_MAX_CONNECTIONS` | 最大并发连接数（默认 1000，Semaphore 强制） |
 | `HYDRA_HEALTH_ADDR` | 健康检查 + 指标端点（如 `127.0.0.1:8081`；`GET /health` 状态 JSON，`GET /metrics` Prometheus 文本；未设=关闭） |
+| `HYDRA_HEALTH_PUBLIC` | `1` 放行健康端点非回环绑定（默认拒绝——端点无认证，公网暴露自担风险） |
 | `HYDRA_IDLE_TIMEOUT_SECS` | 转发空闲看门狗（默认 300s，双向无数据即断开；**也是已认证连接等待目标地址帧的时限**——客户端温连接池依赖该窗口） |
 | `HYDRA_DNS_FILTER_AAAA` | `1` 强制开启 DNS AAAA 本地过滤 / `0` 关闭；默认自动（节点无 IPv6 出口路由时开启，v4-only VPS 降噪） |
+| `HYDRA_DNS_CACHE` | `0` 关闭节点 DNS 共享缓存（回落逐连接解析，并发闸保留）；默认开（正向 60s/负 10s/1024 LRU） |
 | `HYDRA_MAX_CONN_AGE_SECS` | 连接最长寿命（V3.3 Tier1，默认 0=关；clamp 60..604800）：超龄强制关闭（客户端按传输故障处理/UDP 通道自动重连）——会话寿命上限的防御纵深（rustls 已自动刷新 TLS 流量密钥）；运营推荐 86400（24h）。**客户端 TUN 的 UDP 通道轮换读同一变量** |
 | `HYDRA_NODE_CONFIG` | toml 配置路径（自动探测 `./node.toml` → `/etc/hydra/node.toml`） |
 | `HYDRA_ALLOW_PRIVATE_TARGETS` | `1` 放行私有目标（默认拒绝，仅测试/本地开发） |
@@ -236,6 +302,7 @@ curl -x socks5h://127.0.0.1:1080 https://www.google.com
 | `HYDRA_CERT_SHA256` | ca 模式可选：叶证书 SHA-256 硬 pin（64 hex，防 CA 误签发） |
 | `HYDRA_SNI` | SNI 域名（默认 `hydra.node`；真证书部署填证书 SAN 域名） |
 | `HYDRA_PROBE_INTERVAL_SECS` | 节点探测周期（Offline 恢复 + Online 活性探测，默认 30s） |
+| `HYDRA_WARM_TIMEOUT_SECS` | 温连接复用陈旧连接的响应短超时（默认 8s，clamp 2..20）——过期握手快速失败重建，不拖满节点 15s 目标拨号预算 |
 | `HYDRA_SPLIT` | `cn` 启用国内域名直连分流（默认关闭） |
 | `HYDRA_DIRECT_DOMAIN_FILE` | 自定义直连域名列表（一行一域名） |
 | `HYDRA_SPEEDTEST` | `0` 关闭测速评分（Online 节点活性探测与 Offline 恢复探测保留） |
@@ -279,6 +346,7 @@ TCP 建连 → TLS 1.3（证书 pinning 或 CA + SNI 校验；无 ALPN；禁会�
 - 握手前的任何异常（版本字节非 0x03、握手失败、超时）＝**零字节静默关闭**，无应答码回显（防主动探测）
 - 目标失败属认证后的应用层错误：回 2B 应答码后关闭，客户端**不误触发节点故障切换**
 - 通道绑定：confirm 绑定 **TLS 协商出的对端叶证书指纹**（pin/CA 两模式均已被 TLS 认证）+ TLS exporter（跨连接转发/重放即失效）
+- **地址帧捎带**（v0.2.4 优化）：客户端可把目标地址帧并入握手尾包（msg3）一次发出——冷连接省 1 RTT；节点兼容无捎带的旧式两段发送（老客户端无感知）
 
 ---
 
@@ -286,17 +354,18 @@ TCP 建连 → TLS 1.3（证书 pinning 或 CA + SNI 校验；无 ALPN；禁会�
 
 ```
 Hydra-Multipath-Proxy/
-├── hydra-protocol/     # 协议：Noise-PSK 握手、TCP/UDP 帧编解码、认证 token、日志脱敏
-├── hydra-node/         # 节点：TCP/TLS 服务、握手认证、SSRF 过滤、UDP 中继、DNS AAAA 过滤、/health + /metrics、信号停机、toml 配置
-├── hydra-client/       # 客户端：SOCKS5/HTTP、TCP 传输、温连接池、故障切换、测速调度、分流、TUN（用户态栈）、NAT/STUN、订阅
+├── hydra-protocol/     # 协议：Noise-PSK 握手（含地址帧捎带）、TCP/UDP 帧编解码、认证 token、日志脱敏
+├── hydra-node/         # 节点：TCP/TLS 服务、握手认证、SSRF 过滤、DNS 共享缓存、UDP 中继、Metrics v2、Happy Eyeballs、信号停机、toml 配置
+├── hydra-client/       # 客户端：SOCKS5/HTTP、TCP 传输、温连接池（弹性 cap）、故障切换、测速调度、分流、TUN（用户态栈）、NAT/STUN、订阅
 ├── hydra-fetch/        # 多节点并行下载器 CLI：Range 分块 + 评分加权 + 断点续传 + 单流回落
 ├── hydra-core/         # 跨平台核心库：代理/调度/测速/传输/池/订阅/分流（桌面与 Android 共用）
-├── hydra-client-gui/   # GUI：模块化拆分（main + 20 模块，现 src 共 26 个 .rs；六页导航/托盘/分享/订阅/主题）
+├── hydra-client-gui/   # GUI：模块化拆分（src 共 27 个 .rs；六页导航/托盘/分享/订阅/三主题/公共组件库）
 ├── hydra-android/      # Android FFI 库（uniffi）：HydraEngine、start_vpn/stop_vpn（VPN 数据面）、protect 钩子、分享解析
 ├── android/            # Android Gradle 工程（Kotlin/Compose：全局 VPN 服务 + 本地引擎 + 三页 UI + cargo-ndk 脚本）
 ├── config/             # 节点 toml 样例
 ├── deploy/             # systemd unit / Docker / install.sh / env.example / 99-hydra-bbr.conf（BBR+fq）
-└── docs/               # review（00-09 共 10 份审查报告）/ design / improvement / assessment / guides
+├── scripts/            # 本地构建辅助（build-ui.ps1 一键出本地 GUI 测试包；Android Rust 交叉编译脚本）
+└── docs/               # review（00-09 共 10 份审查报告）/ design（内核优化 13 项/UI v4/TUN/NAT/指纹等方案）/ improvement / assessment / guides
 ```
 
 ## 测试与质量
@@ -305,7 +374,7 @@ Hydra-Multipath-Proxy/
 cargo test --workspace
 ```
 
-**329 通过 / 0 失败**（26 个测试套件，2026-10-09 实测；rustls 0.23 + ring 0.17 单版本收敛，clippy `--all-targets -D warnings` 零告警；CI 为 Windows + Ubuntu 双矩阵 + cargo-audit/cargo-deny 安全扫描，badge 见顶部）。
+**363 通过 / 0 失败**（30 个测试套件，2026-10-10 实测；rustls 0.23 + ring 0.17 单版本收敛，clippy `--all-targets -D warnings` 零告警；CI 为 Windows + Ubuntu 双矩阵 + cargo-audit/cargo-deny 安全扫描，badge 见顶部）。
 
 **Linux 构建系统依赖**（tray-icon/egui 的 GTK 后端需要，CI 已内置）：
 
@@ -320,7 +389,23 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 - 半关闭：写端 shutdown 后读端收到完整回显 + 干净 EOF
 - 默认传输 = TCP；多节点测速动态调度路由切换
 
-覆盖还包括：握手双栈互通/篡改拒绝/真重放拒绝；SSRF 拒绝；分流直连；日志脱敏；二维码往返；流量统计与按节点计数；恢复探测；STUN 编解码与 NAT 分类；节点信令路由与 loopback 同时打开打洞端到端；TUN 路由计算与用户态栈回环。
+覆盖还包括：握手双栈互通/篡改拒绝/真重放拒绝；SSRF 拒绝；分流直连；日志脱敏；二维码往返；流量统计与按节点计数；恢复探测；STUN 编解码与 NAT 分类；节点信令路由与 loopback 同时打开打洞端到端（含**同时打开握手角色按地址序对偶**回归）；**温命中 e2e**（idle=30s 注入后 11.5s 交付仍命中 / idle=2s 负例）；TUN 路由计算与用户态栈回环。
+
+## 故障排查（FAQ）
+
+| 症状 | 原因与处理 |
+|---|---|
+| `未设置 HYDRA_AUTH_KEY 环境变量` | 密钥没配到当前进程。**分享链接用户**：v0.2.4 起 CLI/GUI/Android 直传 `hydra://` 链接即自动配置（GUI 首启向导粘贴链接即可）；**手动 env 用户**：`export HYDRA_AUTH_KEY=<64 hex>` 后再启动 |
+| GUI 双击打不开 | 大概率**单实例冲突**：已有实例在后台（托盘里找），会弹提示框；仍无反应则删 `%APPDATA%\hydra\config.json` 重试并用 `RUST_LOG=debug` 收集日志 |
+| 托盘右键退出无响应 | v0.2.4 已修复（退出即时收敛）；旧版本请用任务管理器结束进程后升级 |
+| 停止代理一直转圈后报失败 | Android 端 v0.2.4 已修复（FdTransport 停机重写）；请更新 APK |
+| 能连上但所有网站打不开 | ①节点侧看日志有无 `Blocked SSRF target`（不该出现，除非目标是内网）②客户端证书与节点指纹不匹配（重新分发 `hydra-node-cert.der`）③节点防火墙没放行 443 |
+| TUN 模式报权限错误 | Windows 需**管理员**运行且 wintun.dll 与 exe 同架构同目录；Linux 需 root 或 CAP_NET_ADMIN |
+| TUN 下 QUIC/视频网站慢 | v0.2.4 默认 UDP 经隧道；若节点 UDP 中继质量差可 `HYDRA_TUN_UDP=0` 回落（QUIC 应用自动降 TCP） |
+| v4-only VPS 大量 ENETUNREACH 日志 | v0.2.4 已内置 AAAA 本地过滤自动开启；确认 `HYDRA_DNS_FILTER_AAAA` 未被设为 `0` |
+| 浏览器走代理但 IP 没变 | 确认用的是 `socks5h://`（域名交代理解析）而非 `socks5://`；或直接开 TUN/系统代理 |
+| 节点 443 被占用 | `ss -tlnp | grep 443` 找占用进程；或改监听端口（客户端节点地址同步改） |
+| 时间不对导致 TLS 失败 | Noise-PSK 无时钟窗依赖，但 TLS 1.3 证书校验依赖系统时钟——设备时钟偏差过大会握手失败 |
 
 ## 安全模型（摘要）
 
@@ -359,6 +444,10 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 - [x] **Android M2 全局 VPN + M2.1 VPN 保护：VpnService 全接管 + TCP 任意端口动态接流 + DNS 经隧道 + kill switch 断线阻断自动重连 + 开机自启 + 分应用代理白黑名单（2026-10，v0.2.2 + Unreleased）**
 - [x] **性能与运维批次：温连接池（每请求省一次节点握手）+ 节点 v4-only 降噪（DNS AAAA 本地过滤 + v4 优先建连）+ 托盘菜单禁用态 + 节点 /metrics（Prometheus）+ GUI 模块化拆分 21 文件（2026-10）**
 - [x] **多节点并行下载 v1（CLI）**：`hydra-fetch`（Range 分块按节点评分加权 + 断点续传 + 单流回落 + keep-alive 隧道复用；方案经设计评审修正——公开低层 API 组合，hydra-core 零改动）（2026-10；GUI 前端待产品需求）
+- [x] **UI v4 企业级设计 + v4.1 落地**：设计团队方案（55 条启发式审计 + Design Tokens 对比度实测）→ 状态三通道编码/公共组件库/破坏性确认 → 三主题运行时体系（Dark/Light/Abyss）+ 首页重排（2026-10，[方案 v4](docs/design/UI设计方案-v4-企业级.md)）
+- [x] **CLI 分享链接自动配置**：`hydra://` 直传 CLI 即全配好（与 GUI/Android 一致，功能缺口补齐，2026-10）
+- [x] **内核优化 13 项（四批）**：温池 stale 短超时 / 握手捎带 5→4 RTT / Metrics v2 / 弹性温池 / 节点 DNS 共享缓存 / Happy Eyeballs 并行建连 / UDP 分层缓冲 + 单调钟 / 节点侧 TFO / 评分归一化 / keepalive + TCP_USER_TIMEOUT（方案评审修正后执行，code review 回顾 3P0 修复，[执行方案](docs/design/内核优化执行方案-13项.md)）
+- [x] **P2P 打洞同时打开握手角色修复**：角色按地址序分配（低=client）——真·同时打开时连接两端都是出站 socket，按连接方向分配会双端同为 client 互相等 msg2 而全败（2026-10）
 - [ ] eframe/egui 升级 0.27→0.33+（根治 webbrowser 漏洞告警 + unmaintained 依赖群；21 文件 GUI 需适配）
 - [x] ClientHello 指纹模仿（调研结论：ja-tools fork 供应链风险高，落地为 stock rustls 最大近似 + `HYDRA_FINGERPRINT=chrome|none`，[方案与实施](docs/design/ClientHello指纹模仿方案与实施.md)）
 - [x] 门③重放测试以 TCP 形态重写（`hydra-protocol/src/handshake.rs` 真重放单测在库，roadmap 此前未勾——09 审查补正）
