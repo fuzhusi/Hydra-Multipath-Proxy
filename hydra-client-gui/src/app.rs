@@ -86,6 +86,7 @@ impl Default for HydraApp {
             tray: None,
             current_tab: Tab::Overview,
             really_quit: false,
+            about_open: false,
             last_tray_tooltip: String::new(),
             tun_shutdown: None,
             #[cfg(windows)]
@@ -259,6 +260,7 @@ impl HydraApp {
             current_tab: Tab::Overview,
             tray,
             really_quit: false,
+            about_open: false,
             last_tray_tooltip: "Hydra 代理已停止".to_string(),
             tun_shutdown: None,
             #[cfg(windows)]

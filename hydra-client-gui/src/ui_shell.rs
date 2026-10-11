@@ -369,6 +369,16 @@ impl eframe::App for HydraApp {
                     if resp.clicked() {
                         self.switch_theme(ctx, cur.next());
                     }
+                    // ── 「关于」入口（用户需求：侧栏可查当前版本）──
+                    if ui
+                        .button(
+                            egui::RichText::new("ⓘ 关于 Hydra")
+                                .size(palette::FONT_SECONDARY),
+                        )
+                        .clicked()
+                    {
+                        self.about_open = !self.about_open;
+                    }
                 });
             });
 
@@ -388,6 +398,49 @@ impl eframe::App for HydraApp {
                     Tab::Logs => self.ui_logs(ui),
                 });
         });
+
+        // ── 「关于」对话框（侧栏底部入口）：版本/许可/项目地址 ──
+        if self.about_open {
+            egui::Window::new("关于 Hydra")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(320.0);
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(palette::SPACING_SM);
+                        ui.label(
+                            egui::RichText::new("Hydra Multipath Proxy")
+                                .size(palette::FONT_HEADING)
+                                .strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "版本 {}（多路径加密代理）",
+                                env!("CARGO_PKG_VERSION")
+                            ))
+                            .size(palette::FONT_SECONDARY)
+                            .color(palette::text_weak()),
+                        );
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("PolyForm Noncommercial 1.0.0 + 补充条款")
+                                .size(palette::FONT_SECONDARY)
+                                .color(palette::text_weak()),
+                        );
+                        ui.label(
+                            egui::RichText::new("禁止商业使用 · 详见仓库 LICENSE")
+                                .size(palette::FONT_BADGE)
+                                .color(palette::text_faint()),
+                        );
+                        ui.add_space(palette::SPACING_SM);
+                        if ui.button("关闭").clicked() {
+                            self.about_open = false;
+                        }
+                        ui.add_space(palette::SPACING_XS);
+                    });
+                });
+        }
 
         // ── Team-UI：节点编辑对话框 ──
         if self.node_edit_open {

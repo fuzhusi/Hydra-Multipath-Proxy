@@ -211,6 +211,8 @@ struct HydraApp {
     tray: Option<tray::HydraTray>,
     /// 真·退出标记：托盘「退出」或菜单退出后放行窗口关闭（区别于隐藏到托盘）
     really_quit: bool,
+    /// 「关于」对话框开关（侧栏底部入口：版本/许可说明）
+    about_open: bool,
     /// 托盘 tooltip 缓存（变化才 set_tooltip）
     last_tray_tooltip: String,
     /// TUN 停机令牌（审查修复：从代理线程内部提升到 HydraApp，真退出路径
