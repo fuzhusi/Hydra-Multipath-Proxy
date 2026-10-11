@@ -26,7 +26,7 @@ tracing = { workspace = true }
 # 分享/订阅导入（证书 DER base64 编码交付 Kotlin）
 base64 = { workspace = true }
 # uniffi：Rust→Kotlin 绑定（proc-macro 导出风格；cli feature 供 bindgen bin）
-uniffi = { version = "0.29", features = ["cli"] }
+uniffi = { version = "0.32", features = ["cli"] }
 # 显式错误类型（uniffi::Error derive 要求 thiserror 风格）
 thiserror = { workspace = true }
 # VPN 栈停机令牌（与 hydra-client 同版本）
