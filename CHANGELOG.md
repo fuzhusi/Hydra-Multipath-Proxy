@@ -39,6 +39,17 @@
 - **方案 C（会话层）**：多连接聚合协议（V3.4 恢复）内做 key rotation——依赖多路径协议恢复
 - **结论**：短期维持现状（每连接独立密钥已足够）；V3.3 多路径恢复时一并设计 C 方案
 
+## [0.2.5] - 2026-10-11
+
+### Android 端 UI 重设计（v1.1 / 评审 R1-R13 全部落实）
+
+- **品牌四主题**：跟随系统（Material You 动态取色，默认）/ 深色 / 浅色 / 深海 Abyss（青绿品牌色，对齐桌面三主题令牌）
+- **连接主页大按钮形态**：112dp 圆钮 + 四态状态环（断开灰/连接中旋转/已连接绿/错误红）+ 28sp 状态大字 + 节点摘要 + 统计带（独立 composable，每秒跳字不触发整屏重组）
+- **双模语义**：本地代理（启动/停止代理）与全局 VPN（连接/断开 VPN）同一按钮按 runMode 分流；VpnService 授权流挂点就绪
+- **MainActivity 拆分**：52KB 单文件 → Theme/Home/Nodes/Settings/ShareImporter/EngineState 独立模块（装配壳 13KB）
+- **可达性**：大按钮动态 contentDescription + stateDescription + liveRegion；动画随系统「关闭动画」设置静止；横屏两栏适配
+- **评审修复（P1×2）**：运行中切换模式不再产生孤儿引擎（persist 停旧服务 + 双停兜底）；证书 SAF 导入移出主线程（防 ANR）
+- 其他：LazyColumn 重复 key 崩溃修复、主题存 SharedPreferences（非 SecureStore）、导入成功 Snackbar + 节点 Tab 徽标
 ## [0.2.4] - 2026-10-10
 
 ### 批次：内核优化 13 项（四批）+ UI v4.1 三主题 + CLI 分享链接 + 打洞同时打开修复
