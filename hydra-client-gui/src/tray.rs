@@ -127,6 +127,23 @@ pub fn create_tray(ctx: egui::Context) -> Result<HydraTray, String> {
                 None
             };
             if let Some(cmd) = cmd {
+                // 「退出」终极兜底（用户实测两轮：经 UI 轮询的退出在窗口隐藏/
+                // 清理挂起时不可达）——托盘线程**直接**还原系统代理并结束进程，
+                // 不依赖 egui 心跳：
+                // - 系统代理：remove_system_proxy_static 线程安全、无 app 状态依赖
+                // - TUN 路由：进程退出 → wintun 句柄关闭 → 适配器销毁 → 依附
+                //   路由由系统随接口自动回收
+                // - 配置：每次变更已差分落盘，最多丢未触发的一次保存
+                // UI 活着时的优雅路径（stop_proxy/落盘/关窗）仍保留：两条路
+                // 幂等，先到先处理。
+                if matches!(cmd, TrayCommand::Quit) {
+                    eprintln!("[Tray] 退出：托盘线程直接清理并结束进程");
+                    crate::HydraApp::remove_system_proxy_static();
+                    std::thread::spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        std::process::exit(0);
+                    });
+                }
                 let _ = tx_menu.send(cmd);
                 // 窗口隐藏/空闲时唤醒 egui 立即处理
                 ctx_menu.request_repaint();

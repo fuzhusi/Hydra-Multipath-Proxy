@@ -483,10 +483,14 @@ impl HydraApp {
                 TrayCommand::StartProxy => self.start_proxy(),
                 TrayCommand::StopProxy => self.stop_proxy(),
                 TrayCommand::Quit => {
-                    // 退出信号先发（UI 立即响应，不再阻塞 5s 等代理线程——
-                    // Windows 会把无重绘的窗口判为无响应）；代理停机/TUN 路由
-                    // 清理由 on_exit 的 shutdown_and_wait_for_exit 兜底完成
-                    // （run_native 退出时必调，进程在清理后才真正结束）
+                    // 退出兜底看门狗**先行**（用户实测第二轮：清理链上的
+                    // remove_system_proxy 走 reg/netsh 子进程，可能挂起——
+                    // 看门狗若排在清理之后则永不触发）。8s 足够正常清理；
+                    // 超时无论卡在哪都强制结束，宁断连接不留僵尸进程。
+                    std::thread::spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_secs(8));
+                        std::process::exit(0);
+                    });
                     self.really_quit = true;
                     self.stop_proxy();
                     if let Some(token) = &self.tun_shutdown {
@@ -497,14 +501,6 @@ impl HydraApp {
                     // 鼠标划过才消失）
                     self.tray.take();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    // 兜底强退（用户实测：托盘「退出」偶发不退出——on_exit
-                    // 清理挂起时进程永不结束、托盘图标残留）。8s 宽限足够
-                    // TUN 路由清理（route delete 毫秒级）；超时强制结束，
-                    // 宁可断连接也不留永久挂起进程
-                    std::thread::spawn(|| {
-                        std::thread::sleep(std::time::Duration::from_secs(8));
-                        std::process::exit(0);
-                    });
                 }
             }
         }
