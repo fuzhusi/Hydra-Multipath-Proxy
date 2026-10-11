@@ -13,7 +13,9 @@
 
 报告方式：通过 GitHub [Security Advisories](https://github.com/fuzhusi/Hydra-Multipath-Proxy/security/advisories/new) 私密报告。
 
-预期响应时间：72 小时内确认，7 天内提供修复或缓解方案。
+**响应说明（如实）**：本项目为个人维护，无法承诺商业化 SLA（如"72 小时确认、7 天修复"）。
+报告会收到确认，但修复时间取决于维护者的空闲程度——可能是几天，也可能更久；
+严重问题会优先，有空即修。若需确定性时效，请自行 fork 修复。
 
 ## 安全设计说明
 

@@ -9,6 +9,7 @@
 > **交付状态：v1.0 可交付产品**（2026-10）。三档如实划分：
 > - **已交付**：TCP/TLS + Noise-PSK 隧道、自签 pinning 与 ACME 真证书双路线、多节点加权分发与故障自愈、测速动态调度、**温连接池**（预热复用，每请求省一次节点握手）、TUN 透明代理完整版（IPv6 双栈 + **UDP-over-proxy 接管** + **DNS 经隧道** + **TCP 任意端口动态接流**）、**节点侧 v4-only 降噪**（DNS AAAA 本地过滤 + 目标建连 v4 优先）、NAT 穿透 v1（TCP STUN 分类 + 同时打开打洞 + 中继兜底；真实 NAT 组合环境需人工实网验证）、反代静态页回退、ClientHello 指纹模仿（最大近似方案，见 docs/design/ClientHello指纹模仿方案与实施.md）、UI 重设计 v3 全部批次（含连接页）+ **GUI 模块化拆分**（21 文件）、GUI 全功能（托盘/分享/订阅/连接页/配置持久化/CA 信任模式/**托盘菜单禁用态**）、**节点 /metrics（Prometheus）**、CI 与 Release 安装包、**Android M1 本地代理 + M2 全局 VPN**（VpnService 全接管 + TCP 任意端口 + DNS 经隧道）+ **M2.1 VPN 保护**（kill switch 断线阻断自动重连 / 开机自启 / 分应用代理白黑名单）。
 > - **v0.2.4 增量**（2026-10-10）：**内核优化 13 项**——节点 DNS 共享缓存（正向 60s/负 10s/1024 LRU）、Happy Eyeballs 目标并行建连（首两候选 250ms 错峰竞速）、冷连接握手捎带（5→4 RTT）、弹性温池（cap 按 peak EWMA clamp 2..8）、温连接 stale 8s 短超时、Metrics v2（17 指标族 + 四段握手直方图）、UDP 中继分层缓冲 + 单调钟、节点侧 TCP Fast Open + keepalive + TCP_USER_TIMEOUT、评分归一化；**UI v4.1 三主题**（Dark/Light/Abyss 运行时切换）+ 首页重排；**CLI 分享链接直传**（`hydra://` 给 CLI 即全配好）；P2P 打洞同时打开握手角色修复（按地址序分配）。
+> - **v0.2.5 / 0.2.6 增量 + Unreleased**（2026-10-11）：**Android UI v1.1**——品牌四主题（跟随系统 Material You 动态取色/深色/浅色/深海 Abyss）+ 连接主页大按钮（112dp 圆钮 + 四态状态环）+ 双模语义（本地代理/全局 VPN 同钮分流）+ MainActivity 模块化拆分 + TalkBack 可达性；**真机端到端验证**（模拟器 + 真实 VPS：tun0 全局接管实测流量、深链导入、四主题渲染）；**Android 正式签名链**（keystore Secrets 注入 CI，缺失回退 debug 签名）+ R8 修复 + 真机 P0 修复（深链导入配置覆盖清空等）；桌面速率图 10 秒定格滚动 + Catmull-Rom 平滑 + 托盘退出强退兜底 + 关于对话框；**系统代理残留治理**（启动自愈 + 修复式保存 + WM_ENDSESSION 关机恢复——根治"关闭代理后浏览器断网"）。
 > - **规划中**：eframe/egui 升级 0.27→0.33+（根治 webbrowser 漏洞告警与 unmaintained 依赖群，当前已评估豁免）、多节点并行下载 GUI 前端（CLI 已交付）、rekey Tier2（并入 v4 帧化协议——snow 0.9.6 具备 rekey API 但现协议 Noise 仅认证、数据面为 TLS 1.3，对现协议无效果）。
 
 > **项目性质**：个人自用工具，AI 辅助开发。经多轮独立代码审查（[docs/review/](docs/review/)），本 README 与代码逐项核对——未列出的能力即为未实现，不做夸大宣传。
@@ -75,15 +76,18 @@
 - **订阅**：自有格式（多行/逐行 base64/整体 base64），URL 或本地文件，自动合并节点
 - **国内直连分流**（`HYDRA_SPLIT=cn`）：内置 CN 域名后缀表 + 用户扩展文件，默认关闭（隐私优先）
 
-### Android（已交付：M1 本地代理 + M2 全局 VPN + M2.1 VPN 保护）
+### Android（已交付：M1 本地代理 + M2 全局 VPN + M2.1 VPN 保护 + UI v1.1）
 - **全局 VPN**（VpnService）：全流量接管（含 DNS），首次启动系统授权；`establish` TUN → fd 交付 Rust 用户态栈（与桌面 TUN 同栈：任意端口动态接流 + UDP 中继 + DNS 经隧道）；出站连接 protect 防回环
 - **本地端口模式**：前台服务持进程内 SOCKS5 引擎（EncryptedSharedPreferences 加密存储，Keystore 主密钥；厂商 ROM Keystore 损坏自动降级并留痕）
+- **UI v1.1（v0.2.5，评审 R1-R13 落实）**：品牌四主题（跟随系统 Material You 动态取色，默认 / 深色 / 浅色 / 深海 Abyss）+ 连接主页**大按钮形态**（112dp 圆钮 + 四态状态环：断开灰/连接中旋转/已连接绿/错误红 + 28sp 状态字）+ **双模语义**（本地代理与全局 VPN 同一按钮按模式分流）+ TalkBack 可达性（动态 contentDescription/状态直播/动画随系统）+ MainActivity 模块化拆分（52KB 单文件 → Theme/Home/Nodes/Settings/ShareImporter 独立模块）
+- **真机端到端验证**（v0.2.6，模拟器 + 真实 VPS）：tun0 UP 全局接管实测隧道流量、深链导入反馈动线、四主题渲染、TalkBack 语义；P0 修复（深链导入后点连接不再覆盖清空配置、相机权限改按需、配置 commit 落盘）
 - **M2.1 VPN 保护**：
   - **kill switch（默认开）**：隧道中断时保持接管路由**黑洞阻断出站流量**（防真实 IP 泄漏）+ 指数退避自动重连；用户显式停止才恢复直连。已知边界：重连切换存在毫秒级直连窗口；分应用白名单模式下阻断范围为白名单应用（见已知限制）
   - **开机自启**（默认关）+ 系统 Always-on 深链引导（OS 级"始终开启 + 屏蔽无 VPN 网络"，最可靠路径）
   - **分应用代理**：白名单（仅所选应用走 VPN）/ 黑名单（所选应用直连），应用选择器多选
-- **导入与运维**：`hydra://` 链接 / 扫二维码 / 粘贴导入；逐节点连通性测试；事件日志时间线；启动逐阶段诊断（①-④）+ 20s 看门狗
-- 分发：GitHub Release 附 APK（或本地 `android/gradlew assembleDebug`）；真机回归清单见 CHANGELOG
+- **导入与运维**：`hydra://` 链接 / 扫二维码（相机权限按需请求）/ 粘贴导入；逐节点连通性测试；事件日志时间线；启动逐阶段诊断（①-④）+ 20s 看门狗
+- **分发与签名**：Release 工作流自动产出 APK——CI 配有 keystore Secrets 时为**正式签名 release 包（R8 优化）**，缺失时自动生成临时 debug 签名兜底；本地构建 `android/gradlew assembleDebug`。注意：**签名不同不能覆盖安装**（换包需先卸载）
+- 真机回归清单见 CHANGELOG
 
 ### 节点运维
 - **健康检查 + Metrics v2（Prometheus，17 指标族）**：`HYDRA_HEALTH_ADDR` 开启独立 HTTP 端点（默认拒绝非回环绑定，确需暴露设 `HYDRA_HEALTH_PUBLIC=1` 自担风险）——`GET /health` 运行状态 JSON；`GET /metrics` Prometheus 文本格式，Grafana 直接抓取：
@@ -259,6 +263,24 @@ curl -x socks5h://127.0.0.1:1080 https://www.google.com
 
 首启引导：①粘贴认证密钥 ②选择节点证书 ③添加节点 ④启动代理。配置持久化后双击即用。节点列表点"分享"生成**二维码**，其他设备"从图片导入"扫码即用。
 
+### GUI 页面导览（六页）
+
+| 页面 | 能做什么 |
+|---|---|
+| 状态总览 | 启动/停止 + Hero 状态条（运行态/节点归属）、三数据卡（构造级等宽）、**10 秒定格滚动速率图**（Catmull-Rom 平滑、Y 轴固定网格、悬停显示格式化上/下行网速）、快捷操作 |
+| 节点 | 节点卡片（健康**三通道**：颜色 + 字形 + 文字，色盲可辨）、逐节点延迟测试、增删改（确认对话框）、分享二维码、分组管理 |
+| 订阅 | 订阅 URL / 本地文件导入、多行逐行/整体 base64 兼容、自动合并节点、级联删除确认（显示将删节点数） |
+| 连接 | 活跃连接**实时表格**：目标（SHA-256 脱敏）/ 节点归属 / 上下行字节计数 / 最近关闭时间 |
+| 日志 | 级别枚举着色与过滤（info/warn/error）、容量 1000、导出文件；启动自愈等关键事件在此留痕 |
+| 设置 | 系统代理开关、TUN、三主题（Dark/Light/Abyss 运行时切换）、信任模式（pin / CA + 叶证书硬 pin）、分流、关窗行为、关于（版本/许可，读取构建版本号） |
+
+### Android 安装（侧载）
+
+1. Release 页下载 `hydra-android-<版本>.apk`（CI 自动产出：配了 keystore Secrets 时为**正式签名 + R8 优化**的 release 包；缺失时回退临时 debug 签名。**签名不同不能覆盖安装**——换签名包需先卸载旧版）
+2. 允许"安装未知来源应用"（各厂商入口不同，安装时系统会引导）
+3. 打开 App 导入节点：粘贴 `hydra://` 链接 / 扫二维码 / 手动填写
+4. **大按钮连接**：本地代理模式直接启停；全局 VPN 模式首次需授权 VpnService。主题默认跟随系统（Material You 动态取色），可切深色/浅色/深海
+
 ---
 
 ## 配置参考
@@ -374,7 +396,7 @@ Hydra-Multipath-Proxy/
 cargo test --workspace
 ```
 
-**363 通过 / 0 失败**（30 个测试套件，2026-10-10 实测；rustls 0.23 + ring 0.17 单版本收敛，clippy `--all-targets -D warnings` 零告警；CI 为 Windows + Ubuntu 双矩阵 + cargo-audit/cargo-deny 安全扫描，badge 见顶部）。
+**366 通过 / 0 失败**（30 个测试套件，2026-10-11 实测；rustls 0.23 + ring 0.17 单版本收敛，clippy `--all-targets -D warnings` 零告警；CI 为 Windows + Ubuntu 双矩阵 + cargo-audit/cargo-deny 安全扫描，badge 见顶部）。
 
 **Linux 构建系统依赖**（tray-icon/egui 的 GTK 后端需要，CI 已内置）：
 
@@ -399,6 +421,7 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 | GUI 双击打不开 | 大概率**单实例冲突**：已有实例在后台（托盘里找），会弹提示框；仍无反应则删 `%APPDATA%\hydra\config.json` 重试并用 `RUST_LOG=debug` 收集日志 |
 | 托盘右键退出无响应 | v0.2.4 已修复（退出即时收敛）；旧版本请用任务管理器结束进程后升级 |
 | 停止代理一直转圈后报失败 | Android 端 v0.2.4 已修复（FdTransport 停机重写）；请更新 APK |
+| 关闭代理后浏览器断网 | v0.2.6+ 已根治：**重新打开一次 Hydra 即自动清除残留系统代理**（日志页可见"启动自愈"留痕），此后正常启停不再复现；应急可在 Windows 设置→网络→代理 手动关闭 |
 | 能连上但所有网站打不开 | ①节点侧看日志有无 `Blocked SSRF target`（不该出现，除非目标是内网）②客户端证书与节点指纹不匹配（重新分发 `hydra-node-cert.der`）③节点防火墙没放行 443 |
 | TUN 模式报权限错误 | Windows 需**管理员**运行且 wintun.dll 与 exe 同架构同目录；Linux 需 root 或 CAP_NET_ADMIN |
 | TUN 下 QUIC/视频网站慢 | v0.2.4 默认 UDP 经隧道；若节点 UDP 中继质量差可 `HYDRA_TUN_UDP=0` 回落（QUIC 应用自动降 TCP） |
@@ -420,7 +443,7 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 
 - **单连接单流**：TCP 下无多流通道聚合（V3.4 已随 QUIC 移除）；连接级加权分发保留；温连接池为预热式（每请求仍独占一条节点连接），单连接多目标复用需 v4 帧化协议
 - TUN 已交付（含 UDP-over-proxy 接管、DNS 经隧道、TCP 全端口动态接流），已知边界：无域名分流；动态监听上限 256 端口；Wintun 全链路 + 真机 v6 接管需管理员人工验证
-- Android kill switch 为应用级：重连切换存在**毫秒级直连窗口**（先放旧黑洞再建新黑洞的权衡，反向依赖 OEM 原子替换行为）；分应用白名单下阻断范围为白名单应用；进程被杀则阻断消失恢复直连；数据面静默死亡（罕见路径）暂不触发自动重连——**OS 级保障请开启系统 Always-on「始终开启 + 屏蔽无 VPN 网络」**（specialUse 服务类型已不受 Android 15+ 自启/超时限制）
+- Android kill switch 为应用级：重连切换存在**毫秒级直连窗口**（先放旧黑洞再建新黑洞的权衡，反向依赖 OEM 原子替换行为）；分应用白名单下阻断范围为白名单应用；进程被杀则阻断消失恢复直连；数据面静默死亡（罕见路径）暂不触发自动重连——**OS 级保障请开启系统 Always-on「始终开启 + 屏蔽无 VPN 网络」**（specialUse 服务类型已不受 Android 15+ 自启/超时限制）；VPN 模式统计带（发送/接收/时长/活跃）暂未上报（FFI 缺 vpn_stats 接口，已排期下批）
 - NAT 穿透已交付 v1：对称型 NAT 打洞成功率有限（自动回落节点中继）；真实 NAT 组合环境（hairpin/EIF/端口漂移）需人工实网验证
 - 分流为域名后缀版（无 GeoIP）；订阅为自有格式（不对接机场）
 - 分享链接含完整凭据时等同于交付节点，仅限可信渠道
@@ -470,3 +493,4 @@ TCP 转型验收门（[tests/test_tcp_transport.rs](hydra-client/tests/test_tcp_
 
 - 项目: [GitHub Repository](https://github.com/fuzhusi/Hydra-Multipath-Proxy)
 - 问题反馈: [Issues](https://github.com/fuzhusi/Hydra-Multipath-Proxy/issues)
+- 安全漏洞: [Security Policy](SECURITY.md)（勿走公开 Issues，私密报告）
