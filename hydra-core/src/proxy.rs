@@ -473,6 +473,121 @@ impl ProxyServer {
         }) as UdpChannelFactory)
     }
 
+    // ── 智能分流（TUN 规则模式 v1.1）：直连通道工厂 ─────────────────────────
+
+    /// TUN 规则模式 opener 工厂（评审 R10 接线建议：run_stack 入口包装原
+    /// opener，spawn_up_task/Flow 零改动）。返回的 opener 闭包：
+    /// 1. 解析目标（TUN 侧 target 由原始 `SocketAddr` format! 而来——
+    ///    "ip:port" / "[v6]:port"；通道抽象仅传 String，此处一次 parse 还原，
+    ///    解析失败（非 IP 目标）→ 直接走节点，行为与全局模式一致）；
+    /// 2. `engine.decide(addr)`：
+    ///    - DIRECT → [`Self::tun_direct_connect`]（bind 物理源 IP + protect
+    ///      钩子，评审 R3/R5），叠加 `DIRECT_CONNECT_TIMEOUT` **独立短超时**
+    ///      （评审 §1.3：不复用 OPEN_TIMEOUT 15s）；
+    ///    - 直连失败/超时 → 回退 `proxy_opener` 走节点（永不断网）；
+    ///    - PROXY → 直接走 `proxy_opener`。
+    pub fn tun_rule_opener(
+        engine: Arc<crate::routing_rules::RuleEngine>,
+        direct_bind_ipv4: Option<std::net::IpAddr>,
+        direct_bind_ipv6: Option<std::net::IpAddr>,
+        proxy_opener: crate::channel::ChannelOpener,
+    ) -> crate::channel::ChannelOpener {
+        use crate::channel::OpenFuture;
+        Arc::new(move |target: String| {
+            let engine = engine.clone();
+            let proxy_opener = proxy_opener.clone();
+            Box::pin(async move {
+                let addr: SocketAddr = match target.parse() {
+                    Ok(a) => a,
+                    Err(_) => return (proxy_opener)(target).await, // 非 IP 目标 → 走节点
+                };
+                if engine.decide(addr) == crate::routing_rules::Decision::Direct {
+                    let bind = match addr {
+                        SocketAddr::V4(_) => direct_bind_ipv4,
+                        SocketAddr::V6(_) => direct_bind_ipv6,
+                    };
+                    match tokio::time::timeout(
+                        DIRECT_CONNECT_TIMEOUT,
+                        Self::tun_direct_duplex(addr, bind),
+                    )
+                    .await
+                    {
+                        Ok(Ok(duplex)) => {
+                            debug!(
+                                "TUN 规则直连: {}（bind {}）",
+                                mask_target(&target),
+                                bind.map(|b| b.to_string())
+                                    .unwrap_or_else(|| "无".into())
+                            );
+                            return Ok(duplex);
+                        }
+                        Ok(Err(e)) => {
+                            warn!("TUN 规则直连失败（{}: {e}）→ 回退走节点", mask_target(&target));
+                        }
+                        Err(_) => {
+                            warn!(
+                                "TUN 规则直连超时（{}，{:?}）→ 回退走节点",
+                                mask_target(&target),
+                                DIRECT_CONNECT_TIMEOUT
+                            );
+                        }
+                    }
+                    // 回退语义（评审 §1.3）：直连失败/超时 → 节点路径，永不因分流断网
+                }
+                (proxy_opener)(target).await
+            }) as OpenFuture
+        })
+    }
+
+    /// 直连通道：受保护建连（protect 钩子先行，R3——Android 防 VpnService
+    /// 回环）+ bind 物理源 IP（桌面强主机模型下按物理接口出网不进 TUN）。
+    /// bind 缺失/地址族不匹配时不 bind（仍过 protect 钩子）。
+    async fn tun_direct_duplex(
+        addr: SocketAddr,
+        bind: Option<std::net::IpAddr>,
+    ) -> std::io::Result<crate::channel::ProxyDuplex> {
+        let tcp = Self::tun_direct_connect(addr, bind).await?;
+        // 拆读写两端（tokio::io::split：内部 Arc 共享底层 socket；ProxyDuplex
+        // 需要 reader/writer 各自 owned——直连成功路径 rarely 失败点）
+        let (reader, writer) = tokio::io::split(tcp);
+        Ok(crate::channel::ProxyDuplex {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+        })
+    }
+
+    /// 直连 TCP 建连（R3 契约：protect 钩子 + 可选 bind；桌面=bind IP，
+    /// Android=protect 无 bind）。成功后启用 keepalive（与节点路径同款
+    /// 静默死亡检测，见 try_direct）。
+    pub async fn tun_direct_connect(
+        addr: SocketAddr,
+        bind: Option<std::net::IpAddr>,
+    ) -> std::io::Result<TcpStream> {
+        let sock = if addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        // protect 钩子在建连前对 fd 调用（与 connect_tcp_protected 同契约）；
+        // 失败立即中止防回环。socket_protect 未安装钩子时零开销直通。
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            crate::socket_protect::protect_outbound_fd(sock.as_raw_fd() as i64)?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::os::windows::io::AsRawSocket;
+            crate::socket_protect::protect_outbound_fd(sock.as_raw_socket() as i64)?;
+        }
+        if let Some(b) = bind.filter(|b| b.is_ipv4() == addr.is_ipv4()) {
+            sock.bind(SocketAddr::new(b, 0))?;
+        }
+        let tcp = sock.connect(addr).await?;
+        tcp_transport::enable_tcp_keepalive(&tcp);
+        Ok(tcp)
+    }
+
     async fn handle_connection(
         mut stream: TcpStream,
         scheduler: Arc<Scheduler>,
@@ -1772,5 +1887,113 @@ mod unreach_counter_tests {
         );
         clear_target_unreachable(&t);
         clear_target_unreachable(&t2);
+    }
+}
+
+// ── 智能分流（TUN 规则模式 v1.1）：tun_rule_opener 单测 ─────────────────────
+#[cfg(test)]
+mod tun_rule_opener_tests {
+    use super::*;
+    use crate::channel::{ChannelOpener, OpenFuture, ProxyDuplex};
+    use crate::routing_rules::RuleEngine;
+    use std::net::SocketAddr;
+
+    /// 哑代理 opener：记录被调目标并返回空 duplex（Proxy 路径断言用）
+    fn fake_proxy_opener(recorded: Arc<std::sync::Mutex<Vec<String>>>) -> ChannelOpener {
+        Arc::new(move |target: String| {
+            let recorded = recorded.clone();
+            Box::pin(async move {
+                recorded.lock().unwrap().push(target);
+                // 空通道（读写端互不连通的 duplex 对），测试只验证 opener 被调用
+                let (r, w) = tokio::io::duplex(64);
+                let (reader, _r_dead) = tokio::io::split(r);
+                let (_w_dead, writer) = tokio::io::split(w);
+                Ok(ProxyDuplex {
+                    reader: Box::new(reader),
+                    writer: Box::new(writer),
+                })
+            }) as OpenFuture
+        }) as ChannelOpener
+    }
+
+    #[tokio::test]
+    async fn 直连判定_走本地回环_不经代理opener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((s, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let (mut r, mut w) = tokio::io::split(s);
+                        let _ = tokio::io::copy(&mut r, &mut w).await;
+                    });
+                }
+            }
+        });
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let opener = ProxyServer::tun_rule_opener(
+            Arc::new(RuleEngine::builtin_cn()), // 回环 → 内置 DIRECT（R5）
+            None,
+            None,
+            fake_proxy_opener(recorded.clone()),
+        );
+        let mut d = opener(format!("{addr}")).await.expect("直连应成功");
+        // 回环直连数据往返验证（不经代理通道）
+        d.writer.write_all(b"ping").await.unwrap();
+        d.writer.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(std::time::Duration::from_secs(3), d.reader.read_exact(&mut buf))
+            .await
+            .expect("回环直连回读超时")
+            .unwrap();
+        assert_eq!(&buf, b"ping");
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "DIRECT 判定不应调用代理 opener"
+        );
+    }
+
+    #[tokio::test]
+    async fn 代理判定_走原opener() {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let opener = ProxyServer::tun_rule_opener(
+            Arc::new(RuleEngine::builtin_cn()), // 8.8.8.8 非 CN → Proxy
+            None,
+            None,
+            fake_proxy_opener(recorded.clone()),
+        );
+        let _ = opener("8.8.8.8:443".to_string()).await;
+        assert_eq!(
+            recorded.lock().unwrap().as_slice(),
+            ["8.8.8.8:443"],
+            "PROXY 判定应转交原 opener"
+        );
+    }
+
+    #[tokio::test]
+    async fn 直连失败_回退代理opener() {
+        // 自定义引擎把 203.0.113.1（TEST-NET-3，保证不可路由直连失败）判 DIRECT，
+        // 但无 bind IP 直连会被本地栈尝试——用不可达地址（连接被拒/超时由
+        // DIRECT_CONNECT_TIMEOUT 兜底）触发回退。为避免测试慢跑，用本地
+        // 必然拒绝的端口（127.0.0.1 上无监听的端口：回环 → 内置 DIRECT，
+        // connect ECONNREFUSED 立即失败 → 回退）。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied = listener.local_addr().unwrap().port();
+        drop(listener);
+        let dead_port = if occupied == 1 { 2 } else { 1 };
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let opener = ProxyServer::tun_rule_opener(
+            Arc::new(RuleEngine::builtin_cn()), // 127.0.0.1 → 内置 DIRECT
+            None,
+            None,
+            fake_proxy_opener(recorded.clone()),
+        );
+        let target = format!("127.0.0.1:{dead_port}");
+        let _ = opener(target.clone()).await;
+        assert_eq!(
+            recorded.lock().unwrap().as_slice(),
+            [target.as_str()],
+            "直连失败应回退代理 opener"
+        );
     }
 }

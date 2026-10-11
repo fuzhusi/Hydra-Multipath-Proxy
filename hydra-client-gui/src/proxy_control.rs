@@ -167,6 +167,10 @@ impl HydraApp {
                 Some(self.config.tun_addr_or_default()),
                 Some(self.config.tun_ports_or_default()),
                 &nodes,
+                // 智能分流（v1.1）：规则开关 + 规则文件（空 = %APPDATA%\hydra\rules.txt）；
+                // 引擎构建/源 IP 探测/DNS 直连联动在 tun_config_from_settings 内完成
+                self.config.tun_rule_mode,
+                &self.config.tun_rule_file,
             ) {
                 Ok(c) => {
                     // 与 CLI（main.rs warn_system_proxy_loop）一致的环路告警：
@@ -176,6 +180,12 @@ impl HydraApp {
                         self.add_log(
                             "⚠ 检测到 Windows 系统代理已开启：TUN 模式下经系统代理的流量会\
                              二次进入本代理形成环路，建议关闭系统代理后使用 TUN 模式"
+                                .to_string(),
+                        );
+                    }
+                    if c.rule_engine.is_some() {
+                        self.add_log(
+                            "TUN 规则分流开启：CN 直连 · 其余经节点（DNS 已联动直连解析）"
                                 .to_string(),
                         );
                     }

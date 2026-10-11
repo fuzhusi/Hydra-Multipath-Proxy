@@ -19,6 +19,9 @@ pub mod nat;
 pub mod pool;
 pub mod proxy;
 pub mod routing;
+// 智能分流规则引擎（TUN 规则模式 v1.1：IP-CIDR/GEOIP CN/DST-PORT + 内置
+// GeoIP-CN 嵌入表，纯逻辑零平台依赖；桌面 tun.rs 与未来 tun_core 共用）
+pub mod routing_rules;
 pub mod scheduler;
 pub mod share_link;
 // R4 防环回：出站 socket 保护钩子（Android VpnService 场景；未安装零开销）
@@ -36,6 +39,7 @@ pub use connections::*;
 pub use nat::*;
 pub use proxy::*;
 pub use routing::*;
+pub use routing_rules::*;
 pub use scheduler::*;
 pub use share_link::*;
 pub use socket_protect::*;

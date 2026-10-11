@@ -82,6 +82,17 @@ pub struct TunConfig {
     /// 泄漏——TUN 方案 v2 方向的实现）。`HYDRA_TUN_DNS_DIRECT=1` 恢复 v1 直连
     /// 行为；用户显式指定的 `HYDRA_TUN_DNS` 恒豁免（可能是内网 resolver）。
     pub dns_via_proxy: bool,
+    /// 智能分流规则引擎（设计 v1.1 §三/§五）：Some = 规则模式——run_stack
+    /// 入口包装 opener（DIRECT 走源 IP 绑定直连、失败/超时回退节点）、
+    /// UDP/DNS 分流接入 [`try_forward_udp`]、DNS 直连联动（R2）。
+    /// None = 全局模式（行为与既有完全一致，默认）。
+    pub rule_engine: Option<Arc<hydra_core::routing_rules::RuleEngine>>,
+    /// 直连物理源 IPv4（评审 R4：UDP connect+getsockname 源 IP 探测，见
+    /// [`detect_physical_source_ips`]）。None = 该地址族直连不可用 → 全走节点
+    /// （规则模式静默退化为全局代理，须告警）。
+    pub direct_bind_ipv4: Option<std::net::IpAddr>,
+    /// 直连物理源 IPv6（v6 临时地址轮换/无全局 v6 → None，v6 直连回退节点，R6）
+    pub direct_bind_ipv6: Option<std::net::IpAddr>,
 }
 
 impl Default for TunConfig {
@@ -100,6 +111,11 @@ impl Default for TunConfig {
             listen_ports: vec![80, 443, 8080, 8443],
             udp_relay: true,
             dns_via_proxy: true,
+            // 智能分流：默认全局模式（行为兼容）；GUI/CLI 开启时由
+            // tun_config_from_settings 构建引擎并填入直连源 IP
+            rule_engine: None,
+            direct_bind_ipv4: None,
+            direct_bind_ipv6: None,
         }
     }
 }
@@ -730,6 +746,68 @@ pub fn detect_physical_gateway_v6() -> Option<Ipv6Addr> {
         }
     }
     None
+}
+
+// ── 智能分流（规则模式 v1.1）：源 IP 探测 + 规则文件路径 ─────────────────────
+
+/// best-effort 探测本机物理网卡的**出网源 IP**（评审 R4）：
+/// 通用 UDP connect + getsockname 技巧——UDP socket connect **不发包**，
+/// 仅让内核按既有路由表选出源地址（TUN 接管路由生成前调用时选中的即物理
+/// 网卡源 IP），`getsockname` 取回。逐候选探测目标回退（公网路由器 anycast
+/// 地址，UDP connect 无流量，不构成网络探测行为）。
+///
+/// 返回 `(v4 源 IP, v6 源 IP)`；任一地址族失败 → None（该族直连不可用，
+/// 规则模式该族全走节点——R4 语义，须告警可见）。
+pub fn detect_physical_source_ips() -> (Option<std::net::IpAddr>, Option<std::net::IpAddr>) {
+    let v4 = (|| {
+        for target in ["8.8.8.8:80", "223.5.5.5:80", "1.1.1.1:80"] {
+            if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                if s.connect(target).is_ok() {
+                    if let Ok(local) = s.local_addr() {
+                        if !local.ip().is_unspecified() && local.ip().is_ipv4() {
+                            return Some(local.ip());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    })();
+    let v6 = (|| {
+        for target in ["[2001:4860:4860::8888]:80", "[2400:3200::1]:80"] {
+            if let Ok(s) = std::net::UdpSocket::bind("[::]:0") {
+                if s.connect(target).is_ok() {
+                    if let Ok(local) = s.local_addr() {
+                        if !local.ip().is_unspecified() && local.ip().is_ipv6() {
+                            return Some(local.ip());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    })();
+    (v4, v6)
+}
+
+/// 规则文件默认路径（设计 §4.1）：Windows `%APPDATA%\hydra\rules.txt`；
+/// 非 Windows `~/.config/hydra/rules.txt`。目录不自动创建（首次由用户/GUI 建立）。
+pub fn default_rule_file_path() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("hydra")
+            .join("rules.txt")
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".config").join("hydra"))
+            .unwrap_or_else(|| std::path::PathBuf::from(".config").join("hydra"))
+            .join("rules.txt")
+    }
 }
 
 /// best-effort 探测系统 DNS 服务器（豁免路由用：DNS 明文直出物理网卡，方案 §1 非目标）。
@@ -1416,6 +1494,140 @@ fn ensure_v6_dst(
 
 use hydra_core::udp_relay::{NodeUdpChannel, UdpChannelFactory, UdpRx};
 
+/// UDP 直连 NAT（智能分流 R1）：规则判定 DIRECT 的公网/私网 UDP 包不经节点
+/// 中继，改由「bind 物理源 IP 的本机 UdpSocket 直发」，回包按客户端源地址
+/// 反查会话并注入 TUN（简易 NAT 映射表，空闲超时回收）。
+/// 会话按客户端源地址（SocketAddr）键控：应用一个 socket 可达多个目的地，
+/// 回包以 `recv_from` 的真实远端构造（src=远端，dst=客户端）。
+struct UdpDirectNat {
+    /// 规则引擎（判定入口在 [`try_forward_udp`]，此处持有供未来扩展）
+    #[allow(dead_code)]
+    engine: Arc<hydra_core::routing_rules::RuleEngine>,
+    /// 直连物理源 IP（R4 探测；对应地址族缺失 → 该族目标直连不可用 → 回落中继）
+    bind_v4: Option<std::net::IpAddr>,
+    bind_v6: Option<std::net::IpAddr>,
+    /// 回包注入 TUN 的设备通道
+    transport: Arc<dyn PacketTransport>,
+    /// NAT 会话表（锁粒度小：仅查改 last_seen 与插入）
+    sessions: Mutex<HashMap<SocketAddr, DirectUdpSession>>,
+}
+
+struct DirectUdpSession {
+    sock: Arc<tokio::net::UdpSocket>,
+    last_seen: Instant,
+}
+
+impl UdpDirectNat {
+    const IDLE_SECS: u64 = 150; // 与中继流表 UdpFlowTable::IDLE_SECS 同口径
+
+    fn new(
+        engine: Arc<hydra_core::routing_rules::RuleEngine>,
+        bind_v4: Option<std::net::IpAddr>,
+        bind_v6: Option<std::net::IpAddr>,
+        transport: Arc<dyn PacketTransport>,
+    ) -> Self {
+        Self {
+            engine,
+            bind_v4,
+            bind_v6,
+            transport,
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 直发一个 UDP 包：命中既有会话则刷新并 send_to；否则建会话
+    /// （bind 物理源 IP + 派生回包泵）后直发。返回 true = 已直发。
+    async fn forward(&self, src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> bool {
+        // 会话存在性检查（锁内只做查改，socket 建立在锁外）
+        let exists = self
+            .sessions
+            .lock()
+            .map(|mut s| match s.get_mut(&src) {
+                Some(sess) => {
+                    sess.last_seen = Instant::now();
+                    true
+                }
+                None => false,
+            })
+            .unwrap_or(false);
+        if !exists && self.ensure_session(src).is_err() {
+            debug!("TUN UDP 直连会话建立失败（{} → {}），回落中继", src, dst);
+            return false;
+        }
+        let sock = self
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|s| s.get(&src).map(|x| x.sock.clone()));
+        match sock {
+            Some(sk) => sk.send_to(payload, dst).await.is_ok(),
+            None => false,
+        }
+    }
+
+    /// 建立直连会话：bind 物理源 IP（无对应族源 IP → Err 回落中继），
+    /// 并派生回包泵（recv_from → 构造 UDP/IP 回包注入 TUN）。
+    fn ensure_session(&self, client_src: SocketAddr) -> std::io::Result<()> {
+        let bind = match client_src.ip() {
+            std::net::IpAddr::V4(_) => self.bind_v4.filter(|b| b.is_ipv4()),
+            std::net::IpAddr::V6(_) => self.bind_v6.filter(|b| b.is_ipv6()),
+        };
+        let Some(bind) = bind else {
+            return Err(std::io::Error::other(
+                "无该地址族的物理源 IP（R4 探测缺失）",
+            ));
+        };
+        let std_sock = std::net::UdpSocket::bind(SocketAddr::new(bind, 0))?;
+        std_sock.set_nonblocking(true)?;
+        let sock = Arc::new(tokio::net::UdpSocket::from_std(std_sock)?);
+        // 回包泵：持有 socket + 传输通道；会话被回收（socket drop）即退出
+        let pump_sock = sock.clone();
+        let transport = self.transport.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            // 回包循环：socket 关闭（会话回收）或读错误 → 泵退出
+            while let Ok((n, remote)) = pump_sock.recv_from(&mut buf).await {
+                // 回包：src = 真实远端（应用看到的"远端"），dst = 客户端源
+                let reply = match (remote, client_src) {
+                    (SocketAddr::V4(s), SocketAddr::V4(d)) => Some(build_udp_reply_v4(
+                        *s.ip(), *d.ip(), s.port(), d.port(), &buf[..n],
+                    )),
+                    (SocketAddr::V6(s), SocketAddr::V6(d)) => Some(build_udp_reply_v6(
+                        *s.ip(), *d.ip(), s.port(), d.port(), &buf[..n],
+                    )),
+                    _ => None, // v4/v6 混线（不应发生）：丢弃
+                };
+                match reply {
+                    Some(pkt) => {
+                        if transport.send(&pkt).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => continue,
+                }
+            }
+        });
+        if let Ok(mut s) = self.sessions.lock() {
+            s.insert(
+                client_src,
+                DirectUdpSession {
+                    sock,
+                    last_seen: Instant::now(),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// 空闲会话回收（janitor 周期调用；socket drop → 回包泵自然退出）
+    fn sweep_idle(&self) {
+        if let Ok(mut s) = self.sessions.lock() {
+            let now = Instant::now();
+            s.retain(|_, sess| now.duration_since(sess.last_seen).as_secs() < Self::IDLE_SECS);
+        }
+    }
+}
+
 /// 中继通道任务命令：分发循环把公网 UDP 包转交此通道（带完整流上下文）
 enum UdpCmd {
     Send {
@@ -1736,16 +1948,40 @@ fn private_targets_allowed() -> bool {
     *ALLOW.get_or_init(|| matches!(std::env::var("HYDRA_ALLOW_PRIVATE_TARGETS"), Ok(v) if v == "1"))
 }
 
-/// 分发入口（run_stack 调用）：解析 + 私网/组播过滤 + 转交中继任务。
-/// 返回 true = 已接管（转发中）；false = 未接管（调用方按旧行为处理）。
-fn try_forward_udp(pkt: &[u8], cmd_tx: &tokio::sync::mpsc::Sender<UdpCmd>) -> bool {
+/// 分发入口（run_stack 调用）：解析 + 私网/组播过滤 + 规则分流（R1）+ 转交。
+/// - 规则模式（rule=Some）：先经 [`RuleEngine::decide`] 判定——DIRECT 走
+///   [`UdpDirectNat`] 直发（bind 物理源 IP + 回包注入 TUN），PROXY 走既有
+///   节点中继；私网目标不再被无差别过滤（内置私网 DIRECT 兜底，R5——
+///   例外：组播/广播/未指定仍一律不入）；
+/// - 非规则模式（rule=None）：行为与既有完全一致。
+///
+/// 返回 true = 已接管（直发或转发中）；false = 未接管（调用方按旧行为处理）。
+fn try_forward_udp<'a>(
+    pkt: &'a [u8],
+    cmd_tx: &'a tokio::sync::mpsc::Sender<UdpCmd>,
+    rule: Option<&'a hydra_core::routing_rules::RuleEngine>,
+    direct: Option<&'a UdpDirectNat>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+    Box::pin(
+        async move { try_forward_udp_inner(pkt, cmd_tx, rule, direct).await },
+    )
+}
+
+async fn try_forward_udp_inner(
+    pkt: &[u8],
+    cmd_tx: &tokio::sync::mpsc::Sender<UdpCmd>,
+    rule: Option<&hydra_core::routing_rules::RuleEngine>,
+    direct: Option<&UdpDirectNat>,
+) -> bool {
     let parsed = parse_udp_v4(pkt).or_else(|| parse_udp_v6(pkt));
     let Some((src, dst, off, len)) = parsed else {
         return false;
     };
     // 目的地过滤：与路由豁免语义一致——私网/回环/链路本地/ULA/组播/广播不入
-    // 隧道；HYDRA_ALLOW_PRIVATE_TARGETS=1 时放开私网类（组播/广播/未指定仍拦）
-    let allow_private = private_targets_allowed();
+    // 隧道；HYDRA_ALLOW_PRIVATE_TARGETS=1 时放开私网类。规则模式下私网类
+    // 放行进入规则判定（内置私网 DIRECT 会直连，R5）；组播/广播/未指定仍拦。
+    let rule_mode = rule.is_some() && direct.is_some();
+    let allow_private = private_targets_allowed() || rule_mode;
     let excluded = match dst.ip() {
         std::net::IpAddr::V4(v4) => {
             let private_like = v4.is_loopback()
@@ -1754,9 +1990,9 @@ fn try_forward_udp(pkt: &[u8], cmd_tx: &tokio::sync::mpsc::Sender<UdpCmd>) -> bo
                 || v4.octets()[0] == 0
                 || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]));
             if allow_private {
-                v4.is_broadcast() || v4.is_multicast()
+                v4.is_broadcast() || v4.is_multicast() || v4.is_unspecified()
             } else {
-                private_like || v4.is_broadcast() || v4.is_multicast()
+                private_like || v4.is_broadcast() || v4.is_multicast() || v4.is_unspecified()
             }
         }
         std::net::IpAddr::V6(v6) => {
@@ -1773,6 +2009,17 @@ fn try_forward_udp(pkt: &[u8], cmd_tx: &tokio::sync::mpsc::Sender<UdpCmd>) -> bo
     };
     if excluded {
         return false;
+    }
+    // R1：规则判定——DIRECT 走直连 NAT 直发（bind 物理源 IP + 回包注入 TUN）
+    if let (Some(rule), Some(direct)) = (rule, direct) {
+        if rule.decide(dst) == hydra_core::routing_rules::Decision::Direct {
+            let payload = &pkt[off..off + len];
+            if direct.forward(src, dst, payload).await {
+                return true;
+            }
+            // 直连不可用（无源 IP/建会话失败/直发失败）→ 落回既有中继
+            debug!("TUN UDP 直连不可用（{} → {}），回落节点中继", src, dst);
+        }
     }
     let flow = format!("{src}|{dst}");
     // 有界通道 try_send：Full = 重连退避/下游过载——静默丢弃（UDP 语义，
@@ -1842,11 +2089,81 @@ fn ensure_dynamic_listener(
 /// 保持 v1 行为（公网 UDP 代答 ICMP 不可达回落 TCP）。
 pub async fn run_stack<T: PacketTransport>(
     transport: Arc<T>,
-    cfg: TunConfig,
+    mut cfg: TunConfig,
     opener: ChannelOpener,
     udp_factory: Option<UdpChannelFactory>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    // ── 智能分流（规则模式 v1.1）接线 ──
+    // R2 DNS 策略联动：规则模式强制等效 HYDRA_TUN_DNS_DIRECT=1（DNS 直连解析）——
+    // 否则国内 CDN 域名经境外节点解析返回海外边缘 IP（不在 CN 表内），GeoIP
+    // 对 CDN 主体流量静默失效。builder（tun_config_from_settings）已提前联动
+    // 并生成 DNS 豁免路由，此处兜底覆盖 CLI 等其他构造路径。
+    if cfg.rule_engine.is_some() && cfg.dns_via_proxy {
+        cfg.dns_via_proxy = false;
+        info!(
+            "TUN 规则模式：DNS 联动强制直连解析（等效 HYDRA_TUN_DNS_DIRECT=1）——\
+             经节点解析会使国内 CDN 拿到海外边缘 IP、GeoIP 分流失效"
+        );
+    }
+    // R4 退化告警：直连源 IP 探测失败（None）→ 全部走节点（规则模式静默
+    // 退化为全局代理，日志必须可见）
+    if cfg.rule_engine.is_some()
+        && cfg.direct_bind_ipv4.is_none()
+        && cfg.direct_bind_ipv6.is_none()
+    {
+        warn!(
+            "TUN 规则模式：物理网卡源 IP 探测失败（无可用直连源地址），\
+             直连全部退化为走节点——退化为全局代理模式"
+        );
+    }
+    // R10 接线：run_stack 入口包装 opener——闭包内按规则判定，DIRECT 走
+    // 直连（bind 物理 IP + protect 钩子 + 短超时，失败/超时回退代理）；
+    // spawn_up_task/Flow/中继泵零改动（ProxyDuplex 来源对下游无感知）
+    let opener = match &cfg.rule_engine {
+        Some(engine) => {
+            info!(
+                "TUN 规则分流启用：私网/回环直连（内置）→ 自定义规则 → GeoIP-CN 直连 → 其余经节点\
+                 （直连 bind v4={} v6={}）",
+                cfg.direct_bind_ipv4
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "无".into()),
+                cfg.direct_bind_ipv6
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "无".into()),
+            );
+            hydra_core::proxy::ProxyServer::tun_rule_opener(
+                engine.clone(),
+                cfg.direct_bind_ipv4,
+                cfg.direct_bind_ipv6,
+                opener,
+            )
+        }
+        None => opener,
+    };
+    // R1 UDP 分流：规则判定的 UDP 直连通道（bind 物理 IP 的本机 socket 直发 +
+    // 回包注入 TUN 的简易 NAT 表）；无引擎或无直连源 IP → None（全走中继）
+    let udp_direct: Option<Arc<UdpDirectNat>> = cfg.rule_engine.as_ref().map(|engine| {
+        let nat = Arc::new(UdpDirectNat::new(
+            engine.clone(),
+            cfg.direct_bind_ipv4,
+            cfg.direct_bind_ipv6,
+            transport.clone(),
+        ));
+        // NAT 会话空闲回收（超时 150s，与中继流表同款口径）
+        let janitor_nat = nat.clone();
+        let janitor_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = janitor_shutdown.cancelled() => return,
+                    _ = tick.tick() => janitor_nat.sweep_idle(),
+                }
+            }
+        });
+        nat
+    });
     let (mut device, _in_q, _out_q) = ChanDevice::new(cfg.mtu as usize);
     let mut iface = build_interface(&cfg, &mut device)?;
     let mut sockets: SocketSet<'_> = SocketSet::new(vec![]);
@@ -2037,8 +2354,15 @@ pub async fn run_stack<T: PacketTransport>(
                                 // 快速失败即可，审查批次 C P3-8 同源场景）
                                 debug!("TUN 丢弃带扩展头的 IPv6 包（无 v6 转发能力）");
                             } else if let Some(tx) = udp_tx.as_ref().filter(|_| !v6_drop).filter(|_| parse_udp_v6(pkt).is_some()) {
-                                // 09 交付：v6 公网 UDP 经节点中继（与 v4 对称）
-                                try_forward_udp(pkt, tx);
+                                // 09 交付：v6 公网 UDP 经节点中继（与 v4 对称）；
+                                // 规则模式（v1.1 R1）：先经规则判定，DIRECT 直发
+                                try_forward_udp(
+                                    pkt,
+                                    tx,
+                                    cfg.rule_engine.as_deref(),
+                                    udp_direct.as_deref(),
+                                )
+                                .await;
                             } else {
                                 let icmp = build_icmpv6_unreachable_v6(pkt);
                                 if let Err(e) = transport.send(&icmp).await {
@@ -2057,12 +2381,21 @@ pub async fn run_stack<T: PacketTransport>(
                         let (src, dst, _off, _len) = parse_udp_v4(pkt).unwrap();
                         let private = is_private_udp_v4_dst(pkt);
                         let allow_private = private_targets_allowed();
+                        // 规则模式下私网目标进入 try_forward_udp（内置私网
+                        // DIRECT 直连兜底，R5）；非规则模式保持丢弃口径
+                        let rule_mode = cfg.rule_engine.is_some() && udp_direct.is_some();
                         let no_relay = dst.ip().is_multicast()
                             || matches!(dst, SocketAddr::V4(v4) if v4.ip().is_broadcast())
                             || src.ip().is_unspecified()
-                            || (private && !allow_private);
+                            || (private && !allow_private && !rule_mode);
                         if let Some(tx) = udp_tx.as_ref().filter(|_| !no_relay) {
-                            try_forward_udp(pkt, tx);
+                            try_forward_udp(
+                                pkt,
+                                tx,
+                                cfg.rule_engine.as_deref(),
+                                udp_direct.as_deref(),
+                            )
+                            .await;
                         } else if no_relay {
                             debug!(
                                 "TUN 丢弃 UDP 包（广播/组播/未指定源/私网未放开）: dst={}",
@@ -2176,6 +2509,14 @@ fn handle_v4_else(pkt: &[u8], cfg: &TunConfig, device: &mut ChanDevice, warned_p
             || (dst.octets()[0] == 100 && (64..=127).contains(&dst.octets()[1]));
         let tun_subnet_hit = cfg.prefix > 0 && (dst_u32 & mask) == (net_u32 & mask);
         if private && !tun_subnet_hit {
+            // R5 规则模式兜底：内置「私网/回环/链路本地 → DIRECT」最高优先级，
+            // 直连 opener bind 物理 IP 后可访问 NAS/路由器——投喂栈经规则引擎
+            // 判定直连，优于丢弃（豁免路由缺失场景的降级路径）
+            if cfg.rule_engine.is_some() {
+                debug!("TUN 私网 TCP 目标 {dst} 进入规则分流直连兜底（R5，豁免路由缺失）");
+                device.push_inbound(pkt);
+                return;
+            }
             if !*warned_private {
                 *warned_private = true;
                 warn!(

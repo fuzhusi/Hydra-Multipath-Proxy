@@ -68,6 +68,10 @@ pub fn node_certs_from_env() -> Result<Vec<Vec<u8>>, String> {
 /// GUI 场景的 TUN 配置构造：显式参数（非 env），豁免清单 = 节点 IP + 系统 DNS。
 /// - `addr`：形如 "10.7.0.1/30"（可省略前缀，默认 /30）；None = 全默认
 /// - `ports`：逗号分隔拦截端口列表；None = 默认 80,443,8080,8443
+/// - `rule_mode`：智能分流规则模式（设计 v1.1）——构建规则引擎
+///   （`rule_file` 为空 → 默认 `%APPDATA%\hydra\rules.txt`；文件缺失/不可读 →
+///   降级内置 GeoIP-CN 表并告警）+ R4 源 IP 探测 + R2 DNS 直连联动
+/// - `rule_file`：自定义规则文件路径（空串 = 默认路径）
 /// - 解析失败返回 Err（GUI 先行校验后仍需兜底，与 CLI 的「告警+回落默认」不同：
 ///   GUI 用户输入场景应显式报错而非静默换值）
 #[cfg(feature = "tun")]
@@ -75,6 +79,8 @@ pub fn tun_config_from_settings(
     addr: Option<&str>,
     ports: Option<&str>,
     nodes: &[std::net::SocketAddr],
+    rule_mode: bool,
+    rule_file: &str,
 ) -> std::result::Result<crate::tun::TunConfig, String> {
     use std::net::Ipv4Addr;
     let mut cfg = crate::tun::TunConfig::default();
@@ -131,9 +137,61 @@ pub fn tun_config_from_settings(
             cfg.dns_via_proxy = false;
         }
     }
+    // ── 智能分流规则模式（设计 v1.1 + 评审 R2/R4）────────────────────────────
+    // R2：规则模式强制 DNS 直连解析（等效 HYDRA_TUN_DNS_DIRECT=1）——置于
+    // 下方 DNS 豁免块之前，使系统 DNS 自动进入豁免清单直出物理网卡。
+    // 否则国内 CDN 域名经境外节点解析返回海外边缘 IP（不在 CN 表内），
+    // GeoIP 对 CDN 主体流量静默失效。
+    if rule_mode {
+        cfg.dns_via_proxy = false;
+        tracing::info!(
+            "TUN 规则分流：DNS 联动强制直连解析（等效 HYDRA_TUN_DNS_DIRECT=1）"
+        );
+        // R4：物理网卡源 IP 探测（UDP connect+getsockname，不发包）；
+        // 双族皆失败 → 规则模式退化为全局代理（run_stack 内再告警一次）
+        let (v4, v6) = crate::tun::detect_physical_source_ips();
+        if v4.is_none() && v6.is_none() {
+            tracing::warn!(
+                "TUN 规则分流：物理网卡源 IP 探测失败（v4/v6 均无）——\
+                 直连全部退化为走节点（退化为全局代理模式）"
+            );
+        }
+        cfg.direct_bind_ipv4 = v4;
+        cfg.direct_bind_ipv6 = v6;
+        // 规则引擎：自定义规则文件（空 = 默认 %APPDATA%\hydra\rules.txt）；
+        // 文件缺失/不可读 → 降级内置 GeoIP-CN 表（CN 直连仍然可用）
+        let path = if rule_file.trim().is_empty() {
+            crate::tun::default_rule_file_path()
+        } else {
+            std::path::PathBuf::from(rule_file.trim())
+        };
+        cfg.rule_engine =
+            Some(match hydra_core::routing_rules::RuleEngine::from_rule_file(&path) {
+                Ok(engine) => {
+                    tracing::info!(
+                        "TUN 规则分流：已加载规则文件 {}（端口 {} 条 / CIDR v4 {} 条 / v6 {} 条 / \
+                         跳过 {} 行；GeoIP {}）",
+                        path.display(),
+                        engine.port_rule_count(),
+                        engine.cidr4_count(),
+                        engine.cidr6_count(),
+                        engine.skipped_lines,
+                        if engine.geoip_enabled() { "启用" } else { "关闭" }
+                    );
+                    std::sync::Arc::new(engine)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "TUN 规则分流：规则文件 {} 不可用（{e}）——降级为内置 GeoIP-CN 表",
+                        path.display()
+                    );
+                    std::sync::Arc::new(hydra_core::routing_rules::RuleEngine::builtin_cn())
+                }
+            });
+    }
     // 系统 DNS 豁免：DNS 经隧道开启时**不再**自动豁免——公网 DNS 查询随 UDP
     // 隧道经节点解析（加密，TUN 方案 v2 方向）；DNS 直连模式（v1 行为或显式
-    // HYDRA_TUN_DNS_DIRECT=1）照旧豁免。v4+v6 都在覆盖内。
+    // HYDRA_TUN_DNS_DIRECT=1，或规则模式 R2 联动）照旧豁免。v4+v6 都在覆盖内。
     if !cfg.udp_relay || !cfg.dns_via_proxy {
         for dns in crate::tun::detect_dns_servers() {
             cfg.exclude_routes.push(dns);
@@ -239,32 +297,32 @@ mod tun_settings_tests {
     #[test]
     fn tun_settings_defaults() {
         // 全 None → 库默认（10.7.0.1/30 + 80,443,8080,8443）
-        let cfg = tun_config_from_settings(None, None, &[]).unwrap();
+        let cfg = tun_config_from_settings(None, None, &[], false, "").unwrap();
         assert_eq!(cfg.addr, std::net::Ipv4Addr::new(10, 7, 0, 1));
         assert_eq!(cfg.prefix, 30);
         assert_eq!(cfg.listen_ports, vec![80, 443, 8080, 8443]);
         // 空串等价 None（GUI 未填写场景）
-        let cfg = tun_config_from_settings(Some("  "), Some("  "), &[]).unwrap();
+        let cfg = tun_config_from_settings(Some("  "), Some("  "), &[], false, "").unwrap();
         assert_eq!(cfg.prefix, 30);
         assert_eq!(cfg.listen_ports, vec![80, 443, 8080, 8443]);
     }
 
     #[test]
     fn tun_settings_parse_addr_ports() {
-        let cfg = tun_config_from_settings(Some("10.9.9.1/24"), Some("80, 443"), &[]).unwrap();
+        let cfg = tun_config_from_settings(Some("10.9.9.1/24"), Some("80, 443"), &[], false, "").unwrap();
         assert_eq!(cfg.addr, std::net::Ipv4Addr::new(10, 9, 9, 1));
         assert_eq!(cfg.prefix, 24);
         assert_eq!(cfg.listen_ports, vec![80, 443]);
         // 裸 IP（无前缀）→ 默认 /30
-        let cfg = tun_config_from_settings(Some("10.9.9.1"), None, &[]).unwrap();
+        let cfg = tun_config_from_settings(Some("10.9.9.1"), None, &[], false, "").unwrap();
         assert_eq!(cfg.prefix, 30);
     }
 
     #[test]
     fn tun_settings_rejects_bad_input() {
-        assert!(tun_config_from_settings(Some("10.7.0.1/33"), None, &[]).is_err());
-        assert!(tun_config_from_settings(Some("no-host/30"), None, &[]).is_err());
-        assert!(tun_config_from_settings(None, Some("http,abc"), &[]).is_err());
+        assert!(tun_config_from_settings(Some("10.7.0.1/33"), None, &[], false, "").is_err());
+        assert!(tun_config_from_settings(Some("no-host/30"), None, &[], false, "").is_err());
+        assert!(tun_config_from_settings(None, Some("http,abc"), &[], false, "").is_err());
     }
 
     #[test]
@@ -273,7 +331,7 @@ mod tun_settings_tests {
             "1.2.3.4:443".parse::<SocketAddr>().unwrap(),
             "[::1]:443".parse::<SocketAddr>().unwrap(),
         ];
-        let cfg = tun_config_from_settings(None, None, &nodes).unwrap();
+        let cfg = tun_config_from_settings(None, None, &nodes, false, "").unwrap();
         assert!(cfg
             .exclude_routes
             .contains(&std::net::Ipv4Addr::new(1, 2, 3, 4)));
