@@ -506,23 +506,24 @@ impl ProxyServer {
                     // Linux 弱主机模型下 bind 源 IP **不约束出接口**（目的路由
                     // 仍可能命中 /1 接管 → 包回自身 TUN 回环），规则分流直连
                     // 暂不可用（计划 SO_BINDTODEVICE/接口 index 方案）。非
-                    // Android（无 protect 钩子）一律跳过直连走节点；私网/回环
-                    // 目标同样保守走节点（防回环），例外仅保留 Windows（强主机
-                    // 模型，bind 即约束出接口）。AtomicBool 去重防每连接刷屏。
+                    // Android（无 protect 钩子）一律跳过直连走节点；例外：
+                    // **回环目标**——127/8 与 ::1 走 local 路由表（优先级高于
+                    // main 表的 /1 接管），直连回环在 Linux 同样安全（CI 测试
+                    // 即依赖此路径）。AtomicBool 去重防每连接刷屏。
                     #[cfg(not(windows))]
+                    if !addr.ip().is_loopback()
+                        && !crate::socket_protect::socket_protect_installed()
                     {
-                        if !crate::socket_protect::socket_protect_installed() {
-                            static NON_WIN_DIRECT_WARNED:
-                                std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                            if !NON_WIN_DIRECT_WARNED.swap(true, Ordering::Relaxed) {
-                                warn!(
-                                    "TUN 规则分流直连在非 Windows 平台已禁用：Linux 弱主机模型下 \
-                                     bind 源 IP 不约束出接口，规则分流直连暂不可用（计划 \
-                                     SO_BINDTODEVICE）——全部走节点"
-                                );
-                            }
-                            return (proxy_opener)(target).await;
+                        static NON_WIN_DIRECT_WARNED:
+                            std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !NON_WIN_DIRECT_WARNED.swap(true, Ordering::Relaxed) {
+                            warn!(
+                                "TUN 规则分流直连在非 Windows 平台已禁用：Linux 弱主机模型下 \
+                                 bind 源 IP 不约束出接口，规则分流直连暂不可用（计划 \
+                                 SO_BINDTODEVICE）——全部走节点（回环目标除外）"
+                            );
                         }
+                        return (proxy_opener)(target).await;
                     }
                     let bind = match addr {
                         SocketAddr::V4(_) => direct_bind_ipv4,
