@@ -156,8 +156,19 @@ pub(crate) async fn resolve_host_cached(host_with_port: &str) -> Option<Vec<Sock
 mod tests {
     use super::*;
 
+    /// 测试串行锁：三测试共享进程级全局缓存，「容量上限_清最旧」灌满 1024 条
+    /// 会按最旧驱逐其他测试刚写入的条目——并行交错时「正向缓存存取与过期」
+    /// 的 get_mut 拿到 None（CI ubuntu 实测 flake）。所有测试先取此锁再动缓存
+    /// （锁序恒为 TEST_SERIAL → cache，无死锁面；毒化时恢复继续避免连锁 panic）。
+    static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn 负缓存与过期语义() {
+        let _g = test_lock();
         // 独立 host 避免与其他测试串扰
         let host = format!("neg-{}.invalid", std::process::id());
         assert!(lookup_cached(&host).is_none(), "未缓存应 None");
@@ -167,6 +178,7 @@ mod tests {
 
     #[test]
     fn 正向缓存存取与过期() {
+        let _g = test_lock();
         let host = format!("pos-{}.test", std::process::id());
         let addr: SocketAddr = "203.0.113.5:443".parse().unwrap();
         put_cache(&host, vec![addr], false);
@@ -182,6 +194,7 @@ mod tests {
 
     #[test]
     fn 容量上限_清最旧() {
+        let _g = test_lock();
         let mut c = cache().lock().unwrap();
         // 灌满（前 1024 条用带序号 key；已有条目共存无碍）
         for i in 0..MAX_ENTRIES {
