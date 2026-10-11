@@ -440,7 +440,18 @@ impl HydraApp {
                         token.cancel();
                     }
                     self.add_log("正在退出 Hydra...".to_string());
+                    // 先移除托盘图标（process::exit 不跑析构——图标会残留到
+                    // 鼠标划过才消失）
+                    self.tray.take();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    // 兜底强退（用户实测：托盘「退出」偶发不退出——on_exit
+                    // 清理挂起时进程永不结束、托盘图标残留）。8s 宽限足够
+                    // TUN 路由清理（route delete 毫秒级）；超时强制结束，
+                    // 宁可断连接也不留永久挂起进程
+                    std::thread::spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_secs(8));
+                        std::process::exit(0);
+                    });
                 }
             }
         }

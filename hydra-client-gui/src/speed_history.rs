@@ -24,8 +24,10 @@ pub(crate) struct SpeedHistory {
 }
 
 impl SpeedHistory {
-    /// 曲线保留的最大采样点数（v3 方案 P1：最近 120 点）
-    pub(crate) const CAPACITY: usize = 120;
+    /// 曲线保留的最大采样点数（用户反馈第 2 轮定稿：**启动后从 1 秒慢慢拉长，
+    /// 满 10 秒定格**——20 点 × 500ms = 10 秒窗口；满窗后最旧点滚动丢弃，
+    /// X 域恒 [0,19] → 网格静止）
+    pub(crate) const CAPACITY: usize = 20;
 
     pub(crate) fn now_day() -> chrono::NaiveDate {
         chrono::Local::now().date_naive()
@@ -43,7 +45,7 @@ impl SpeedHistory {
     }
 
     /// 推入一次采样（每 500ms 由后台采样线程调用）：
-    /// 维护 120 点滑动窗口 + 当日流量差分累计 + 跨日清零。
+    /// 维护 600 点滑动窗口（5 分钟）+ 当日流量差分累计 + 跨日清零。
     pub(crate) fn push_sample(&mut self, stats: &TrafficStats) {
         // 跨自然日：清空当日累计（「今日」语义）
         let today = Self::now_day();
@@ -117,18 +119,18 @@ mod tests {
     }
 
     #[test]
-    fn speed_history_caps_at_120_and_keeps_latest() {
+    fn speed_history_caps_at_20_and_keeps_latest() {
         let mut h = SpeedHistory::new();
-        for i in 0..300u64 {
+        for i in 0..30u64 {
             h.push_sample(&sample_stats(i * 10, i * 20, i as f64, (i * 2) as f64));
         }
         assert_eq!(h.len(), SpeedHistory::CAPACITY);
-        assert_eq!(h.len(), 120);
-        // 最新点在队尾：上行 = 299，下行 = 598
-        assert_eq!(h.up_series().last(), Some(&299.0));
-        assert_eq!(h.down_series().last(), Some(&598.0));
-        // 最旧点 = 第 180 个采样（300-120）
-        assert_eq!(h.up_series().first(), Some(&180.0));
+        assert_eq!(h.len(), 20);
+        // 最新点在队尾：上行 = 29，下行 = 58
+        assert_eq!(h.up_series().last(), Some(&29.0));
+        assert_eq!(h.down_series().last(), Some(&58.0));
+        // 最旧点 = 第 10 个采样（30-20）
+        assert_eq!(h.up_series().first(), Some(&10.0));
     }
 
     #[test]

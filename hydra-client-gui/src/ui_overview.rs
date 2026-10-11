@@ -468,15 +468,20 @@ impl HydraApp {
                     ),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.small("最近 120 个采样点（500ms/点）");
+                    ui.small("最近 10 秒（20 点 · 500ms/点）");
                 });
             });
             let has_data = !up_series.is_empty() || !down_series.is_empty();
+            // Y 离散档位上限（nice_y_cap）：网格静止的关键
+            let y_cap = nice_y_cap(&up_series, &down_series);
             // 固定高度曲线区（180px）：给 Plot / 空态一个确定大小的 rect
             ui.allocate_ui(egui::vec2(ui.available_width(), 180.0), |ui| {
                 if has_data {
                     egui_plot::Plot::new("dashboard_speed_plot")
-                        // 仪表盘装饰性图表：禁用全部交互与悬停读数（R6 显式约定）
+                        // 坐标稳定方案（用户反馈：网格白线随数据每帧重排=卡顿
+                        // 感）：egui_plot 0.27 无公开 set_bounds API——改用
+                        // 「隐形档位线」：y=档位 处一条透明线，auto-bounds 把
+                        // Y 上限钉在离散档位上，仅峰值跨档时网格才重排
                         .allow_zoom(false)
                         .allow_drag(false)
                         .allow_scroll(false)
@@ -494,7 +499,7 @@ impl HydraApp {
                             let up_snap = up_series.clone();
                             let down_snap = down_series.clone();
                             move |_name, value| {
-                                let idx = (value.x.round().clamp(0.0, 119.0)) as usize;
+                                let idx = (value.x.round().clamp(0.0, 19.0)) as usize;
                                 let up = format_speed(up_snap.get(idx).copied().unwrap_or(0.0));
                                 let down = format_speed(down_snap.get(idx).copied().unwrap_or(0.0));
                                 format!("上行 {up}/s\n下行 {down}/s")
@@ -517,6 +522,15 @@ impl HydraApp {
                                 .formatter(|mark, _digits, _range| format_speed(mark.value)),
                         ])
                         .show(ui, |plot| {
+                            // 隐形档位线：Y 上限钉在离散档位（网格静止的关键）；
+                            // 未命名 → 不进图例。线本体透明，仅撑起 auto-bounds
+                            plot.line(
+                                egui_plot::Line::new(egui_plot::PlotPoints::from(vec![
+                                    [0.0, y_cap],
+                                    [19.0, y_cap],
+                                ]))
+                                .stroke(egui::Stroke::NONE),
+                            );
                             // Catmull-Rom 样条平滑（用户反馈：折线太生硬）——
                             // 相邻四控制点插值，每段 6 个采样点；点数 <3 时
                             // 原样返回（无法构造切线）
@@ -595,6 +609,19 @@ fn stat_label(ui: &mut egui::Ui, label: &str) {
         )
         .truncate(true),
     );
+}
+
+/// Y 轴离散档位上限（用户反馈：网格线随数据每帧重排=卡顿感）。取「能容纳
+/// 双序列峰值的最近档」，档间跳变仅在峰值跨档时发生——平时网格完全静止。
+/// 档位下限 100 KB/s（空闲时网格也稳定在 100K 量级）。
+fn nice_y_cap(a: &[f64], b: &[f64]) -> f64 {
+    let peak = a.iter().chain(b.iter()).copied().fold(0.0_f64, f64::max);
+    const TIERS: [f64; 12] = [
+        100.0e3, 250.0e3, 500.0e3, 1.0e6, 2.5e6, 5.0e6, 10.0e6, 25.0e6, 50.0e6, 100.0e6,
+        250.0e6, 500.0e6,
+    ];
+    // 注意：上表第 3 项写作 500.0e6*0.001 是笔误防护位——实际 500 KB/s
+    TIERS.iter().copied().find(|t| peak <= *t).unwrap_or(peak * 1.3)
 }
 
 /// Catmull-Rom 样条平滑（用户反馈：折线生硬）——相邻四控制点三次插值，
