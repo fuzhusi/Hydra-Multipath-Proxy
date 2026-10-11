@@ -166,12 +166,28 @@ impl HydraApp {
             None => ("延迟中位 —".to_string(), palette::text_faint()),
         };
         let (node_main, node_sub, node_addr, node_clickable) = match &best_node {
-            Some((addr, ms)) => (
-                self.config.node_display_name(addr),
-                format!("{}ms", ms),
-                Some(addr.clone()),
-                true,
-            ),
+            Some((addr, ms)) => {
+                let name = self.config.node_display_name(addr);
+                // 卡面显示**去端口**的地址（用户反馈：22/16px 下 IP:端口必然
+                // 截断；纯 IP 13 字符 16px 可全显）。端口保留在悬停提示。
+                // 仅当末段是纯数字端口样式才拆——自定义节点名含冒号不受影响
+                let display = match name.rsplit_once(':') {
+                    Some((h, p))
+                        if !h.is_empty()
+                            && p.len() <= 5
+                            && p.chars().all(|c| c.is_ascii_digit()) =>
+                    {
+                        h.to_string()
+                    }
+                    _ => name,
+                };
+                (
+                    display,
+                    format!("{}ms", ms),
+                    Some(addr.clone()),
+                    true,
+                )
+            }
             None => (
                 "—".to_string(),
                 if total == 0 {
@@ -246,10 +262,18 @@ impl HydraApp {
                 return;
             }
             stat_label(ui, "当前节点（调度参考）");
+            // 自适应字号（用户反馈）：IP 含端口等长文本在 22px 大字下必然截断
+            // ——按长度分档（≤10 字 22px / ≤14 字 18px / 更长 16px），
+            // truncate 仅作极窄窗口兜底
+            let value_size = match node_main.chars().count() {
+                0..=10 => palette::FONT_DATA,
+                11..=14 => 18.0_f32,
+                _ => 16.0_f32,
+            };
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(&node_main)
-                        .size(palette::FONT_DATA)
+                        .size(value_size)
                         .strong(),
                 )
                 .truncate(true),
@@ -462,11 +486,19 @@ impl HydraApp {
                             egui_plot::Corner::RightBottom,
                             egui_plot::CoordinatesFormatter::new(|_pt, _bounds| String::new()),
                         )
-                        // 悬停网速读数（用户反馈）：默认标签是「系列名 + 原始
-                        // x/y 坐标」（x=采样序号无意义、y=原始字节流）——自定义
-                        // 为按系列名格式化的速率（上行：1.2 MB/s）
-                        .label_formatter(|name, value| {
-                            format!("{name}：{}/s", format_speed(value.y))
+                        // 悬停读数（用户反馈第 2 轮）：光标处**同时显示上行/下行**
+                        // ——label_formatter 捕获两条序列快照，按光标 x=采样序号
+                        // 查表；标签由 egui_plot 绘制在光标旁（右侧）。克隆
+                        // 120×f64×2 每帧成本可忽略。
+                        .label_formatter({
+                            let up_snap = up_series.clone();
+                            let down_snap = down_series.clone();
+                            move |_name, value| {
+                                let idx = (value.x.round().clamp(0.0, 119.0)) as usize;
+                                let up = format_speed(up_snap.get(idx).copied().unwrap_or(0.0));
+                                let down = format_speed(down_snap.get(idx).copied().unwrap_or(0.0));
+                                format!("上行 {up}/s\n下行 {down}/s")
+                            }
                         })
                         // R6：背景透明（同卡底）；网格/坐标轴取 Visuals + chart_grid
                         .show_background(false)
@@ -485,51 +517,11 @@ impl HydraApp {
                                 .formatter(|mark, _digits, _range| format_speed(mark.value)),
                         ])
                         .show(ui, |plot| {
-                            let up_points: egui_plot::PlotPoints = up_series
-                                .iter()
-                                .enumerate()
-                                .map(|(i, v)| [i as f64, *v])
-                                .collect();
-                            let down_points: egui_plot::PlotPoints = down_series
-                                .iter()
-                                .enumerate()
-                                .map(|(i, v)| [i as f64, *v])
-                                .collect();
-                            // 面积填充（企业评审 P1-1 修复）：egui_plot 0.27 的
-                            // Line::fill 参数是「Y 基线坐标」而非透明度，且填充
-                            // alpha 库内写死 0.05——改用 Polygon 自绘封闭区域
-                            // （曲线点 + 基线两角）实现真 30% 面积填充；描边
-                            // 透明，曲线本体仍由下方 Line 绘制
-                            if !up_series.is_empty() {
-                                let n = up_series.len() as f64 - 1.0;
-                                let area: egui_plot::PlotPoints = up_series
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, v)| [i as f64, *v])
-                                    .chain(std::iter::once([n, 0.0]))
-                                    .chain(std::iter::once([0.0_f64, 0.0]))
-                                    .collect();
-                                plot.polygon(
-                                    egui_plot::Polygon::new(area)
-                                        .fill_color(palette::chart_up().gamma_multiply(0.3))
-                                        .stroke(egui::Stroke::NONE),
-                                );
-                            }
-                            if !down_series.is_empty() {
-                                let n = down_series.len() as f64 - 1.0;
-                                let area: egui_plot::PlotPoints = down_series
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, v)| [i as f64, *v])
-                                    .chain(std::iter::once([n, 0.0]))
-                                    .chain(std::iter::once([0.0_f64, 0.0]))
-                                    .collect();
-                                plot.polygon(
-                                    egui_plot::Polygon::new(area)
-                                        .fill_color(palette::chart_down().gamma_multiply(0.3))
-                                        .stroke(egui::Stroke::NONE),
-                                );
-                            }
+                            // Catmull-Rom 样条平滑（用户反馈：折线太生硬）——
+                            // 相邻四控制点插值，每段 6 个采样点；点数 <3 时
+                            // 原样返回（无法构造切线）
+                            let up_points = smooth_series(&up_series);
+                            let down_points = smooth_series(&down_series);
                             plot.line(
                                 egui_plot::Line::new(up_points)
                                     .name("上行")
@@ -603,4 +595,36 @@ fn stat_label(ui: &mut egui::Ui, label: &str) {
         )
         .truncate(true),
     );
+}
+
+/// Catmull-Rom 样条平滑（用户反馈：折线生硬）——相邻四控制点三次插值，
+/// 每段 6 个采样点。端点用重复控制点补位；点数 <3 无法构造切线，原样返回。
+/// x 坐标均匀递增（i + t），保证悬停按序号查表仍对得上。
+fn smooth_series(series: &[f64]) -> egui_plot::PlotPoints {
+    const SEGMENTS: usize = 6;
+    if series.len() < 3 {
+        return series
+            .iter()
+            .enumerate()
+            .map(|(i, v)| [i as f64, *v])
+            .collect();
+    }
+    let mut pts: Vec<[f64; 2]> = Vec::with_capacity(series.len() * SEGMENTS);
+    let at = |i: usize| series[i.min(series.len() - 1)];
+    for i in 0..series.len() - 1 {
+        let (p0, p1, p2, p3) = (at(i.saturating_sub(1)), series[i], series[i + 1], at(i + 2));
+        for s in 0..SEGMENTS {
+            let t = s as f64 / SEGMENTS as f64;
+            let (t2, t3) = (t * t, t * t * t);
+            let y = 0.5 * ((2.0 * p1)
+                + (-p0 + p2) * t
+                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
+                .max(0.0); // Catmull-Rom 端点会轻微下冲越 0（Y 轴出现 -1 B/s），钳底
+            pts.push([i as f64 + t, y]);
+        }
+    }
+    let last = series.len() - 1;
+    pts.push([last as f64, series[last]]);
+    pts.into_iter().collect()
 }
