@@ -152,7 +152,7 @@ fn record_and_should_failover(target: &str) -> bool {
     }
 }
 /// 国内直连分流的直连建连超时（超时后回退节点路径，不让浏览器干等）
-const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct ProxyServer {
     listen_addr: SocketAddr,
@@ -506,6 +506,27 @@ impl ProxyServer {
                         SocketAddr::V4(_) => direct_bind_ipv4,
                         SocketAddr::V6(_) => direct_bind_ipv6,
                     };
+                    // 审查 P1-3：该族**无物理源 IP** 时，**公网目标**绝不裸连——
+                    // 桌面无 protect 钩子时裸 connect 按目的地址路由命中 /1 接管
+                    // → 包回自身 TUN → any_ip 接受 → 再判 DIRECT → 再裸连，
+                    // 自激回环风暴（每 socket ~128KB 缓冲直至 max_flows）。
+                    // 例外：回环/私网/链路本地目标本就有豁免路由（直连安全），
+                    // 且「私网 → 直连」是 R5 的设计语义（有测试覆盖）
+                    let is_local = match addr.ip() {
+                        std::net::IpAddr::V4(v4) => {
+                            v4.is_loopback() || v4.is_private() || v4.is_link_local()
+                        }
+                        std::net::IpAddr::V6(v6) => {
+                            v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
+                        }
+                    };
+                    if bind.is_none()
+                        && !is_local
+                        && !crate::socket_protect::socket_protect_installed()
+                    {
+                        debug!("TUN 规则直连跳过（公网目标 + 该族无物理源 IP + 无 protect 钩子）→ 走节点");
+                        return (proxy_opener)(target).await;
+                    }
                     match tokio::time::timeout(
                         DIRECT_CONNECT_TIMEOUT,
                         Self::tun_direct_duplex(addr, bind),

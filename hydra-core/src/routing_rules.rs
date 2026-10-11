@@ -64,7 +64,12 @@ impl GeoTables {
                 .ok_or_else(|| "GeoIP dat 截断（段数区）".to_string())
         };
         let n4 = be32(4)? as usize;
-        let v4_end = 8 + n4 * 8;
+        // 审查 P3-1：段数来自文件（可损坏/被替换）——用 checked 运算，溢出返回
+        // Err 而非 debug panic / release 回绕后越界读
+        let v4_end = n4
+            .checked_mul(8)
+            .and_then(|v| 8usize.checked_add(v))
+            .ok_or_else(|| "GeoIP dat 段数溢出".to_string())?;
         if dat.len() < v4_end + 4 {
             return Err("GeoIP dat 截断（v4 段区）".to_string());
         }
@@ -79,7 +84,11 @@ impl GeoTables {
             v4.push((s, e));
         }
         let n6 = be32(v4_end)? as usize;
-        let need = v4_end + 4 + n6 * 32;
+        // 审查 P3-1：同 v4 区，checked 运算防溢出
+        let need = v4_end
+            .checked_add(4)
+            .and_then(|v| n6.checked_mul(32).and_then(|o| v.checked_add(o)))
+            .ok_or_else(|| "GeoIP dat 长度溢出".to_string())?;
         if dat.len() < need {
             return Err("GeoIP dat 截断（v6 段区）".to_string());
         }
@@ -173,7 +182,7 @@ impl Action {
 
 /// 自定义 CIDR 段二分优化的阈值（评审 R10：≥50 条时构建排序合并段二分，
 /// 避免「数百条 CIDR 线性扫描」成为热路径）
-const CIDR_BINARY_SEARCH_THRESHOLD: usize = 50;
+const CIDR_BINARY_SEARCH_THRESHOLD: usize = 16;
 
 /// 规则引擎：自定义规则（规则文件）+ 内置 GeoIP-CN 表 + 内置私网直连
 pub struct RuleEngine {
@@ -231,7 +240,10 @@ impl RuleEngine {
             cidr6: Vec::new(),
             cidr4_sorted: None,
             cidr6_sorted: None,
-            geoip_enabled: false,
+            // 审查 P1-1：内置 CN 表**默认启用**——用户自定义规则是「叠加在内置表
+            // 之上」，不是替换。此前默认 false 且仅显式 GEOIP 行才启用，导致
+            // 用户写一条 DST-PORT/IP-CIDR 规则就静默丢掉全部 CN 直连（分流形同虚设）
+            geoip_enabled: true,
             skipped_lines: 0,
         };
         let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes);

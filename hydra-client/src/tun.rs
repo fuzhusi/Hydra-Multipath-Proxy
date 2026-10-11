@@ -1515,10 +1515,17 @@ struct UdpDirectNat {
 struct DirectUdpSession {
     sock: Arc<tokio::net::UdpSocket>,
     last_seen: Instant,
+    /// 回包泵任务句柄（审查 P1-2：仅删表项不关 socket 时泵自持 Arc、
+    /// recv_from 永不返回 Err → fd/任务/64KB 缓冲永久泄漏且幽灵 NAT 继续注入；
+    /// 回收时显式 abort 才能真正释放）
+    pump: tokio::task::JoinHandle<()>,
 }
 
 impl UdpDirectNat {
     const IDLE_SECS: u64 = 150; // 与中继流表 UdpFlowTable::IDLE_SECS 同口径
+    /// 直连 UDP 会话表上限（审查 P1-2 附带建议）：超限回收最旧会话，
+    /// 防客户端大量本地端口造成的表/fd 无界增长
+    const MAX_SESSIONS: usize = 512;
 
     fn new(
         engine: Arc<hydra_core::routing_rules::RuleEngine>,
@@ -1580,12 +1587,14 @@ impl UdpDirectNat {
         let std_sock = std::net::UdpSocket::bind(SocketAddr::new(bind, 0))?;
         std_sock.set_nonblocking(true)?;
         let sock = Arc::new(tokio::net::UdpSocket::from_std(std_sock)?);
-        // 回包泵：持有 socket + 传输通道；会话被回收（socket drop）即退出
+        // 回包泵：持有 socket + 传输通道。**退出条件 = 会话回收时 abort**
+        // （审查 P1-2：未 connect 的 UDP socket 无人发送时 recv_from 永远
+        // Pending，不会因 socket drop 自行退出——必须显式 abort）
         let pump_sock = sock.clone();
         let transport = self.transport.clone();
-        tokio::spawn(async move {
+        let pump = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            // 回包循环：socket 关闭（会话回收）或读错误 → 泵退出
+            // 回包循环：读错误（含 abort 取消）→ 泵退出
             while let Ok((n, remote)) = pump_sock.recv_from(&mut buf).await {
                 // 回包：src = 真实远端（应用看到的"远端"），dst = 客户端源
                 let reply = match (remote, client_src) {
@@ -1608,22 +1617,48 @@ impl UdpDirectNat {
             }
         });
         if let Ok(mut s) = self.sessions.lock() {
+            // 会话表上限（审查 P1-2 附带建议）：超限先回收最旧会话（abort 泵释放 fd）
+            if s.len() >= Self::MAX_SESSIONS {
+                if let Some(oldest) = s
+                    .iter()
+                    .min_by_key(|(_, v)| v.last_seen)
+                    .map(|(k, _)| *k)
+                {
+                    if let Some(victim) = s.remove(&oldest) {
+                        victim.pump.abort();
+                    }
+                }
+            }
             s.insert(
                 client_src,
                 DirectUdpSession {
                     sock,
                     last_seen: Instant::now(),
+                    pump,
                 },
             );
         }
         Ok(())
     }
 
-    /// 空闲会话回收（janitor 周期调用；socket drop → 回包泵自然退出）
+    /// 空闲会话回收（janitor 周期调用；abort 泵 + socket 随 Arc 归零关闭）。
+    /// 先收集过期 key 再 remove（JoinHandle 非 Clone，需 move 出才能 abort）
     fn sweep_idle(&self) {
         if let Ok(mut s) = self.sessions.lock() {
             let now = Instant::now();
-            s.retain(|_, sess| now.duration_since(sess.last_seen).as_secs() < Self::IDLE_SECS);
+            let expired: Vec<SocketAddr> = s
+                .iter()
+                .filter(|(_, sess)| {
+                    now.duration_since(sess.last_seen).as_secs() >= Self::IDLE_SECS
+                })
+                .map(|(k, _)| *k)
+                .collect();
+            for k in expired {
+                if let Some(victim) = s.remove(&k) {
+                    victim.pump.abort();
+                    // socket 随 victim drop（Arc 归零）→ fd 真正关闭
+                }
+            }
         }
     }
 }
@@ -1896,7 +1931,11 @@ fn build_udp_reply_v4(
     pkt[20..22].copy_from_slice(&sport.to_be_bytes());
     pkt[22..24].copy_from_slice(&dport.to_be_bytes());
     pkt[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
-    // 伪首部校验和
+    // ⚠ 载荷必须在算校验和**之前**写入（审查 P0-1：此前先算校验和再拷载荷，
+    // 校验和覆盖的是全零载荷 → 所有非空回包被本机栈校验失败丢弃，
+    // UDP 直连与既有中继回包全链路静默失效）
+    pkt[28..].copy_from_slice(payload);
+    // 伪首部校验和（RFC 768：伪首部 + UDP 头 + 载荷）
     let mut pseudo = Vec::with_capacity(12 + udp_len);
     pseudo.extend_from_slice(&src.octets());
     pseudo.extend_from_slice(&dst.octets());
@@ -1906,7 +1945,6 @@ fn build_udp_reply_v4(
     pseudo.extend_from_slice(&pkt[20..]);
     let uc = checksum16(&pseudo);
     pkt[26..28].copy_from_slice(&uc.to_be_bytes());
-    pkt[28..].copy_from_slice(payload);
     pkt
 }
 
@@ -1929,13 +1967,16 @@ fn build_udp_reply_v6(
     pkt[40..42].copy_from_slice(&sport.to_be_bytes());
     pkt[42..44].copy_from_slice(&dport.to_be_bytes());
     pkt[44..46].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    // ⚠ 载荷先写（审查 P0-1 同 v4：校验和必须覆盖真实载荷）
+    pkt[48..].copy_from_slice(payload);
     // 校验和覆盖伪首部 + UDP 头 + 载荷（RFC 2460；checksum16 顺序无关）
     let pseudo = ipv6_pseudo_header(&src.octets(), &dst.octets(), udp_len as u32, 17);
     let mut covered = pseudo;
     covered.extend_from_slice(&pkt[40..]);
     let uc = checksum16(&covered);
+    // RFC 2460：v6 UDP 校验和算出 0 时须写 0xFFFF（0 表示"无校验和"仅 v4 合法）
+    let uc = if uc == 0 { 0xFFFF } else { uc };
     pkt[46..48].copy_from_slice(&uc.to_be_bytes());
-    pkt[48..].copy_from_slice(payload);
     pkt
 }
 
@@ -4581,5 +4622,44 @@ mod tests {
         }
         shutdown.cancel();
         assert!(got, "应在超时前收到经中继的 UDP 回包（src/dst/载荷匹配）");
+    }
+
+    /// 审查 P0-1 回归：UDP 回包校验和必须覆盖真实载荷（RFC 768 反码和 = 0）。
+    /// 此前载荷在算完校验和之后才拷入 → 校验和覆盖全零载荷 → 所有非空回包
+    /// 被本机 IP 栈丢弃；既有 E2E 只逐字节比对载荷，故该缺陷逃逸。
+    #[test]
+    fn udp_reply_checksum_covers_payload_v4() {
+        let src = std::net::Ipv4Addr::new(192, 168, 1, 5);
+        let dst = std::net::Ipv4Addr::new(93, 184, 216, 34);
+        let payload = b"hello";
+        let pkt = build_udp_reply_v4(src, dst, 54321, 443, payload);
+        // 载荷写入了
+        assert_eq!(&pkt[28..], payload);
+        // 伪首部 + UDP 段（含载荷）反码和必须为 0
+        let udp_len = 8 + payload.len();
+        let mut pseudo = Vec::new();
+        pseudo.extend_from_slice(&src.octets());
+        pseudo.extend_from_slice(&dst.octets());
+        pseudo.push(0);
+        pseudo.push(17);
+        pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
+        pseudo.extend_from_slice(&pkt[20..]);
+        assert_eq!(checksum16(&pseudo), 0, "v4 UDP 回包校验和必须覆盖载荷");
+    }
+
+    /// 审查 P0-1 回归（v6）：同 v4，且校验和为 0 时必须改写为 0xFFFF（RFC 2460）。
+    #[test]
+    fn udp_reply_checksum_covers_payload_v6() {
+        let src: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst: std::net::Ipv6Addr = "2606:2800:220:1::1".parse().unwrap();
+        let payload = b"hello";
+        let pkt = build_udp_reply_v6(src, dst, 54321, 443, payload);
+        assert_eq!(&pkt[48..], payload);
+        let udp_len = 8 + payload.len();
+        let mut covered = ipv6_pseudo_header(&src.octets(), &dst.octets(), udp_len as u32, 17);
+        covered.extend_from_slice(&pkt[40..]);
+        assert_eq!(checksum16(&covered), 0, "v6 UDP 回包校验和必须覆盖载荷");
+        let stored = u16::from_be_bytes([pkt[46], pkt[47]]);
+        assert_ne!(stored, 0, "v6 校验和不得为 0（RFC 2460 要求 0xFFFF）");
     }
 }
