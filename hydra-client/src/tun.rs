@@ -4973,6 +4973,10 @@ mod tests {
     }
 
     // ── 评审 P3-8 ②：sweep 后泵任务结束 ──
+    // 仅 Windows：P1-1 守卫在非 Windows（无 protect 钩子）拒绝建直连会话，
+    // 本测试的直接路径不可达；非 Windows 行为由
+    // udp_direct_非windows无protect钩子_建会话被守卫拒绝 覆盖
+    #[cfg(windows)]
     #[tokio::test]
     async fn udp_direct_nat_sweep后泵任务结束() {
         // 哑 transport（回包泵只 recv，不发）
@@ -5008,6 +5012,9 @@ mod tests {
     // 客户端 UDP 包（10.7.0.1:41000 → 127.0.0.1:echo）经 run_stack 分发 →
     // 内置私网 DIRECT（R5）→ UdpDirectNat bind 127.0.0.1 直发（不经节点）→
     // 回包注入 TUN。断言：载荷回显 + RFC 1071 反码和 == 0（校验和真实有效）。
+    // 仅 Windows：非 Windows（无 protect 钩子）下 P1-1 守卫拒绝直连 →
+    // 回落中继，直接路径不可达（守卫行为由专用测试覆盖）
+    #[cfg(windows)]
     #[tokio::test]
     async fn run_stack_规则模式udp直连_回环端到端校验和归零() {
         let _ = tracing_subscriber::fmt()
