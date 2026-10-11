@@ -205,18 +205,27 @@ pub fn set_split_enabled_for_test(on: bool) {
 /// 输入应为**域名**；IP 字面量请走 [`is_direct_target`]（其会直接拒绝）。
 pub fn is_direct(domain: &str) -> bool {
     let d = normalize_domain(domain);
+    is_direct_normalized(&d)
+}
+
+/// 接收**已归一化**（小写、去尾点、剥 `*.` 前缀，即 [`normalize_domain`] 产物）
+/// 域名的直连判定——三轮 P3-3：统一路由层热路径（`decide_domain` 内置 CN 层）
+/// 调用方已完成归一化，经本入口避免重复 `to_ascii_lowercase` 等分配；
+/// [`is_direct`] 保留为本函数的归一化薄包装，外部口径不变。
+/// 前置条件：输入已经归一化（调用方违反则行为未定义——大小写/尾点不再容错）。
+pub(crate) fn is_direct_normalized(d: &str) -> bool {
     if d.is_empty() {
         return false;
     }
     // 本机回显名恒直连（本地测试便利）
-    if LOOPBACK_NAMES.contains(&d.as_str()) || d.ends_with(".localhost") {
+    if LOOPBACK_NAMES.contains(&d) || d.ends_with(".localhost") {
         return true;
     }
     // .cn 顶级域通配（含 gov.cn / edu.cn / com.cn 等全部二级）
     if d == "cn" || d.ends_with(".cn") {
         return true;
     }
-    suffix_match(all_suffixes(), &d)
+    suffix_match(all_suffixes(), d)
 }
 
 /// `host:port` 形态目标的分流判定入口（proxy.rs 接线用）。

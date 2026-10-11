@@ -236,11 +236,14 @@ impl HydraApp {
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "分流规则文件 {} 不可用（{e}）：SOCKS/HTTP 不挂引擎，走既有内置行为",
+                            "分流规则文件 {} 不可用（{e}）：SOCKS/HTTP 不挂引擎，分流不生效，本代理路径全部流量走节点",
                             rule_path.display()
                         );
+                        // 三轮 P2-2：如实表述——引擎未挂载即无任何分流判定，
+                        // 不存在「降级为内置域名表」（HYDRA_SPLIT 未启用，
+                        // 内置域名直连路径不生效）
                         self.add_log(format!(
-                            "⚠ 规则文件不可用（{e}）：SOCKS/HTTP 分流降级为既有内置域名表"
+                            "⚠ 规则文件构建失败：分流不生效，本代理路径全部流量走节点（HYDRA_SPLIT 未启用，无内置域名直连；{e}）"
                         ));
                         None
                     }

@@ -2212,12 +2212,22 @@ mod unified_routing_tests {
     async fn try_direct_引擎未挂载_基线行为不变() {
         // engine = None：判定完全交给既有 routing::is_direct_target
         // （HYDRA_SPLIT 未开启 → 一律 None，与基线 2be66e8 零行为变更）
+        //
+        // 三轮 P1-1 竞态防护：分流开关是进程级全局 AtomicBool
+        // （routing::SPLIT_STATE），既有测试（routing.rs
+        // split_state_and_ip_literals 等）会临时置 true 且与本项目并行运行——
+        // 若此处开关恰为 true，www.taobao.com 命中内置 CN 表 → try_direct
+        // 发起**真实公网直连**，断言结果受网络环境摆布。故先存原值、强制
+        // 关断、测毕恢复。
+        let prev = routing::split_enabled();
+        routing::set_split_enabled_for_test(false);
         assert!(ProxyServer::try_direct(None, "www.taobao.com:443", pseudo_peer())
             .await
             .is_none());
         assert!(ProxyServer::try_direct(None, "8.8.8.8:443", pseudo_peer())
             .await
             .is_none());
+        routing::set_split_enabled_for_test(prev);
     }
 
     #[test]
@@ -2240,5 +2250,25 @@ mod unified_routing_tests {
         // 域名目标（SOCKS 侧 decide_domain；TUN 侧无域名输入，不参与一致性样例）
         assert!(engine_wants_direct(&eng, "nas.corp.test:5001"));
         assert!(!engine_wants_direct(&eng, "evil-corp.test:443"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn 域名侧_TUN_SOCKS_一致性样例() {
+        // 三轮 P3-5：域名侧 TUN/SOCKS 一致性样例。TUN 侧无域名输入（域名仅
+        // 存在于 SOCKS 握手），一致性体现为同一规则面下的分工：域名规则仅经
+        // decide_domain 生效（SOCKS 域名路径），IP 规则仅经 decide 生效
+        // （TUN 路径与 SOCKS IP 字面量路径共用同一入口）——两侧判定互不越界。
+        let eng =
+            RuleEngine::from_bytes(b"DOMAIN-SUFFIX,corp.test,DIRECT\nIP-CIDR,9.9.9.0/24,DIRECT\n");
+        // 域名规则：decide_domain 判定（SOCKS 域名路径）
+        assert_eq!(eng.decide_domain("nas.corp.test", 5001), crate::routing_rules::Decision::Direct);
+        assert_eq!(eng.decide_domain("evil-corp.test", 443), crate::routing_rules::Decision::Proxy);
+        // 前导点 host（P3-1 空标签防御，routing_rules 侧已有专项测试，此处补
+        // SOCKS 调用口径样例）：跳过用户后缀层 → 不命中
+        assert_eq!(eng.decide_domain(".corp.test", 443), crate::routing_rules::Decision::Proxy);
+        // 同规则面 IP 侧：decide 判定（TUN 与 SOCKS IP 路径同一入口）
+        assert_eq!(eng.decide("9.9.9.9:443".parse().unwrap()), crate::routing_rules::Decision::Direct);
+        assert_eq!(eng.decide("9.10.0.1:443".parse().unwrap()), crate::routing_rules::Decision::Proxy);
     }
 }

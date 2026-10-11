@@ -233,7 +233,10 @@ impl std::fmt::Debug for RuleEngine {
 
 /// 域名规则参数归一化：去首尾空白、小写、去结尾点、容忍 `*.example.com`
 /// 通配写法（与 `routing` 模块 normalize_domain 同口径；该函数私有故此处
-/// 独立实现，口径由单测对齐保证）
+/// 独立实现，口径由单测对齐保证）。通配语义（三轮 P3-2 文档化）：
+/// `*.example.com` 等价 `example.com`——剥前缀后按完整标签后缀匹配，
+/// **含裸域自身**（`example.com` 也命中 `DOMAIN-SUFFIX,*.example.com`），
+/// 与 Clash 的 DOMAIN-SUFFIX 惯例一致。
 fn normalize_rule_domain(d: &str) -> String {
     let mut s = d.trim().to_ascii_lowercase();
     while s.ends_with('.') {
@@ -476,30 +479,47 @@ impl RuleEngine {
     /// 走 [`Self::decide`]——见 proxy.rs `engine_wants_direct`）。
     ///
     /// 判定顺序：
+    /// 0. 回环名直连（三轮 P2-1，对应 [`Self::decide`] 层 1 私网直连——socks
+    ///    客户端连 `localhost:端口` 场景，引擎挂载后不得走节点）；
     /// 1. 用户域名规则（文件序：DOMAIN 全等 → DOMAIN-SUFFIX 完整标签后缀 →
-    ///    DOMAIN-KEYWORD 包含；大小写不敏感）；
+    ///    DOMAIN-KEYWORD 包含；大小写不敏感；含空标签的 host 跳过后缀层）；
     /// 2. DST-PORT 规则（与 [`Self::decide`] 同层，端口例外语义一致）；
     /// 3. 内置 CN 域名直连层（`routing::is_direct`：内置 CN 后缀表 + `.cn`
     ///    顶级域通配 + 回环名 + `HYDRA_DIRECT_DOMAIN_FILE` 用户扩展——地位
     ///    等同 GeoIP 内置表：默认启用，用户规则叠加其上）；
     /// 4. 默认 Proxy。
+    ///
+    /// 已知不对称（三轮 P2-1 文档声明）：域名路径仅能识别**回环名**，非回环
+    /// 私网名（`nas.lan` 类）无法从域名判定归属，默认走节点；TUN 路径按
+    /// 目的 IP 判私网直连，不受影响。见设计文档 §8.2。
     pub fn decide_domain(&self, host: &str, port: u16) -> Decision {
         let h = normalize_rule_domain(host);
+        // 0. 回环名直连（先于用户规则/DST-PORT：本地回环无分流语义可言）
+        if h == "localhost" || h.ends_with(".localhost") {
+            return Decision::Direct;
+        }
         // 1. 用户域名规则（full → suffix → keyword）
         for (d, a) in &self.domain_full {
             if *d == h {
                 return a.decision();
             }
         }
-        for (sfx, a) in &self.domain_suffix {
-            // 完整标签边界：`evil-baidu.com` 不得命中 `baidu.com`（与
-            // routing::suffix_match 同口径）
-            if *sfx == h
-                || (h.len() > sfx.len()
-                    && h.ends_with(sfx.as_str())
-                    && h.as_bytes()[h.len() - sfx.len() - 1] == b'.')
-            {
-                return a.decision();
+        // 空标签防御（三轮 P3-1）：`.foo.com` / `a..foo.com` 的拆分产物含空
+        // 段——DNS 规范不容许空标签，部分系统解析器却会容忍/规整，放行后缀
+        // 层会产生伪命中；与内置层 routing::suffix_match 口径一致，遇空段
+        // 跳过用户后缀层（full 全等/keyword 包含无标签边界问题，不在此列）
+        let has_empty_label = h.split('.').any(|s| s.is_empty());
+        if !has_empty_label {
+            for (sfx, a) in &self.domain_suffix {
+                // 完整标签边界：`evil-baidu.com` 不得命中 `baidu.com`（与
+                // routing::suffix_match 同口径）
+                if *sfx == h
+                    || (h.len() > sfx.len()
+                        && h.ends_with(sfx.as_str())
+                        && h.as_bytes()[h.len() - sfx.len() - 1] == b'.')
+                {
+                    return a.decision();
+                }
             }
         }
         for (kw, a) in &self.domain_keyword {
@@ -513,8 +533,9 @@ impl RuleEngine {
                 return a.decision();
             }
         }
-        // 3. 内置 CN 域名直连层（引用 routing 模块数据，不复制表）
-        if crate::routing::is_direct(host) {
+        // 3. 内置 CN 域名直连层（引用 routing 模块数据，不复制表；
+        // 三轮 P3-3：h 已归一化，走 is_direct_normalized 免重复分配）
+        if crate::routing::is_direct_normalized(&h) {
             return Decision::Direct;
         }
         // 4. 默认策略 → PROXY
@@ -1000,9 +1021,10 @@ mod tests {
         assert_eq!(domain_str(&eng, "WWW.Baidu.Com.:443"), Decision::Direct);
         assert_eq!(domain_str(&eng, "api.taobao.com:443"), Decision::Direct);
         assert_eq!(domain_str(&eng, "www.GitHub.com:443"), Decision::Proxy);
-        // *.example.com 通配写法等价 example.com 后缀
+        // *.example.com 通配写法等价 example.com（含裸域，P3-2 文档化断言）
         let eng2 = RuleEngine::from_bytes(b"DOMAIN-SUFFIX,*.Example.com,DIRECT\n");
         assert_eq!(domain_str(&eng2, "a.example.com:80"), Decision::Direct);
+        assert_eq!(domain_str(&eng2, "example.com:443"), Decision::Direct);
     }
 
     #[test]
@@ -1060,6 +1082,30 @@ mod tests {
         let eng2 = RuleEngine::from_bytes(b"DOMAIN-SUFFIX,corp.internal,DIRECT\nIP-CIDR,9.9.9.0/24,DIRECT\n");
         assert_eq!(domain_str(&eng2, "nas.corp.internal:5001"), Decision::Direct);
         assert_eq!(eng2.decide("9.9.9.9:443".parse().unwrap()), Decision::Direct);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn 域名规则_回环名直连() {
+        // 三轮 P2-1：回环名直连先于用户规则与 DST-PORT 层——socks 客户端
+        // 连本机回环服务（localhost:端口）场景，引擎挂载后不得改走节点
+        let eng = RuleEngine::from_bytes(b"DST-PORT,443,PROXY\nDOMAIN-SUFFIX,foo.com,DIRECT\n");
+        // 即便 443 端口有 PROXY 例外规则也不改判（回环层在最前）
+        assert_eq!(domain_str(&eng, "localhost:443"), Decision::Direct);
+        assert_eq!(domain_str(&eng, "foo.localhost:8080"), Decision::Direct);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn 域名规则_空标签跳过用户后缀层() {
+        // 三轮 P3-1：空标签 host（.foo.com / a..foo.com）跳过用户后缀层，
+        // 与内置层 routing::suffix_match 口径一致
+        let eng = RuleEngine::from_bytes(b"DST-PORT,443,PROXY\nDOMAIN-SUFFIX,foo.com,DIRECT\n");
+        // 否则 `.foo.com` 伪命中 DOMAIN-SUFFIX,foo.com（内网仿冒域）
+        assert_eq!(domain_str(&eng, ".foo.com:443"), Decision::Proxy);
+        assert_eq!(domain_str(&eng, "a..foo.com:443"), Decision::Proxy);
+        // 正常子域仍命中后缀规则
+        assert_eq!(domain_str(&eng, "www.foo.com:443"), Decision::Direct);
     }
 
     #[test]
