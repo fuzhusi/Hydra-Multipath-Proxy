@@ -75,12 +75,9 @@ class MainActivity : ComponentActivity() {
             ) {
                 add(Manifest.permission.POST_NOTIFICATIONS)
             }
-            // 扫码导入分享二维码的前置条件（zxing CaptureActivity 不代请求）
-            if (ActivityCompat.checkSelfPermission(this@MainActivity, Manifest.permission.CAMERA) !=
-                android.content.pm.PackageManager.PERMISSION_GRANTED
-            ) {
-                add(Manifest.permission.CAMERA)
-            }
+            // 相机权限**不在此处请求**（真机实测 UX 问题：启动即弹相机授权，
+            // 与用户当下意图无关、徒增反感）。扫码入口（onScan）点击时按需请求，
+            // 见 requestCameraThenScan。
         }
         if (wanted.isNotEmpty()) {
             requestPermissions(wanted.toTypedArray(), 1)
@@ -138,6 +135,12 @@ private fun HydraApp(themeMode: ThemeMode, onSetTheme: (ThemeMode) -> Unit) {
     var tab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(Tab.Home) }
     var toast by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf<String?>(null) }
     val imported by ImportFeedback.importedNodes.collectAsState()
+    // 深链导入（handleDeepLink 在 Activity 侧执行）不会触碰本 composable 的
+    // cfg 状态——不刷新则 UI 一直显示「尚未配置」，且任何 persist 都会把
+    // 导入的数据覆盖掉（真机实测 P0）。导入信号到达即从存储重读。
+    LaunchedEffect(imported) {
+        if (imported != null) cfg = store.load()
+    }
     LaunchedEffect(toast) {
         toast?.let {
             Toast.makeText(context, it, Toast.LENGTH_LONG).show()
@@ -264,6 +267,26 @@ private fun HydraApp(themeMode: ThemeMode, onSetTheme: (ThemeMode) -> Unit) {
         }
     }
 
+    // 按需相机权限（真机实测 UX 修复）：启动不再请求，点「扫码」时才请求；
+    // 授权即启动扫描，拒绝给可操作提示（还有其他导入方式）
+    fun launchQrScan() {
+        qrLauncher.launch(
+            ScanOptions()
+                .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                .setPrompt("对准桌面端生成的 Hydra 分享二维码")
+                .setBeepEnabled(false),
+        )
+    }
+    val cameraPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            launchQrScan()
+        } else {
+            toast = "未授予相机权限——可改用「粘贴分享链接」导入"
+        }
+    }
+
     val nodeSummary = run {
         val n = cfg.nodesText.lines().count { it.isNotBlank() }
         if (n > 0) "$n 个节点已配置" else "尚未配置——去节点页导入分享链接"
@@ -311,7 +334,12 @@ private fun HydraApp(themeMode: ThemeMode, onSetTheme: (ThemeMode) -> Unit) {
                     vpnPrepareLauncher = { intent -> vpnConsent.launch(intent) },
                     onGoNodes = { tab = Tab.Nodes },
                     onConnect = {
-                        persist(cfg)
+                        // 真机实测修复（P0）：此处曾 persist(cfg)——用 UI 缓存的
+                        // **陈旧配置**回写存储。深链导入后 UI 缓存未刷新时，
+                        // 点连接 = 把导入的节点/密钥/证书整份覆盖清空（实测
+                        // prefs 3298B→2562B），服务随即读到 0 节点启动失败。
+                        // 改为**先刷新缓存**（从存储重新读）再启动，绝不回写。
+                        cfg = store.load()
                         startCurrentMode()
                     },
                     onDisconnect = { stopCurrentMode() },
@@ -321,12 +349,16 @@ private fun HydraApp(themeMode: ThemeMode, onSetTheme: (ThemeMode) -> Unit) {
                     onPersist = ::persist,
                     onImport = { text -> doImport(text) },
                     onScan = {
-                        qrLauncher.launch(
-                            ScanOptions()
-                                .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                                .setPrompt("对准桌面端生成的 Hydra 分享二维码")
-                                .setBeepEnabled(false),
-                        )
+                        // 按需权限：已授权直接扫，未授权先请求（启动不再弹）
+                        if (androidx.core.content.ContextCompat.checkSelfPermission(
+                                context,
+                                Manifest.permission.CAMERA,
+                            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                        ) {
+                            launchQrScan()
+                        } else {
+                            cameraPermLauncher.launch(Manifest.permission.CAMERA)
+                        }
                     },
                     onToast = { toast = it },
                     onTestNode = testNode,

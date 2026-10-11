@@ -69,7 +69,10 @@ class SecureStore(context: Context) {
             .putBoolean(KEY_VPN_BOOT_START, c.vpnBootStart)
             .putInt(KEY_APP_FILTER_MODE, c.appFilterMode)
             .putString(KEY_APP_FILTER_PKGS, c.appFilterPkgs)
-            .apply()
+            // commit() 同步落盘（企业评审）：apply() 异步刷盘在进程意外终止/
+            // 系统回收时可能丢失（实测：深链导入成功后启动读到空配置）。配置
+            // 体量小、写入频率低，同步开销可接受——正确性优先。
+            .commit()
     }
 
     companion object {

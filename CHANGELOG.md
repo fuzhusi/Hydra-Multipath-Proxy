@@ -39,6 +39,24 @@
 - **方案 C（会话层）**：多连接聚合协议（V3.4 恢复）内做 key rotation——依赖多路径协议恢复
 - **结论**：短期维持现状（每连接独立密钥已足够）；V3.3 多路径恢复时一并设计 C 方案
 
+## [0.2.6] - 2026-10-11
+
+### Android 真机实测修复（模拟器 + 真实 VPS 节点端到端验证）
+
+- **P0 配置覆盖清空**：大按钮 onConnect 曾用 UI 陈旧缓存 `persist(cfg)` 回写存储——深链导入后点连接会把导入的节点/密钥/证书整份覆盖清空（实测 prefs 3298B→2562B，服务读到 0 节点启动失败）。改为先刷新缓存再启动，绝不回写；深链导入信号到达即重读存储刷新 UI
+- **UX 相机权限**：启动即弹相机授权 → 改为点「扫码导入」时按需请求（拒绝给出可操作提示）
+- **SecureStore 落盘**：`apply()` → `commit()` 同步（配置体量小、频率低，正确性优先）
+- **R8 缺类修复**：Tink/Guava 编译期注解 dontwarn 规则（release 构建此前失败）
+- **JNA proguard 规则**：uniffi 绑定经 JNA 调 FFI，禁混淆
+- **正式签名**：keystore 生成 + gradle release signingConfig（环境变量注入 CI，本地文件回退 debug 签名）；keystore 入 .gitignore 不入库
+
+### 真机验证结论（Medium_Phone_API_37 模拟器 + 真实节点 43.133.91.218）
+
+- ✅ M2 全局 VPN 端到端打通：`tun0` UP（10.7.0.1/30），隧道 RX 30MB/TX 688KB 实测流量，App 显示「✓ 全局 VPN 已接管」
+- ✅ 深链导入 → Snackbar + 节点 Tab 徽标（R5 反馈动线）
+- ✅ 四主题实拍（跟随系统动态取色/深色/浅色/深海）全部正确渲染
+- ✅ TalkBack 语义（content-desc/stateDescription 经 uiautomator 确认）
+- ⚠️ 已知遗留：VPN 模式统计带（发送/接收/时长/活跃）未上报（FFI 缺 vpn_stats 接口，需 run_stack 暴露计数器，排入下批）
 ## [0.2.5] - 2026-10-11
 
 ### Android 端 UI 重设计（v1.1 / 评审 R1-R13 全部落实）

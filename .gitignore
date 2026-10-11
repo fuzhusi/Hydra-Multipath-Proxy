@@ -48,3 +48,8 @@ android/.gradle/
 
 # 本地构建产物（本地 UI 测试包）
 local-dist/
+
+# 正式签名 keystore（切勿入库）
+android/hydra-release.keystore
+*.keystore
+*.jks

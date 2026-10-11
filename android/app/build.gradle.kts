@@ -4,6 +4,15 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 // `cargo build -p hydra-android` 产出；经 JNA 加载）
 val rustDebugLibDir: String = file("${rootProject.projectDir}/../target/debug").absolutePath
 
+// 正式签名（keystore 不入库：.gitignore 有 android/*.keystore）。
+// 来源优先级：环境变量（CI Secrets 注入）→ 仓库根 android/hydra-release.keystore
+// （本地）→ 回退 debug 签名（CI 无 keystore 时仍可出可装包）。
+val releaseStoreFile: String =
+    System.getenv("HYDRA_KEYSTORE_PATH")
+        ?: file("${rootProject.projectDir}/hydra-release.keystore").absolutePath
+val releaseStorePass: String =
+    System.getenv("HYDRA_KEYSTORE_PASSWORD") ?: "hydra-release-2026"
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -18,11 +27,29 @@ android {
         applicationId = "dev.hydra.vpn"
         minSdk = 26
         targetSdk = 36
-        versionCode = 6
-        versionName = "0.2.5"
+        versionCode = 7
+        versionName = "0.2.6"
         // 首发 ABI（设计 v2.1 §6）：arm64-v8a 真机 + x86_64 模拟器；armeabi-v7a 延后
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
+        }
+    }
+
+    signingConfigs {
+        create("release") {
+            val ks = file(releaseStoreFile)
+            if (ks.exists()) {
+                storeFile = ks
+                storePassword = releaseStorePass
+                keyAlias = "hydra"
+                keyPassword = releaseStorePass
+            } else {
+                // 回退 debug 签名（可装可跑；正式分发需配 HYDRA_KEYSTORE_* ）
+                storeFile = signingConfigs.getByName("debug").storeFile
+                storePassword = signingConfigs.getByName("debug").storePassword
+                keyAlias = signingConfigs.getByName("debug").keyAlias
+                keyPassword = signingConfigs.getByName("debug").keyPassword
+            }
         }
     }
 
@@ -34,6 +61,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
