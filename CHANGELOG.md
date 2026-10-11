@@ -39,6 +39,55 @@
 - **方案 C（会话层）**：多连接聚合协议（V3.4 恢复）内做 key rotation——依赖多路径协议恢复
 - **结论**：短期维持现状（每连接独立密钥已足够）；V3.3 多路径恢复时一并设计 C 方案
 
+## [0.2.4] - 2026-10-10
+
+### 批次：内核优化 13 项（四批）+ UI v4.1 三主题 + CLI 分享链接 + 打洞同时打开修复
+
+### 新增
+
+- **CLI 分享链接自动配置**：`hydra-client.exe "hydra://..."` 直传即全配好
+  （此前分享链接只在 GUI/Android 生效，CLI 报"未设置 HYDRA_AUTH_KEY"）
+- **UI v4.1 三主题运行时体系**：Dark/Light/Abyss 零锁切换 + 首页重排
+  （Hero 条/三数据卡/快捷条/图表重构）+ 设计评审 12 条与 code review 修复
+- **节点 DNS 共享缓存**（hydra-node/dns_cache.rs）：正向 60s/负缓存 10s/
+  1024 LRU + 并发 64 闸——多客户端并发解析不再放大上游 DNS 压力
+- **Happy Eyeballs 并行建连**（#6③）：首两候选 250ms 错峰竞速先到先用，
+  黑洞候选不再吃满串行预算（失败尾延迟 20s → ~2-3s）
+- **Metrics v2**：17 指标族——字节收支/四段握手延迟直方图/UDP 会话面/
+  拒入四因分解（per_ip/capacity/tls/auth）
+- **弹性温连接池**（#7）：cap 按 peak EWMA 弹性 clamp(2..8) + 周期清扫
+- **节点侧 TCP Fast Open**（listen，Linux 门控）+ sysctl≥2 文档
+- **温池 stale 短超时**（#1）：复用陈旧温连接 8s 快速失败（env 可调 2..20s）
+- 本地 UI 测试包一键构建脚本（scripts/build-ui.ps1 → local-dist/）
+
+### 优化
+
+- **冷连接握手压缩**（#3）：握手与目标地址帧捎带合并，5→4 RTT
+- **UDP 中继瘦身**（#9）：会话接收缓冲分层 8K→16K→64K（截断升档）+
+  时钟统一单调 Instant（reap 不再受 NTP 墙钟回拨影响）
+- **Android FdTransport 重写**（#2）：专职读/写线程 + poll 轮询停止位——
+  停止代理不再卡死转圈（真机 bug 根治）
+- **目标流 keepalive + TCP_USER_TIMEOUT 90s**（#12，Linux）：死目标 ~90s
+  回收，不再等 300s idle 兜底
+- 候选排序效用值归一化（#11）：和恒定 0.4/0.3/0.2/0.1 ∈ [0,1]
+- pump 读唤醒常数化（#8）：1s 轮询替代不稳定时钟假设
+
+### 修复
+
+- **P2P 打洞同时打开握手角色**：角色改按地址序分配（低=client）——真·
+  同时打开时连接两端都是出站 socket，按连接方向分配会双端同为 client
+  互相等对方 msg2 而全败 → 白等 10s 窗口回落中继（Windows CI 实测）
+- **GUI 粘贴导入分享链接丢弃凭据**：密钥/证书未入配置致启动报
+  "未设置 HYDRA_AUTH_KEY"（真机反馈）
+- **GUI 托盘退出即时收敛**：不再阻塞 5s 被系统判无响应 + 单实例冲突可见化
+- **SEC-01/SEC-02（Android P1）**：VPN protect 钩子 vpnActive 门控（本地
+  模式不再被残留钩子断网）；数据面死亡先建黑洞 TUN 防真实 IP 泄漏
+- **企业评审 P0**：Cargo.lock 入库（缓存 key/复现性/审计）；wintun.dll
+  签名强制校验；B-1 帧读取独立任务修复 select 取消不安全流失步
+- 内核优化 code review 回顾 3P0：客户端 TFO 撤下（DEFER_CONNECT 与 tokio
+  poll_writable 不兼容挂起）、Android 停机死锁、DNS 缓存键丢端口放大负缓存
+- 节点 setsockopt extern 声明统一（clashing-extern-declarations，Linux CI）
+
 ## [0.2.3] - 2026-10-09
 
 ### 批次：UI v4 企业级批次（P0）+ 设计方案评审入库

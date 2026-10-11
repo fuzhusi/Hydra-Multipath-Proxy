@@ -2483,7 +2483,7 @@ dependencies = [
 
 [[package]]
 name = "hydra-android"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64",
  "hydra-client",
@@ -2498,7 +2498,7 @@ dependencies = [
 
 [[package]]
 name = "hydra-client"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytes",
  "hydra-core",
@@ -2518,7 +2518,7 @@ dependencies = [
 
 [[package]]
 name = "hydra-client-gui"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "base64",
@@ -2546,7 +2546,7 @@ dependencies = [
 
 [[package]]
 name = "hydra-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64",
  "bytes",
@@ -2566,7 +2566,7 @@ dependencies = [
 
 [[package]]
 name = "hydra-fetch"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "hydra-core",
  "hydra-protocol",
@@ -2583,7 +2583,7 @@ dependencies = [
 
 [[package]]
 name = "hydra-node"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2606,7 +2606,7 @@ dependencies = [
 
 [[package]]
 name = "hydra-protocol"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytes",
  "ring",
