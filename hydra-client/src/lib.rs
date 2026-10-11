@@ -147,9 +147,12 @@ pub fn tun_config_from_settings(
         tracing::info!(
             "TUN 规则分流：DNS 联动强制直连解析（等效 HYDRA_TUN_DNS_DIRECT=1）"
         );
-        // R4：物理网卡源 IP 探测（UDP connect+getsockname，不发包）；
+        // R4：物理网卡源 IP 探测（UDP connect+getsockname，不发包）；评审 P2-6：
+        // 传入解析后的 TUN 地址，探测排除 TUN 自身地址//30 网段（防残留 /1
+        // 路由/VPN 下选中 TUN 地址 → bind 直连回环）。
         // 双族皆失败 → 规则模式退化为全局代理（run_stack 内再告警一次）
-        let (v4, v6) = crate::tun::detect_physical_source_ips();
+        let (v4, v6) =
+            crate::tun::detect_physical_source_ips(Some(std::net::IpAddr::V4(cfg.addr)));
         if v4.is_none() && v6.is_none() {
             tracing::warn!(
                 "TUN 规则分流：物理网卡源 IP 探测失败（v4/v6 均无）——\
@@ -189,6 +192,10 @@ pub fn tun_config_from_settings(
                 }
             });
     }
+    // 评审 P2-5：DNS 端口 53 强制直连开关 = !dns_via_proxy（规则模式下
+    // try_forward_udp 对端口 53 的 UDP 无条件判 DIRECT）。置于所有
+    // dns_via_proxy 变更（env / 规则模式联动）之后统一推导。
+    cfg.dns_direct = !cfg.dns_via_proxy;
     // 系统 DNS 豁免：DNS 经隧道开启时**不再**自动豁免——公网 DNS 查询随 UDP
     // 隧道经节点解析（加密，TUN 方案 v2 方向）；DNS 直连模式（v1 行为或显式
     // HYDRA_TUN_DNS_DIRECT=1，或规则模式 R2 联动）照旧豁免。v4+v6 都在覆盖内。

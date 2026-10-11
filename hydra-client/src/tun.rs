@@ -82,6 +82,11 @@ pub struct TunConfig {
     /// 泄漏——TUN 方案 v2 方向的实现）。`HYDRA_TUN_DNS_DIRECT=1` 恢复 v1 直连
     /// 行为；用户显式指定的 `HYDRA_TUN_DNS` 恒豁免（可能是内网 resolver）。
     pub dns_via_proxy: bool,
+    /// 评审 P2-5：DNS 端口 53 强制直连开关（builder 按 `!dns_via_proxy` 填充）：
+    /// 规则模式下目的端口 53 的 UDP 无条件判 DIRECT（先于 GeoIP/默认策略，仍在
+    /// 私网内置直连之后——语义同为 DIRECT 无冲突；该族 bind 不可用时回落原
+    /// 中继逻辑）。默认 false（自建 TunConfig 未联动时保持既有行为）。
+    pub dns_direct: bool,
     /// 智能分流规则引擎（设计 v1.1 §三/§五）：Some = 规则模式——run_stack
     /// 入口包装 opener（DIRECT 走源 IP 绑定直连、失败/超时回退节点）、
     /// UDP/DNS 分流接入 [`try_forward_udp`]、DNS 直连联动（R2）。
@@ -111,6 +116,9 @@ impl Default for TunConfig {
             listen_ports: vec![80, 443, 8080, 8443],
             udp_relay: true,
             dns_via_proxy: true,
+            // 评审 P2-5：与 dns_via_proxy 反相（DNS 直连 → 53 端口强制直连）；
+            // 仅 tun_config_from_settings 构造路径联动填充
+            dns_direct: false,
             // 智能分流：默认全局模式（行为兼容）；GUI/CLI 开启时由
             // tun_config_from_settings 构建引擎并填入直连源 IP
             rule_engine: None,
@@ -756,15 +764,35 @@ pub fn detect_physical_gateway_v6() -> Option<Ipv6Addr> {
 /// 网卡源 IP），`getsockname` 取回。逐候选探测目标回退（公网路由器 anycast
 /// 地址，UDP connect 无流量，不构成网络探测行为）。
 ///
+/// 评审 P2-6：候选排除集——回环 / 链路本地 / 未指定，以及 **等于 TUN 自身
+/// 地址或落在 TUN /30 网段内**的候选（`tun_addr` 由调用方传入解析后的
+/// cfg.addr）：残留 /1 路由或第三方 VPN 可能让内核选中 TUN/VPN 地址 →
+/// bind 该地址直连 = 包回自身 → 回环。物理内网 IP（RFC1918）是合法直连源，
+/// **不排除私网**。
+///
 /// 返回 `(v4 源 IP, v6 源 IP)`；任一地址族失败 → None（该族直连不可用，
 /// 规则模式该族全走节点——R4 语义，须告警可见）。
-pub fn detect_physical_source_ips() -> (Option<std::net::IpAddr>, Option<std::net::IpAddr>) {
+pub fn detect_physical_source_ips(
+    tun_addr: Option<std::net::IpAddr>,
+) -> (Option<std::net::IpAddr>, Option<std::net::IpAddr>) {
+    // 候选有效性：排除回环/链路本地/未指定 + TUN 自身地址 / /30 网段
+    let valid = |ip: std::net::IpAddr| -> bool {
+        let basic_ok = match ip {
+            std::net::IpAddr::V4(v4) => {
+                !(v4.is_loopback() || v4.is_link_local() || v4.is_unspecified())
+            }
+            std::net::IpAddr::V6(v6) => {
+                !(v6.is_loopback() || v6.is_unicast_link_local() || v6.is_unspecified())
+            }
+        };
+        basic_ok && !candidate_in_tun_subnet(ip, tun_addr)
+    };
     let v4 = (|| {
         for target in ["8.8.8.8:80", "223.5.5.5:80", "1.1.1.1:80"] {
             if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
                 if s.connect(target).is_ok() {
                     if let Ok(local) = s.local_addr() {
-                        if !local.ip().is_unspecified() && local.ip().is_ipv4() {
+                        if valid(local.ip()) && local.ip().is_ipv4() {
                             return Some(local.ip());
                         }
                     }
@@ -778,7 +806,7 @@ pub fn detect_physical_source_ips() -> (Option<std::net::IpAddr>, Option<std::ne
             if let Ok(s) = std::net::UdpSocket::bind("[::]:0") {
                 if s.connect(target).is_ok() {
                     if let Ok(local) = s.local_addr() {
-                        if !local.ip().is_unspecified() && local.ip().is_ipv6() {
+                        if valid(local.ip()) && local.ip().is_ipv6() {
                             return Some(local.ip());
                         }
                     }
@@ -788,6 +816,20 @@ pub fn detect_physical_source_ips() -> (Option<std::net::IpAddr>, Option<std::ne
         None
     })();
     (v4, v6)
+}
+
+/// 候选 IP 是否落在 TUN 自身网段内（评审 P2-6 排除集）：v4 按 /30 网段比较
+/// （与默认 TUN 前缀一致），v6 仅精确比较（TUN v6 无 /30 语义）。
+/// `tun_addr` 为 None（调用方未解析出 TUN 地址）时不排除任何候选。
+fn candidate_in_tun_subnet(cand: std::net::IpAddr, tun_addr: Option<std::net::IpAddr>) -> bool {
+    match (cand, tun_addr) {
+        (std::net::IpAddr::V4(c), Some(std::net::IpAddr::V4(t))) => {
+            // /30 掩码：主机位 = 低 2 位
+            (u32::from(c) & !3) == (u32::from(t) & !3)
+        }
+        (std::net::IpAddr::V6(c), Some(std::net::IpAddr::V6(t))) => c == t,
+        _ => false,
+    }
 }
 
 /// 规则文件默认路径（设计 §4.1）：Windows `%APPDATA%\hydra\rules.txt`；
@@ -1512,6 +1554,11 @@ struct UdpDirectNat {
     sessions: Mutex<HashMap<SocketAddr, DirectUdpSession>>,
 }
 
+/// 直连 UDP 会话的回包来源白名单上限（评审 P3-7）：FIFO 淘汰最旧。
+/// 一个客户端 socket 的常用目的地数有限（DNS 常驻 + 少量服务端），
+/// 8 个足够覆盖正常流量形态。
+const DST_ALLOW_CAP: usize = 8;
+
 struct DirectUdpSession {
     sock: Arc<tokio::net::UdpSocket>,
     last_seen: Instant,
@@ -1519,6 +1566,27 @@ struct DirectUdpSession {
     /// recv_from 永不返回 Err → fd/任务/64KB 缓冲永久泄漏且幽灵 NAT 继续注入；
     /// 回收时显式 abort 才能真正释放）
     pump: tokio::task::JoinHandle<()>,
+    /// 评审 P3-7 回包来源校验：已直发目的地集合（上限 [`DST_ALLOW_CAP`]，
+    /// FIFO 淘汰最旧）。回包泵注入前校验 remote ∈ 集合，不在集合内丢弃——
+    /// 收敛全锥 NAT（socket 未 connect），防第三方向本机端口注入伪造回包。
+    dst_allow: Arc<Mutex<Vec<SocketAddr>>>,
+}
+
+/// 评审 P3-7：回包来源是否在已直发目的地集合内
+fn dst_allowed(allow: &Mutex<Vec<SocketAddr>>, remote: SocketAddr) -> bool {
+    allow.lock().map(|a| a.contains(&remote)).unwrap_or(false)
+}
+
+/// 评审 P3-7：直发成功后记录目的地（去重；上限 [`DST_ALLOW_CAP`]，FIFO 淘汰最旧）
+fn record_dst(allow: &Mutex<Vec<SocketAddr>>, dst: SocketAddr) {
+    if let Ok(mut a) = allow.lock() {
+        if !a.contains(&dst) {
+            if a.len() >= DST_ALLOW_CAP {
+                a.remove(0);
+            }
+            a.push(dst);
+        }
+    }
 }
 
 impl UdpDirectNat {
@@ -1558,16 +1626,31 @@ impl UdpDirectNat {
             })
             .unwrap_or(false);
         if !exists && self.ensure_session(src).is_err() {
+            // 评审 P2-6：bind 失败计数（每 32 次告警一次防刷屏）——物理网卡
+            // 换网/DHCP 续租后源 IP 失效的可见信号。**不做自动重探**：源 IP
+            // 探测依赖 TUN 接管生成前的路由上下文，运行期 /1 接管路由在场时
+            // 重探结果同样不可信（可能选中 TUN 自身地址 → 回环），仅提示重启
+            static NAT_BIND_FAILS: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let fails = NAT_BIND_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if fails.is_multiple_of(32) {
+                warn!("TUN UDP 直连建会话已失败 {fails} 次：物理源 IP 可能已失效，建议重启代理");
+            }
             debug!("TUN UDP 直连会话建立失败（{} → {}），回落中继", src, dst);
             return false;
         }
-        let sock = self
-            .sessions
-            .lock()
-            .ok()
-            .and_then(|s| s.get(&src).map(|x| x.sock.clone()));
-        match sock {
-            Some(sk) => sk.send_to(payload, dst).await.is_ok(),
+        let sess = self.sessions.lock().ok().and_then(|s| {
+            s.get(&src).map(|x| (x.sock.clone(), x.dst_allow.clone()))
+        });
+        match sess {
+            Some((sk, allow)) => {
+                let ok = sk.send_to(payload, dst).await.is_ok();
+                if ok {
+                    // 评审 P3-7：直发成功才记录目的地（回包白名单）
+                    record_dst(&allow, dst);
+                }
+                ok
+            }
             None => false,
         }
     }
@@ -1587,15 +1670,24 @@ impl UdpDirectNat {
         let std_sock = std::net::UdpSocket::bind(SocketAddr::new(bind, 0))?;
         std_sock.set_nonblocking(true)?;
         let sock = Arc::new(tokio::net::UdpSocket::from_std(std_sock)?);
+        // 评审 P3-7：回包来源白名单（与泵共享；forward 直发成功后记录目的地）
+        let dst_allow: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(Vec::new()));
         // 回包泵：持有 socket + 传输通道。**退出条件 = 会话回收时 abort**
         // （审查 P1-2：未 connect 的 UDP socket 无人发送时 recv_from 永远
         // Pending，不会因 socket drop 自行退出——必须显式 abort）
         let pump_sock = sock.clone();
+        let pump_allow = dst_allow.clone();
         let transport = self.transport.clone();
         let pump = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             // 回包循环：读错误（含 abort 取消）→ 泵退出
             while let Ok((n, remote)) = pump_sock.recv_from(&mut buf).await {
+                // 评审 P3-7：来源校验——不在此前直发目的地集合内的回包一律
+                // 丢弃（收敛全锥 NAT，防第三方注入伪造回包）
+                if !dst_allowed(&pump_allow, remote) {
+                    debug!("TUN UDP 直连丢弃非预期来源回包（{} ← {}）", client_src, remote);
+                    continue;
+                }
                 // 回包：src = 真实远端（应用看到的"远端"），dst = 客户端源
                 let reply = match (remote, client_src) {
                     (SocketAddr::V4(s), SocketAddr::V4(d)) => Some(build_udp_reply_v4(
@@ -1635,6 +1727,7 @@ impl UdpDirectNat {
                     sock,
                     last_seen: Instant::now(),
                     pump,
+                    dst_allow,
                 },
             );
         }
@@ -1644,6 +1737,13 @@ impl UdpDirectNat {
     /// 空闲会话回收（janitor 周期调用；abort 泵 + socket 随 Arc 归零关闭）。
     /// 先收集过期 key 再 remove（JoinHandle 非 Clone，需 move 出才能 abort）
     fn sweep_idle(&self) {
+        self.sweep_idle_collect();
+    }
+
+    /// [`Self::sweep_idle`] 的实现（返回被回收会话的泵句柄——测试断言
+    /// 「sweep 后泵任务结束」用，评审 P3-8）
+    fn sweep_idle_collect(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut pumps = Vec::new();
         if let Ok(mut s) = self.sessions.lock() {
             let now = Instant::now();
             let expired: Vec<SocketAddr> = s
@@ -1656,8 +1756,26 @@ impl UdpDirectNat {
             for k in expired {
                 if let Some(victim) = s.remove(&k) {
                     victim.pump.abort();
+                    pumps.push(victim.pump);
                     // socket 随 victim drop（Arc 归零）→ fd 真正关闭
                 }
+            }
+        }
+        pumps
+    }
+
+    /// 测试辅助（评审 P3-8）：当前会话数
+    #[cfg(test)]
+    fn session_count(&self) -> usize {
+        self.sessions.lock().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// 测试辅助（评审 P3-8）：把全部会话置为过期（sweep 前置，免 150s 等待）
+    #[cfg(test)]
+    fn expire_all_sessions(&self) {
+        if let Ok(mut s) = self.sessions.lock() {
+            for v in s.values_mut() {
+                v.last_seen = Instant::now() - Duration::from_secs(Self::IDLE_SECS + 1);
             }
         }
     }
@@ -2002,9 +2120,10 @@ fn try_forward_udp<'a>(
     cmd_tx: &'a tokio::sync::mpsc::Sender<UdpCmd>,
     rule: Option<&'a hydra_core::routing_rules::RuleEngine>,
     direct: Option<&'a UdpDirectNat>,
+    dns_direct: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
     Box::pin(
-        async move { try_forward_udp_inner(pkt, cmd_tx, rule, direct).await },
+        async move { try_forward_udp_inner(pkt, cmd_tx, rule, direct, dns_direct).await },
     )
 }
 
@@ -2013,6 +2132,7 @@ async fn try_forward_udp_inner(
     cmd_tx: &tokio::sync::mpsc::Sender<UdpCmd>,
     rule: Option<&hydra_core::routing_rules::RuleEngine>,
     direct: Option<&UdpDirectNat>,
+    dns_direct: bool,
 ) -> bool {
     let parsed = parse_udp_v4(pkt).or_else(|| parse_udp_v6(pkt));
     let Some((src, dst, off, len)) = parsed else {
@@ -2051,9 +2171,15 @@ async fn try_forward_udp_inner(
     if excluded {
         return false;
     }
-    // R1：规则判定——DIRECT 走直连 NAT 直发（bind 物理源 IP + 回包注入 TUN）
+    // R1：规则判定——DIRECT 走直连 NAT 直发（bind 物理源 IP + 回包注入 TUN）。
+    // 评审 P2-5：`dns_direct`（= !dns_via_proxy，builder 填充）时对端口 53 的
+    // UDP **无条件判 DIRECT**——先于 GeoIP/默认策略（防 DNS over 隧道使国内
+    // CDN 解析到海外边缘 IP），与私网内置直连语义同为 DIRECT 无顺序冲突；
+    // 该族 bind 不可用/直发失败 → forward 返回 false，回落下方原逻辑（中继）。
     if let (Some(rule), Some(direct)) = (rule, direct) {
-        if rule.decide(dst) == hydra_core::routing_rules::Decision::Direct {
+        let decision = rule.decide(dst);
+        let force_dns_direct = dns_direct && dst.port() == 53;
+        if decision == hydra_core::routing_rules::Decision::Direct || force_dns_direct {
             let payload = &pkt[off..off + len];
             if direct.forward(src, dst, payload).await {
                 return true;
@@ -2130,21 +2256,20 @@ fn ensure_dynamic_listener(
 /// 保持 v1 行为（公网 UDP 代答 ICMP 不可达回落 TCP）。
 pub async fn run_stack<T: PacketTransport>(
     transport: Arc<T>,
-    mut cfg: TunConfig,
+    cfg: TunConfig,
     opener: ChannelOpener,
     udp_factory: Option<UdpChannelFactory>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     // ── 智能分流（规则模式 v1.1）接线 ──
-    // R2 DNS 策略联动：规则模式强制等效 HYDRA_TUN_DNS_DIRECT=1（DNS 直连解析）——
-    // 否则国内 CDN 域名经境外节点解析返回海外边缘 IP（不在 CN 表内），GeoIP
-    // 对 CDN 主体流量静默失效。builder（tun_config_from_settings）已提前联动
-    // 并生成 DNS 豁免路由，此处兜底覆盖 CLI 等其他构造路径。
+    // 评审 P2-5：删除此前的「伪兜底」（原实现仅改本函数局部 `cfg.dns_via_proxy`
+    // 再打一条误导性 info——真正生效在 builder 生成的 DNS 豁免路由，此处改值
+    // 什么都没做）。改为仅告警：自建 TunConfig（Android 式/测试/未来 CLI）路径
+    // 未做 DNS 直连联动时提示风险，不再伪装成已联动。
     if cfg.rule_engine.is_some() && cfg.dns_via_proxy {
-        cfg.dns_via_proxy = false;
-        info!(
-            "TUN 规则模式：DNS 联动强制直连解析（等效 HYDRA_TUN_DNS_DIRECT=1）——\
-             经节点解析会使国内 CDN 拿到海外边缘 IP、GeoIP 分流失效"
+        warn!(
+            "规则模式已启用但 dns_via_proxy=true：该构造路径未做 DNS 直连联动，\
+             国内 CDN 域名可能被 GeoIP 误判走节点（应经 tun_config_from_settings 构造）"
         );
     }
     // R4 退化告警：直连源 IP 探测失败（None）→ 全部走节点（规则模式静默
@@ -2402,6 +2527,7 @@ pub async fn run_stack<T: PacketTransport>(
                                     tx,
                                     cfg.rule_engine.as_deref(),
                                     udp_direct.as_deref(),
+                                    cfg.dns_direct,
                                 )
                                 .await;
                             } else {
@@ -2435,6 +2561,7 @@ pub async fn run_stack<T: PacketTransport>(
                                 tx,
                                 cfg.rule_engine.as_deref(),
                                 udp_direct.as_deref(),
+                                cfg.dns_direct,
                             )
                             .await;
                         } else if no_relay {
@@ -4661,5 +4788,184 @@ mod tests {
         assert_eq!(checksum16(&covered), 0, "v6 UDP 回包校验和必须覆盖载荷");
         let stored = u16::from_be_bytes([pkt[46], pkt[47]]);
         assert_ne!(stored, 0, "v6 校验和不得为 0（RFC 2460 要求 0xFFFF）");
+    }
+
+    // ── 评审 P3-7：直连 UDP 回包来源白名单 ──
+    #[test]
+    fn udp_direct_回包来源allowlist_淘汰与过滤() {
+        let allow: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(Vec::new()));
+        let mk = |p: u16| -> SocketAddr { format!("93.184.216.34:{p}").parse().unwrap() };
+        for i in 0..8u16 {
+            record_dst(&allow, mk(1000 + i));
+        }
+        // 8 个目的地全部在白名单内
+        for i in 0..8u16 {
+            assert!(dst_allowed(&allow, mk(1000 + i)));
+        }
+        // 第 9 个目的地：FIFO 淘汰最旧（1000）
+        record_dst(&allow, mk(2000));
+        assert!(!dst_allowed(&allow, mk(1000)), "超上限应 FIFO 淘汰最旧目的地");
+        assert_eq!(allow.lock().unwrap().len(), DST_ALLOW_CAP, "白名单长度应有界");
+        assert!(dst_allowed(&allow, mk(2000)));
+        // 未直发过的来源不得注入（防全锥 NAT 第三方伪造回包）
+        assert!(!dst_allowed(&allow, mk(3000)));
+        // 重复直发同一目的地不重复记录、不淘汰
+        record_dst(&allow, mk(2000));
+        assert_eq!(allow.lock().unwrap().len(), DST_ALLOW_CAP);
+    }
+
+    // ── 评审 P3-8 ②：sweep 后泵任务结束 ──
+    #[tokio::test]
+    async fn udp_direct_nat_sweep后泵任务结束() {
+        // 哑 transport（回包泵只 recv，不发）
+        let (_in_tx, in_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let transport = Arc::new(TestTransport {
+            inbound: tokio::sync::Mutex::new(in_rx),
+            outbound: out_tx,
+        });
+        let nat = UdpDirectNat::new(
+            Arc::new(hydra_core::routing_rules::RuleEngine::builtin_cn()),
+            Some("127.0.0.1".parse().unwrap()),
+            None,
+            transport,
+        );
+        let src: SocketAddr = "10.7.0.1:50000".parse().unwrap();
+        nat.ensure_session(src).expect("回环 bind 建会话应成功");
+        assert_eq!(nat.session_count(), 1);
+        // 置为过期（免等 150s idle）→ sweep → 表空 + 泵被 abort 结束
+        nat.expire_all_sessions();
+        let pumps = nat.sweep_idle_collect();
+        assert_eq!(pumps.len(), 1, "应恰好回收 1 个会话的泵");
+        assert_eq!(nat.session_count(), 0, "sweep 后会话表应为空");
+        // 留 100ms 余量等 abort 生效
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            pumps.iter().all(|p| p.is_finished()),
+            "sweep 后回包泵任务应已结束"
+        );
+    }
+
+    // ── 评审 P3-8 ①：规则模式 + 假 bind 源 IP + 本机 UDP 回显端到端 ──
+    // 客户端 UDP 包（10.7.0.1:41000 → 127.0.0.1:echo）经 run_stack 分发 →
+    // 内置私网 DIRECT（R5）→ UdpDirectNat bind 127.0.0.1 直发（不经节点）→
+    // 回包注入 TUN。断言：载荷回显 + RFC 1071 反码和 == 0（校验和真实有效）。
+    #[tokio::test]
+    async fn run_stack_规则模式udp直连_回环端到端校验和归零() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .try_init();
+
+        // 1. 本机 UDP 回显服务
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 2048];
+            loop {
+                if let Ok((n, from)) = echo.recv_from(&mut b).await {
+                    let _ = echo.send_to(&b[..n], from).await;
+                }
+            }
+        });
+
+        // 2. 规则模式配置：内置 GeoIP-CN 引擎（含 R5 内置私网/回环 DIRECT）；
+        // 「假 bind 源 IP」= 127.0.0.1（mock 基建下直连 socket 可达本机回显）；
+        // dns_direct=false（仅验证直连主路径，53 端口联动另有单测覆盖）
+        let cfg = TunConfig {
+            udp_relay: true,
+            dns_via_proxy: true,
+            dns_direct: false,
+            rule_engine: Some(Arc::new(hydra_core::routing_rules::RuleEngine::builtin_cn())),
+            direct_bind_ipv4: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            ..Default::default()
+        };
+        // 哑 TCP opener + 哑 UDP 工厂（DIRECT 路径不应触达节点；触达即失败可辨）
+        let opener: ChannelOpener = Arc::new(|_t: String| {
+            Box::pin(async {
+                Err(HydraError::ConnectionError("测试未使用 TCP 路径".into()))
+            }) as OpenFuture
+        }) as ChannelOpener;
+        let factory: hydra_core::udp_relay::UdpChannelFactory = Arc::new(|| {
+            Box::pin(async {
+                Err(HydraError::ConnectionError("DIRECT 路径不应使用 UDP 中继".into()))
+                    as Result<hydra_core::udp_relay::NodeUdpChannel>
+            }) as std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<hydra_core::udp_relay::NodeUdpChannel>> + Send>,
+            >
+        });
+
+        // 3. mock TUN：入站注入客户端 UDP 包，出站收集回包
+        let (in_tx, in_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let transport = Arc::new(TestTransport {
+            inbound: tokio::sync::Mutex::new(in_rx),
+            outbound: out_tx,
+        });
+        let payload = b"hydra-rule-direct-e2e";
+        let src_ip = Ipv4Addr::new(10, 7, 0, 1);
+        let mut pkt = Vec::with_capacity(20 + 8 + payload.len());
+        pkt.extend_from_slice(&[0x45, 0, 0, 0]);
+        let total = (28 + payload.len()) as u16;
+        pkt[2..4].copy_from_slice(&total.to_be_bytes());
+        pkt.extend_from_slice(&[0, 1, 0, 0, 64, 17, 0, 0]);
+        pkt.extend_from_slice(&src_ip.octets());
+        pkt.extend_from_slice(&[127, 0, 0, 1]); // 回环目标 → 内置 DIRECT
+        pkt.extend_from_slice(&41000u16.to_be_bytes());
+        pkt.extend_from_slice(&echo_addr.port().to_be_bytes());
+        pkt.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        pkt.extend_from_slice(&[0, 0]);
+        pkt.extend_from_slice(payload);
+        assert!(parse_udp_v4(&pkt).is_some());
+
+        let shutdown = CancellationToken::new();
+        tokio::spawn(run_stack(
+            transport,
+            cfg,
+            opener,
+            Some(factory),
+            shutdown.clone(),
+        ));
+        in_tx.send(pkt).unwrap();
+
+        // 4. 等回包（最长 8s）：src=echo, dst=10.7.0.1:41000，载荷回显 + 校验和归零
+        let mut got = false;
+        for _ in 0..160 {
+            match tokio::time::timeout(Duration::from_millis(50), out_rx.recv()).await {
+                Ok(Some(p)) => {
+                    if p.len() >= 28 + payload.len() && p[0] >> 4 == 4 && p[9] == 17 {
+                        let s = Ipv4Addr::new(p[12], p[13], p[14], p[15]);
+                        let d = Ipv4Addr::new(p[16], p[17], p[18], p[19]);
+                        let sp = u16::from_be_bytes([p[20], p[21]]);
+                        let dp = u16::from_be_bytes([p[22], p[23]]);
+                        if s == echo_addr.ip()
+                            && d == src_ip
+                            && sp == echo_addr.port()
+                            && dp == 41000
+                            && &p[28..] == payload
+                        {
+                            // RFC 1071 反码和校验（伪首部 + UDP 段）必须为 0
+                            let udp_len = u16::from_be_bytes([p[24], p[25]]) as usize;
+                            let mut pseudo = Vec::new();
+                            pseudo.extend_from_slice(&p[12..20]); // src+dst
+                            pseudo.push(0);
+                            pseudo.push(17);
+                            pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
+                            pseudo.extend_from_slice(&p[20..20 + udp_len]);
+                            assert_eq!(
+                                checksum16(&pseudo),
+                                0,
+                                "直连回包校验和（覆盖载荷）反码和必须为 0"
+                            );
+                            got = true;
+                            break;
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+        shutdown.cancel();
+        assert!(got, "应在超时前收到经直连 NAT 注入的 UDP 回包（src/dst/载荷匹配）");
     }
 }

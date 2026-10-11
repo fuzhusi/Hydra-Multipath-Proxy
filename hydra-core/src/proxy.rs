@@ -502,6 +502,28 @@ impl ProxyServer {
                     Err(_) => return (proxy_opener)(target).await, // 非 IP 目标 → 走节点
                 };
                 if engine.decide(addr) == crate::routing_rules::Decision::Direct {
+                    // 评审 P2-4：非 Windows 显式禁用规则分流直连（强告警）——
+                    // Linux 弱主机模型下 bind 源 IP **不约束出接口**（目的路由
+                    // 仍可能命中 /1 接管 → 包回自身 TUN 回环），规则分流直连
+                    // 暂不可用（计划 SO_BINDTODEVICE/接口 index 方案）。非
+                    // Android（无 protect 钩子）一律跳过直连走节点；私网/回环
+                    // 目标同样保守走节点（防回环），例外仅保留 Windows（强主机
+                    // 模型，bind 即约束出接口）。AtomicBool 去重防每连接刷屏。
+                    #[cfg(not(windows))]
+                    {
+                        if !crate::socket_protect::socket_protect_installed() {
+                            static NON_WIN_DIRECT_WARNED:
+                                std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !NON_WIN_DIRECT_WARNED.swap(true, Ordering::Relaxed) {
+                                warn!(
+                                    "TUN 规则分流直连在非 Windows 平台已禁用：Linux 弱主机模型下 \
+                                     bind 源 IP 不约束出接口，规则分流直连暂不可用（计划 \
+                                     SO_BINDTODEVICE）——全部走节点"
+                                );
+                            }
+                            return (proxy_opener)(target).await;
+                        }
+                    }
                     let bind = match addr {
                         SocketAddr::V4(_) => direct_bind_ipv4,
                         SocketAddr::V6(_) => direct_bind_ipv6,
@@ -543,6 +565,19 @@ impl ProxyServer {
                             return Ok(duplex);
                         }
                         Ok(Err(e)) => {
+                            // 评审 P2-6：bind 失败计数告警（每 32 次一次，防刷屏）——
+                            // 物理网卡换网/DHCP 续租后源 IP 失效的可见信号。
+                            // **不做自动重探**：探测依赖 TUN 接管生成前的路由
+                            // 上下文，运行期 /1 接管路由在场时重探结果同样不可信
+                            // （可能选中 TUN 自身地址 → 回环），故仅提示重启
+                            static DIRECT_BIND_FAILS: AtomicUsize = AtomicUsize::new(0);
+                            let fails = DIRECT_BIND_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+                            if fails.is_multiple_of(32) {
+                                warn!(
+                                    "TUN 规则直连已失败 {fails} 次：物理源 IP 可能已失效，\
+                                     建议重启代理"
+                                );
+                            }
                             warn!("TUN 规则直连失败（{}: {e}）→ 回退走节点", mask_target(&target));
                         }
                         Err(_) => {

@@ -4,9 +4,10 @@
 //! 1. 规则文件解析（容错：UTF-8 BOM / CRLF / 行尾空白 / `#` 内联注释 /
 //!    GBK 非法 UTF-8 行告警跳过——评审 R8）；
 //! 2. 规则类型：IP-CIDR（v4+v6）/ GEOIP CN / DST-PORT（v1 范围）；
-//! 3. 匹配 [`RuleEngine::decide`]（顺序，评审 §三.2）：
-//!    内置「私网/回环/链路本地 → DIRECT」（R5，最高优先）→ 自定义规则
-//!    （端口线性 + CIDR 匹配）→ GeoIP-CN 二分 → 默认 Proxy；
+//! 3. 匹配 [`RuleEngine::decide`]（顺序，评审 P2-3 文档对齐口径）：
+//!    内置「私网/回环/链路本地 → DIRECT」（R5，最高优先）→ **端口例外层**
+//!    （DST-PORT 线性，恒先于 CIDR——端口为最高优先例外层）→ 自定义 CIDR
+//!    匹配 → GeoIP-CN 二分 → 默认 Proxy；
 //! 4. GeoIP-CN 表：构建期由 `scripts/gen-geoip.ps1` 生成的
 //!    `assets/geoip_cn.dat`（v4 + v6 段，评审 R6），`include_bytes!` 嵌入 +
 //!    懒解析 OnceLock，查询为排序段二分 O(log n)；
@@ -188,10 +189,10 @@ const CIDR_BINARY_SEARCH_THRESHOLD: usize = 16;
 pub struct RuleEngine {
     /// DST-PORT 规则（线性，数量小；评审 §2.3：仅作 DIRECT 例外等次要手段）
     port_rules: Vec<(u16, Action)>,
-    /// 自定义 CIDR v4（文件顺序；≤阈值时线性首中即返回）
-    cidr4: Vec<(u32, u32, Action)>,
+    /// 自定义 CIDR v4（文件顺序 + 原始序号（P3-2 排序稳定性）；≤阈值时线性首中即返回）
+    cidr4: Vec<(u32, u32, Action, u32)>,
     /// 自定义 CIDR v6（同上）
-    cidr6: Vec<(u128, u128, Action)>,
+    cidr6: Vec<(u128, u128, Action, u32)>,
     /// ≥阈值时对 CIDR 构建的排序合并段（先出现规则优先，跨动作重叠裁剪后段）
     cidr4_sorted: Option<Vec<(u32, u32, Action)>>,
     cidr6_sorted: Option<Vec<(u128, u128, Action)>>,
@@ -304,8 +305,16 @@ impl RuleEngine {
                     return false;
                 }
                 match parse_cidr(parts[1]) {
-                    Ok(Cidr::V4(s, e)) => self.cidr4.push((s, e, action)),
-                    Ok(Cidr::V6(s, e)) => self.cidr6.push((s, e, action)),
+                    // P3-2：记录原始序号（本地址族内的文件出现顺序），供排序
+                    // 合并时做稳定 tiebreak（同起止段跨动作规则命中可确定）
+                    Ok(Cidr::V4(s, e)) => {
+                        let idx = self.cidr4.len() as u32;
+                        self.cidr4.push((s, e, action, idx));
+                    }
+                    Ok(Cidr::V6(s, e)) => {
+                        let idx = self.cidr6.len() as u32;
+                        self.cidr6.push((s, e, action, idx));
+                    }
                     Err(e) => {
                         tracing::warn!("规则文件 CIDR 非法（{e}），跳过: {line}");
                         return false;
@@ -375,11 +384,19 @@ impl RuleEngine {
         }
         let hit4 = |ip: u32| match &self.cidr4_sorted {
             Some(segs) => lookup_sorted(segs, ip),
-            None => self.cidr4.iter().find(|(s, e, _)| ip >= *s && ip <= *e).map(|r| r.2),
+            None => self
+                .cidr4
+                .iter()
+                .find(|(s, e, _, _)| ip >= *s && ip <= *e)
+                .map(|r| r.2),
         };
         let hit6 = |ip: u128| match &self.cidr6_sorted {
             Some(segs) => lookup_sorted(segs, ip),
-            None => self.cidr6.iter().find(|(s, e, _)| ip >= *s && ip <= *e).map(|r| r.2),
+            None => self
+                .cidr6
+                .iter()
+                .find(|(s, e, _, _)| ip >= *s && ip <= *e)
+                .map(|r| r.2),
         };
         let custom = match dst.ip() {
             IpAddr::V4(ip) => hit4(u32::from(ip)),
@@ -471,15 +488,18 @@ fn host_mask(prefix: u32) -> u32 {
 }
 
 /// 排序合并（先出现规则优先语义保持）——IPv4 版：
+/// - 排序键 = (start, end, 原始序号)（P3-2：同起止段跨动作规则经 sort_unstable
+///   命中不确定 → 以解析时记录的原始序号做稳定 tiebreak，同段同动作取序号
+///   小者、跨动作重叠仍「先出现优先」）；
 /// - 同动作重叠段合并；
 /// - 跨动作重叠：先出现的规则胜出，后段从 `last.end+1` 起裁剪
 ///   （首中即返回语义，交界的单个 IP 归先出现规则）。
 ///
-/// 输出按 start 升序不重叠，可安全二分。
-fn merge_cidr4(segs: &mut [(u32, u32, Action)]) -> Vec<(u32, u32, Action)> {
-    segs.sort_unstable_by_key(|&(s, e, _)| (s, e));
+/// 输出按 start 升序不重叠（原始序号列丢弃），可安全二分。
+fn merge_cidr4(segs: &mut [(u32, u32, Action, u32)]) -> Vec<(u32, u32, Action)> {
+    segs.sort_unstable_by_key(|&(s, e, _, idx)| (s, e, idx));
     let mut out: Vec<(u32, u32, Action)> = Vec::with_capacity(segs.len());
-    for &(s, e, a) in segs.iter() {
+    for &(s, e, a, _) in segs.iter() {
         // 先以不可变借用取前段信息，避免 push 与 last_mut 的借用冲突
         let prev = out.last().filter(|last| s <= last.1).map(|last| (last.2 == a, last.1));
         match prev {
@@ -500,11 +520,11 @@ fn merge_cidr4(segs: &mut [(u32, u32, Action)]) -> Vec<(u32, u32, Action)> {
     out
 }
 
-/// 排序合并——IPv6 版（u128，语义同 [`merge_cidr4`]）
-fn merge_cidr6(segs: &mut [(u128, u128, Action)]) -> Vec<(u128, u128, Action)> {
-    segs.sort_unstable_by_key(|&(s, e, _)| (s, e));
+/// 排序合并——IPv6 版（u128，语义同 [`merge_cidr4`]，含 P3-2 原始序号 tiebreak）
+fn merge_cidr6(segs: &mut [(u128, u128, Action, u32)]) -> Vec<(u128, u128, Action)> {
+    segs.sort_unstable_by_key(|&(s, e, _, idx)| (s, e, idx));
     let mut out: Vec<(u128, u128, Action)> = Vec::with_capacity(segs.len());
-    for &(s, e, a) in segs.iter() {
+    for &(s, e, a, _) in segs.iter() {
         let prev = out.last().filter(|last| s <= last.1).map(|last| (last.2 == a, last.1));
         match prev {
             Some((same_action, last_end)) => {
@@ -534,26 +554,29 @@ fn lookup_sorted<T: Copy + PartialOrd>(segs: &[(T, T, Action)], ip: T) -> Option
     None
 }
 
-/// 内置最高优先级直连（R5）：私网 / 回环 / 链路本地 / 未指定 / 0.0.0.0::/8 与
-/// 运营商级 NAT 100.64/10 / 组播 / 广播 / ULA。与 tun.rs 的私网过滤口径一致。
+/// 内置最高优先级直连（R5，P3-3/3-4 口径修正）——**显式网段清单**（不再依赖
+/// std `is_private`：其另含 192.0.0.0/24、198.18.0.0/15 等保留段，口径不透明）：
+/// - IPv4：127/8 回环、10/8、172.16/12、192.168/16（RFC1918）、
+///   169.254/16 链路本地、100.64/10 CGNAT；
+/// - IPv6：::1、fc00::/7 ULA、fe80::/10 链路本地。
+///
+/// **不再内置 DIRECT**（与 tun.rs UDP 侧口径对齐）：组播 / 广播 / 未指定 /
+/// 0.0.0.0::/8——UDP 侧仍拦截（不回差错），TCP 侧落到默认 PROXY 走节点。
 pub fn is_builtin_direct(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_private()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                || v4.is_unspecified()
-                || v4.octets()[0] == 0
-                || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]))
+            let o = v4.octets();
+            o[0] == 127                                        // 127/8 回环
+                || o[0] == 10                                  // 10/8
+                || (o[0] == 172 && (16..=31).contains(&o[1]))  // 172.16/12
+                || (o[0] == 192 && o[1] == 168)                // 192.168/16
+                || (o[0] == 169 && o[1] == 254)                // 169.254/16 链路本地
+                || (o[0] == 100 && (64..=127).contains(&o[1])) // 100.64/10 CGNAT
         }
         IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 链路本地
+            v6.is_loopback()                             // ::1
                 || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
-                || v6.is_multicast()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 链路本地
         }
     }
 }
@@ -658,7 +681,7 @@ mod tests {
         assert_eq!(decide_str(&eng, "8.8.8.8:443"), Decision::Proxy);
     }
 
-    // ── 匹配优先级 ──
+    // ── 匹配优先级（P2-3 口径：内置私网 → 端口例外层 → 自定义 CIDR → GeoIP）──
     #[test]
     fn 优先级_私网内置最高() {
         // 即便规则写 PROXY，私网仍内置 DIRECT（R5）
@@ -671,6 +694,7 @@ mod tests {
 
     #[test]
     fn 优先级_端口与自定义_cidr先于_geoip() {
+        // P2-3 口径：端口为最高优先例外层（恒先于 CIDR），CIDR 依序先于 GeoIP
         // 8.8.8.8 非 CN；端口 53 放行直连（DST-PORT 例外形态，评审 §2.3）
         let eng = RuleEngine::from_bytes(b"DST-PORT,53,DIRECT\nGEOIP,CN,DIRECT\n");
         assert_eq!(decide_str(&eng, "8.8.8.8:53"), Decision::Direct);
@@ -705,6 +729,28 @@ mod tests {
         // 先出现的 21/8 PROXY 覆盖全部 DIRECT 子段（首中即返回语义）
         assert_eq!(decide_str(&eng, "21.30.0.1:80"), Decision::Proxy);
         assert_eq!(decide_str(&eng, "22.0.0.1:80"), Decision::Proxy);
+    }
+
+    // ── P3-2：同起止段跨动作规则经排序合并命中必须确定（原始序号 tiebreak）──
+    #[test]
+    fn 大量cidr_同段跨动作_先出现者胜() {
+        // 60+ 条触发二分索引路径；前两条为**完全相同段**的 DIRECT/PROXY——
+        // 修复前 sort_unstable_by_key(|(s, e)|) 对同键元素顺序不定，
+        // 命中结果不确定；修复后按原始序号 tiebreak，先出现者恒胜
+        let mut rules = String::from("IP-CIDR,23.0.0.0/16,DIRECT\nIP-CIDR,23.0.0.0/16,PROXY\n");
+        for i in 1..60u32 {
+            rules.push_str(&format!("IP-CIDR,23.{i}.0.0/16,DIRECT\n"));
+        }
+        let eng = RuleEngine::from_bytes(rules.as_bytes());
+        assert!(eng.cidr4_sorted.is_some());
+        assert_eq!(decide_str(&eng, "23.0.0.1:80"), Decision::Direct);
+        // 反序：先 PROXY 后 DIRECT → PROXY 胜（与文件顺序一致，可确定）
+        let mut rev = String::from("IP-CIDR,24.0.0.0/16,PROXY\nIP-CIDR,24.0.0.0/16,DIRECT\n");
+        for i in 1..60u32 {
+            rev.push_str(&format!("IP-CIDR,24.{i}.0.0/16,DIRECT\n"));
+        }
+        let eng2 = RuleEngine::from_bytes(rev.as_bytes());
+        assert_eq!(decide_str(&eng2, "24.0.0.1:80"), Decision::Proxy);
     }
 
     // ── R8 容错解析 ──
@@ -742,13 +788,12 @@ mod tests {
         assert_eq!(decide_str(&eng, "9.9.9.9:80"), Decision::Direct);
     }
 
-    // ── 内置直连判定（R5）──
+    // ── 内置直连判定（R5，P3-3/3-4 显式清单口径）──
     #[test]
     fn 内置直连_口径完整() {
         for t in [
             "10.0.0.1:1", "172.16.0.1:1", "192.168.1.1:1", "127.0.0.1:1",
-            "169.254.1.1:1", "100.64.0.1:1", "0.1.2.3:1", "255.255.255.255:1",
-            "224.0.0.1:1", "[::1]:1", "[fe80::1]:1", "[fc00::1]:1", "[ff02::1]:1",
+            "169.254.1.1:1", "100.64.0.1:1", "[::1]:1", "[fe80::1]:1", "[fc00::1]:1",
         ] {
             assert_eq!(
                 decide_str(&RuleEngine::builtin_cn(), t),
@@ -756,15 +801,34 @@ mod tests {
                 "{t} 应内置 DIRECT"
             );
         }
+        // P3-3/3-4：组播/广播/未指定/0.x **不再内置 DIRECT**（与 UDP 侧口径
+        // 对齐：UDP 侧仍拦，TCP 侧落到默认 PROXY 走节点）
+        for t in [
+            "0.1.2.3:1", "255.255.255.255:1", "224.0.0.1:1", "[ff02::1]:1",
+            "[::]:1",
+        ] {
+            assert_eq!(
+                decide_str(&RuleEngine::builtin_cn(), t),
+                Decision::Proxy,
+                "{t} 不应内置 DIRECT（TCP 侧默认 PROXY）"
+            );
+        }
+        // 边界：172.16/12 两端、100.64/10 两端、192.0.0.0/24（std is_private
+        // 含但本清单不含——保留段不直连）
+        assert_eq!(decide_str(&RuleEngine::builtin_cn(), "172.31.255.255:1"), Decision::Direct);
+        assert_eq!(decide_str(&RuleEngine::builtin_cn(), "172.32.0.1:1"), Decision::Proxy);
+        assert_eq!(decide_str(&RuleEngine::builtin_cn(), "100.127.255.255:1"), Decision::Direct);
+        assert_eq!(decide_str(&RuleEngine::builtin_cn(), "192.0.0.1:1"), Decision::Proxy);
+        assert_eq!(decide_str(&RuleEngine::builtin_cn(), "198.18.0.1:1"), Decision::Proxy);
     }
 
     // ── merge 辅助：跨动作裁剪后的二分正确性 ──
     #[test]
     fn 合并裁剪_二分查找无假阳() {
-        let mut segs: Vec<(u32, u32, Action)> = vec![
-            (10, 20, Action::Direct),
-            (15, 25, Action::Proxy), // 与前段重叠：交界起裁剪
-            (30, 40, Action::Direct),
+        let mut segs: Vec<(u32, u32, Action, u32)> = vec![
+            (10, 20, Action::Direct, 0),
+            (15, 25, Action::Proxy, 1), // 与前段重叠：交界起裁剪
+            (30, 40, Action::Direct, 2),
         ];
         let merged = merge_cidr4(&mut segs);
         let hit = |ip| lookup_sorted(&merged, ip);
