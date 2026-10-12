@@ -382,6 +382,114 @@ impl HydraApp {
             ui.small("托盘左键单击 = 显示/隐藏主窗；托盘右键菜单 = 显示主窗 / 启动 / 停止 / 退出");
         });
 
+        // ◈ 📝 日志（批次 A3/A4：级别热调 + 自动保存开关；沿用既有设置行样式）
+        egui::CollapsingHeader::new(
+            egui::RichText::new("📝 日志")
+                .size(palette::FONT_TITLE)
+                .strong(),
+        )
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.colored_label(
+                palette::text_weak(),
+                "说明：日志级别即时热调（无需重启）并持久化；内核事件见「📜 日志」页",
+            );
+            // A4：日志级别下拉（error/warn/info/debug/trace）——选中即热调
+            // reload EnvFilter + 持久化；启动时按配置初始化（见 main.rs init_logging）。
+            // P2-2：选中值经 config 归一化落盘（trim + 小写白名单）；RUST_LOG
+            // 环境变量已设置 → 下拉禁用 + hover 提示，热调调用点同步跳过 reload。
+            ui.horizontal(|ui| {
+                ui.label("日志级别:");
+                let current = self.config.log_level_effective();
+                let rust_log = crate::log_bridge::rust_log_override();
+                if rust_log {
+                    // P2-2：RUST_LOG 环境变量优先，热调已跳过（下拉整体禁用 + 提示）
+                    let (combo_rect,) = ui
+                        .add_enabled_ui(false, |ui| {
+                            egui::ComboBox::from_id_source("log_level_combo")
+                                .selected_text(current.clone())
+                                .show_ui(ui, |ui| {
+                                    for level in ["error", "warn", "info", "debug", "trace"] {
+                                        // 禁用态仅展示不响应点击（selectable_label must_use 抑制）
+                                        let _ = ui.selectable_label(current == level, level);
+                                    }
+                                });
+                            (ui.min_rect(),)
+                        })
+                        .inner;
+                    // ComboBox 非 Widget 拿不到自身 Response：用其绘制矩形补一个
+                    // hover 命中区（egui 0.27 Ui::interact）挂禁用提示
+                    let resp = ui.interact(
+                        combo_rect,
+                        egui::Id::new("log_level_combo_rustlog_hint"),
+                        egui::Sense::hover(),
+                    );
+                    resp.on_disabled_hover_text("RUST_LOG 环境变量优先，热调已跳过");
+                    ui.small("（RUST_LOG 环境变量优先，级别热调已跳过）");
+                } else {
+                    egui::ComboBox::from_id_source("log_level_combo")
+                        .selected_text(current.clone())
+                        .show_ui(ui, |ui| {
+                            for level in ["error", "warn", "info", "debug", "trace"] {
+                                if ui
+                                    .selectable_label(current == level, level)
+                                    .clicked()
+                                    && current != level
+                                {
+                                    match crate::log_bridge::set_level(level) {
+                                        Ok(()) => {
+                                            // P2-2：落盘值即归一值（下拉白名单本身就是小写规范形）
+                                            self.config.log_level = level.to_string();
+                                            self.maybe_save_config(true);
+                                            self.add_log(format!(
+                                                "日志级别已切换为 {level}（即时生效）"
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            self.add_error(format!("日志级别切换失败: {e}"))
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                }
+                if current == "debug" || current == "trace" {
+                    ui.colored_label(palette::warning(), "⚠ debug/trace 事件量大，排障后建议切回 info");
+                }
+            });
+            // A3：「自动保存日志」开关（默认关 = 与基线行为一致）。
+            // 开 = 追加写 %APPDATA%\hydra\logs\gui.log（每日滚动）；关 = 不写。
+            ui.horizontal(|ui| {
+                let mut on = self.config.log_to_file;
+                if ui.checkbox(&mut on, "自动保存日志到文件（每日滚动）").changed() {
+                    // 开关门控（无失败路径）；级别跟随全局 EnvFilter
+                    //（P2-2：级别取归一化口径）
+                    crate::log_bridge::set_file_logging(on, &self.config.log_level_effective());
+                    {
+                        self.config.log_to_file = on;
+                            self.maybe_save_config(true);
+                            let path = config::config_dir()
+                                .map(|d| d.join("logs").join("gui.log"))
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "logs\\gui.log".to_string());
+                            self.add_log(if on {
+                                format!("自动保存日志：已开启（{}）", path)
+                            } else {
+                                "自动保存日志：已关闭".to_string()
+                            });
+                    }
+                }
+            });
+            if self.config.log_to_file {
+                ui.small(format!(
+                    "日志文件: {}（日志页事件同步追加；每日滚动）",
+                    config::config_dir()
+                        .map(|d| d.join("logs").join("gui.log").display().to_string())
+                        .unwrap_or_else(|| "(配置目录不可用)".to_string())
+                ));
+            }
+        });
+
         // ◈ ⑥ 外观与数据（默认收起：主题与配置目录）
         egui::CollapsingHeader::new(
             egui::RichText::new("🎨 外观与数据")

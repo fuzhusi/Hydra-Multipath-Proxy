@@ -433,7 +433,13 @@ pub async fn connect_target(
         }
     }
     let tls = rd.unsplit(wr);
-    info!("✓ TCP/TLS target {} opened", mask_target(target));
+    // A1 字段化：通道打开事件（目标掩码/方向/路径，替代 format! 内嵌）
+    info!(
+        target = %mask_target(target),
+        direction = "outbound",
+        path = "node",
+        "TCP/TLS 通道打开"
+    );
     Ok(tls)
 }
 
@@ -674,8 +680,13 @@ pub async fn request_target_with_timeout(
 
     // 握手/帧交互完成，读写两半合回流（同一 split 产物，unsplit 必成功）
     let tls = rd.unsplit(wr);
-    // 日志脱敏：info 级不落目标明文（审查 R-08）
-    info!("✓ TCP/TLS target {} opened", mask_target(target));
+    // 日志脱敏：info 级不落目标明文（审查 R-08）；A1 字段化
+    info!(
+        target = %mask_target(target),
+        direction = "outbound",
+        path = "node",
+        "TCP/TLS 通道打开（池化路径）"
+    );
     Ok(tls)
 }
 

@@ -367,7 +367,9 @@ impl ProxyServer {
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
-                    info!("━━━ New SOCKS5 connection from {} ━━━", addr);
+                    // A1 字段化：入站连接事件（peer 字段；目标地址在中继起点
+                    // 的「连接建立」事件给出掩码值）
+                    info!(direction = "inbound", peer = %addr, "SOCKS5/HTTP 入站连接建立");
                     let scheduler = self.scheduler.clone();
                     let traffic = traffic.clone();
                     let creds = creds.clone();
@@ -378,17 +380,19 @@ impl ProxyServer {
                             .await
                         {
                             Ok(()) => {
-                                info!("━━━ Connection from {} completed successfully ━━━", addr);
+                                // A1 字段化：连接完成事件（替代 ━━━ 内嵌格式串）
+                                info!(direction = "inbound", peer = %addr, result = "ok", "连接完成");
                             }
                             Err(e) => {
-                                error!("━━━ Connection error from {}: {} ━━━", addr, e);
+                                // A1 字段化：失败原因进 error 字段（脱敏后透传）
+                                error!(direction = "inbound", peer = %addr, result = "error", error = %e, "连接失败");
                                 // 注意：handle_connection 内部已经发送了 SOCKS5 错误响应
                             }
                         }
                     });
                 }
                 Err(e) => {
-                    error!("Failed to accept connection: {}", e);
+                    error!(direction = "inbound", error = %e, "accept 失败");
                 }
             }
         }
@@ -420,7 +424,8 @@ impl ProxyServer {
                 status: NodeStatus::Online,
             };
             self.scheduler.add_node(node).await;
-            info!("Added node to scheduler: {}", addr);
+            // A1 字段化：节点注册事件（node 字段）
+            info!(node = %addr, "节点已注册进调度器");
         }
     }
 
@@ -754,11 +759,12 @@ impl ProxyServer {
     ) -> Result<NodeLink> {
         const MAX_NODE_ATTEMPTS: usize = 3;
 
-        // 日志脱敏（Exec2）：info 及以上级别目标地址一律短哈希；完整明文仅 debug 级别
-        //（排查时开 RUST_LOG=debug 可见）
+        // 日志脱敏（Exec2 + P1-1）：info 及以上级别目标地址一律短哈希；debug 级
+        // 也不得以文本携带明文（GUI 环缓冲会捕获 debug 事件）——一律字段化 + 掩码
         debug!(
-            "[{}] open_target (plaintext for troubleshooting): {}",
-            peer_addr, target
+            target = %mask_target(target),
+            peer = %peer_addr,
+            "open_target 目标（掩码，排障）"
         );
 
         let sni = &creds.sni;
@@ -964,9 +970,11 @@ impl ProxyServer {
             peer_addr,
             mask_target(first_line_view)
         );
+        // P1-1：请求行含目标 URL，明文不进事件文本——字段化 + 掩码
         debug!(
-            "[{}] HTTP request (plaintext): {}",
-            peer_addr, first_line_view
+            target = %mask_target(first_line_view),
+            peer = %peer_addr,
+            "HTTP 请求行（掩码，排障）"
         );
 
         // 解析请求
@@ -995,9 +1003,12 @@ impl ProxyServer {
             method,
             mask_target(url)
         );
+        // P1-1：URL 明文不进事件文本——字段化 + 掩码
         debug!(
-            "[{}] HTTP request (plaintext): {} {}",
-            peer_addr, method, url
+            method = %method,
+            target = %mask_target(url),
+            peer = %peer_addr,
+            "HTTP 请求目标（掩码，排障）"
         );
 
         if method == "CONNECT" {
@@ -1008,9 +1019,11 @@ impl ProxyServer {
                 peer_addr,
                 mask_target(&target_str)
             );
+            // P1-1：CONNECT 目标明文不进事件文本——字段化 + 掩码
             debug!(
-                "[{}] >>> HTTP CONNECT request (plaintext): {}",
-                peer_addr, target_str
+                target = %mask_target(&target_str),
+                peer = %peer_addr,
+                "HTTP CONNECT 请求（掩码，排障）"
             );
             return Self::handle_http_connect(stream, target_str, scheduler, traffic, creds, routing_engine)
                 .await;
@@ -1101,9 +1114,12 @@ impl ProxyServer {
             method,
             mask_target(&target_host)
         );
+        // P1-1：目标主机明文不进事件文本——字段化 + 掩码
         debug!(
-            "[{}] >>> HTTP {} request (plaintext): {}",
-            peer_addr, method, target_host
+            method = %method,
+            target = %mask_target(&target_host),
+            peer = %peer_addr,
+            "HTTP 请求主机（掩码，排障）"
         );
 
         // 发送目标地址到服务器（包含端口）
@@ -1398,7 +1414,12 @@ impl ProxyServer {
                 let port = u16::from_be_bytes([body[4], body[5]]);
                 let v4_target = format!("{}:{}", ip, port);
                 info!("[{}] Target IPv4: {}", peer_addr, mask_target(&v4_target));
-                debug!("[{}] Target IPv4 (plaintext): {}", peer_addr, v4_target);
+                // P1-1：明文目标不进事件文本（GUI 环缓冲会捕获 debug 事件）——字段化 + 掩码
+                debug!(
+                    target = %mask_target(&v4_target),
+                    peer = %peer_addr,
+                    "SOCKS5 目标 IPv4（掩码，排障）"
+                );
                 v4_target
             }
             0x03 => {
@@ -1448,9 +1469,11 @@ impl ProxyServer {
                     peer_addr,
                     mask_target(&domain_target)
                 );
+                // P1-1：域名明文不进事件文本——字段化 + 掩码
                 debug!(
-                    "[{}] Target domain (plaintext): {} - sending to node for DNS resolution",
-                    peer_addr, domain_target
+                    target = %mask_target(&domain_target),
+                    peer = %peer_addr,
+                    "SOCKS5 目标域名（掩码，排障；域名由节点解析 DNS）"
                 );
                 domain_target
             }
@@ -1480,7 +1503,12 @@ impl ProxyServer {
                 let port = u16::from_be_bytes([body[16], body[17]]);
                 let v6_target = format!("[{}]:{}", ip, port);
                 info!("[{}] Target IPv6: {}", peer_addr, mask_target(&v6_target));
-                debug!("[{}] Target IPv6 (plaintext): {}", peer_addr, v6_target);
+                // P1-1：明文目标不进事件文本——字段化 + 掩码
+                debug!(
+                    target = %mask_target(&v6_target),
+                    peer = %peer_addr,
+                    "SOCKS5 目标 IPv6（掩码，排障）"
+                );
                 v6_target
             }
             _ => {
@@ -1503,9 +1531,11 @@ impl ProxyServer {
             peer_addr,
             mask_target(&target_str)
         );
+        // P1-1：CONNECT 目标明文不进事件文本——字段化 + 掩码
         debug!(
-            "[{}] >>> SOCKS5 CONNECT request (plaintext): {}",
-            peer_addr, target_str
+            target = %mask_target(&target_str),
+            peer = %peer_addr,
+            "SOCKS5 CONNECT 请求（掩码，排障）"
         );
 
         // Exec2 / 统一路由层：国内直连分流——引擎挂载时按统一规则面判定
@@ -1569,9 +1599,11 @@ impl ProxyServer {
         if !should_direct {
             return None;
         }
+        // P1-1：直连目标明文不进事件文本——字段化 + 掩码
         debug!(
-            "[{}] Direct (CN split) connect (plaintext): {}",
-            peer_addr, target
+            target = %mask_target(target),
+            peer = %peer_addr,
+            "CN 分流直连建连（掩码，排障）"
         );
         match tokio::time::timeout(
             DIRECT_CONNECT_TIMEOUT,
@@ -1651,11 +1683,30 @@ impl ProxyServer {
         ACTIVE_RELAYS.fetch_add(1, Ordering::Relaxed);
         let _guard = RelayGuard;
 
-        // 日志脱敏：info 级目标一律短哈希；明文仅 debug 级别（RUST_LOG=debug）
+        // 日志脱敏（P1-1 修订）：目标一律字段化 + 短哈希掩码——明文目标永不以
+        // 文本形式进入任何级别的事件（GUI 环缓冲经 KernelRingLayer 捕获全部
+        // debug/trace 事件，掩码边界必须保持在字段化层；排障靠哈希比对，
+        // 不再提供明文 debug 出口）
         let masked = mask_target(target);
         debug!(
-            "[{}] relay target (plaintext for troubleshooting): {}",
-            peer_addr, target
+            target = %masked,
+            peer = %peer_addr,
+            "relay 中继目标（掩码，排障）"
+        );
+        // A6（评审新增）：连接建立结构化事件（路径掩码 + 方向 + 出口形态）；
+        // 对应的「连接关闭」事件在本函数终点统一发出（含字节数/时长）。
+        // P2-1（评审修复）：连接级摘要事件从 info 降 debug——GUI 环缓冲信噪比
+        // 优化，内核连接级摘要保留在 debug 排障级别（需 RUST_LOG=debug 才可见）。
+        let relay_started = std::time::Instant::now();
+        let relay_path = match &link {
+            RemoteLink::Node { .. } => "node",
+            RemoteLink::Direct(_) => "direct",
+        };
+        debug!(
+            target = %masked,
+            direction = "outbound",
+            path = relay_path,
+            "连接建立（中继开始）"
         );
 
         // ── 连接注册表钩子（GUI「连接」页数据源，与 TrafficMonitor 同范式）──
@@ -1794,7 +1845,8 @@ impl ProxyServer {
             // 浏览器已关写侧且上行干净：保留下行，在超时窗口内收完剩余响应（半关闭）
             (true, None) => match tokio::time::timeout(RELAY_DRAIN_TIMEOUT, &mut down).await {
                 Ok(Ok(Ok(_))) => {
-                    info!(
+                    // A6：关闭原因进调试级（连接关闭统一事件在终点发出）
+                    debug!(
                         "[{}] Connection to {} closed (half-close drained)",
                         peer_addr, masked
                     );
@@ -1847,7 +1899,8 @@ impl ProxyServer {
                 match up_result {
                     Some(e) => Err(Self::relay_error(e, peer_addr, target)),
                     None => {
-                        info!("[{}] Connection to {} closed", peer_addr, masked);
+                        // A6：正常关闭原因进调试级（统一关闭事件在终点发出）
+                        debug!("[{}] Connection to {} closed", peer_addr, masked);
                         Ok(())
                     }
                 }
@@ -1860,7 +1913,21 @@ impl ProxyServer {
             }
         };
         // 连接注册表钩子（中继终点）：幂等标记关闭（连接页转「最近关闭」）
+        // A6：连接关闭统一结构化事件——路径掩码/方向/出口路径/上下行字节数/
+        // 持续时长/结果，替代散落的关闭 info!（数据取自注册表原子计数器）。
+        // P2-1（评审修复）：从 info 降 debug（GUI 环缓冲信噪比；连接级摘要
+        // 保留在 debug 排障级别）。
         conn.finish();
+        debug!(
+            target = %masked,
+            direction = "outbound",
+            path = relay_path,
+            up_bytes = conn.up_bytes(),
+            down_bytes = conn.down_bytes(),
+            duration_ms = relay_started.elapsed().as_millis() as u64,
+            result = if relay_result.is_ok() { "ok" } else { "error" },
+            "连接关闭（中继结束）"
+        );
         relay_result
     }
 

@@ -24,6 +24,8 @@ mod app;
 mod config;
 mod groups;
 mod icon;
+/// 批次 A1/A3/A4：内核 tracing 事件桥接 Layer + 级别/文件日志热调句柄
+mod log_bridge;
 mod node_test;
 mod nodes;
 
@@ -78,13 +80,23 @@ struct HydraApp {
     proxy_starting: bool,
     /// 代理监听地址（09-P1-6：TUN 失败降级回退系统代理时需要；就绪信号携带）
     proxy_bound_addr: Option<std::net::SocketAddr>,
-    logs: Vec<(crate::LogLevel, String)>,
+    /// A2：页面日志缓冲换 VecDeque（push_back + 超容量 pop_front，O(1)；
+    /// 顺手修——评审标注非性能项）。
+    /// 元素升级为结构化 [`log_bridge::LogEntry`]（内核事件的 target/direction
+    /// 字段供日志页筛选）。
+    logs: std::collections::VecDeque<crate::log_bridge::LogEntry>,
     confirm_state: Option<crate::components::ConfirmAction>,
     dialog_cancel_requested: bool,
     /// 日志级别过滤（LG-01）
     log_show_info: bool,
     log_show_warn: bool,
     log_show_error: bool,
+    /// 日志页筛选增强（批次 A）：包含文本（不区分大小写 substring，纯 UI 过滤）
+    log_text_filter: String,
+    /// 日志页方向筛选：全部 / 入站 / 出站（按内核事件 direction 字段）
+    log_direction_all: bool,
+    log_direction_inbound: bool,
+    log_direction_outbound: bool,
     /// 持久化配置（配置文件 > 环境变量，见 config.rs）
     config: GuiConfig,
     /// 最近一次成功落盘的配置快照（用于差分 + 防抖保存）
@@ -233,17 +245,26 @@ struct HydraApp {
 
 #[tokio::main]
 async fn main() -> eframe::Result<()> {
-    // 初始化日志：HYDRA_LOG_LEVEL（默认 info；RUST_LOG 优先）——与 CLI/节点
-    // 同款（应用内日志页之外，内部组件的 tracing 诊断也写 stderr 供排查；
-    // info 级安全：目标地址已在日志层脱敏）
-    {
-        use tracing_subscriber::EnvFilter;
-        let level = std::env::var("HYDRA_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
-        let filter = match EnvFilter::try_from_default_env() {
-            Ok(f) => f,
-            Err(_) => EnvFilter::try_new(&level).unwrap_or_else(|_| EnvFilter::new("info")),
-        };
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+    // ── 批次 A1（评审硬约束）：tracing 初始化全局唯一，一次性 registry 组装 ──
+    // 此前是 fmt().init()；GUI 进程内会起代理（hydra-core 的 tracing 事件同进程
+    // 发出），若后续任何代码再 .init()/.try_init() 即 panic——因此此后全进程
+    // 禁止再调（含依赖内部）。组装次序（tower 语义：过滤层作用于其后的层）：
+    //   EnvFilter(reload 热调) → fmt(stderr) → KernelRingLayer(GUI 环缓冲)
+    //   → fmt(文件, 独立 reload 门控「自动保存日志」开关)
+    // 级别来源优先级：RUST_LOG > HYDRA_LOG_LEVEL > 配置文件 log_level（归一化）> "info"。
+    // P0-1（评审修复）：初始化抽为 [`init_logging`] 函数，文件日志 WorkerGuard 作为
+    // 返回值由 main() **顶层作用域**命名变量持有到退出——此前初始化包在裸块内，
+    // `let _log_file_guard` 随块结束 drop → non_blocking 写线程立即关闭 →
+    // gui.log 静默失效（文件不再增长）。
+    // **验收 = 开启「自动保存日志」后 gui.log 持续增长**：启动后操作 GUI（切页、
+    // 改配置、起停代理），gui.log 体积应随事件持续增长；若文件不再增长，
+    // 即 guard 生命周期回归，必须排查 init_logging 返回值是否仍被 main 持有。
+    let _log_file_guard = init_logging();
+
+    // P3-1：启动时清理滚动日志目录中 7 天前的轮转残留（gui.log.日期；失败静默，
+    // 不影响启动；当前日志本体 gui.log 不含 `.log.` 二段后缀，永不误删）
+    if let Some(dir) = config::config_dir().map(|d| d.join("logs")) {
+        clean_stale_roll_logs(&dir);
     }
 
     // 09-P3-5：双实例互斥——双 GUI 实例会并发写配置、互相抢系统代理开关状态。
@@ -321,4 +342,149 @@ async fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Box::new(build_app(cc))),
     )
+}
+
+/// 批次 A1（评审 P0-1/P1-2/P2-2 修订）：GUI tracing 全局唯一初始化（全进程
+/// 禁止再调 .init()/.try_init()），抽函数返回 `Option<WorkerGuard>`，
+/// **调用方（main）必须以命名变量持有返回值到退出**。
+///
+/// 组装次序（tower 语义：过滤层作用于其后的层）：
+///   EnvFilter(reload 热调) → fmt(stderr) → KernelRingLayer(GUI 环缓冲)
+///   → fmt(文件, 独立 reload 门控「自动保存日志」开关)
+///
+/// - P1-2：滚动文件构造改 `RollingFileAppender::builder().build()` Result 形态——
+///   失败 eprintln 告警并降级为仅 stderr/环缓冲（文件层不挂，返回 None），
+///   绝不 panic、不阻断启动；
+/// - P2-2：RUST_LOG 已设置 → 环境变量优先（设置页下拉禁用 + 热调跳过，经
+///   log_bridge::rust_log_override 传递）；配置内级别归一化（trim + 小写 +
+///   白名单）并把归一值回写配置文件（尽力而为，失败静默）。
+///
+/// 返回 `Some(guard)` = 文件层已挂载；`None` = 文件层降级未挂载。
+/// **验收 = 开启「自动保存日志」后 gui.log 持续增长**（详见 main() 顶部注释）。
+fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    // with_filter（层内过滤）来自 Layer trait
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::{reload, EnvFilter};
+
+    // 启动期读一次配置文件里的日志设置（HydraApp::new 会再完整加载一次；
+    // 此处容忍任何错误并回落默认，保证日志系统先于一切建立）
+    let file_cfg = config::config_path().and_then(|p| config::load_from_file(&p).ok().flatten());
+    let log_to_file = file_cfg.as_ref().map(|c| c.log_to_file).unwrap_or(false);
+    // P2-2：级别来源统一归一化（trim + 小写 + 白名单；非法/空回落 "info"）
+    let cfg_level = std::env::var("HYDRA_LOG_LEVEL")
+        .ok()
+        .or_else(|| file_cfg.as_ref().map(|c| c.log_level.clone()))
+        .and_then(|s| config::GuiConfig::normalize_log_level(&s))
+        .unwrap_or_else(|| "info".to_string());
+    // P2-2：配置文件内的级别归一值回写（仅当来源是配置且值有变化；启动时归一，
+    // 尽力而为，失败静默——回写失败不影响日志系统建立）
+    if std::env::var("HYDRA_LOG_LEVEL").is_err() {
+        if let Some(cfg) = file_cfg.as_ref() {
+            let norm = config::GuiConfig::normalize_log_level(&cfg.log_level)
+                .unwrap_or_else(|| "info".to_string());
+            if cfg.log_level != norm {
+                let mut out = cfg.clone();
+                out.log_level = norm;
+                if let Some(p) = config::config_path() {
+                    let _ = config::save_to_file(&p, &out);
+                }
+            }
+        }
+    }
+    // P2-2：RUST_LOG 已设置 → 环境变量优先，设置页级别热调整体跳过
+    //（UI 下拉禁用 + hover 提示；热调调用点据此跳过 reload）
+    crate::log_bridge::set_rust_log_override(std::env::var("RUST_LOG").is_ok());
+
+    let initial = match EnvFilter::try_from_default_env() {
+        Ok(f) => f,
+        Err(_) => EnvFilter::try_new(&cfg_level).unwrap_or_else(|_| EnvFilter::new("info")),
+    };
+    // 全局级别过滤层（reload：设置页热调句柄）
+    let (level_filter, level_handle) = reload::Layer::new(initial);
+
+    // P1-2：每日滚动 logs/gui.log（builder().build() Result 形态，失败降级不 panic）
+    let log_dir = config::config_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("logs");
+    let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("gui.log")
+        .build(&log_dir);
+    // A3：GUI 文件日志（开 = 每日滚动，级别跟随全局 EnvFilter；关 = FileGate 门控不写）
+    let file_layer = file_appender
+        .ok()
+        .map(|appender| {
+            let (file_writer, file_guard) = tracing_appender::non_blocking(appender);
+            let layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(file_writer)
+                .with_filter(crate::log_bridge::FileGate);
+            crate::log_bridge::set_file_logging(log_to_file, &cfg_level);
+            (layer, file_guard)
+        });
+    match file_layer {
+        Some((file_layer, file_guard)) => {
+            tracing_subscriber::registry()
+                .with(level_filter)
+                .with(tracing_subscriber::fmt::layer()) // stderr（保留基线行为）
+                .with(crate::log_bridge::KernelRingLayer) // 内核事件 → GUI 日志页
+                .with(file_layer)
+                .init();
+            crate::log_bridge::install_handles(level_handle);
+            // P0-1：guard 作为返回值交 main 顶层持有（不能 let _ =：下划线立即 drop）
+            Some(file_guard)
+        }
+        None => {
+            // P1-2：滚动文件构造失败 → eprintln 告警 + 降级仅 stderr/环缓冲，
+            // 文件层不挂、不阻断启动
+            eprintln!(
+                "警告：滚动日志文件初始化失败（目录 {}），已降级为仅 stderr/界面日志输出",
+                log_dir.display()
+            );
+            tracing_subscriber::registry()
+                .with(level_filter)
+                .with(tracing_subscriber::fmt::layer())
+                .with(crate::log_bridge::KernelRingLayer)
+                .init();
+            crate::log_bridge::install_handles(level_handle);
+            crate::log_bridge::set_file_logging(false, &cfg_level);
+            None
+        }
+    }
+}
+
+/// P3-1：启动时清理滚动日志目录中 7 天前的 `*.log.*` 轮转残留（按文件修改时间
+/// 判断；任何失败静默——清理属尽力而为，绝不影响启动）。当前日志本体
+/// （gui.log）不含 `.log.` 二段后缀，不匹配通配，永不误删。
+fn clean_stale_roll_logs(dir: &std::path::Path) {
+    const RETENTION_SECS: u64 = 7 * 24 * 3600;
+    let cutoff = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(now) => now.saturating_sub(std::time::Duration::from_secs(RETENTION_SECS)),
+        Err(_) => return, // 系统时钟早于 UNIX 纪元（异常环境）：跳过清理
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // 目录不存在/不可读：静默（首启或权限受限场景）
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // 仅匹配轮转产物（形如 gui.log.2026-10-13）：文件名含 `.log.` 二段后缀
+        let is_rotated = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains(".log."));
+        if !is_rotated {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|m| m <= cutoff);
+        if stale {
+            let _ = std::fs::remove_file(&path); // 失败静默（占用/权限：下次启动再试）
+        }
+    }
 }

@@ -12,6 +12,14 @@ description = "Hydra 跨平台核心库：协议/认证/TCP-TLS 传输/代理调
 [features]
 default = ["fingerprint"]
 fingerprint = ["rustls/brotli"]
+# 批次 B0：分配计数分配器门控（仅基准启用 #[global_allocator]，避免影响生产
+# 分配器；cargo bench --features bench-alloc 时基准输出附 allocations 统计）
+bench-alloc = []
+
+# 批次 B0：criterion 基准（udp_relay 帧构造/checksum16/路由 decide 基线）
+[[bench]]
+name = "udp_relay"
+harness = false
 
 [dependencies]
 # 版本统一由根 [workspace.dependencies] 声明（审查 R-31）
@@ -31,3 +39,12 @@ base64 = { workspace = true }
 # 恢复探测周期的随机抖动（±20%，防整周期被动特征）
 rand = "0.8"
 hydra-protocol = { path = "../hydra-protocol" }
+
+[dev-dependencies]
+# 批次 B0：基准框架（[[bench]] udp_relay，基线数字见 benches/README.md）
+criterion = { workspace = true }
+# checksum16 基准：实现位于 hydra-client/src/tun.rs（pub 导出）；Cargo 允许
+# dev-dependency 回环（仅测试/基准编译期，不进生产依赖图）。
+# P3-2（评审修复）：钉 feature——default-features = false + 仅 tun，基准只依赖
+# 该模块；避免 no-default-features 特性组合下 `cargo bench` 失编译。
+hydra-client = { path = "../hydra-client", default-features = false, features = ["tun"] }

@@ -117,10 +117,15 @@ async fn main() -> Result<()> {
         }
     };
 
-    if let Err(e) = config::init_tracing(&cfg.log_level) {
-        eprintln!("错误：{}", e);
-        std::process::exit(1);
-    }
+    // 批次 A3：日志初始化返回 WorkerGuard——命名变量持有到进程退出
+    // （防 drop：guard 被 drop 会终止后台写线程，尾部日志丢失）
+    let _log_file_guard = match config::init_tracing(&cfg.log_level) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("错误：{}", e);
+            std::process::exit(1);
+        }
+    };
 
     let EffectiveConfig {
         listen_addr,
@@ -148,12 +153,13 @@ async fn main() -> Result<()> {
         max_conn_age: NodeOptions::from_env().max_conn_age,
     };
 
+    // 批次 A1 字段化：启动摘要改结构化字段（listener/max_connections/cert）
     info!(
-        "Starting Hydra node: listen={}, max_connections={}, cert={}, transport=tcp/tls, fallback_page={}",
-        listen_addr,
-        opts.max_connections,
-        opts.cert_file.display(),
-        opts.fallback_page,
+        listener = %listen_addr,
+        max_connections = opts.max_connections,
+        cert = %opts.cert_file.display(),
+        fallback_page = opts.fallback_page,
+        "Starting Hydra node (transport=tcp/tls)"
     );
 
     let server = HydraServer::new(listen_addr, auth_key, opts).await?;

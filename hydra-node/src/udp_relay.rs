@@ -44,9 +44,23 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// 批次 A5：高频事件采样器（与 hydra_core::telemetry::Sampler 同实现——
+/// hydra-node 不依赖 hydra-core，本地复制；每 N 条放行第 1 条，零锁零分配）
+struct QueueFullSampler(AtomicUsize);
+
+impl QueueFullSampler {
+    const fn new() -> Self {
+        Self(AtomicUsize::new(0))
+    }
+    #[inline]
+    fn should_log(&self, every: usize) -> bool {
+        every == 0 || self.0.fetch_add(1, Ordering::Relaxed).is_multiple_of(every)
+    }
+}
 
 use crate::dns_aaaa;
 use crate::handler::classify_blocked_ip;
@@ -538,18 +552,29 @@ async fn serve_with_idle_and_filter<R, W>(
 
     // 连接结束：整表 drop → 各会话任务发送队列关闭而退出；回收任务显式 abort。
     // overlimit_drops 连接级汇总日志（09-P3：协议层丢弃计数此前完全不可观测）
+    // 批次 A1 字段化：连接结束摘要改结构化字段（direction/duration_ms/
+    // sessions/drops/aaaa_local_replies），替代 format! 内嵌（字段进 GUI 环
+    // Layer 可被筛选）。
     {
         let drops = table.lock().unwrap().overlimit_drops;
         if aaaa_local_replies > 0 {
-            info!("UDP 中继连接关闭：DNS AAAA 查询本地 NODATA 应答 {aaaa_local_replies} 次（v4-only 降噪）");
+            info!(
+                direction = "relay",
+                aaaa_local_replies = aaaa_local_replies,
+                "UDP 中继连接关闭：DNS AAAA 查询本地 NODATA 应答（v4-only 降噪）"
+            );
         }
         if drops > 0 {
-            info!("UDP 中继连接关闭：累计协议层丢弃 {drops} 个数据报（会话满/解析超限/速率预算）");
+            info!(
+                direction = "relay",
+                drops = drops,
+                "UDP 中继连接关闭：累计协议层丢弃数据报（会话满/解析超限/速率预算）"
+            );
         }
     }
     reaper.abort();
     drop(table);
-    info!("UDP 中继连接关闭");
+    info!(direction = "relay", "UDP 中继连接关闭");
 }
 
 /// 处理一帧上行数据：建会话 / 更新绑定 / 投递数据报。
@@ -721,8 +746,15 @@ where
                         let _ = write_udp_frame(&mut *w, &encode_udp_close(session_id)).await;
                     }
                 } else {
-                    // 队列满 = 对端 socket 短时过载：UDP 语义直接丢包
-                    debug!("UDP 会话 {session_id} 上行队列满，丢弃数据报");
+                    // 队列满 = 对端 socket 短时过载：UDP 语义直接丢包。
+                    // 批次 A5：洪峰下逐包刷屏——采样放行（采样因子 N=50000）；
+                    // 丢弃总量仍由连接级 overlimit_drops 汇总事件在连接结束时给出。
+                    // 采样器与 hydra_core::telemetry::Sampler 同实现（hydra-node
+                    // 不依赖 hydra-core，本地复制 8 行原子计数器）。
+                    static QUEUE_FULL_SAMPLER: QueueFullSampler = QueueFullSampler::new();
+                    if QUEUE_FULL_SAMPLER.should_log(50_000) {
+                        debug!("UDP 会话 {session_id} 上行队列满，丢弃数据报（采样日志，每 50000 丢包至多 1 条）");
+                    }
                 }
             }
         }

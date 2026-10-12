@@ -1250,8 +1250,10 @@ fn is_ipv6_packet(pkt: &[u8]) -> bool {
     pkt.len() >= 40 && pkt[0] >> 4 == 6
 }
 
-/// RFC 1071 校验和（16 位反码求和；输入网络字节序，输出网络字节序）
-fn checksum16(data: &[u8]) -> u16 {
+/// RFC 1071 校验和（16 位反码求和；输入网络字节序，输出网络字节序）。
+/// 批次 B0：改为 pub 供 hydra-core 基准（benches/udp_relay.rs）作基线——
+/// 后续 B2 单遍化优化的前后对比即以此函数为基线（纯函数，可见性放宽无风险）。
+pub fn checksum16(data: &[u8]) -> u16 {
     let mut sum = 0u32;
     let mut i = 0;
     while i + 1 < data.len() {
@@ -2032,7 +2034,22 @@ async fn udp_relay_task(
                         };
                         if let Some(pkt) = reply {
                             if let Err(e) = transport.send(&pkt).await {
-                                error!("TUN UDP 回包注入失败: {e}");
+                                // 批次 A5：故障洪峰下此事件会退化为每包一条——
+                                // 采样放行（采样因子 N=50000，hydra_core::telemetry::Sampler）
+                                // P3-3（评审修复）：累计失败计数——聚合观测口径：
+                                // 采样日志仅反映放行样本（每 50000 次至多 1 条），
+                                // 累计值反映全量注入失败次数，供长时段排障估算
+                                // 丢包规模（Relaxed 序即可：纯观测计数，无同步依赖）
+                                static TUN_INJECT_FAILS: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                let total = TUN_INJECT_FAILS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    + 1;
+                                static INJECT_FAIL_SAMPLER: hydra_core::telemetry::Sampler =
+                                    hydra_core::telemetry::Sampler::new();
+                                if INJECT_FAIL_SAMPLER.should_log(50_000) {
+                                    error!("TUN UDP 回包注入失败（累计失败 {total} 次）: {e}");
+                                }
                             }
                         }
                     }
@@ -2880,7 +2897,13 @@ async fn step(
         // 与下方"待建立流"循环）——此处只登记通道与流槽。
         let (tx, rx) = mpsc::channel(FLOW_CHAN);
         let flow_tx = tx.clone();
-        debug!("TUN 新流: {target}");
+        // 批次 A6/A1 字段化：TUN 流建立事件（掩码目标 + 入站方向）
+        debug!(
+            target = %mask_target(&target),
+            direction = "inbound",
+            path = "tun",
+            "TUN 新流建立"
+        );
         flows.insert(
             h,
             Flow {
@@ -3113,7 +3136,14 @@ async fn step(
     // 5. 清理（socket 移除 + 相关任务收敛）
     for h in to_remove {
         if let Some(mut f) = flows.remove(&h) {
-            debug!("TUN 流关闭: {}", f.target);
+            // 批次 A6/A1 字段化：TUN 流关闭事件（掩码目标 + 存续时长）
+            debug!(
+                target = %mask_target(&f.target),
+                direction = "inbound",
+                path = "tun",
+                lifetime_ms = f.accepted_at.elapsed().as_millis() as u64,
+                "TUN 流关闭"
+            );
             f.up_task.abort();
             if let Some(t) = f.reader_task.take() {
                 t.abort();

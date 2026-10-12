@@ -123,6 +123,14 @@ pub struct GuiConfig {
     /// None = 默认深色。侧栏切换入口与后续设置页卡片共享同一字段。
     #[serde(default)]
     pub ui_theme: Option<String>,
+    /// A4：日志级别持久化（error/warn/info/debug/trace）；空串/非法 = 默认 "info"。
+    /// 设置页下拉选择即热调 EnvFilter 并落盘，重启后按此值初始化。
+    #[serde(default)]
+    pub log_level: String,
+    /// A3：「自动保存日志」开关（默认关 = 与基线行为一致，不写文件）。
+    /// 开 = 追加写 %APPDATA%\hydra\logs\gui.log（每日滚动）。
+    #[serde(default)]
+    pub log_to_file: bool,
 }
 
 /// serde 默认值：true（关窗默认隐藏到托盘）
@@ -152,11 +160,26 @@ impl Default for GuiConfig {
             ca_leaf_pin: String::new(),
             node_cert_paths: HashMap::new(),
             ui_theme: None,
+            log_level: String::new(),
+            log_to_file: false,
         }
     }
 }
 
 impl GuiConfig {
+    /// P2-2：日志级别归一——trim + ASCII 小写 + 白名单校验。
+    /// 合法返回归一值（小写）；空串/非法返回 None（调用方回落 "info"）。
+    /// 启动时（main::init_logging）与热调时统一走本口径，归一值回写 config。
+    pub fn normalize_log_level(raw: &str) -> Option<String> {
+        let s = raw.trim().to_ascii_lowercase();
+        matches!(s.as_str(), "error" | "warn" | "info" | "debug" | "trace").then_some(s)
+    }
+
+    /// A4/P2-2：生效日志级别（先归一化再校验白名单；空串/非法/大小写混写
+    /// 一律归一，非法回落 "info"）。设置页展示与 EnvFilter 初始化统一走本口径。
+    pub fn log_level_effective(&self) -> String {
+        Self::normalize_log_level(&self.log_level).unwrap_or_else(|| "info".to_string())
+    }
     /// 节点来源标记（单一事实来源 = 各订阅的 `nodes` 列表，避免平行账本漂移）：
     /// 地址出现在某订阅的 nodes 中 → "订阅:<名>"；否则 → [`NODE_SOURCE_MANUAL`]。
     /// 多个订阅含同一地址时取先匹配者。
@@ -1106,6 +1129,48 @@ mod tests {
         // 未知值不报错（解析在 palette::UiTheme::from_config_str 处回落默认）
         let weird: GuiConfig = serde_json::from_str(r#"{"ui_theme":"bogus"}"#).unwrap();
         assert_eq!(weird.ui_theme.as_deref(), Some("bogus"));
+    }
+
+    // ===================== A3/A4：日志级别 + 自动保存开关 =====================
+
+    /// 新增字段默认值：log_level 空（生效回落 info）、log_to_file=false（与基线一致）
+    #[test]
+    fn test_log_fields_defaults() {
+        let cfg: GuiConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.log_level, "");
+        assert_eq!(cfg.log_level_effective(), "info");
+        assert!(!cfg.log_to_file);
+
+        // 非法值同样回落 info（热调侧已拦非法，此处兜底）
+        let bad = GuiConfig {
+            log_level: "verbose".into(),
+            ..Default::default()
+        };
+        assert_eq!(bad.log_level_effective(), "info");
+
+        // P2-2：大小写/空白容错——归一化生效（"DEBUG"/" Info " 均合法）
+        let mixed = GuiConfig {
+            log_level: "  DEBUG ".into(),
+            ..Default::default()
+        };
+        assert_eq!(mixed.log_level_effective(), "debug");
+        assert_eq!(
+            GuiConfig::normalize_log_level(" Trace "),
+            Some("trace".to_string())
+        );
+        assert_eq!(GuiConfig::normalize_log_level("verbose"), None);
+        assert_eq!(GuiConfig::normalize_log_level("   "), None);
+
+        // 合法值 + serde 往返
+        let cfg = GuiConfig {
+            log_level: "debug".into(),
+            log_to_file: true,
+            ..Default::default()
+        };
+        let back: GuiConfig = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.log_level, "debug");
+        assert!(back.log_to_file);
+        assert_eq!(back.log_level_effective(), "debug");
     }
 
     #[test]

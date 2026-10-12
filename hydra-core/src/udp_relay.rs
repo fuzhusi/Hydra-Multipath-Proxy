@@ -279,17 +279,21 @@ where
                             });
                         }
                         Some(bound_target) => {
+                            // A1 字段化：期望/实际目标掩码分列字段（热路径丢弃
+                            // 事件，仅 debug 级；字段化后 GUI 环 Layer 可筛选）
                             tracing::debug!(
-                                "UDP 下行帧 target 与流绑定不一致（期望 {}，实际 {}），丢弃",
-                                mask_target(&bound_target),
-                                mask_target(&target)
+                                target = %mask_target(&bound_target),
+                                actual = %mask_target(&target),
+                                sid = session_id,
+                                "UDP 下行帧 target 与流绑定不一致，丢弃"
                             );
                             continue;
                         }
                         None => {
                             tracing::debug!(
-                                "UDP 下行帧 sid 无本地映射（会话已关/迟到帧），丢弃: {}",
-                                mask_target(&target)
+                                target = %mask_target(&target),
+                                sid = session_id,
+                                "UDP 下行帧 sid 无本地映射（会话已关/迟到帧），丢弃"
                             );
                             continue;
                         }

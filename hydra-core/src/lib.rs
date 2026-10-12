@@ -29,6 +29,8 @@ pub mod socket_protect;
 pub mod speedtest;
 pub mod subscription;
 pub mod tcp_transport;
+// 批次 A5：高频事件采样器（热路径日志洪峰防护）
+pub mod telemetry;
 pub mod traffic;
 pub mod transport;
 // UDP-over-proxy 客户端通道（同一条 TCP/TLS 流上的 UDP 多路复用）

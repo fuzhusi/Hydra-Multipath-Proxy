@@ -79,6 +79,16 @@ impl ConnEntry {
         self.id
     }
 
+    /// 累计上行字节快照（A6 连接结束日志字段；原子读，零锁）
+    pub fn up_bytes(&self) -> u64 {
+        self.bytes_up.load(Ordering::Relaxed)
+    }
+
+    /// 累计下行字节快照（A6 连接结束日志字段；原子读，零锁）
+    pub fn down_bytes(&self) -> u64 {
+        self.bytes_down.load(Ordering::Relaxed)
+    }
+
     /// 标记连接结束（幂等：重复 finish 只记首次关闭时刻）
     pub fn finish(&self) {
         if self.active.swap(false, Ordering::Relaxed) {

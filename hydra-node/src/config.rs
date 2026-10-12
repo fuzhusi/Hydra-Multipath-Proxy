@@ -1,4 +1,4 @@
-//! 节点 toml 配置文件支持（施工方案遗留四大项之④）。
+﻿//! 节点 toml 配置文件支持（施工方案遗留四大项之④）。
 //!
 //! 读取顺序（每字段独立回落）：**CLI 参数 > 环境变量 > 配置文件 > 默认值**。
 //!
@@ -340,8 +340,17 @@ pub fn load_auth_key(source: &AuthKeySource) -> Result<Vec<u8>, String> {
     decode_auth_key(&hex_str)
 }
 
-/// 初始化日志：RUST_LOG 优先，否则用配置的 log_level；非法级别显式报错
-pub fn init_tracing(level: &str) -> Result<(), String> {
+/// 初始化日志（批次 A3）：stderr fmt 保留 + tracing-appender 每日滚动文件
+/// （logs/hydra-node.log.[日期]，non_blocking 后台线程写）。
+/// 返回 [`WorkerGuard`]——**调用方（main）必须以命名变量持有到进程退出**，
+/// 否则后台写线程被随 drop 终止，尾部日志丢失（WorkerGuard 防丢失语义）。
+/// 级别过滤：RUST_LOG 优先，否则用配置的 log_level；非法级别显式报错。
+/// P1-2（评审修复）：滚动文件构造改 `RollingFileAppender::builder().build()`
+/// Result 形态——失败 eprintln 告警并降级为仅 stderr 输出（文件层挂 sink 空写，
+/// 保住 WorkerGuard 返回语义），绝不 panic、不阻断启动。
+pub fn init_tracing(level: &str) -> Result<tracing_appender::non_blocking::WorkerGuard, String> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
     let filter = match EnvFilter::try_from_default_env() {
         Ok(f) => f,
@@ -349,8 +358,77 @@ pub fn init_tracing(level: &str) -> Result<(), String> {
             EnvFilter::try_new(level).map_err(|e| format!("日志级别 {} 非法: {}", level, e))?
         }
     };
-    tracing_subscriber::fmt().with_env_filter(filter).init();
-    Ok(())
+    // P3-1（评审修复）：启动时清理 logs 目录 7 天前的轮转残留（失败静默；
+    // 当前日志本体 hydra-node.log 不含 `.log.` 二段后缀，永不误删）
+    clean_stale_roll_logs(Path::new("logs"));
+    // 每日滚动：logs/ 目录（工作目录相对，部署约定）；前缀 hydra-node
+    let appender = match tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("hydra-node.log")
+        .build("logs")
+    {
+        Ok(a) => a,
+        Err(e) => {
+            // P1-2：构造失败 → 告警 + 降级（仅 stderr；文件层挂 sink 空写，
+            // 返回的 WorkerGuard 语义不变——main 仍须持有到退出）
+            eprintln!("警告：滚动日志文件初始化失败，已降级为仅 stderr 输出: {e}");
+            let (sink_writer, guard) = tracing_appender::non_blocking(std::io::sink());
+            let sink_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(sink_writer);
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer()) // stderr（降级后唯一输出）
+                .with(sink_layer)
+                .init();
+            return Ok(guard);
+        }
+    };
+    let (file_writer, guard) = tracing_appender::non_blocking(appender);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(file_writer);
+    tracing_subscriber::registry()
+        .with(filter) // 全局级别过滤（作用于其后的层）
+        .with(tracing_subscriber::fmt::layer()) // stderr（保留基线输出）
+        .with(file_layer)
+        .init();
+    Ok(guard)
+}
+
+/// P3-1（评审修复）：启动时清理滚动日志目录中 7 天前的 `*.log.*` 轮转残留
+/// （按文件修改时间判断；任何失败静默——清理属尽力而为，绝不阻断启动/服务）。
+/// 当前日志本体（hydra-node.log / gui.log）不含 `.log.` 二段后缀，不匹配
+/// 通配，永不误删。
+fn clean_stale_roll_logs(dir: &Path) {
+    const RETENTION_SECS: u64 = 7 * 24 * 3600;
+    let cutoff = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(now) => now.saturating_sub(std::time::Duration::from_secs(RETENTION_SECS)),
+        Err(_) => return, // 系统时钟早于 UNIX 纪元（异常环境）：跳过清理
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // 目录不存在/不可读：静默（首启或权限受限场景）
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // 仅匹配轮转产物（形如 hydra-node.log.2026-10-13）：文件名含 `.log.` 二段后缀
+        let is_rotated = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains(".log."));
+        if !is_rotated {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|m| m <= cutoff);
+        if stale {
+            let _ = std::fs::remove_file(&path); // 失败静默（占用/权限：下次启动再试）
+        }
+    }
 }
 
 #[cfg(test)]

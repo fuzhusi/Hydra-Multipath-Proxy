@@ -131,17 +131,19 @@ impl HydraApp {
             });
 
         // ── ② 异常态（R7）：启动失败横幅（DANGER_BG）置于 Hero 下 ──
+        // （批次 A2 机械适配：logs 元素 (LogLevel, String) → LogEntry 结构体；
+        //   仅编译适配，不改本页任何行为）
         if !self.proxy_running && !self.proxy_starting {
-            if let Some((_, line)) = self
+            if let Some(entry) = self
                 .logs
                 .iter()
                 .rev()
-                .find(|(_, l)| l.contains("启动失败") || l.contains("启动超时"))
+                .find(|e| e.text.contains("启动失败") || e.text.contains("启动超时"))
             {
                 crate::components::banner(
                     ui,
                     crate::components::BannerKind::Danger,
-                    line,
+                    &entry.text,
                 );
                 ui.add_space(palette::SPACING_XS);
             }
@@ -605,13 +607,14 @@ impl HydraApp {
         });
 
         // ── 最近日志摘要（最近 3 条；原先快捷卡内信息随卡片改条后垫底）──
+        // （批次 A2 机械适配：VecDeque 切片 → 迭代器 skip，行为不变）
         ui.add_space(palette::SPACING_SM);
-        let start = self.logs.len().saturating_sub(3);
-        if start == self.logs.len() {
+        if self.logs.is_empty() {
             ui.weak("暂无日志");
         }
-        for (_, line) in &self.logs[start..] {
-            ui.small(line);
+        let skip = self.logs.len().saturating_sub(3);
+        for entry in self.logs.iter().skip(skip) {
+            ui.small(&entry.text);
         }
     }
 

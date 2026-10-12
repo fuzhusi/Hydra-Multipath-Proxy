@@ -21,6 +21,8 @@ bytes = { workspace = true }
 socket2 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# 批次 A3：每日滚动日志（logs/ 目录，non_blocking + WorkerGuard 防退出丢日志）
+tracing-appender = { workspace = true }
 toml = "0.8"
 anyhow = { workspace = true }
 thiserror = { workspace = true }

@@ -19,12 +19,16 @@ impl Default for HydraApp {
             proxy_start_receiver: None,
             proxy_bound_addr: None,
             proxy_starting: false,
-            logs: Vec::new(),
+            logs: VecDeque::new(),
             confirm_state: None,
             dialog_cancel_requested: false,
             log_show_info: true,
             log_show_warn: true,
             log_show_error: true,
+            log_text_filter: String::new(),
+            log_direction_all: true,
+            log_direction_inbound: true,
+            log_direction_outbound: true,
             config: GuiConfig::default(),
             saved_snapshot: GuiConfig::default(),
             last_config_save: None,
@@ -193,12 +197,16 @@ impl HydraApp {
             proxy_start_receiver: None,
             proxy_bound_addr: None,
             proxy_starting: false,
-            logs: Vec::new(),
+            logs: VecDeque::new(),
             confirm_state: None,
             dialog_cancel_requested: false,
             log_show_info: true,
             log_show_warn: true,
             log_show_error: true,
+            log_text_filter: String::new(),
+            log_direction_all: true,
+            log_direction_inbound: true,
+            log_direction_outbound: true,
             saved_snapshot: cfg.clone(),
             last_config_save: None,
             config: cfg,
@@ -361,17 +369,53 @@ impl HydraApp {
         self.push_log(crate::LogLevel::Error, message);
     }
 
+    /// 日志入页（A2 顺手修）：`Vec + remove(0)`（溢出 O(n) 整体搬移）改为
+    /// VecDeque push_back + 超容量 pop_front（O(1)）。评审标注：非性能项，
+    /// 顺手修——1000 条搬移量级可忽略，换结构是为语义正确与统一。
+    fn push_log_full(
+        &mut self,
+        level: crate::LogLevel,
+        message: String,
+        direction: Option<String>,
+        target: Option<String>,
+    ) {
+        Self::push_capped(
+            &mut self.logs,
+            crate::log_bridge::LogEntry {
+                level,
+                text: format!(
+                    "[{}] {}",
+                    chrono::Local::now().format("%H:%M:%S"),
+                    message
+                ),
+                direction,
+                target,
+            },
+        );
+    }
+
+    /// 容量边界纯函数（供 push_log_full 与单测共用）：超容量时 O(1) 弹出最旧
+    pub(crate) fn push_capped(
+        buf: &mut std::collections::VecDeque<crate::log_bridge::LogEntry>,
+        entry: crate::log_bridge::LogEntry,
+    ) {
+        buf.push_back(entry);
+        while buf.len() > crate::LOG_CAPACITY {
+            buf.pop_front();
+        }
+    }
+
     fn push_log(&mut self, level: crate::LogLevel, message: String) {
-        self.logs.push((
-            level,
-            format!(
-                "[{}] {}",
-                chrono::Local::now().format("%H:%M:%S"),
-                message
-            ),
-        ));
-        if self.logs.len() > crate::LOG_CAPACITY {
-            self.logs.remove(0);
+        self.push_log_full(level, message, None, None);
+    }
+
+    /// A1：把环形缓冲里的内核事件搬进页面缓冲（日志页每帧调用；容量裁剪同上）
+    pub(crate) fn drain_kernel_logs(&mut self) {
+        let mut drained: Vec<crate::log_bridge::LogEntry> = Vec::new();
+        crate::log_bridge::drain_kernel_entries(&mut drained);
+        for e in drained {
+            let (level, text, direction, target) = (e.level, e.text, e.direction, e.target);
+            self.push_log_full(level, text, direction, target);
         }
     }
 
@@ -389,6 +433,7 @@ impl HydraApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_bridge::LogEntry;
 
     // ── 问题 1：启动按钮状态机转换 ──
 
@@ -403,5 +448,31 @@ mod tests {
         assert_eq!(start_button_state(true, false), ("■ 停止代理", true));
         // 运行态下 starting 残留（不可能出现，但规则应保持确定）：以 running 优先
         assert_eq!(start_button_state(true, true), ("■ 停止代理", true));
+    }
+
+    // ── A2（新增测试①）：VecDeque 容量边界——超容量弹出最旧，O(1) 不搬移 ──
+    #[test]
+    fn test_push_capped_drops_oldest() {
+        let mut buf: VecDeque<LogEntry> = VecDeque::new();
+        // 塞满容量 + 50 条：总数钉在 LOG_CAPACITY，最旧被挤出
+        for i in 0..(crate::LOG_CAPACITY + 50) {
+            HydraApp::push_capped(
+                &mut buf,
+                LogEntry::app(crate::LogLevel::Info, format!("第 {i} 条")),
+            );
+        }
+        assert_eq!(buf.len(), crate::LOG_CAPACITY);
+        assert!(
+            buf.front().unwrap().text.contains("第 50 条"),
+            "最旧 50 条应被弹出: {:?}",
+            buf.front().unwrap().text
+        );
+        assert!(buf.back().unwrap().text.contains("第 1049 条"));
+        // 未超容量时全保留（边界不误删）
+        let mut small: VecDeque<LogEntry> = VecDeque::new();
+        for i in 0..10 {
+            HydraApp::push_capped(&mut small, LogEntry::app(crate::LogLevel::Info, format!("{i}")));
+        }
+        assert_eq!(small.len(), 10);
     }
 }
