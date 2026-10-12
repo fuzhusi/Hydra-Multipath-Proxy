@@ -1,5 +1,7 @@
 # Hydra Multipath Proxy RFC v1.0
 
+> ⚠ **本文档为历史档案**（项目初创时的多链路聚合原型设想）。与现状的偏差记录及现行定稿见 **Hydra-Multipath-Proxy-RFC-v2.md** §2。
+
 > 基于 Rust 的多链路聚合代理协议设计方案
 
 项目代号：Hydra\
