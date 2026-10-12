@@ -1865,10 +1865,10 @@ impl UdpDirectNat {
     }
 
     /// 测试辅助（评审 P3-8）：把全部会话置为过期（sweep 前置，免 150s 等待）。
-    /// 仅 Windows：唯一调用方（sweep 泵结束测试）为 Windows 专属路径——
-    /// 非 Windows 下 P1-1 守卫拒绝建直连会话，直接路径不可达；
-    /// 不加门控会在 Linux 触发 dead_code 被 -D warnings 阻断（CI 实证）
-    #[cfg(all(test, windows))]
+    /// 跨平台：protect 形态端到端测试（非 Windows 亦可跑）同样调用——
+    /// 门控纯 #[cfg(test)] 即可（此前 all(test, windows) 门控的
+    /// 「唯一调用方为 Windows 测试」前提已被 protect 形态测试打破）
+    #[cfg(test)]
     fn expire_all_sessions(&self) {
         if let Ok(mut s) = self.sessions.lock() {
             for v in s.values_mut() {
