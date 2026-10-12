@@ -343,6 +343,16 @@ private fun HydraApp(themeMode: ThemeMode, onSetTheme: (ThemeMode) -> Unit) {
                         startCurrentMode()
                     },
                     onDisconnect = { stopCurrentMode() },
+                    ruleMode = cfg.runRuleMode,
+                    // §九 智能分流开关：持久化（启动 VPN 时经 VpnConfig 生效）；
+                    // 运行中不热切换——提示重启 VPN 生效（分流字段在启动时读取）
+                    onToggleRuleMode = { on ->
+                        persist(cfg.copy(runRuleMode = on))
+                        if (EngineState.ui.value.running) {
+                            toast = "分流已${if (on) "开启" else "关闭"}——重启 VPN 后生效"
+                            EngineState.addLog("智能分流已${if (on) "开启" else "关闭"}（重启 VPN 生效）")
+                        }
+                    },
                 )
                 Tab.Nodes -> NodesScreen(
                     cfg = cfg,

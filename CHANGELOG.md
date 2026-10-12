@@ -45,6 +45,19 @@
 
 ## [Unreleased]
 
+### 安卓端规则代理（智能分流延伸到 VPN 模式）
+
+- **hydra-android**：`VpnConfig` 新增 `rule_mode` / `rule_file`（Kotlin 传
+  沙箱绝对路径）；`start_vpn` 规则模式构建规则引擎（文件缺失/解析失败安全
+  降级为全局代理，永不断网）；DNS 直连联动（R2）；安卓直连走 protect 形态
+  （无 bind，P1-3 守卫自动放行）；全局模式（开关 OFF）行为与基线逐字节一致
+- **Kotlin**：连接页新增「分流：CN 直连」开关（仅 VPN 模式，主题令牌适配四
+  主题 + TalkBack）；设置页新增「分流规则」（规则文件 SAF 导入，限 1MB 只读
+  复制到沙箱）；规则模式 VPN DNS 换用 223.5.5.5 / 119.29.29.29（CN 域名解析
+  近端 CDN，GeoIP 判准直连）；运行中切换提示重启 VPN 生效
+- 已知边界：规则判定的 UDP 暂走节点中继（安卓 UDP 直发需 bind 源 IP，TCP
+  直连正常）；详见设计文档 §九与评审台账 §〇-B
+
 ### 统一路由层：TUN 规则引擎与 SOCKS/HTTP 域名分流两套机制合一（技术债闭环）
 
 - **RuleEngine 双模判定**（hydra-core/routing_rules.rs）：新增

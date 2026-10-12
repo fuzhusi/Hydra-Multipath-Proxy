@@ -24,6 +24,7 @@ import uniffi.hydra_android.VpnConfig
 import uniffi.hydra_android.VpnExitCallback
 import uniffi.hydra_android.startVpn
 import uniffi.hydra_android.stopVpn
+import uniffi.hydra_android.vpnRuleModeDegraded
 import java.util.Base64
 
 /**
@@ -287,9 +288,22 @@ class HydraVpnService : VpnService() {
                                 }
                                 EngineState.update {
                                     it.copy(running = true, transition = null,
-                                        boundAddr = "全局 VPN（所有应用流量经节点）")
+                                        boundAddr = if (cfg.runRuleMode)
+                                            "全局 VPN（分流：CN 直连 · 其余走节点）"
+                                        else "全局 VPN（所有应用流量经节点）")
                                 }
-                                EngineState.addLog("✓ 全局 VPN 已接管——所有应用流量经节点加密隧道")
+                                EngineState.addLog(
+                                    if (cfg.runRuleMode)
+                                        "✓ 全局 VPN 已接管——智能分流：命中 CN 规则直连，其余走节点"
+                                    else "✓ 全局 VPN 已接管——所有应用流量经节点加密隧道"
+                                )
+                                // 评审一轮 P2-3：规则降级对用户可见——规则文件不可用
+                                // 时 Rust 引擎已用内置 CN 表兜底，此处显式写日志流
+                                if (cfg.runRuleMode && vpnRuleModeDegraded()) {
+                                    EngineState.addLog(
+                                        "⚠ 规则文件不可用，已降级为内置 CN 规则（自定义规则未加载）"
+                                    )
+                                }
                                 updateNotification()
                                 return@launch
                             },
@@ -367,7 +381,11 @@ class HydraVpnService : VpnService() {
     }
 
     /** 建立 TUN 接口（v4/v6 全接管；节点出站连接经 protect 防回环，无需路由豁免）。
-     *  分应用代理：白名单（仅所选应用走 VPN）/ 黑名单（所选应用直连）。 */
+     *  分应用代理：白名单（仅所选应用走 VPN）/ 黑名单（所选应用直连）。
+     *  规则模式 DNS（设计 §九，性能/正确性关键）：addDnsServer 换用国内公共
+     *  DNS（223.5.5.5，备 119.29.29.29）——CN 域名解析出近端 CDN IP，GeoIP
+     *  才能判准直连（对齐桌面 R2 语义，Rust 侧 dns_direct 联动）；全局模式
+     *  维持现状（系统 DNS 随隧道经节点解析）。 */
     private fun establish(cfg: HydraConfig): ParcelFileDescriptor? {
         return runCatching {
             val b = Builder()
@@ -379,6 +397,21 @@ class HydraVpnService : VpnService() {
                 .addAddress("fd07::1", 126)
                 .addRoute("::", 1)
                 .addRoute("8000::", 1)
+            if (cfg.runRuleMode) {
+                // 规则模式 DNS（设计 §九，性能/正确性关键）：addDnsServer 换用
+                // 国内公共 DNS（223.5.5.5，备 119.29.29.29）——CN 域名解析出近端
+                // CDN IP，GeoIP 才能判准直连（对齐桌面 R2 语义）。
+                // 评审一轮 P1-1 说明——为何不在此做 VpnBuilder 路由豁免：
+                // addDisallowedApplication 只接受「已安装应用包名」（官方文档
+                // 明确，未安装即抛 NameNotFoundException），对 DNS IP /32 调用
+                // 会让 establish 必然失败；安卓 VpnBuilder 也没有任何按 IP
+                // 排除路由的 API。「DNS 直连解析」的实际生效路径是 Rust 数据
+                // 面：规则模式下 dns_direct=true，进入 TUN 的 UDP 53 查询被
+                // 无条件判 DIRECT，经 protect 钩子建原生 socket 物理直出到
+                // 上述公共 DNS（Android protect 形态直连）——应用硬编码的
+                // 8.8.8.8 等外部 DNS 同样入 TUN 判定，命中规则走节点。
+                b.addDnsServer("223.5.5.5").addDnsServer("119.29.29.29")
+            }
             // 分应用代理包名先经 PackageManager 校验——失效包名（已卸载/拼写错）
             // 在部分系统上会使 addAllowed/Disallowed 抛异常 → establish 持续失败
             val pm = packageManager
@@ -563,21 +596,26 @@ class HydraVpnService : VpnService() {
         else -> "${bytes}B"
     }
 
-    companion object {
-        /** 配置 → Rust VpnConfig（地址与 establish() 的 Builder 严格一致） */
-        private fun HydraConfig.toVpnConfig(): VpnConfig = VpnConfig(
-            nodes = nodesText.lines().map { it.trim() }.filter { it.isNotEmpty() },
-            authKeyHex = authKeyHex,
-            trust = if (trustMode == SecureStore.TRUST_CA) TrustMode.PublicCa
-            else TrustMode.Pinned(listOf(Base64.getDecoder().decode(certDerB64))),
-            sni = sni.ifEmpty { null },
-            mtu = 1500.toUShort(),
-            addr4 = "10.7.0.1",
-            prefix4 = 30.toUByte(),
-            addr6 = "fd07::1",
-            udpRelay = true,
-        )
+    /** 配置 → Rust VpnConfig（地址与 establish() 的 Builder 严格一致）。
+     *  智能分流（§九）：ruleMode 开关 + 规则文件**完整绝对路径**（Rust 不知
+     *  安卓沙箱路径，filesDir/rules.txt 由本侧组装；文件缺失时 Rust 侧安全
+     *  降级为全局代理）。 */
+    private fun HydraConfig.toVpnConfig(): VpnConfig = VpnConfig(
+        nodes = nodesText.lines().map { it.trim() }.filter { it.isNotEmpty() },
+        authKeyHex = authKeyHex,
+        trust = if (trustMode == SecureStore.TRUST_CA) TrustMode.PublicCa
+        else TrustMode.Pinned(listOf(Base64.getDecoder().decode(certDerB64))),
+        sni = sni.ifEmpty { null },
+        mtu = 1500.toUShort(),
+        addr4 = "10.7.0.1",
+        prefix4 = 30.toUByte(),
+        addr6 = "fd07::1",
+        udpRelay = true,
+        ruleMode = runRuleMode,
+        ruleFile = java.io.File(filesDir, "rules.txt").absolutePath,
+    )
 
+    companion object {
         const val ACTION_START = "dev.hydra.vpn.action.VPN_START"
         const val ACTION_STOP = "dev.hydra.vpn.action.VPN_STOP"
         private const val CHANNEL_ID = "hydra_vpn"

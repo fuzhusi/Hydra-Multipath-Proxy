@@ -54,6 +54,7 @@ class SecureStore(context: Context) {
         vpnBootStart = prefs.getBoolean(KEY_VPN_BOOT_START, false),
         appFilterMode = prefs.getInt(KEY_APP_FILTER_MODE, APP_FILTER_ALL),
         appFilterPkgs = prefs.getString(KEY_APP_FILTER_PKGS, "").orEmpty(),
+        runRuleMode = prefs.getBoolean(KEY_RUN_RULE_MODE, false),
     )
 
     fun save(c: HydraConfig) {
@@ -69,6 +70,7 @@ class SecureStore(context: Context) {
             .putBoolean(KEY_VPN_BOOT_START, c.vpnBootStart)
             .putInt(KEY_APP_FILTER_MODE, c.appFilterMode)
             .putString(KEY_APP_FILTER_PKGS, c.appFilterPkgs)
+            .putBoolean(KEY_RUN_RULE_MODE, c.runRuleMode)
             // commit() 同步落盘（企业评审）：apply() 异步刷盘在进程意外终止/
             // 系统回收时可能丢失（实测：深链导入成功后启动读到空配置）。配置
             // 体量小、写入频率低，同步开销可接受——正确性优先。
@@ -88,6 +90,8 @@ class SecureStore(context: Context) {
         private const val KEY_VPN_BOOT_START = "vpn_boot_start"
         private const val KEY_APP_FILTER_MODE = "app_filter_mode"
         private const val KEY_APP_FILTER_PKGS = "app_filter_pkgs"
+        /** 智能分流开关（规则模式：命中 CN 规则直连，其余走节点；默认关闭=全局） */
+        private const val KEY_RUN_RULE_MODE = "run_rule_mode"
 
         const val TRUST_PINNED = "pinned"
         const val TRUST_CA = "ca"
@@ -121,4 +125,7 @@ data class HydraConfig(
     val appFilterMode: Int = SecureStore.APP_FILTER_ALL,
     /** 分应用代理应用包名列表（换行分隔） */
     val appFilterPkgs: String = "",
+    /** 智能分流（规则模式）：命中 CN 规则直连 · 其余走节点（默认 false = 全局代理，
+     *  行为与关闭前逐字节一致）。切换在下次启动 VPN 时生效（运行中不热切换） */
+    val runRuleMode: Boolean = false,
 )

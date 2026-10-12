@@ -73,6 +73,56 @@ fun SettingsScreen(
     var showAppPicker by remember { mutableStateOf(false) }
     val scope = androidx.compose.runtime.rememberCoroutineScope()
 
+    // ── 智能分流（§九）：规则文件（filesDir/rules.txt）状态与 SAF 导入 ──
+    val ruleFile = remember { java.io.File(context.filesDir, "rules.txt") }
+    // exist 在导入后刷新（@Volatile 计数器驱动 recompose 即可，stat 开销微小）
+    var ruleFileStamp by remember { mutableStateOf(0) }
+    val rulePicker = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
+    ) { uri: Uri? ->
+        if (uri != null) {
+            scope.launch(Dispatchers.IO) {
+                // 安全约束（§九）：content:// 只读复制进应用沙箱，不持久化
+                // URI 权限；限 1MB（规则文件上限，防超大输入撑爆内存）。
+                // 评审一轮 P2-1：流式限界读取——先读到 1MB+1 判超限（超限即
+                // 失败、不落盘），≤1MB 才写入 rules.txt；禁止 readBytes() 全量读
+                val result = runCatching {
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        val max = 1 shl 20
+                        val buf = ByteArray(64 * 1024)
+                        var total = 0
+                        val collected = java.io.ByteArrayOutputStream(max)
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            total += n
+                            check(total <= max) { "规则文件超过 1MB" }
+                            collected.write(buf, 0, n)
+                        }
+                        val bytes = collected.toByteArray()
+                        check(bytes.isNotEmpty()) { "文件为空" }
+                        ruleFile.writeBytes(bytes)
+                        bytes.size
+                    } ?: error("无法读取所选文件")
+                }
+                withContext(Dispatchers.Main) {
+                    ruleFileStamp++
+                    result.fold(
+                        onSuccess = { size ->
+                            Toast.makeText(context, "规则已导入（$size 字节，重启 VPN 生效）", Toast.LENGTH_SHORT).show()
+                        },
+                        onFailure = { e ->
+                            // 超限给明确文案（P2-1：限界读取失败不落盘）
+                            val msg = if (e.message?.contains("1MB") == true) "规则文件超过 1MB"
+                            else "规则导入失败：${e.message}"
+                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                        },
+                    )
+                }
+            }
+        }
+    }
+
     val certPicker = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
     ) { uri: Uri? ->
@@ -282,6 +332,34 @@ fun SettingsScreen(
             }
         }
 
+        // ── 分流规则（§九）：规则文件导入（SAF，text/*，≤1MB → 沙箱 rules.txt）──
+        if (cfg.runMode == SecureStore.MODE_VPN) {
+            Section("分流规则") {
+                Text(
+                    "配合连接页「分流：CN 直连」开关使用：自定义规则叠加在内置 " +
+                        "CN 域名/GeoIP 表之上（GEOIP,CN,DIRECT / DOMAIN-SUFFIX,… 语法），" +
+                        "文件不可用时自动退化为全局代理",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                run {
+                    val exists = remember(ruleFileStamp) { ruleFile.exists() }
+                    Text(
+                        if (exists) {
+                            val size = runCatching { ruleFile.length() }.getOrDefault(0L)
+                            "规则文件：${ruleFile.absolutePath}\n已导入 ✓（$size 字节，导入即覆盖）"
+                        } else {
+                            "规则文件：${ruleFile.absolutePath}\n尚未导入——仅使用内置 CN 直连表"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                OutlinedButton(onClick = { rulePicker.launch(arrayOf("text/*")) }) {
+                    Text("导入规则文件（≤1MB）")
+                }
+            }
+        }
         Section("高级") {
             OutlinedTextField(
                 value = sni,

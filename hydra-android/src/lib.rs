@@ -205,6 +205,98 @@ pub struct VpnConfig {
     /// TUN v6 网关地址（默认 fd07::1）
     pub addr6: String,
     pub udp_relay: bool,
+    /// 智能分流开关（设计 v1 §九）：true = 规则模式（内置 CN 域名/GeoIP 表 +
+    /// 可选自定义规则文件）；false = 全局模式（与既有行为逐字节一致，零开销）。
+    pub rule_mode: bool,
+    /// 规则文件**完整绝对路径**（Kotlin 沙箱 `context.filesDir/rules.txt`——
+    /// Rust 不知道安卓沙箱路径）。仅 rule_mode=true 时读取；文件缺失/解析
+    /// 失败 → 降级为内置 CN 规则引擎（对齐桌面语义：内置 CN 直连保留，
+    /// 自定义规则未加载），**永不因分流断网**。
+    pub rule_file: Option<String>,
+}
+
+/// VPN 规则降级标记（P2-3）：rule_mode=true 且规则文件不可用、实际使用
+/// [`hydra_core::routing_rules::RuleEngine::builtin_cn`] 兜底时置 true；
+/// 正常文件引擎或全局模式为 false。`stop_vpn` 复位（未启动 = false）。
+static VPN_RULE_DEGRADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 查询当前 VPN 是否处于「规则降级」状态（P2-3）：true = 规则模式开启但
+/// 自定义规则文件不可用，正在使用内置 CN 规则兜底（Kotlin 层据此在日志流
+/// 中给用户可见提示）。VPN 未启动时恒为 false。
+#[uniffi::export]
+pub fn vpn_rule_mode_degraded() -> bool {
+    VPN_RULE_DEGRADED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 智能分流引擎构建（start_vpn 与单测共用）：`rule_mode=false` → None（全局
+/// 模式零开销）；`rule_mode=true` 恒 Some——文件缺失/解析失败降级为内置
+/// CN 规则引擎（对齐桌面 hydra-client：内置 CN 直连保留，消除「开关在规则
+/// 模式而引擎为全局」的脑裂），并置降级标记；成功 → Arc 包裹（只读共享，
+/// 每连接一次 O(log n) 判定）。
+fn build_rule_engine(
+    cfg: &VpnConfig,
+) -> Option<std::sync::Arc<hydra_core::routing_rules::RuleEngine>> {
+    if !cfg.rule_mode {
+        VPN_RULE_DEGRADED.store(false, std::sync::atomic::Ordering::SeqCst);
+        return None;
+    }
+    let Some(path) = cfg.rule_file.as_deref().filter(|p| !p.trim().is_empty()) else {
+        tracing::warn!("规则模式已开启但未提供规则文件路径——降级为内置 CN 规则（自定义规则未加载）");
+        VPN_RULE_DEGRADED.store(true, std::sync::atomic::Ordering::SeqCst);
+        return Some(std::sync::Arc::new(
+            hydra_core::routing_rules::RuleEngine::builtin_cn(),
+        ));
+    };
+    match hydra_core::routing_rules::RuleEngine::from_rule_file(path) {
+        Ok(engine) => {
+            tracing::info!(
+                "规则引擎已加载（{} 条规则，跳过 {} 行非法）：文件 {}",
+                engine.domain_rule_count() + engine.port_rule_count(),
+                engine.skipped_lines,
+                path
+            );
+            VPN_RULE_DEGRADED.store(false, std::sync::atomic::Ordering::SeqCst);
+            Some(std::sync::Arc::new(engine))
+        }
+        Err(e) => {
+            // 安全降级语义（对齐桌面）：规则文件不可用 → 内置 CN 规则兜底，
+            // 永不断网；降级对用户可见（vpn_rule_mode_degraded）
+            tracing::warn!("规则文件不可用（{e}）——降级为内置 CN 规则（自定义规则未加载）");
+            VPN_RULE_DEGRADED.store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(std::sync::Arc::new(
+                hydra_core::routing_rules::RuleEngine::builtin_cn(),
+            ))
+        }
+    }
+}
+
+/// VpnConfig → TunConfig（start_vpn 与单测共用）：规则模式额外联动 DNS 直连
+/// （dns_via_proxy=false + dns_direct=true，对齐桌面 R2——DNS 直连出网才能把
+/// CN 域名解析到近端 CDN IP，GeoIP 才判得准；安卓侧 Kotlin 同步把
+/// VpnBuilder.addDnsServer 换成国内公共 DNS）。**不设 direct_bind_ip**：
+/// 安卓直连 = protect 形态（R3 双形态），tun_rule_opener 在 protect 钩子
+/// 已安装时放行无 bind 直连（P1-3 守卫既有逻辑自动正确）。
+fn build_tun_config(
+    cfg: &VpnConfig,
+    addr4: std::net::Ipv4Addr,
+    addr6: std::net::Ipv6Addr,
+    rule_engine: Option<std::sync::Arc<hydra_core::routing_rules::RuleEngine>>,
+) -> hydra_client::tun::TunConfig {
+    let rule_active = rule_engine.is_some();
+    hydra_client::tun::TunConfig {
+        addr: addr4,
+        prefix: cfg.prefix4,
+        mtu: cfg.mtu,
+        addr6,
+        ipv6_enabled: true,
+        udp_relay: cfg.udp_relay,
+        // 全局模式：dns_via_proxy=true（与基线逐字节一致）；规则模式：DNS
+        // 直连联动（R2），避免「规则模式 + dns_via_proxy=true」的 P2-5 告警
+        dns_via_proxy: !rule_active,
+        dns_direct: rule_active,
+        rule_engine,
+        ..Default::default() // direct_bind_ipv4/6 = None：安卓 protect 形态
+    }
 }
 
 /// fd 包传输（内核优化 #2，评审修正后设计）：VpnService tun fd →
@@ -543,6 +635,11 @@ pub fn start_vpn(
         .clone()
         .unwrap_or_else(|| hydra_core::DEFAULT_SNI.into());
 
+    // 智能分流（§九）：规则模式构建引擎（rule_mode=true 恒 Some——文件缺失/
+    // 解析失败降级内置 CN 规则，对齐桌面；必须在可失败路径之后、fd 使用之前
+    // 语义无冲突——此处仅内存构建）。
+    let rule_engine = build_rule_engine(&config);
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -572,16 +669,10 @@ pub fn start_vpn(
             }
         };
         let udp_factory = proxy.tun_udp_channel_factory().ok();
-        let tun_cfg = hydra_client::tun::TunConfig {
-            addr: addr4,
-            prefix: config.prefix4,
-            mtu: config.mtu,
-            addr6,
-            ipv6_enabled: true,
-            udp_relay: config.udp_relay,
-            dns_via_proxy: true,
-            ..Default::default()
-        };
+        let tun_cfg = build_tun_config(&config, addr4, addr6, rule_engine);
+        if tun_cfg.rule_engine.is_some() {
+            tracing::info!("Hydra VPN 规则分流已启用（CN 直连 · 其余走节点）");
+        }
         tracing::info!("Hydra VPN 栈启动（fd 模式，mtu={}）", config.mtu);
         let stack_res = hydra_client::tun::run_stack(
             std::sync::Arc::new(transport),
@@ -618,6 +709,8 @@ pub fn stop_vpn() -> bool {
             h.shutdown.cancel();
             h.runtime
                 .shutdown_timeout(std::time::Duration::from_secs(3));
+            // P2-3：停止后降级标记复位（未启动 = false）
+            VPN_RULE_DEGRADED.store(false, std::sync::atomic::Ordering::SeqCst);
             true
         }
         None => false,
@@ -915,5 +1008,91 @@ mod tests {
             0
         )
         .is_err());
+    }
+
+    // ── §九：VpnConfig → TunConfig 规则引擎接线三态 ─────────────────────────
+
+    /// VPN_RULE_DEGRADED 是进程级全局标记——涉它的测试必须串行（防止并行
+    /// 测试互相重置标记造成竞态假阳性）
+    static DEGRADED_FLAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn vpn_cfg(rule_mode: bool, rule_file: Option<String>) -> VpnConfig {
+        VpnConfig {
+            nodes: vec!["127.0.0.1:44300".into()],
+            auth_key_hex: HEX.repeat(32),
+            trust: TrustMode::Pinned {
+                cert_der: vec![vec![0x30u8, 0x00]],
+            },
+            sni: None,
+            mtu: 1500,
+            addr4: "10.7.0.1".into(),
+            prefix4: 30,
+            addr6: "fd07::1".into(),
+            udp_relay: true,
+            rule_mode,
+            rule_file,
+        }
+    }
+
+    #[test]
+    fn rule_mode_off_tun_config_has_no_engine() {
+        // 全局模式（开关 OFF）：rule_engine=None 且 DNS 配置与基线逐字节一致
+        let cfg = vpn_cfg(false, Some("whatever.txt".into()));
+        assert!(build_rule_engine(&cfg).is_none(), "OFF 不得构建引擎");
+        let tun = build_tun_config(&cfg, "10.7.0.1".parse().unwrap(), "fd07::1".parse().unwrap(), None);
+        assert!(tun.rule_engine.is_none());
+        assert!(tun.dns_via_proxy, "全局模式 DNS 语义与基线一致");
+        assert!(!tun.dns_direct);
+        assert!(tun.direct_bind_ipv4.is_none() && tun.direct_bind_ipv6.is_none(),
+            "安卓 protect 形态：不设直连 bind 源 IP");
+    }
+
+    #[test]
+    fn rule_mode_missing_file_degrades_to_builtin_cn() {
+        let _g = DEGRADED_FLAG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // 安全降级（P1-2 对齐桌面）：规则模式 + 文件缺失/解析失败 → 内置 CN
+        // 规则引擎（内置 CN 表有效），引擎恒 Some——消除脑裂；不报错不断网
+        let cfg = vpn_cfg(true, None);
+        let engine = build_rule_engine(&cfg).expect("文件缺失应降级为内置 CN 引擎而非 None");
+        assert!(engine.geoip_enabled(), "内置引擎必须启用 GeoIP-CN 表");
+        assert!(vpn_rule_mode_degraded(), "降级兜底必须置标记（P2-3）");
+        let cfg = vpn_cfg(true, Some("Z:/不存在的路径/rules.txt".into()));
+        let engine = build_rule_engine(&cfg).expect("解析失败应降级为内置 CN 引擎而非 None");
+        assert!(engine.geoip_enabled(), "内置引擎必须启用 GeoIP-CN 表");
+        assert!(vpn_rule_mode_degraded());
+        let cfg = vpn_cfg(true, Some("   ".into()));
+        let engine = build_rule_engine(&cfg).expect("空白路径视同未提供——同样降级为内置 CN");
+        assert!(engine.geoip_enabled());
+        // 正常文件引擎不置降级标记
+        let dir = std::env::temp_dir().join(format!("hydra_rules_deg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rules.txt");
+        std::fs::write(&path, "GEOIP,CN,DIRECT\n").unwrap();
+        let cfg = vpn_cfg(true, Some(path.to_string_lossy().into_owned()));
+        build_rule_engine(&cfg).expect("有效规则文件应构建出引擎");
+        assert!(!vpn_rule_mode_degraded(), "正常文件引擎不得置降级标记");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rule_mode_valid_file_wires_engine_and_dns_direct() {
+        let _g = DEGRADED_FLAG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // 规则模式 + 有效规则文件：引擎接入 TunConfig + DNS 直连联动（R2）
+        let dir = std::env::temp_dir().join(format!("hydra_rules_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rules.txt");
+        std::fs::write(&path, "# 注释\nGEOIP,CN,DIRECT\nDOMAIN-SUFFIX,example.com,DIRECT\n")
+            .unwrap();
+        let cfg = vpn_cfg(true, Some(path.to_string_lossy().into_owned()));
+        let engine = build_rule_engine(&cfg).expect("有效规则文件应构建出引擎");
+        let tun = build_tun_config(
+            &cfg,
+            "10.7.0.1".parse().unwrap(),
+            "fd07::1".parse().unwrap(),
+            Some(engine),
+        );
+        assert!(tun.rule_engine.is_some(), "规则模式必须接入 TunConfig");
+        assert!(!tun.dns_via_proxy && tun.dns_direct, "DNS 直连联动（R2）");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

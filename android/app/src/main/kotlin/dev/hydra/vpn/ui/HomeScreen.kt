@@ -36,6 +36,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -99,6 +100,10 @@ fun HomeScreen(
     /** 本地模式：启停 EngineService；VPN 模式：装配层 prepare/consent 分流 */
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
+    /** 智能分流开关当前值（SecureStore.runRuleMode，§九） */
+    ruleMode: Boolean = false,
+    /** 切换智能分流（持久化由装配层完成；运行中切换 → 提示重启 VPN 生效） */
+    onToggleRuleMode: (Boolean) -> Unit = {},
 ) {
     val context = LocalContext.current
     val scope = androidx.compose.runtime.rememberCoroutineScope()
@@ -166,6 +171,7 @@ fun HomeScreen(
                         Modifier.weight(1f),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
+                        RuleModeCard(isVpn, ruleMode, onToggleRuleMode)
                         StatBand()
                         ErrorBanner(phase)
                         RecentLogs(logs.take(2)) { showAllLogs = true }
@@ -182,6 +188,7 @@ fun HomeScreen(
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     BigButtonSection(phase, isVpn, ::onBigButtonClick, nodeSummary)
+                    RuleModeCard(isVpn, ruleMode, onToggleRuleMode)
                     ErrorBanner(phase)
                 }
                 StatBand()
@@ -357,6 +364,56 @@ private fun BigConnectButton(phase: ConnPhase, isVpn: Boolean, onClick: () -> Un
                     color = hc.onAccent,
                 )
             }
+        }
+    }
+}
+
+// ── 智能分流卡片（§九，美观重点）：VPN 卡片下「分流：CN 直连」开关 ─────────
+// 主题令牌约束：颜色只取 MaterialTheme.colorScheme / hydraColors（四主题模式
+// 全兼容），文字层级走既有 typography，间距对齐 12dp rhythm。
+
+@Composable
+private fun RuleModeCard(isVpn: Boolean, ruleMode: Boolean, onToggle: (Boolean) -> Unit) {
+    if (!isVpn) return // 仅 VPN 模式可见（本地端口无分流语义）
+    // 独立收集连接态（R10 护栏：distinctUntilChanged，迁移时才重组本卡片）
+    val phase by EngineState.connPhase.collectAsState(ConnPhase.DISCONNECTED)
+    val runningOrConnecting = phase == ConnPhase.CONNECTED || phase == ConnPhase.CONNECTING
+    Card(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    // 状态点：主题令牌（开 = success / 关 = ringDisconnected），
+                    // 禁硬编码色值——四主题（深/浅/Abyss/动态取色）自动适配
+                    Box(
+                        Modifier
+                            .size(8.dp)
+                            .background(
+                                if (ruleMode) hydraColors.success else hydraColors.ringDisconnected,
+                                CircleShape,
+                            ),
+                    )
+                    Spacer(Modifier.size(8.dp))
+                    Text("分流：CN 直连", style = MaterialTheme.typography.titleSmall)
+                }
+                Text(
+                    "命中 CN 规则直连 · 其余走节点" +
+                        if (runningOrConnecting) "（切换后重启 VPN 生效）" else "",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = ruleMode,
+                onCheckedChange = onToggle,
+                modifier = Modifier.semantics {
+                    // TalkBack：开关状态 + 副标题语义可完整读出（既有无障碍基线）
+                    contentDescription = "智能分流开关：命中 CN 规则直连，其余走节点" +
+                        if (ruleMode) "，已开启" else "，已关闭"
+                },
+            )
         }
     }
 }

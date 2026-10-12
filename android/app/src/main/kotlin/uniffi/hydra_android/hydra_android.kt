@@ -774,6 +774,8 @@ internal open class UniffiVTableCallbackInterfaceVpnExitCallback(
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -796,6 +798,8 @@ fun uniffi_hydra_android_checksum_func_start_vpn(
 fun uniffi_hydra_android_checksum_func_stop_vpn(
 ): Short
 fun uniffi_hydra_android_checksum_func_test_node_connection(
+): Short
+fun uniffi_hydra_android_checksum_func_vpn_rule_mode_degraded(
 ): Short
 fun uniffi_hydra_android_checksum_method_hydraengine_bound_addr(
 ): Short
@@ -888,6 +892,8 @@ fun uniffi_hydra_android_fn_func_stop_vpn(uniffi_out_err: UniffiRustCallStatus,
 ): Byte
 fun uniffi_hydra_android_fn_func_test_node_connection(`node`: RustBuffer.ByValue,`authKeyHex`: RustBuffer.ByValue,`trust`: RustBuffer.ByValue,`sni`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_hydra_android_fn_func_vpn_rule_mode_degraded(uniffi_out_err: UniffiRustCallStatus, 
+): Byte
 fun ffi_hydra_android_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun ffi_hydra_android_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1024,6 +1030,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_hydra_android_checksum_func_test_node_connection() != 57530.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_hydra_android_checksum_func_vpn_rule_mode_degraded() != 41889.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_hydra_android_checksum_method_hydraengine_bound_addr() != 10632.toShort()) {
@@ -2014,7 +2023,19 @@ data class VpnConfig (
      * TUN v6 网关地址（默认 fd07::1）
      */
     var `addr6`: kotlin.String, 
-    var `udpRelay`: kotlin.Boolean
+    var `udpRelay`: kotlin.Boolean, 
+    /**
+     * 智能分流开关（设计 v1 §九）：true = 规则模式（内置 CN 域名/GeoIP 表 +
+     * 可选自定义规则文件）；false = 全局模式（与既有行为逐字节一致，零开销）。
+     */
+    var `ruleMode`: kotlin.Boolean, 
+    /**
+     * 规则文件**完整绝对路径**（Kotlin 沙箱 `context.filesDir/rules.txt`——
+     * Rust 不知道安卓沙箱路径）。仅 rule_mode=true 时读取；文件缺失/解析
+     * 失败 → 降级为内置 CN 规则引擎（对齐桌面语义：内置 CN 直连保留，
+     * 自定义规则未加载），**永不因分流断网**。
+     */
+    var `ruleFile`: kotlin.String?
 ) {
     
     companion object
@@ -2035,6 +2056,8 @@ public object FfiConverterTypeVpnConfig: FfiConverterRustBuffer<VpnConfig> {
             FfiConverterUByte.read(buf),
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -2047,7 +2070,9 @@ public object FfiConverterTypeVpnConfig: FfiConverterRustBuffer<VpnConfig> {
             FfiConverterString.allocationSize(value.`addr4`) +
             FfiConverterUByte.allocationSize(value.`prefix4`) +
             FfiConverterString.allocationSize(value.`addr6`) +
-            FfiConverterBoolean.allocationSize(value.`udpRelay`)
+            FfiConverterBoolean.allocationSize(value.`udpRelay`) +
+            FfiConverterBoolean.allocationSize(value.`ruleMode`) +
+            FfiConverterOptionalString.allocationSize(value.`ruleFile`)
     )
 
     override fun write(value: VpnConfig, buf: ByteBuffer) {
@@ -2060,6 +2085,8 @@ public object FfiConverterTypeVpnConfig: FfiConverterRustBuffer<VpnConfig> {
             FfiConverterUByte.write(value.`prefix4`, buf)
             FfiConverterString.write(value.`addr6`, buf)
             FfiConverterBoolean.write(value.`udpRelay`, buf)
+            FfiConverterBoolean.write(value.`ruleMode`, buf)
+            FfiConverterOptionalString.write(value.`ruleFile`, buf)
     }
 }
 
@@ -2549,6 +2576,20 @@ public object FfiConverterSequenceTypeNodeSpec: FfiConverterRustBuffer<List<Node
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_hydra_android_fn_func_test_node_connection(
         FfiConverterString.lower(`node`),FfiConverterString.lower(`authKeyHex`),FfiConverterTypeTrustMode.lower(`trust`),FfiConverterOptionalString.lower(`sni`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * 查询当前 VPN 是否处于「规则降级」状态（P2-3）：true = 规则模式开启但
+         * 自定义规则文件不可用，正在使用内置 CN 规则兜底（Kotlin 层据此在日志流
+         * 中给用户可见提示）。VPN 未启动时恒为 false。
+         */ fun `vpnRuleModeDegraded`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_hydra_android_fn_func_vpn_rule_mode_degraded(
+        _status)
 }
     )
     }

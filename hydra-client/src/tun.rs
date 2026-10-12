@@ -1549,15 +1549,20 @@ fn ensure_v6_dst(
 use hydra_core::udp_relay::{NodeUdpChannel, UdpChannelFactory, UdpRx};
 
 /// UDP 直连 NAT（智能分流 R1）：规则判定 DIRECT 的公网/私网 UDP 包不经节点
-/// 中继，改由「bind 物理源 IP 的本机 UdpSocket 直发」，回包按客户端源地址
-/// 反查会话并注入 TUN（简易 NAT 映射表，空闲超时回收）。
+/// 中继，改由「本机 UdpSocket 直发」，回包按客户端源地址反查会话并注入 TUN
+/// （简易 NAT 映射表，空闲超时回收）。会话建立双形态（[`Self::ensure_session`]）：
+/// - **bind 形态**（桌面）：bind 物理源 IP；
+/// - **protect 形态**（Android）：无 bind 源 IP 时通配 bind + protect(fd) 绕过
+///   VpnService 出物理口。
+///
 /// 会话按客户端源地址（SocketAddr）键控：应用一个 socket 可达多个目的地，
 /// 回包以 `recv_from` 的真实远端构造（src=远端，dst=客户端）。
 struct UdpDirectNat {
     /// 规则引擎（判定入口在 [`try_forward_udp`]，此处持有供未来扩展）
     #[allow(dead_code)]
     engine: Arc<hydra_core::routing_rules::RuleEngine>,
-    /// 直连物理源 IP（R4 探测；对应地址族缺失 → 该族目标直连不可用 → 回落中继）
+    /// 直连物理源 IP（R4 探测；对应地址族缺失且无 protect 钩子 → 该族目标
+    /// 直连不可用 → 回落中继；缺失但钩子已装（Android）→ protect 形态直发）
     bind_v4: Option<std::net::IpAddr>,
     bind_v6: Option<std::net::IpAddr>,
     /// 回包注入 TUN 的设备通道
@@ -1682,40 +1687,66 @@ impl UdpDirectNat {
         }
     }
 
-    /// 建立直连会话：bind 物理源 IP（无对应族源 IP → Err 回落中继），
-    /// 并派生回包泵（recv_from → 构造 UDP/IP 回包注入 TUN）。
+    /// 建立直连会话（双形态）：
+    /// - **bind 形态**：有该族物理源 IP（R4 探测，桌面）→ bind 物理 IP 直发
+    ///   （Windows 强主机模型保证出接口）；
+    /// - **protect 形态**：无 bind 源 IP（Android TUN 内探测为 None）但 protect
+    ///   钩子已安装 → 通配 bind（0.0.0.0:0 / [::]:0）+ `VpnService.protect(fd)`
+    ///   ——protect 语义即出网绕过本应用 TUN 走物理口，无回环风险；protect
+    ///   失败 → Err 回落中继；
+    /// - 两者皆无（桌面无钩子无 bind）→ Err 回落中继（回环风险，禁直连）。
+    ///
+    /// 随后派生回包泵（recv_from → 构造 UDP/IP 回包注入 TUN）。
     fn ensure_session(&self, client_src: SocketAddr) -> std::io::Result<()> {
         let bind = match client_src.ip() {
             std::net::IpAddr::V4(_) => self.bind_v4.filter(|b| b.is_ipv4()),
             std::net::IpAddr::V6(_) => self.bind_v6.filter(|b| b.is_ipv6()),
         };
-        let Some(bind) = bind else {
-            return Err(std::io::Error::other(
-                "无该地址族的物理源 IP（R4 探测缺失）",
-            ));
-        };
-        // 二轮 P1-1：平台守卫（与 proxy.rs:512 附近 TCP 守卫完全同口径）——
-        // 非 Windows（Linux 弱主机模型）下 bind 源 IP 不约束出接口，UDP 直发
-        // 同样可能命中 /1 接管路由把包送回自身 TUN 回环；无 protect 钩子
-        // （非 Android）时一律 Err 回落中继。Windows 强主机模型 + bind 已
-        // 保证出接口，行为不变。AtomicBool 去重告警一次防刷屏。
-        #[cfg(not(windows))]
-        {
-            if !hydra_core::socket_protect::socket_protect_installed() {
-                static NON_WIN_UDP_DIRECT_WARNED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !NON_WIN_UDP_DIRECT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    warn!(
-                        "TUN UDP 直连在非 Windows 平台已禁用：Linux 弱主机模型下 \
-                         bind 源 IP 不约束出接口，直发可能回环——全部回落中继"
-                    );
+        // 双形态 socket 建立：bind 形态（现状不动）/ protect 形态（通配 bind）
+        let std_sock = match bind {
+            Some(b) => {
+                // 二轮 P1-1：bind 形态平台守卫（与 proxy.rs:512 附近 TCP 守卫
+                // 完全同口径，现状不动）——非 Windows（Linux 弱主机模型）下
+                // bind 源 IP 不约束出接口，UDP 直发同样可能命中 /1 接管路由
+                // 把包送回自身 TUN 回环；无 protect 钩子（非 Android）时一律
+                // Err 回落中继。Windows 强主机模型 + bind 已保证出接口，行为
+                // 不变。AtomicBool 去重告警一次防刷屏。
+                #[cfg(not(windows))]
+                {
+                    if !hydra_core::socket_protect::socket_protect_installed() {
+                        static NON_WIN_UDP_DIRECT_WARNED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !NON_WIN_UDP_DIRECT_WARNED
+                            .swap(true, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            warn!(
+                                "TUN UDP 直连在非 Windows 平台已禁用：Linux 弱主机模型下 \
+                                 bind 源 IP 不约束出接口，直发可能回环——全部回落中继"
+                            );
+                        }
+                        return Err(std::io::Error::other(
+                            "非 Windows 平台无 protect 钩子，UDP 直发禁用（回落中继）",
+                        ));
+                    }
                 }
-                return Err(std::io::Error::other(
-                    "非 Windows 平台无 protect 钩子，UDP 直发禁用（回落中继）",
-                ));
+                std::net::UdpSocket::bind(SocketAddr::new(b, 0))?
             }
-        }
-        let std_sock = std::net::UdpSocket::bind(SocketAddr::new(bind, 0))?;
+            None => {
+                // protect 形态前置：无钩子（桌面无 bind 场景）= 回环风险，
+                // 禁直连，维持 Err 回落中继（Windows 桌面行为分毫不变）
+                if !hydra_core::socket_protect::socket_protect_installed() {
+                    return Err(std::io::Error::other(
+                        "无该地址族物理源 IP 且无 protect 钩子：直连不可用（回落中继）",
+                    ));
+                }
+                // Android（钩子已装）：通配 bind 后由下方 protect(fd) 标记
+                // 绕过 VpnService 出物理口，不存在 bind 源 IP 缺失问题
+                match client_src.ip() {
+                    std::net::IpAddr::V4(_) => std::net::UdpSocket::bind("0.0.0.0:0"),
+                    std::net::IpAddr::V6(_) => std::net::UdpSocket::bind("[::]:0"),
+                }?
+            }
+        };
         std_sock.set_nonblocking(true)?;
         // 二轮 P1-1：protect 钩子覆盖 UDP——Android（钩子已安装）场景下，
         // 直发 socket 若不经 VpnService.protect(fd) 标记会被本应用 TUN 捕获
@@ -2175,7 +2206,7 @@ fn private_targets_allowed() -> bool {
 
 /// 分发入口（run_stack 调用）：解析 + 私网/组播过滤 + 规则分流（R1）+ 转交。
 /// - 规则模式（rule=Some）：先经 [`RuleEngine::decide`] 判定——DIRECT 走
-///   [`UdpDirectNat`] 直发（bind 物理源 IP + 回包注入 TUN），PROXY 走既有
+///   [`UdpDirectNat`] 直发（bind 物理源 IP / protect 形态直发 + 回包注入 TUN），PROXY 走既有
 ///   节点中继；私网目标不再被无差别过滤（内置私网 DIRECT 兜底，R5——
 ///   例外：组播/广播/未指定仍一律不入）；
 /// - 非规则模式（rule=None）：行为与既有完全一致。
@@ -2338,11 +2369,13 @@ pub async fn run_stack<T: PacketTransport>(
              国内 CDN 域名可能被 GeoIP 误判走节点（应经 tun_config_from_settings 构造）"
         );
     }
-    // R4 退化告警：直连源 IP 探测失败（None）→ 全部走节点（规则模式静默
-    // 退化为全局代理，日志必须可见）
+    // R4 退化告警：仅在「双族直连 bind 源 IP 均缺失**且** protect 钩子不在场」
+    // 时告警——安卓 protect 形态（bind 缺失但钩子在场）的 TCP 直连经钩子放行
+    // 可用，不构成退化，不得误报
     if cfg.rule_engine.is_some()
         && cfg.direct_bind_ipv4.is_none()
         && cfg.direct_bind_ipv6.is_none()
+        && !hydra_core::socket_protect::socket_protect_installed()
     {
         warn!(
             "TUN 规则模式：物理网卡源 IP 探测失败（无可用直连源地址），\
@@ -2373,8 +2406,9 @@ pub async fn run_stack<T: PacketTransport>(
         }
         None => opener,
     };
-    // R1 UDP 分流：规则判定的 UDP 直连通道（bind 物理 IP 的本机 socket 直发 +
-    // 回包注入 TUN 的简易 NAT 表）；无引擎或无直连源 IP → None（全走中继）
+    // R1 UDP 分流：规则判定的 UDP 直连通道（本机 socket 直发——桌面 bind 物理
+    // IP / Android protect 形态，+ 回包注入 TUN 的简易 NAT 表）；无引擎 → None（全走中继）
+    // 构造不要求 bind 源 IP 必须存在：Android（钩子已装）走 protect 形态直发
     let udp_direct: Option<Arc<UdpDirectNat>> = cfg.rule_engine.as_ref().map(|engine| {
         let nat = Arc::new(UdpDirectNat::new(
             engine.clone(),
@@ -4934,6 +4968,49 @@ mod tests {
         assert!(!err.to_string().is_empty());
     }
 
+    // ── protect 形态（无 bind）：Android UDP 直连闭环 ──
+    // bind 源 IP 缺失（Android TUN 内 R4 探测为 None）时：
+    // - 无 protect 钩子（桌面）→ Err 回落中继（回环风险禁直连）；
+    // - 有 protect 钩子（Android / 本测试装真钩子）→ 通配 bind + protect(fd)
+    //   建会话成功。OnceLock 进程级固化：钩子安装后不可复位，测试进程独立，
+    //   接受残留（后续依赖「无钩子」的测试自行跳过）。
+    #[tokio::test]
+    async fn udp_direct_protect形态_bind缺失_装钩子前后建会话语义切换() {
+        let (_in_tx, in_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let transport = Arc::new(TestTransport {
+            inbound: tokio::sync::Mutex::new(in_rx),
+            outbound: out_tx,
+        });
+        // bind 全 None：模拟 Android TUN 内无物理源 IP 探测结果
+        let nat = UdpDirectNat::new(
+            Arc::new(hydra_core::routing_rules::RuleEngine::builtin_cn()),
+            None,
+            None,
+            transport,
+        );
+        let src: SocketAddr = "10.7.0.1:50002".parse().unwrap();
+        // 阶段 1：无钩子 → Err（若同进程其他测试已先装钩子，本阶段跳过）
+        if !hydra_core::socket_protect::socket_protect_installed() {
+            assert!(
+                nat.ensure_session(src).is_err(),
+                "无 bind 且无 protect 钩子应 Err 回落中继"
+            );
+            assert_eq!(nat.session_count(), 0, "拒绝后不得残留会话");
+        }
+        // 阶段 2：安装真钩子（已被占用则沿用既有钩子，语义一致）
+        let _ = hydra_core::socket_protect::set_socket_protect_hook(Box::new(|_fd| true));
+        assert!(hydra_core::socket_protect::socket_protect_installed());
+        nat.ensure_session(src)
+            .expect("protect 形态（通配 bind + protect fd）应建会话成功");
+        assert_eq!(nat.session_count(), 1, "protect 形态应落表 1 个会话");
+        // 清理：回收泵任务，避免悬挂
+        nat.expire_all_sessions();
+        let pumps = nat.sweep_idle_collect();
+        assert_eq!(pumps.len(), 1, "应回收 1 个会话的泵");
+        assert_eq!(nat.session_count(), 0);
+    }
+
     // ── 二轮 P2-1：探测排除集前缀精确化 ──
     #[test]
     fn candidate_in_tun_subnet_按实际前缀排除() {
@@ -5135,5 +5212,117 @@ mod tests {
         }
         shutdown.cancel();
         assert!(got, "应在超时前收到经直连 NAT 注入的 UDP 回包（src/dst/载荷匹配）");
+    }
+
+    // ── protect 形态端到端：bind 缺失 + 真 protect 钩子 → 通配直发 ──
+    // 模拟 Android 场景：direct_bind_ipv4=None（TUN 内无物理源 IP 探测）+
+    // 进程内安装真 protect 钩子 → ensure_session 走 protect 形态（通配 bind +
+    // protect fd）直发本机回环回显 → 回包注入 TUN。跨平台可跑：钩子在测试
+    // 进程内真实调用（|_| true），直发 socket 为通配 bind 的本机 UDP socket。
+    // 注意：钩子 OnceLock 进程级不可复位——本测试与其余依赖钩子在场的测试
+    // 共存，「无钩子」断言均有 installed 前置跳过保护。
+    #[tokio::test]
+    async fn run_stack_protect形态udp直连_bind缺失回环端到端() {
+        // 真钩子（幂等：已被占用则沿用，断言在场即可）
+        let _ = hydra_core::socket_protect::set_socket_protect_hook(Box::new(|_fd| true));
+        assert!(hydra_core::socket_protect::socket_protect_installed());
+
+        // 1. 本机 UDP 回显服务（protect 形态直发 socket 通配 bind 可达回环）
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 2048];
+            loop {
+                if let Ok((n, from)) = echo.recv_from(&mut b).await {
+                    let _ = echo.send_to(&b[..n], from).await;
+                }
+            }
+        });
+
+        // 2. 规则模式配置：bind 源 IP 缺失（None）→ 只能走 protect 形态；
+        // 哑 UDP 工厂保证 DIRECT 不会触达节点中继（触达即失败可辨）
+        let cfg = TunConfig {
+            udp_relay: true,
+            dns_via_proxy: true,
+            dns_direct: false,
+            rule_engine: Some(Arc::new(hydra_core::routing_rules::RuleEngine::builtin_cn())),
+            direct_bind_ipv4: None,
+            ..Default::default()
+        };
+        let opener: ChannelOpener = Arc::new(|_t: String| {
+            Box::pin(async {
+                Err(HydraError::ConnectionError("测试未使用 TCP 路径".into()))
+            }) as OpenFuture
+        }) as ChannelOpener;
+        let factory: hydra_core::udp_relay::UdpChannelFactory = Arc::new(|| {
+            Box::pin(async {
+                Err(HydraError::ConnectionError("DIRECT 路径不应使用 UDP 中继".into()))
+                    as Result<hydra_core::udp_relay::NodeUdpChannel>
+            }) as std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<hydra_core::udp_relay::NodeUdpChannel>> + Send>,
+            >
+        });
+
+        // 3. mock TUN：入站注入客户端 UDP 包（10.7.0.1:41001 → 回显端口），
+        // 内置私网 DIRECT（R5）判定直连；出站收集回包
+        let (in_tx, in_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let transport = Arc::new(TestTransport {
+            inbound: tokio::sync::Mutex::new(in_rx),
+            outbound: out_tx,
+        });
+        let payload = b"hydra-protect-direct-e2e";
+        let src_ip = Ipv4Addr::new(10, 7, 0, 1);
+        let mut pkt = Vec::with_capacity(20 + 8 + payload.len());
+        pkt.extend_from_slice(&[0x45, 0, 0, 0]);
+        let total = (28 + payload.len()) as u16;
+        pkt[2..4].copy_from_slice(&total.to_be_bytes());
+        pkt.extend_from_slice(&[0, 1, 0, 0, 64, 17, 0, 0]);
+        pkt.extend_from_slice(&src_ip.octets());
+        pkt.extend_from_slice(&[127, 0, 0, 1]); // 回环目标 → 内置 DIRECT
+        pkt.extend_from_slice(&41001u16.to_be_bytes());
+        pkt.extend_from_slice(&echo_addr.port().to_be_bytes());
+        pkt.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        pkt.extend_from_slice(&[0, 0]);
+        pkt.extend_from_slice(payload);
+        assert!(parse_udp_v4(&pkt).is_some());
+
+        let shutdown = CancellationToken::new();
+        tokio::spawn(run_stack(
+            transport,
+            cfg,
+            opener,
+            Some(factory),
+            shutdown.clone(),
+        ));
+        in_tx.send(pkt).unwrap();
+
+        // 4. 等回包（最长 8s）：载荷回显即证明走了 protect 形态直发
+        // （bind=None 下旧逻辑一律 Err 回落中继，哑工厂必失败、无回包）
+        let mut got = false;
+        for _ in 0..160 {
+            match tokio::time::timeout(Duration::from_millis(50), out_rx.recv()).await {
+                Ok(Some(p)) => {
+                    if p.len() >= 28 + payload.len() && p[0] >> 4 == 4 && p[9] == 17 {
+                        let s = Ipv4Addr::new(p[12], p[13], p[14], p[15]);
+                        let d = Ipv4Addr::new(p[16], p[17], p[18], p[19]);
+                        let sp = u16::from_be_bytes([p[20], p[21]]);
+                        let dp = u16::from_be_bytes([p[22], p[23]]);
+                        if s == echo_addr.ip()
+                            && d == src_ip
+                            && sp == echo_addr.port()
+                            && dp == 41001
+                            && &p[28..] == payload
+                        {
+                            got = true;
+                            break;
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+        shutdown.cancel();
+        assert!(got, "bind 缺失 + protect 钩子应在超时前收到直发回包");
     }
 }
