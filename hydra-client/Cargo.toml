@@ -40,7 +40,7 @@ hydra-protocol = { path = "../hydra-protocol" }
 # Linux 走 /dev/net/tun。
 tun2 = { version = "4", optional = true, features = ["async"] }
 # 用户态 TCP/IP 栈：TUN 收发裸 IP 包（medium-ip），只需 IPv4 + TCP socket。
-smoltcp = { version = "0.11", optional = true, default-features = false, features = [
+smoltcp = { version = "0.14", optional = true, default-features = false, features = [
     "alloc",
     "proto-ipv4",
     # v1 完整版：IPv6 正向路径——v6 TCP 由栈直接代理（动态 AnyIP，见 tun.rs
