@@ -27,8 +27,8 @@ android {
         applicationId = "dev.hydra.vpn"
         minSdk = 26
         targetSdk = 36
-        versionCode = 8
-        versionName = "0.2.7"
+        versionCode = 9
+        versionName = "0.2.8"
         // 首发 ABI（设计 v2.1 §6）：arm64-v8a 真机 + x86_64 模拟器；armeabi-v7a 延后
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
