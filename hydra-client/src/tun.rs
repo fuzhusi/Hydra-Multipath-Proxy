@@ -5090,6 +5090,7 @@ mod tests {
     /// mock TUN 回环。客户端 UDP 包（10.7.0.1:40000 → 127.0.0.1:echo）经
     /// run_stack 分发 → 中继任务（keyed 会话）→ 节点中继 → 本机 UDP 回显 →
     /// 回包按流表构造注入 TUN 出口。验证：封装/分发/回包构造/回环全链路。
+    #[ignore = "重资源 E2E：真实 TLS 节点 + 真实 UDP 套接字，共享 CI runner 时序不稳；发布前本地手动运行 cargo test -p hydra-client -- --ignored run_stack_udp接管"]
     #[tokio::test]
     async fn run_stack_udp接管_真节点mock回环端到端() {
         std::env::set_var("HYDRA_ALLOW_PRIVATE_TARGETS", "1");
