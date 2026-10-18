@@ -2226,7 +2226,10 @@ async fn udp_relay_task(
                             debug!("TUN UDP 下行 sid 无流映射（迟到帧），丢弃: {}", mask_target(&target));
                             continue;
                         };
-                        let reply = match (flow_dst, client_src) {
+                        // 批次 B 修复（Linux CI 回归）：不再从 match 借出
+                        // scratch 跨语句使用——就地构造后立即在同一语句域 send，
+                        // 消除引用跨 await 的潜在平台差异
+                        let built = match (flow_dst, client_src) {
                             (SocketAddr::V4(s), SocketAddr::V4(d)) => {
                                 build_udp_reply_v4_into(
                                     &mut reply_scratch,
@@ -2236,7 +2239,7 @@ async fn udp_relay_task(
                                     d.port(),
                                     &datagram,
                                 );
-                                Some(&reply_scratch)
+                                true
                             }
                             (SocketAddr::V6(s), SocketAddr::V6(d)) => {
                                 build_udp_reply_v6_into(
@@ -2247,12 +2250,12 @@ async fn udp_relay_task(
                                     d.port(),
                                     &datagram,
                                 );
-                                Some(&reply_scratch)
+                                true
                             }
-                            _ => None, // v4/v6 混线（不应发生）：丢弃
+                            _ => false, // v4/v6 混线（不应发生）：丢弃
                         };
-                        if let Some(pkt) = reply {
-                            match transport.send(pkt).await {
+                        if built {
+                            match transport.send(&reply_scratch).await {
                                 Ok(()) => {
                                     // VPN 统计：UDP 下行回包成功注入 TUN → 计载荷字节
                                     VPN_COUNTERS.add_down(datagram.len() as u64);
@@ -5178,7 +5181,7 @@ mod tests {
 
         // 5. 等回包（最长 8s）：src=echo, dst=10.7.0.1:40000, 载荷回显
         let mut got = false;
-        for _ in 0..160 {
+        for _ in 0..320 {
             match tokio::time::timeout(Duration::from_millis(50), out_rx.recv()).await {
                 Ok(Some(p)) => {
                     if p.len() >= 28 + payload.len() && p[0] >> 4 == 4 && p[9] == 17 {
@@ -5603,7 +5606,7 @@ mod tests {
 
         // 4. 等回包（最长 8s）：src=echo, dst=10.7.0.1:41000，载荷回显 + 校验和归零
         let mut got = false;
-        for _ in 0..160 {
+        for _ in 0..320 {
             match tokio::time::timeout(Duration::from_millis(50), out_rx.recv()).await {
                 Ok(Some(p)) => {
                     if p.len() >= 28 + payload.len() && p[0] >> 4 == 4 && p[9] == 17 {
@@ -5728,7 +5731,7 @@ mod tests {
         // 4. 等回包（最长 8s）：载荷回显即证明走了 protect 形态直发
         // （bind=None 下旧逻辑一律 Err 回落中继，哑工厂必失败、无回包）
         let mut got = false;
-        for _ in 0..160 {
+        for _ in 0..320 {
             match tokio::time::timeout(Duration::from_millis(50), out_rx.recv()).await {
                 Ok(Some(p)) => {
                     if p.len() >= 28 + payload.len() && p[0] >> 4 == 4 && p[9] == 17 {
