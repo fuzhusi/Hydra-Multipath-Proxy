@@ -15,11 +15,13 @@
 //! Kotlin 冒烟单测（android/app）：经绑定构造 → start → 查询监听地址 → stop。
 
 use std::{
+    collections::VecDeque,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
 use hydra_core::{proxy::ProxyServer, tcp_transport::TlsTrust, traffic::TrafficMonitor};
+use hydra_protocol::mask_target;
 
 // ── uniffi 导出类型 ─────────────────────────────────────────────────────────
 
@@ -255,6 +257,379 @@ pub fn vpn_stats() -> VpnStats {
         active_conns: s.active_conns,
         total_conns: s.total_conns,
     }
+}
+
+// ── 内核日志桥接（A 批：tracing Layer → 环形缓冲 → uniffi 增量拉取）──────────
+//
+// 设计（docs/design/安卓日志与健康观测方案-v1.md §二.A）：
+// - 进程级环形缓冲（Mutex<VecDeque>，容量 500，满员丢最旧）承接内核
+//   （hydra-core / hydra-client）全部 tracing 事件；Kotlin 侧每秒以
+//   `vpn_logs_since(seq)` 增量拉取，**不依赖任何阻塞回调**；
+// - 消息在入环前统一脱敏：目标（URL / IPv4[:端口] / 主机名[:端口] /
+//   [IPv6]:端口）替换为 `mask_target` 短哈希（保留端口），与桌面
+//   log_bridge 的「明文目标不出内核」纪律一致；
+// - 纯内存：不落盘、不上传；`start_vpn` 开启新会话时清空（进程被杀自然清零）。
+
+/// 环形缓冲容量（与 Kotlin `EngineState` 日志上限一致：500 条）
+const LOG_RING_CAPACITY: usize = 500;
+
+/// 单条消息最大字符数（异常长事件截断，防单条撑爆内存）
+const LOG_MESSAGE_MAX_CHARS: usize = 512;
+
+/// 内核日志条目（uniffi Record → Kotlin `VpnLogEntry`）。
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct VpnLogEntry {
+    /// 单调递增序号（进程内唯一；Kotlin 增量拉取游标，重启后继续递增）
+    pub seq: u64,
+    /// 级别三档：`INFO` / `WARN` / `ERROR`（debug/trace 归入 INFO，消息带前缀）
+    pub level: String,
+    /// 已脱敏的消息正文（目标为 mask_target 短哈希）
+    pub message: String,
+    /// Unix 毫秒时间戳（Kotlin 负责格式化为 HH:mm:ss）
+    pub ts_ms: u64,
+}
+
+/// 环形缓冲 + 序号发生器（同一把锁保护，保证 seq 与入队顺序一致）
+struct LogRing {
+    entries: VecDeque<VpnLogEntry>,
+    next_seq: u64,
+}
+
+static LOG_RING: Mutex<LogRing> = Mutex::new(LogRing {
+    entries: VecDeque::new(),
+    next_seq: 1,
+});
+
+/// 入环一条日志（短锁：只做一次 push_back / 可能一次 pop_front；锁中毒降级为丢弃）。
+fn push_log_entry(level: &'static str, message: String) {
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let Ok(mut ring) = LOG_RING.lock() else {
+        return;
+    };
+    if ring.entries.len() >= LOG_RING_CAPACITY {
+        ring.entries.pop_front();
+    }
+    let seq = ring.next_seq;
+    ring.next_seq = ring.next_seq.saturating_add(1);
+    ring.entries.push_back(VpnLogEntry {
+        seq,
+        level: level.to_string(),
+        message,
+        ts_ms,
+    });
+}
+
+/// 清空环形缓冲（新会话开始；**保留 next_seq 单调**——Kotlin 侧游标不会因
+/// 新会话回退而漏拉日志）。
+fn reset_vpn_logs() {
+    if let Ok(mut ring) = LOG_RING.lock() {
+        ring.entries.clear();
+    }
+}
+
+/// 增量拉取内核日志：返回 `seq` 之后的所有条目（最多 500 条，按 seq 升序）。
+/// Kotlin 每秒轮询一次（与 `vpn_stats()` 同一循环），记录上次最大 seq 作游标。
+/// 环形缓冲已丢弃的更早条目自然不可见（UI 上限同为 500 条）。
+#[uniffi::export]
+pub fn vpn_logs_since(seq: u64) -> Vec<VpnLogEntry> {
+    let Ok(ring) = LOG_RING.lock() else {
+        return Vec::new();
+    };
+    ring.entries
+        .iter()
+        .filter(|e| e.seq > seq)
+        .cloned()
+        .collect()
+}
+
+/// tracing Level → 三档级别标签（GUI/Android 日志页只区分三档着色）
+fn log_level_label(level: &tracing::Level) -> &'static str {
+    match *level {
+        tracing::Level::ERROR => "ERROR",
+        tracing::Level::WARN => "WARN",
+        _ => "INFO",
+    }
+}
+
+/// debug/trace 降档为 INFO 后的原文前缀（保留原始级别可辨识性）
+fn log_level_prefix(level: &tracing::Level) -> &'static str {
+    match *level {
+        tracing::Level::DEBUG => "[debug] ",
+        tracing::Level::TRACE => "[trace] ",
+        _ => "",
+    }
+}
+
+/// 字段 Visitor：`message` 为正文，其余字段以 ` k=v` 追加（与桌面 log_bridge
+/// 同款字段化提取；脱敏在拼接后的整行上统一执行）。
+#[derive(Default)]
+struct LogVisitor {
+    message: String,
+    extra: Vec<(&'static str, String)>,
+}
+
+impl tracing::field::Visit for LogVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let name = field.name();
+        let v = format!("{value:?}");
+        if name == "message" {
+            self.message = v;
+        } else {
+            self.extra.push((name, v));
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        let name = field.name();
+        if name == "message" {
+            self.message = value.to_string();
+        } else {
+            self.extra.push((name, value.to_string()));
+        }
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.record_debug(field, &value);
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.record_debug(field, &value);
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.record_debug(field, &value);
+    }
+}
+
+/// 内核事件 → 环形缓冲 Layer（A 批）。
+///
+/// 过滤级别在层内完成：ERROR/WARN/INFO/DEBUG 入环（丢包、直连决策等内核
+/// 诊断在 DEBUG 级——「丢包/中继/DNS 应全部可见」），TRACE 丢弃（噪声/开销）。
+struct KernelLogLayer;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for KernelLogLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let level = event.metadata().level();
+        if *level > tracing::Level::DEBUG {
+            return;
+        }
+        let mut visitor = LogVisitor::default();
+        event.record(&mut visitor);
+        let mut text = String::with_capacity(visitor.message.len() + 32);
+        text.push_str(log_level_prefix(level));
+        text.push_str(&visitor.message);
+        for (k, v) in &visitor.extra {
+            text.push_str(&format!(" {k}={v}"));
+        }
+        let text = truncate_chars(&sanitize_log_message(&text), LOG_MESSAGE_MAX_CHARS);
+        push_log_entry(log_level_label(level), text);
+    }
+}
+
+/// 字符截断（按 Unicode 字符计；超长追加省略号）
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// 已知顶级域白名单：仅当「a.b.tld」的 tld 命中才按域名打码——避免把
+/// `hydra.log` / `rules.txt` 等文件名或 `dev.hydra.vpn` 包名误判为目标。
+const KNOWN_TLDS: &[&str] = &[
+    "com", "cn", "net", "org", "io", "me", "co", "cc", "tv", "xyz", "top", "info", "dev", "app",
+    "cloud", "site", "online", "vip", "uk", "us", "jp", "hk", "tw", "sg", "de", "ru", "au", "ca",
+    "fr", "kr", "edu", "gov",
+];
+
+/// 主机名字符（用于前后边界判定：避免从长串中间截出「伪域名」）
+fn is_host_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
+}
+
+/// 解析 `a.b.c.d`（每段 0-255，最多 3 位）；返回结束位置。
+fn parse_ipv4_at(c: &[char], start: usize) -> Option<usize> {
+    let mut i = start;
+    for octet in 0..4 {
+        let begin = i;
+        while i < c.len() && c[i].is_ascii_digit() && i - begin < 3 {
+            i += 1;
+        }
+        if i == begin {
+            return None;
+        }
+        let value: u32 = c[begin..i].iter().collect::<String>().parse().ok()?;
+        if value > 255 {
+            return None;
+        }
+        if octet < 3 {
+            if i >= c.len() || c[i] != '.' {
+                return None;
+            }
+            i += 1;
+        }
+    }
+    Some(i)
+}
+
+/// 主机名（label("."label)+，末段命中 KNOWN_TLDS）；返回结束位置。
+fn parse_hostname_at(c: &[char], start: usize) -> Option<usize> {
+    let mut i = start;
+    let mut labels = 0usize;
+    loop {
+        let begin = i;
+        while i < c.len() && (c[i].is_ascii_alphanumeric() || c[i] == '-') {
+            i += 1;
+        }
+        if i == begin || i - begin > 63 {
+            return None;
+        }
+        labels += 1;
+        if i < c.len() && c[i] == '.' {
+            // 后续标签必须存在（避免把句末点号当域名分隔）
+            if i + 1 >= c.len() || !c[i + 1].is_ascii_alphanumeric() {
+                break;
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    if labels < 2 {
+        return None;
+    }
+    let host = &c[start..i];
+    let tld_start = host.iter().rposition(|&ch| ch == '.').map(|p| p + 1)?;
+    let tld: String = host[tld_start..].iter().collect();
+    if !KNOWN_TLDS.contains(&tld.to_ascii_lowercase().as_str()) {
+        return None;
+    }
+    Some(i)
+}
+
+/// 可选 `:端口`（1-5 位数字）；返回结束位置。
+fn consume_port(c: &[char], start: usize) -> usize {
+    if start + 1 >= c.len() || c[start] != ':' || !c[start + 1].is_ascii_digit() {
+        return start;
+    }
+    let mut i = start + 1;
+    while i < c.len() && c[i].is_ascii_digit() && i - (start + 1) < 5 {
+        i += 1;
+    }
+    i
+}
+
+/// `http://` / `https://` 前缀：authority 整体按 mask_target 打码（保留协议头）。
+fn match_url_at(c: &[char], i: usize) -> Option<(usize, String)> {
+    let head: String = c[i..c.len().min(i + 8)].iter().collect();
+    let (scheme, prefix_len) = if head.starts_with("https://") {
+        ("https://", 8)
+    } else if head.starts_with("http://") {
+        ("http://", 7)
+    } else {
+        return None;
+    };
+    let begin = i + prefix_len;
+    let mut j = begin;
+    while j < c.len()
+        && !matches!(
+            c[j],
+            '/' | '?' | '#' | ' ' | '\t' | '"' | '\'' | ')' | ']' | ',' | ';' | '|'
+        )
+        && j - begin < 255
+    {
+        j += 1;
+    }
+    if j == begin {
+        return None;
+    }
+    let authority: String = c[begin..j].iter().collect();
+    let host = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(&authority);
+    Some((j, format!("{scheme}{}", mask_target(host))))
+}
+
+/// `[IPv6]` / `[IPv6]:端口`：整体按 mask_target 打码。
+fn match_bracketed_ipv6_at(c: &[char], i: usize) -> Option<(usize, String)> {
+    if i >= c.len() || c[i] != '[' {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < c.len() && c[j] != ']' {
+        if !(c[j].is_ascii_hexdigit() || c[j] == ':' || c[j] == '.') {
+            return None;
+        }
+        j += 1;
+    }
+    if j >= c.len() {
+        return None;
+    }
+    let addr: String = c[i + 1..j].iter().collect();
+    if !addr.contains(':') {
+        return None;
+    }
+    let end = consume_port(c, j + 1);
+    let token: String = c[i..end].iter().collect();
+    Some((end, mask_target(&token)))
+}
+
+/// 日志正文脱敏：把目标形态 token 替换为 `mask_target` 短哈希（端口保留）。
+///
+/// 覆盖：URL authority / IPv4[:端口] / 域名[:端口]（KNOWN_TLDS 白名单）/
+/// `[IPv6][:端口]`。前端字符、路径、耗时数字、版本号（0.2.8）、文件名
+/// （hydra.log）不受影响。裸 IPv6（无方括号）不打码——内核日志按惯例以
+/// `mask_target` 字段化输出，本函数是纵深防御。
+fn sanitize_log_message(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        // URL 优先（避免随后把 URL 内的域名/IP 单独替换）
+        if let Some((end, replacement)) = match_url_at(&chars, i) {
+            out.push_str(&replacement);
+            i = end;
+            continue;
+        }
+        if let Some((end, replacement)) = match_bracketed_ipv6_at(&chars, i) {
+            out.push_str(&replacement);
+            i = end;
+            continue;
+        }
+        let at_boundary = i == 0 || !is_host_char(chars[i - 1]);
+        if at_boundary && chars[i].is_ascii_digit() {
+            if let Some(end) = parse_ipv4_at(&chars, i) {
+                let end = consume_port(&chars, end);
+                if end == chars.len() || !is_host_char(chars[end]) {
+                    let token: String = chars[i..end].iter().collect();
+                    out.push_str(&mask_target(&token));
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        if at_boundary && chars[i].is_ascii_alphanumeric() {
+            if let Some(end) = parse_hostname_at(&chars, i) {
+                let end = consume_port(&chars, end);
+                if end == chars.len() || !is_host_char(chars[end]) {
+                    let token: String = chars[i..end].iter().collect();
+                    out.push_str(&mask_target(&token));
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 /// 智能分流引擎构建（start_vpn 与单测共用）：`rule_mode=false` → None（全局
@@ -601,11 +976,16 @@ pub fn start_vpn(
 ) -> Result<(), HydraEngineError> {
     let mut guard = VPN_STATE.lock().unwrap_or_else(|p| p.into_inner());
 
-    // 诊断：初始化 tracing → 应用 filesDir/hydra.log（debug 包可 run-as 读取）。
-    // 此前无任何 subscriber，内核全部日志被静默丢弃。
+    // 诊断：初始化 tracing → 环形缓冲（→ Kotlin 日志页）+ 应用 filesDir/hydra.log
+    // （debug 包可 run-as 读取）。此前无任何 subscriber，内核全部日志被静默丢弃。
+    // 唯一一次 init（reload/重启不重复安装；try_init 失败 = 已有 subscriber，
+    // 环 Layer 首次安装即生效）。
     {
-        use tracing::Level;
         use std::io::Write;
+        use tracing_subscriber::filter::LevelFilter;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+        use tracing_subscriber::Layer as _;
         struct LogFile(std::sync::Mutex<std::fs::File>);
         impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogFile {
             type Writer = LogFileWriter<'a>;
@@ -618,12 +998,25 @@ pub fn start_vpn(
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.0.write(buf) }
             fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
         }
+        // 内核日志环（DEBUG 起：丢包/直连决策等诊断可见，TRACE 丢弃）
+        let ring_layer = KernelLogLayer.with_filter(LevelFilter::DEBUG);
+        let fmt_level = if cfg!(debug_assertions) { LevelFilter::DEBUG } else { LevelFilter::INFO };
         // Android 无 TMPDIR；debug 诊断固定写应用私有 files 目录
         let path = std::path::PathBuf::from("/data/user/0/dev.hydra.vpn/files/hydra.log");
         if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = tracing_subscriber::fmt()
-                .with_max_level(if cfg!(debug_assertions) { Level::DEBUG } else { Level::INFO })
-                .with_writer(LogFile(std::sync::Mutex::new(f)))
+            let _ = tracing_subscriber::registry()
+                .with(ring_layer)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(LogFile(std::sync::Mutex::new(f)))
+                        .with_filter(fmt_level),
+                )
+                .try_init();
+        } else {
+            // 文件不可用（非 Android 主机/权限异常）：仍安装环 Layer——日志页
+            // 是主通道，不能被可选的文件诊断拖累
+            let _ = tracing_subscriber::registry()
+                .with(ring_layer)
                 .try_init();
         }
     }
@@ -646,6 +1039,10 @@ pub fn start_vpn(
             msg: "VPN 已在运行".into(),
         });
     }
+
+    // 新会话：日志纯内存——清空上一会话的内核日志（seq 保持单调，Kotlin
+    // 游标不会因回退而漏拉；spurious start 在上一检查处已早退，不清）
+    reset_vpn_logs();
 
     let addr4: std::net::Ipv4Addr =
         config
@@ -1177,5 +1574,114 @@ mod tests {
         assert_eq!(s.down_bytes, raw.down_bytes);
         assert_eq!(s.active_conns, raw.active_conns);
         assert_eq!(s.total_conns, raw.total_conns);
+    }
+
+    // ── A 批：内核日志桥接（环形缓冲 / 增量拉取 / 脱敏 / 级别映射）──────────
+
+    /// LOG_RING 是进程级全局缓冲：相关用例经此互斥串行，避免并行测试互相
+    /// 清空/污染（测试基建，非生产路径）
+    static LOG_RING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn log_ring_incremental_pull_and_capacity() {
+        let _g = LOG_RING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        reset_vpn_logs();
+        for i in 0..3 {
+            push_log_entry("INFO", format!("事件 {i}"));
+        }
+        let all = vpn_logs_since(0);
+        assert_eq!(all.len(), 3);
+        // seq 严格递增（Kotlin 增量游标的前提）
+        assert!(all.windows(2).all(|w| w[0].seq < w[1].seq));
+        // 已拉到最新 → 无增量
+        let last = all.last().unwrap().seq;
+        assert!(vpn_logs_since(last).is_empty());
+        // 新增一条 → 只返回该条（增量语义）
+        push_log_entry("WARN", "新事件".to_string());
+        let newer = vpn_logs_since(last);
+        assert_eq!(newer.len(), 1);
+        assert_eq!(newer[0].level, "WARN");
+        assert_eq!(newer[0].message, "新事件");
+        // 满员丢最旧：容量 500，最旧的 14 条（3+1+10）被挤出
+        for i in 0..(LOG_RING_CAPACITY + 10) {
+            push_log_entry("INFO", format!("洪峰 {i}"));
+        }
+        let all = vpn_logs_since(0);
+        assert_eq!(all.len(), LOG_RING_CAPACITY);
+        assert_eq!(all.first().unwrap().message, "洪峰 10");
+    }
+
+    #[test]
+    fn log_ring_reset_keeps_seq_monotonic() {
+        let _g = LOG_RING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        reset_vpn_logs();
+        push_log_entry("INFO", "旧会话".to_string());
+        let old_max = vpn_logs_since(0).last().unwrap().seq;
+        // 新会话清空内容，但 seq 不回退（Kotlin 旧游标不会漏拉新日志）
+        reset_vpn_logs();
+        assert!(vpn_logs_since(0).is_empty());
+        push_log_entry("INFO", "新会话".to_string());
+        let new = vpn_logs_since(old_max);
+        assert_eq!(new.len(), 1, "seq 必须继续递增: {new:?}");
+        assert_eq!(new[0].seq, old_max + 1);
+    }
+
+    #[test]
+    fn log_sanitizer_masks_targets_keeps_benign_text() {
+        // IPv4[:端口] → mask_target 短哈希（保留端口）
+        let ip_masked = sanitize_log_message("连接 1.2.3.4:443 完成");
+        assert!(ip_masked.contains(&mask_target("1.2.3.4:443")), "{ip_masked}");
+        assert!(!ip_masked.contains("1.2.3.4"), "{ip_masked}");
+        // 域名[:端口]（KNOWN_TLDS 白名单）
+        let host_masked = sanitize_log_message("解析 www.baidu.com:443 失败");
+        assert!(host_masked.contains(&mask_target("www.baidu.com:443")), "{host_masked}");
+        assert!(!host_masked.contains("baidu"), "{host_masked}");
+        // 无端口域名同样打码
+        let bare = sanitize_log_message("目标 www.google.com 不可达");
+        assert!(!bare.contains("google"), "{bare}");
+        // URL authority 打码，协议头/路径结构保留
+        let url = sanitize_log_message("GET http://connect.rom.miui.com/generate_204");
+        assert!(url.starts_with("GET http://"), "{url}");
+        assert!(url.ends_with("/generate_204"), "{url}");
+        assert!(!url.contains("miui"), "{url}");
+        // [IPv6]:端口 打码
+        let v6 = sanitize_log_message("出站 [fd07::1]:443");
+        assert!(!v6.contains("fd07"), "{v6}");
+        assert!(v6.ends_with(":443"), "{v6}");
+        // 良性文本零改写：耗时/路径/文件名/版本号/包名
+        let benign = "duration_ms=42 path=/data/user/0/dev.hydra.vpn/files/hydra.log 版本 0.2.8";
+        assert_eq!(sanitize_log_message(benign), benign);
+    }
+
+    #[test]
+    fn kernel_layer_captures_debug_and_drops_trace() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let _g = LOG_RING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        reset_vpn_logs();
+        let subscriber = tracing_subscriber::registry().with(KernelLogLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target = "www.example.com:443", "连接关闭");
+            tracing::warn!("警告：节点 1.2.3.4:443 超时");
+            tracing::debug!("丢包：UDP 下行 sid 无流映射");
+            tracing::trace!("跟踪噪声不得入环");
+        });
+        let logs = vpn_logs_since(0);
+        assert_eq!(logs.len(), 3, "INFO/WARN/DEBUG 入环、TRACE 丢弃: {logs:?}");
+        assert_eq!(logs[0].level, "INFO");
+        assert!(logs[0].message.starts_with("连接关闭"), "{}", logs[0].message);
+        assert!(logs[0].message.contains("target="), "{}", logs[0].message);
+        assert!(!logs[0].message.contains("example.com"), "字段值也须脱敏: {}", logs[0].message);
+        assert_eq!(logs[1].level, "WARN");
+        assert!(!logs[1].message.contains("1.2.3.4"), "{}", logs[1].message);
+        assert_eq!(logs[2].level, "INFO");
+        assert!(logs[2].message.starts_with("[debug] "), "{}", logs[2].message);
+        assert!(logs[2].message.contains("丢包"));
+        assert!(logs.iter().all(|e| e.ts_ms > 0));
     }
 }

@@ -22,13 +22,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -201,7 +198,7 @@ fun HomeScreen(
     }
 
     if (showAllLogs) {
-        LogsDialog(logs) { showAllLogs = false }
+        LogsScreen(logs) { showAllLogs = false }
     }
 }
 
@@ -525,48 +522,20 @@ private fun RecentLogs(recent: List<dev.hydra.vpn.LogEntry>, onShowAll: () -> Un
                 TextButton(onClick = onShowAll) { Text("全部") }
             }
             recent.forEach { e ->
-                Text(
-                    "${e.time}  ${e.message}",
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    LevelDot(e.level)
+                    Spacer(Modifier.size(4.dp))
+                    Text(
+                        "${e.time}  ${e.message}",
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                    )
+                }
             }
         }
     }
-}
-
-@Composable
-private fun LogsDialog(logs: List<dev.hydra.vpn.LogEntry>, onDismiss: () -> Unit) {
-    val context = LocalContext.current
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("事件（${logs.size} 条）") },
-        text = {
-            LazyColumn(
-                modifier = Modifier.fillMaxWidth().height(420.dp),
-                verticalArrangement = Arrangement.spacedBy(3.dp),
-            ) {
-                items(logs) { e ->
-                    Text("${e.time}  ${e.message}", fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = {
-                val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
-                    as android.content.ClipboardManager
-                cm.setPrimaryClip(
-                    android.content.ClipData.newPlainText(
-                        "hydra-logs", logs.joinToString("\n") { "${it.time} ${it.message}" },
-                    ),
-                )
-                android.widget.Toast.makeText(context, "已复制全部事件", android.widget.Toast.LENGTH_SHORT).show()
-            }) { Text("复制全部") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
-    )
 }
 
 // ── 辅助 ────────────────────────────────────────────────────────────────────

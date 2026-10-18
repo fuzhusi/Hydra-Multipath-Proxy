@@ -45,6 +45,35 @@
 
 ## [Unreleased]
 
+### 安卓端日志与健康观测（内核事件桥接 + 周期健康探测 + 网络事件 + 日志页增强）
+
+- **hydra-android（Rust）**：新增 tracing `KernelLogLayer` → 进程级环形缓冲
+  （500 条、满员丢最旧、seq 单调）；入环前按 `mask_target` 语义脱敏（URL /
+  IPv4 / 域名 / [IPv6]:端口 → 短哈希，端口保留）；uniffi 新增
+  `vpn_logs_since(seq) -> Vec<VpnLogEntry>` 与
+  `VpnLogEntry { seq, level, message, ts_ms }` 增量拉取接口；`start_vpn` 首次
+  安装「日志环 + 文件」双订阅器，新会话清空内容但保持 seq 单调。
+- **Kotlin 日志**：1s 统计轮询内增量拉取内核日志（lastSeq 游标 + seq 去重，
+  UI 上限 500、新在前）；用户点击连接开启新会话时清空，kill switch 自动重连
+  保留断线原因/时间线，服务停止（含系统撤销）清空（纯内存不落盘）。
+- **Kotlin 健康探测**：连接后默认 300s 周期（可配 1m/3m/5m/10m/关，SecureStore
+  持久化），连接建立与网络切换即时探测；三项独立计时——节点 TCP 直连
+  （protect 物理路径）/ 隧道内未 protect 的 DNS 查询（223.5.5.5:53，真实测
+  TUN→中继→节点）/ 可选 HTTP 204（1.5s）。日志格式
+  `✓ 健康检查（节点 … · 隧道DNS … · HTTP 204 …）` /
+  `✗ 健康检查失败（…）`；连续 2 次 WARN + 通知栏「网络异常」，连续 5 次建议
+  手动切换节点/网络（不自动切节点）。
+- **网络事件**：ConnectivityManager 回调记录 WiFi/移动网络切换、断开、恢复并
+  即时触发探测；Manifest 新增 `ACCESS_NETWORK_STATE`（仅注册回调所需，无数据面
+  行为变更）。
+- **日志页 UI**：级别徽章着色（INFO/WARN/ERROR）+ 级别阈值过滤 + 关键字搜索 +
+  自动滚动开关 + 清空 + 导出（`files/exports/*.txt` + 剪贴板）/ 系统分享；
+  全部走 HydraTheme 令牌 + TalkBack 语义。
+- 测试：Kotlin 单测 +11（日志合并去重/容量/过滤/导出顺序、健康结果格式化/
+  失败判定/告警阈值/DNS 报文编解码/间隔归一化与默认值）；Rust +4。
+  `cargo test --workspace` 全绿、clippy 零告警、
+  `:app:testDebugUnitTest` / `:app:assembleDebug` 成功。
+
 ### 安卓端规则代理（智能分流延伸到 VPN 模式）
 
 - **hydra-android**：`VpnConfig` 新增 `rule_mode` / `rule_file`（Kotlin 传

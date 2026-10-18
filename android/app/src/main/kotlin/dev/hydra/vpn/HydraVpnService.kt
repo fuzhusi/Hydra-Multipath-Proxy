@@ -6,6 +6,10 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.IBinder
@@ -15,19 +19,32 @@ import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import uniffi.hydra_android.SocketProtect
 import uniffi.hydra_android.TrustMode
 import uniffi.hydra_android.VpnConfig
 import uniffi.hydra_android.VpnExitCallback
 import uniffi.hydra_android.startVpn
 import uniffi.hydra_android.stopVpn
+import uniffi.hydra_android.vpnLogsSince
 import uniffi.hydra_android.vpnRuleModeDegraded
 import uniffi.hydra_android.vpnStats
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.HttpURLConnection
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.net.SocketTimeoutException
+import java.net.URL
 import java.util.Base64
 
 /**
@@ -71,8 +88,18 @@ class HydraVpnService : VpnService() {
     /** kill switch 重连循环任务（stopVpnLocal 取消以打断退避等待） */
     private var retryJob: kotlinx.coroutines.Job? = null
 
-    /** 每秒流量统计轮询任务（数据面启动成功后拉起，停止/销毁时取消） */
+    /** 每秒流量统计 + 内核日志拉取任务（数据面启动成功后拉起，停止/销毁时取消） */
     private var statsJob: kotlinx.coroutines.Job? = null
+
+    /** 周期健康探测任务（默认 300s；连接建立/网络切换即时唤醒） */
+    private var healthJob: kotlinx.coroutines.Job? = null
+
+    /** 健康探测即时唤醒信号（CONFLATED：多次网络事件只补一次探测） */
+    private val healthPoke = Channel<Unit>(Channel.CONFLATED)
+
+    /** 物理链路 → 类型名（NetworkCallback 线程独占；VPN 自身网络被过滤，不计入） */
+    private val physicalNetworkTypes = mutableMapOf<Network, String>()
+    private var networkWatchRegistered = false
 
     /** 用户显式停止标志（区分「停止」与「新一轮启动」两种 gen 失效） */
     @Volatile
@@ -114,9 +141,12 @@ class HydraVpnService : VpnService() {
                 val now = System.currentTimeMillis()
                 if (now - lastStartAt > 60_000) restartCount = 0 // 健康运行重置连退
                 restartCount++
-                EngineState.addLog("✗ 数据面退出（$reason）——自动重连（第 $restartCount 次）")
+                EngineState.addLog("✗ 数据面退出（$reason）——自动重连（第 $restartCount 次）", LogLevel.ERROR)
                 if (restartCount >= 5) {
-                    EngineState.addLog("✗ 连续 5 次数据面退出——停止自动重连，请检查网络/节点后手动重试")
+                    EngineState.addLog(
+                        "✗ 连续 5 次数据面退出——停止自动重连，请检查网络/节点后手动重试",
+                        LogLevel.ERROR,
+                    )
                     EngineState.update {
                         it.copy(running = false, transition = "启动失败：数据面反复退出（$reason）")
                     }
@@ -140,7 +170,7 @@ class HydraVpnService : VpnService() {
                         }
                         holdTun = myHold
                         if (myHold != null) {
-                            EngineState.addLog("🛡 kill switch：数据面中断——已阻断流量防泄漏")
+                            EngineState.addLog("🛡 kill switch：数据面中断——已阻断流量防泄漏", LogLevel.WARN)
                         }
                     }
                 }
@@ -151,7 +181,7 @@ class HydraVpnService : VpnService() {
                 delay(backoff)
                 if (userStopRequested || generation.get() != startGen) return@launch
                 withContext(Dispatchers.Main) {
-                    startVpnFromStore() // startForeground 需主线程（评审 P0-2）
+                    startVpnFromStore(clearLogs = false) // startForeground 需主线程（评审 P0-2）
                 }
             }
         }
@@ -160,6 +190,10 @@ class HydraVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         ensureChannel()
+        ensureHealthChannel()
+        // C 批：网络切换/断开/恢复 → 日志 + 即时健康探测（需 ACCESS_NETWORK_STATE；
+        // 权限缺失时降级为仅周期探测，不崩溃）
+        startNetworkWatch()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -182,8 +216,13 @@ class HydraVpnService : VpnService() {
         }
     }
 
-    private fun startVpnFromStore() {
+    private fun startVpnFromStore(clearLogs: Boolean = true) {
         stopStatsPolling() // 新一轮启动：先停旧轮询，避免旧会话统计覆盖新状态
+        stopHealthPolling() // 旧会话探测循环作废（新会话成功后再拉起）
+        // 日志纯内存：用户点击连接即开启新会话日志（旧会话日志清空）。
+        // kill switch 自动重连传 false——保留「数据面退出」原因与断线前时间线
+        // （排障关键），仅用户显式连接才清空。
+        if (clearLogs) EngineState.clearLogs()
         EngineState.update {
             it.copy(running = false, transition = "正在建立 VPN 隧道…", boundAddr = null,
                 sentBytes = 0, receivedBytes = 0, activeConns = 0,
@@ -207,7 +246,7 @@ class HydraVpnService : VpnService() {
             if (generation.get() == gen && !t.running
                 && !t.transition.orEmpty().startsWith("隧道中断")) {
                 runCatching { stopVpn() }
-                EngineState.addLog("✗ VPN 启动超时（20s）已中止——请重试")
+                EngineState.addLog("✗ VPN 启动超时（20s）已中止——请重试", LogLevel.ERROR)
                 EngineState.update {
                     it.copy(running = false, transition = "启动超时（20s）：请重试")
                 }
@@ -240,7 +279,7 @@ class HydraVpnService : VpnService() {
                 // （重连修复不了配置错误；且 Rust 校验失败发生在 fd 接管之前，
                 //  每轮重试会泄漏 1 个 fd；空配置重试会把设备黑洞在无提示状态）
                 validateVpnConfig(cfg)?.let { err ->
-                    EngineState.addLog("✗ 启动失败：$err")
+                    EngineState.addLog("✗ 启动失败：$err", LogLevel.ERROR)
                     EngineState.update {
                         it.copy(running = false, transition = "启动失败：$err")
                     }
@@ -302,6 +341,9 @@ class HydraVpnService : VpnService() {
                                 // 数据面已启动：拉起每秒统计轮询（读 Rust TUN
                                 // 数据面原子计数器，见 startStatsPolling）
                                 startStatsPolling()
+                                // B 批：连接建立即启动健康探测（首轮立即探测）
+                                cancelHealthNotification()
+                                startHealthLoop(cfg)
                                 EngineState.addLog(
                                     if (cfg.runRuleMode)
                                         "✓ 全局 VPN 已接管——智能分流：命中 CN 规则直连，其余走节点"
@@ -311,7 +353,7 @@ class HydraVpnService : VpnService() {
                                 // 时 Rust 引擎已用内置 CN 表兜底，此处显式写日志流
                                 if (cfg.runRuleMode && vpnRuleModeDegraded()) {
                                     EngineState.addLog(
-                                        "⚠ 规则文件不可用，已降级为内置 CN 规则（自定义规则未加载）"
+                                        "⚠ 规则文件不可用，已降级为内置 CN 规则（自定义规则未加载）", LogLevel.WARN
                                     )
                                 }
                                 updateNotification()
@@ -332,7 +374,7 @@ class HydraVpnService : VpnService() {
 
                     // ── 本轮失败 ──
                     val msg = failMsg ?: "未知错误"
-                    EngineState.addLog("✗ 建连失败：$msg")
+                    EngineState.addLog("✗ 建连失败：$msg", LogLevel.ERROR)
                     runCatching { stopVpn() } // 清 Rust 态并释放失败尝试的 fd
 
                     val superseded = userStopRequested || generation.get() != gen
@@ -357,7 +399,7 @@ class HydraVpnService : VpnService() {
                     if (myHold == null && cfg.appFilterMode != SecureStore.APP_FILTER_ALL) {
                         // 分应用过滤 TUN 建立失败（如含失效包名）：回退全量阻断
                         // ——kill switch 语义「阻断永不回退到直连」
-                        EngineState.addLog("⚠ 分应用过滤建立失败——回退全量阻断（防泄漏优先）")
+                        EngineState.addLog("⚠ 分应用过滤建立失败——回退全量阻断（防泄漏优先）", LogLevel.WARN)
                         myHold = establish(cfg.copy(appFilterMode = SecureStore.APP_FILTER_ALL))
                     }
                     holdTun = myHold // 停止路径可见（stopVpnLocal 立即关闭恢复直连）
@@ -409,8 +451,26 @@ class HydraVpnService : VpnService() {
             var lastAt = startedAt
             var lastUp = 0L
             var lastDown = 0L
+            // 内核日志增量游标（A 批）：新会话从 0 起拉（Rust 环形缓冲已清空，
+            // seq 保持单调；拉到的条目按 seq 去重合并进 EngineState）
+            var lastLogSeq = 0uL
             while (true) {
                 delay(1_000)
+                // ── 内核日志增量拉取（连接/断开/直连/中继/DNS/丢包/警告）──
+                val freshLogs = runCatching { vpnLogsSince(lastLogSeq) }.getOrNull()
+                if (!freshLogs.isNullOrEmpty()) {
+                    EngineState.mergeKernelLogs(
+                        freshLogs.map { entry ->
+                            LogEntry(
+                                time = formatLogTime(entry.tsMs.toLong()),
+                                message = entry.message,
+                                level = logLevelFrom(entry.level),
+                                seq = entry.seq.toLong(),
+                            )
+                        },
+                    )
+                    lastLogSeq = freshLogs.last().seq
+                }
                 // FFI 失败（库未加载等）→ 停止轮询，不刷屏
                 val s = runCatching { vpnStats() }.getOrNull() ?: break
                 // 停止竞态：FFI 返回前可能已 cancel/停止——不得把旧统计写回已复位 UI
@@ -442,6 +502,263 @@ class HydraVpnService : VpnService() {
     private fun stopStatsPolling() {
         statsJob?.cancel()
         statsJob = null
+    }
+
+    // ── B 批：周期健康探测（三项独立计时；失败只告警不自动切节点）────────────
+
+    /**
+     * 启动健康探测循环（连接成功后调用；默认 300s，可配 1m/3m/5m/10m/关）。
+     *
+     * 行为：
+     * - 首轮**立即探测**（连接建立即有基线，不等一个间隔）；
+     * - 之后等待 间隔到期 **或** [healthPoke]（网络切换/恢复瞬间即时探测）；
+     * - 连续失败 2 次 → WARN 日志 + 通知栏「网络异常」；5 次 → 建议手动切换
+     *   节点/网络（含规则文件/订阅排障引导）；恢复时清通知并记恢复日志；
+     * - **永不自动切节点**（v1 决策：避免与最低延迟调度策略冲突）。
+     */
+    private fun startHealthLoop(cfg: HydraConfig) {
+        stopHealthPolling()
+        val intervalSecs = normalizeProbeSecs(cfg.healthProbeSecs)
+        if (intervalSecs == 0) {
+            EngineState.addLog("健康检查已关闭（可在设置页开启）")
+            return
+        }
+        // 清掉启动期间可能积压的唤醒信号（首轮探测已紧随其后）
+        while (healthPoke.tryReceive().isSuccess) { /* drain */ }
+        val node = cfg.nodesText.lines().map { it.trim() }.firstOrNull { it.isNotEmpty() }.orEmpty()
+        healthJob = scope.launch {
+            var streak = 0
+            while (isActive) {
+                val report = runCatching { runHealthProbe(node) }.getOrNull()
+                if (!isActive || userStopRequested) return@launch
+                if (report != null) {
+                    if (report.ok) {
+                        if (streak >= HEALTH_WARN_STREAK) {
+                            EngineState.addLog("✓ 健康检查恢复正常（此前连续 $streak 次失败）")
+                            cancelHealthNotification()
+                        }
+                        streak = 0
+                    } else {
+                        streak++
+                    }
+                    val warn = !report.ok && streak >= HEALTH_WARN_STREAK
+                    EngineState.addLog(
+                        formatHealthLog(report),
+                        if (warn) LogLevel.WARN else LogLevel.INFO,
+                    )
+                    when (healthAlertFor(streak)) {
+                        HealthAlert.WARN -> {
+                            EngineState.addLog(
+                                "⚠ 连续 $HEALTH_WARN_STREAK 次健康检查失败——网络异常（仅告警，不自动切换节点）",
+                                LogLevel.WARN,
+                            )
+                            notifyHealth("网络异常：隧道探测连续失败，请检查网络/节点")
+                        }
+                        HealthAlert.ADVICE -> {
+                            EngineState.addLog(
+                                "⚠ 连续 $HEALTH_ADVICE_STREAK 次健康检查失败——疑似断网，" +
+                                    "建议手动切换节点/网络（如持续失败请检查规则文件/节点订阅）",
+                                LogLevel.WARN,
+                            )
+                            notifyHealth("网络异常：建议手动切换节点/网络")
+                        }
+                        null -> Unit
+                    }
+                }
+                // 间隔到期或网络事件唤醒（连接建立瞬间首轮已探测，此处只等下一轮）
+                withTimeoutOrNull(intervalSecs * 1_000L) { healthPoke.receive() }
+            }
+        }
+    }
+
+    /** 停止健康探测循环并清除残留告警通知（幂等）。 */
+    private fun stopHealthPolling() {
+        healthJob?.cancel()
+        healthJob = null
+        cancelHealthNotification()
+    }
+
+    /** 网络事件即时探测（仅已连接时生效；CONFLATED 合并高频事件）。 */
+    private fun pokeHealth() {
+        if (healthJob?.isActive == true) {
+            healthPoke.trySend(Unit)
+        }
+    }
+
+    /** 三项并行探测（各自独立计时/超时；单项失败不影响其余两项）。 */
+    private suspend fun runHealthProbe(node: String): HealthReport = coroutineScope {
+        val nodeResult = async(Dispatchers.IO) { probeNodeDirect(node) }
+        val dnsResult = async(Dispatchers.IO) { probeTunnelDns() }
+        val httpResult = async(Dispatchers.IO) { probeHttp204() }
+        HealthReport(nodeResult.await(), dnsResult.await(), httpResult.await())
+    }
+
+    /**
+     * ① 节点 TCP 直连（物理路径）：Socket **先 protect 再 connect**——绕过自身
+     * TUN，测节点与载体网络（失败 = 节点不可达/被运营商拦截）。
+     */
+    private fun probeNodeDirect(node: String): ProbeItem {
+        val port = node.substringAfterLast(':', "").toIntOrNull()
+        if (port == null || port !in 1..65535) return ProbeItem.failed()
+        val host = node.substringBeforeLast(':').trim().trim('[', ']')
+        if (host.isEmpty()) return ProbeItem.failed()
+        val started = SystemClock.elapsedRealtime()
+        return try {
+            Socket().use { socket ->
+                if (!protect(socket)) return ProbeItem.failed() // protect 失败不直连（会回环）
+                socket.connect(InetSocketAddress(host, port), HEALTH_NODE_TIMEOUT_MS)
+            }
+            ProbeItem.ok(SystemClock.elapsedRealtime() - started)
+        } catch (e: SocketTimeoutException) {
+            ProbeItem.timeout()
+        } catch (e: Exception) {
+            ProbeItem.failed()
+        }
+    }
+
+    /**
+     * ② 隧道内 DNS 查询：**故意不 protect** 的 DatagramSocket 向 223.5.5.5:53
+     * 发一次 A 查询——包进入 TUN → Rust UDP 中继 → 节点 → 返回，真实测
+     * 「TUN + 中继 + 节点」全链路（2s 超时）。
+     */
+    private fun probeTunnelDns(): ProbeItem {
+        val started = SystemClock.elapsedRealtime()
+        val id = (System.nanoTime() and 0xFFFF).toInt()
+        val query = buildDnsQuery(id, HEALTH_DNS_PROBE_NAME)
+        return try {
+            DatagramSocket().use { socket ->
+                socket.soTimeout = HEALTH_DNS_TIMEOUT_MS
+                val server = InetAddress.getByAddress(
+                    byteArrayOf(223.toByte(), 5.toByte(), 5.toByte(), 5.toByte()),
+                )
+                socket.send(DatagramPacket(query, query.size, server, 53))
+                val buffer = ByteArray(512)
+                val response = DatagramPacket(buffer, buffer.size)
+                socket.receive(response)
+                if (isDnsResponseOk(buffer, response.length, id)) {
+                    ProbeItem.ok(SystemClock.elapsedRealtime() - started)
+                } else {
+                    ProbeItem.failed()
+                }
+            }
+        } catch (e: SocketTimeoutException) {
+            ProbeItem.timeout()
+        } catch (e: Exception) {
+            ProbeItem.failed()
+        }
+    }
+
+    /**
+     * ③ 可选 HTTP 204（隧道内 best-effort，1.5s 超时）：应用自身流量默认被
+     * VPN 接管，请求经 Tun → 节点出网；200/204 即通。**不参与整体失败判定**
+     * （国内端点偶发被拦截，避免误报）。
+     */
+    private fun probeHttp204(): ProbeItem {
+        val started = SystemClock.elapsedRealtime()
+        var connection: HttpURLConnection? = null
+        return try {
+            val conn = (URL(HEALTH_HTTP_204_URL).openConnection() as HttpURLConnection).apply {
+                connectTimeout = HEALTH_HTTP_TIMEOUT_MS
+                readTimeout = HEALTH_HTTP_TIMEOUT_MS
+                instanceFollowRedirects = false
+                requestMethod = "GET"
+                setRequestProperty("Connection", "close")
+            }
+            connection = conn
+            val code = conn.responseCode
+            if (code in 200..204) ProbeItem.ok(SystemClock.elapsedRealtime() - started)
+            else ProbeItem.failed()
+        } catch (e: SocketTimeoutException) {
+            ProbeItem.timeout()
+        } catch (e: Exception) {
+            ProbeItem.failed()
+        } finally {
+            connection?.disconnect()
+        }
+    }
+
+    // ── C 批：网络事件监听（切换/断开/恢复 → 日志 + 即时探测）───────────────
+
+    /**
+     * 注册物理链路监听。用 `registerNetworkCallback(INTERNET)` 而非默认网络
+     * 回调：VPN 建立后默认网络是自身 TUN，拿不到 WiFi/移动网络的切换事件；
+     * 这里过滤 TRANSPORT_VPN，只关心载体网络。
+     */
+    private fun startNetworkWatch() {
+        if (networkWatchRegistered) return
+        runCatching {
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            getSystemService(ConnectivityManager::class.java)
+                .registerNetworkCallback(request, networkWatcher)
+            networkWatchRegistered = true
+        }.onFailure {
+            EngineState.addLog(
+                "⚠ 网络事件监听不可用（${it.message}）——健康检查仍按间隔运行",
+                LogLevel.WARN,
+            )
+        }
+    }
+
+    private fun stopNetworkWatch() {
+        if (!networkWatchRegistered) return
+        runCatching {
+            getSystemService(ConnectivityManager::class.java)
+                .unregisterNetworkCallback(networkWatcher)
+        }
+        networkWatchRegistered = false
+    }
+
+    private val networkWatcher = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            val type = physicalNetworkType(network) ?: return
+            val transition = synchronized(physicalNetworkTypes) {
+                // 记录「新增类型」而非「当前类型」：手机常同时有 WiFi + 移动网络，
+                // 只跟踪单一 lastType 会漏掉「WiFi 关闭但蜂窝仍在」的切换事件
+                val previous = physicalNetworkTypes.values.toSet()
+                physicalNetworkTypes[network] = type
+                val now = physicalNetworkTypes.values.toSet()
+                when {
+                    previous.isEmpty() -> "网络已恢复/连接（$type）"
+                    type !in previous -> "网络已切换：${previous.joinToString("/")} → $type"
+                    else -> null // 同类型链路增删（多 WiFi/多蜂窝）：不刷屏
+                }
+            }
+            transition?.let { EngineState.addLog(it) }
+            pokeHealth()
+        }
+
+        override fun onLost(network: Network) {
+            val (lost, remaining) = synchronized(physicalNetworkTypes) {
+                val lostType = physicalNetworkTypes.remove(network)
+                    ?: physicalNetworkType(network)
+                lostType to physicalNetworkTypes.values.toSet()
+            }
+            if (remaining.isEmpty()) {
+                EngineState.addLog(
+                    "网络已断开" + (lost?.let { "（$it）" } ?: ""),
+                    LogLevel.WARN,
+                )
+            } else if (lost != null && lost !in remaining) {
+                // 载体切换的可见时间线（如 WiFi 关闭、蜂窝仍在 → 已切换到移动网络）
+                EngineState.addLog("网络断开：$lost（当前 ${remaining.joinToString("/")}）")
+            }
+            pokeHealth()
+        }
+    }
+
+    /** 物理链路类型名（VPN 自身网络返回 null = 忽略）。 */
+    private fun physicalNetworkType(network: Network): String? {
+        val capabilities = getSystemService(ConnectivityManager::class.java)
+            .getNetworkCapabilities(network) ?: return null
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return null
+        return when {
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WiFi"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "移动网络"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "以太网"
+            else -> "网络"
+        }
     }
 
     /** 建立 TUN 接口（v4/v6 全接管；节点出站连接经 protect 防回环，无需路由豁免）。
@@ -494,7 +811,7 @@ class HydraVpnService : VpnService() {
                 .filter { p -> runCatching { pm.getPackageInfo(p, 0) }.isSuccess }
             // 白名单过滤后为空（全失效/全卸载）：语义反转为全量接管——显式告警
             if (cfg.appFilterMode == SecureStore.APP_FILTER_ALLOW && pkgs.isEmpty()) {
-                EngineState.addLog("⚠ 分应用白名单全部失效——本连接将接管全部应用流量")
+                EngineState.addLog("⚠ 分应用白名单全部失效——本连接将接管全部应用流量", LogLevel.WARN)
             }
             when (cfg.appFilterMode) {
                 SecureStore.APP_FILTER_ALLOW -> pkgs.forEach { b.addAllowedApplication(it) }
@@ -502,7 +819,7 @@ class HydraVpnService : VpnService() {
             }
             b.establish()
         }.getOrElse {
-            EngineState.addLog("✗ TUN 建立异常：${it.message}")
+            EngineState.addLog("✗ TUN 建立异常：${it.message}", LogLevel.ERROR)
             null
         }
     }
@@ -547,11 +864,14 @@ class HydraVpnService : VpnService() {
         userStopRequested = true
         retryJob?.cancel()           // 打断退避等待
         stopStatsPolling()           // 停流量轮询（断开后统计归零）
+        stopHealthPolling()          // 停健康探测（含清告警通知）
         releaseHoldTun()             // 用户显式停止 = 恢复直连（kill switch 不拦用户）
         VpnProtectHolder.vpnActive = false // SEC-01：无 TUN 后 protect 放行（本地模式不受残留钩子影响）
+        // 日志纯内存：服务停止即清空（会话结束）。**同步清**——异步清空会在
+        // 随后启动的本地代理模式写入日志之后执行，误伤新会话日志（模式切换竞态）
+        EngineState.clearLogs()
         scope.launch(Dispatchers.IO) {
             runCatching { stopVpn() }
-            EngineState.addLog("■ 全局 VPN 已停止")
             EngineState.update {
                 it.copy(running = false, transition = null, boundAddr = null,
                     sentBytes = 0, receivedBytes = 0, activeConns = 0,
@@ -567,12 +887,14 @@ class HydraVpnService : VpnService() {
     /** 系统/用户撤销 VPN（设置页关闭、其他 VPN 接管等）：停数据面并收敛。
      *  与用户停止同语义：取消重连循环、释放黑洞 TUN，不与之争抢。 */
     override fun onRevoke() {
-        EngineState.addLog("VPN 被系统或用户撤销")
         generation.incrementAndGet()
         userStopRequested = true
         retryJob?.cancel()
         stopStatsPolling()
+        stopHealthPolling()
         releaseHoldTun()
+        // 日志纯内存：VPN 被撤销 = 会话结束
+        EngineState.clearLogs()
         // stop_vpn FFI 持 VPN_STATE 锁 shutdown（最长 3s）——移出主线程
         Thread { runCatching { stopVpn() } }.apply { isDaemon = true; start() }
         EngineState.update {
@@ -591,8 +913,12 @@ class HydraVpnService : VpnService() {
         Thread { runCatching { stopVpn() } }.apply { isDaemon = true; start() }
         retryJob?.cancel()
         stopStatsPolling()
+        stopHealthPolling()
+        stopNetworkWatch()
         releaseHoldTun()
         scope.cancel()
+        // 注意：不在此清日志——stopVpnLocal/onRevoke 已同步清空；onDestroy 可能
+        // 紧随「切换到本地代理模式」发生，此处再清会误伤新模式的启动日志
         // 审查 SEC-01 修复：handler 不置空——Rust 钩子进程级 OnceLock 固化，
         // 置空后本地代理模式的出站连接仍命中钩子且 protect 恒 false = 全部
         // 被中止（断网）。改为仅撤 active 标志：VpnProtectHolder.protect 在
@@ -612,6 +938,51 @@ class HydraVpnService : VpnService() {
         val ch = NotificationChannel(CHANNEL_ID, "Hydra VPN", NotificationManager.IMPORTANCE_LOW)
             .apply { description = "全局 VPN 运行状态" }
         getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+    }
+
+    /** 健康告警渠道（DEFAULT：连续失败时可见横幅/提示，不静默）。 */
+    private fun ensureHealthChannel() {
+        val ch = NotificationChannel(
+            HEALTH_CHANNEL_ID,
+            "Hydra 网络健康",
+            NotificationManager.IMPORTANCE_DEFAULT,
+        ).apply { description = "健康检查连续失败告警（只告警，不自动切换节点）" }
+        getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+    }
+
+    /** 通知栏「网络异常」（连续 2 次失败起；恢复时由 cancelHealthNotification 清除）。 */
+    private fun notifyHealth(text: String) {
+        // 通知权限被拒（Android 13+）→ 日志已留痕，不因通知失败影响数据面
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        runCatching {
+            val n = NotificationCompat.Builder(this, HEALTH_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_notify_error)
+                .setContentTitle("Hydra 网络异常")
+                .setContentText(text)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                .setAutoCancel(true)
+                .setContentIntent(
+                    PendingIntent.getActivity(
+                        this, 0,
+                        Intent(this, MainActivity::class.java),
+                        PendingIntent.FLAG_IMMUTABLE,
+                    ),
+                )
+                .build()
+            getSystemService(NotificationManager::class.java).notify(HEALTH_NOTIF_ID, n)
+        }
+    }
+
+    private fun cancelHealthNotification() {
+        runCatching {
+            getSystemService(NotificationManager::class.java).cancel(HEALTH_NOTIF_ID)
+        }
     }
 
     private fun baseBuilder(text: String): NotificationCompat.Builder =
@@ -650,7 +1021,7 @@ class HydraVpnService : VpnService() {
 
     /** Android 15+ FGS 超时兜底（specialUse 类型不应触发；防御性收敛而非静默死亡） */
     override fun onTimeout(startId: Int) {
-        EngineState.addLog("⚠ 前台服务被系统超时回收——VPN 已停止（请重新启动）")
+        EngineState.addLog("⚠ 前台服务被系统超时回收——VPN 已停止（请重新启动）", LogLevel.WARN)
         stopVpnLocal()
         super.onTimeout(startId)
     }
@@ -697,6 +1068,9 @@ class HydraVpnService : VpnService() {
         const val ACTION_STOP = "dev.hydra.vpn.action.VPN_STOP"
         private const val CHANNEL_ID = "hydra_vpn"
         private const val NOTIF_ID = 2
+        /** 健康告警渠道/通知 ID（独立于常驻前台通知，恢复即撤） */
+        private const val HEALTH_CHANNEL_ID = "hydra_health"
+        private const val HEALTH_NOTIF_ID = 3
         private val generation = java.util.concurrent.atomic.AtomicLong(0)
     }
 }

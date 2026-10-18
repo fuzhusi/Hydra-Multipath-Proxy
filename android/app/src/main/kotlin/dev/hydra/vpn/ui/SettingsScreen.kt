@@ -4,6 +4,7 @@ import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -40,8 +41,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import dev.hydra.vpn.HEALTH_PROBE_OPTIONS
 import dev.hydra.vpn.HydraConfig
 import dev.hydra.vpn.SecureStore
+import dev.hydra.vpn.normalizeProbeSecs
+import dev.hydra.vpn.probeIntervalLabel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -329,6 +333,36 @@ fun SettingsScreen(
                     )
                     OutlinedButton(onClick = { showAppPicker = true }) { Text("选择应用") }
                 }
+            }
+        }
+
+        // ── 健康检查（B 批）：间隔可配（1m/3m/5m/10m/关，默认 300s）──
+        if (cfg.runMode == SecureStore.MODE_VPN) {
+            Section("健康检查") {
+                Text(
+                    "检查间隔（连接建立与网络切换瞬间各额外即时检查一次）",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    HEALTH_PROBE_OPTIONS.forEach { secs ->
+                        FilterChip(
+                            selected = normalizeProbeSecs(cfg.healthProbeSecs) == secs,
+                            onClick = { onPersist(cfg.copy(healthProbeSecs = secs)) },
+                            label = { Text(probeIntervalLabel(secs)) },
+                        )
+                    }
+                }
+                Text(
+                    "三项独立计时：节点 TCP 直连 · 隧道内 DNS 查询 · HTTP 204。" +
+                        "连续 2 次失败 → 日志 warn + 通知栏「网络异常」；连续 5 次 → 建议手动" +
+                        "切换节点/网络。只告警，不自动切节点。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
 

@@ -8,6 +8,16 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+/** 日志级别三档（徽章着色 / 级别过滤的共同判定源；与 Rust `VpnLogEntry.level` 对应）。 */
+enum class LogLevel {
+    INFO,
+    WARN,
+    ERROR,
+}
+
+/** 日志上限（与 Rust 内核日志环形缓冲容量一致：500 条，超出丢最旧） */
+const val LOG_CAPACITY = 500
+
 /**
  * 引擎运行态 + 事件日志的单一数据源：EngineService 写，MainActivity 订阅。
  * 独立顶层单例（非 Service companion）——Service 销毁重建期间状态不丢。
@@ -55,16 +65,97 @@ object EngineState {
         _ui.value = transform(_ui.value)
     }
 
-    /** 追加一条事件日志（新条目在前，封顶 100 条；UI 只取前若干条展示）。 */
-    fun addLog(message: String) {
-        val ts = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+    /** 追加一条应用侧事件日志（新条目在前，封顶 [LOG_CAPACITY] 条）。 */
+    fun addLog(message: String, level: LogLevel = LogLevel.INFO) {
+        val entry = LogEntry(logTimestamp(), message, level)
         synchronized(this) {
-            _logs.value = (listOf(LogEntry(ts, message)) + _logs.value).take(100)
+            _logs.value = (listOf(entry) + _logs.value).take(LOG_CAPACITY)
+        }
+    }
+
+    /**
+     * 合并内核增量日志（Rust `vpn_logs_since` 每秒拉取一批，按 seq 升序）。
+     * 去重（seq 游标 + 集合双保险）、整体倒序（新在前）、封顶 500。
+     */
+    fun mergeKernelLogs(incoming: List<LogEntry>) {
+        if (incoming.isEmpty()) return
+        synchronized(this) {
+            _logs.value = mergeLogs(_logs.value, incoming, LOG_CAPACITY)
+        }
+    }
+
+    /** 清空日志（纯内存：点击连接开始新会话 / 服务停止即清空）。 */
+    fun clearLogs() {
+        synchronized(this) {
+            _logs.value = emptyList()
         }
     }
 }
 
-data class LogEntry(val time: String, val message: String)
+/**
+ * 单条日志：级别 + 时间 + 正文。
+ * [seq] > 0 表示内核日志（增量拉取去重键）；Kotlin 应用侧日志为 0。
+ */
+data class LogEntry(
+    val time: String,
+    val message: String,
+    val level: LogLevel = LogLevel.INFO,
+    val seq: Long = 0,
+)
+
+/** 当前时刻 `HH:mm:ss`（日志时间前缀）。 */
+internal fun logTimestamp(): String =
+    SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+
+/** Unix 毫秒 → `HH:mm:ss`（内核日志时间戳格式化；非法值回退当前时刻）。 */
+internal fun formatLogTime(epochMillis: Long): String =
+    if (epochMillis <= 0L) logTimestamp()
+    else SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(epochMillis))
+
+/** Rust 级别字符串 → [LogLevel]（未知值按 INFO 处理，不丢日志）。 */
+internal fun logLevelFrom(raw: String): LogLevel = when (raw.uppercase(Locale.ROOT)) {
+    "ERROR" -> LogLevel.ERROR
+    "WARN" -> LogLevel.WARN
+    else -> LogLevel.INFO
+}
+
+/**
+ * 日志合并（纯函数，单测覆盖）：
+ * - seq > 0 的条目按 seq 去重（已存在/批内重复都丢弃）；
+ * - [incoming] 按 seq 升序（Rust 保证）→ 整体倒序后新条目在最前；
+ * - 结果封顶 [cap] 条（丢最旧）。
+ */
+internal fun mergeLogs(
+    existing: List<LogEntry>,
+    incoming: List<LogEntry>,
+    cap: Int = LOG_CAPACITY,
+): List<LogEntry> {
+    val seen = existing.asSequence().filter { it.seq > 0L }.map { it.seq }.toHashSet()
+    val fresh = ArrayList<LogEntry>(incoming.size)
+    for (entry in incoming) {
+        if (entry.seq > 0L && !seen.add(entry.seq)) continue
+        fresh += entry
+    }
+    if (fresh.isEmpty()) return existing
+    return (fresh.asReversed() + existing).take(cap)
+}
+
+/**
+ * 日志过滤（纯函数，单测覆盖）：级别阈值（null = 全部；INFO < WARN < ERROR）
+ * + 关键字（忽略大小写，匹配正文）。保持输入顺序（新在前）。
+ */
+internal fun filterLogs(
+    logs: List<LogEntry>,
+    minLevel: LogLevel?,
+    query: String,
+): List<LogEntry> {
+    val keyword = query.trim()
+    if (minLevel == null && keyword.isEmpty()) return logs
+    return logs.filter { entry ->
+        (minLevel == null || entry.level.ordinal >= minLevel.ordinal) &&
+            (keyword.isEmpty() || entry.message.contains(keyword, ignoreCase = true))
+    }
+}
 
 /** 连接四态：状态环颜色 / 大按钮文案 / TalkBack 状态描述的共同判定源。 */
 enum class ConnPhase {

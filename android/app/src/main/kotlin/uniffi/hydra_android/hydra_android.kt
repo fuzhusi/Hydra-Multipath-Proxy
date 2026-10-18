@@ -778,6 +778,8 @@ internal open class UniffiVTableCallbackInterfaceVpnExitCallback(
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -800,6 +802,8 @@ fun uniffi_hydra_android_checksum_func_start_vpn(
 fun uniffi_hydra_android_checksum_func_stop_vpn(
 ): Short
 fun uniffi_hydra_android_checksum_func_test_node_connection(
+): Short
+fun uniffi_hydra_android_checksum_func_vpn_logs_since(
 ): Short
 fun uniffi_hydra_android_checksum_func_vpn_rule_mode_degraded(
 ): Short
@@ -895,6 +899,8 @@ fun uniffi_hydra_android_fn_func_start_vpn(`tunFd`: Int,`config`: RustBuffer.ByV
 fun uniffi_hydra_android_fn_func_stop_vpn(uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
 fun uniffi_hydra_android_fn_func_test_node_connection(`node`: RustBuffer.ByValue,`authKeyHex`: RustBuffer.ByValue,`trust`: RustBuffer.ByValue,`sni`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_hydra_android_fn_func_vpn_logs_since(`seq`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_hydra_android_fn_func_vpn_rule_mode_degraded(uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
@@ -1036,6 +1042,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_hydra_android_checksum_func_test_node_connection() != 57530.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_hydra_android_checksum_func_vpn_logs_since() != 4443.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_hydra_android_checksum_func_vpn_rule_mode_degraded() != 41889.toShort()) {
@@ -2102,6 +2111,61 @@ public object FfiConverterTypeVpnConfig: FfiConverterRustBuffer<VpnConfig> {
 
 
 /**
+ * 内核日志条目（uniffi Record → Kotlin `VpnLogEntry`）。
+ */
+data class VpnLogEntry (
+    /**
+     * 单调递增序号（进程内唯一；Kotlin 增量拉取游标，重启后继续递增）
+     */
+    var `seq`: kotlin.ULong, 
+    /**
+     * 级别三档：`INFO` / `WARN` / `ERROR`（debug/trace 归入 INFO，消息带前缀）
+     */
+    var `level`: kotlin.String, 
+    /**
+     * 已脱敏的消息正文（目标为 mask_target 短哈希）
+     */
+    var `message`: kotlin.String, 
+    /**
+     * Unix 毫秒时间戳（Kotlin 负责格式化为 HH:mm:ss）
+     */
+    var `tsMs`: kotlin.ULong
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeVpnLogEntry: FfiConverterRustBuffer<VpnLogEntry> {
+    override fun read(buf: ByteBuffer): VpnLogEntry {
+        return VpnLogEntry(
+            FfiConverterULong.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: VpnLogEntry) = (
+            FfiConverterULong.allocationSize(value.`seq`) +
+            FfiConverterString.allocationSize(value.`level`) +
+            FfiConverterString.allocationSize(value.`message`) +
+            FfiConverterULong.allocationSize(value.`tsMs`)
+    )
+
+    override fun write(value: VpnLogEntry, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`seq`, buf)
+            FfiConverterString.write(value.`level`, buf)
+            FfiConverterString.write(value.`message`, buf)
+            FfiConverterULong.write(value.`tsMs`, buf)
+    }
+}
+
+
+
+/**
  * 全局 VPN 数据面流量统计快照（Kotlin `HydraVpnService` 每秒轮询）。
  * 与本地端口模式的 [`EngineStats`] 相互独立：本结构只反映 TUN 用户态栈
  * （Rust `run_stack`）的中继字节与 TCP 流数；本地模式统计仍走
@@ -2592,6 +2656,34 @@ public object FfiConverterSequenceTypeNodeSpec: FfiConverterRustBuffer<List<Node
         }
     }
 }
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeVpnLogEntry: FfiConverterRustBuffer<List<VpnLogEntry>> {
+    override fun read(buf: ByteBuffer): List<VpnLogEntry> {
+        val len = buf.getInt()
+        return List<VpnLogEntry>(len) {
+            FfiConverterTypeVpnLogEntry.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<VpnLogEntry>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeVpnLogEntry.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<VpnLogEntry>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeVpnLogEntry.write(it, buf)
+        }
+    }
+}
         /**
          * 解析分享链接 / 订阅文本（hydra:// 多行、逐行或整体 base64 订阅），
          * 汇聚为一份引擎配置（节点列表 + 密钥 + 证书）。任一链接携带的 `k=`（密钥）
@@ -2643,6 +2735,20 @@ public object FfiConverterSequenceTypeNodeSpec: FfiConverterRustBuffer<List<Node
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_hydra_android_fn_func_test_node_connection(
         FfiConverterString.lower(`node`),FfiConverterString.lower(`authKeyHex`),FfiConverterTypeTrustMode.lower(`trust`),FfiConverterOptionalString.lower(`sni`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * 增量拉取内核日志：返回 `seq` 之后的所有条目（最多 500 条，按 seq 升序）。
+         * Kotlin 每秒轮询一次（与 `vpn_stats()` 同一循环），记录上次最大 seq 作游标。
+         * 环形缓冲已丢弃的更早条目自然不可见（UI 上限同为 500 条）。
+         */ fun `vpnLogsSince`(`seq`: kotlin.ULong): List<VpnLogEntry> {
+            return FfiConverterSequenceTypeVpnLogEntry.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_hydra_android_fn_func_vpn_logs_since(
+        FfiConverterULong.lower(`seq`),_status)
 }
     )
     }

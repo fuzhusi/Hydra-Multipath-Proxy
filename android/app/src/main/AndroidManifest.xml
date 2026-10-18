@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- 网络事件观测（C 批）：ConnectivityManager 回调记录切换/断开/恢复并即时触发健康探测 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- M1 进程内 SOCKS：应用自身出站访问节点 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- M1 前台服务保活（防 Cached App Freezer 冻结后台引擎）；M2 换 VpnService 常驻 -->

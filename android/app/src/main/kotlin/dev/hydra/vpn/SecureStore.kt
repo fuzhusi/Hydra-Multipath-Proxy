@@ -55,6 +55,10 @@ class SecureStore(context: Context) {
         appFilterMode = prefs.getInt(KEY_APP_FILTER_MODE, APP_FILTER_ALL),
         appFilterPkgs = prefs.getString(KEY_APP_FILTER_PKGS, "").orEmpty(),
         runRuleMode = prefs.getBoolean(KEY_RUN_RULE_MODE, false),
+        // 健康检查间隔（秒）：0 = 关闭；非法历史值归一化到默认 300s
+        healthProbeSecs = normalizeProbeSecs(
+            prefs.getInt(KEY_HEALTH_PROBE_SECS, HEALTH_PROBE_DEFAULT_SECS),
+        ),
     )
 
     fun save(c: HydraConfig) {
@@ -71,6 +75,7 @@ class SecureStore(context: Context) {
             .putInt(KEY_APP_FILTER_MODE, c.appFilterMode)
             .putString(KEY_APP_FILTER_PKGS, c.appFilterPkgs)
             .putBoolean(KEY_RUN_RULE_MODE, c.runRuleMode)
+            .putInt(KEY_HEALTH_PROBE_SECS, normalizeProbeSecs(c.healthProbeSecs))
             // commit() 同步落盘（企业评审）：apply() 异步刷盘在进程意外终止/
             // 系统回收时可能丢失（实测：深链导入成功后启动读到空配置）。配置
             // 体量小、写入频率低，同步开销可接受——正确性优先。
@@ -92,6 +97,8 @@ class SecureStore(context: Context) {
         private const val KEY_APP_FILTER_PKGS = "app_filter_pkgs"
         /** 智能分流开关（规则模式：命中 CN 规则直连，其余走节点；默认关闭=全局） */
         private const val KEY_RUN_RULE_MODE = "run_rule_mode"
+        /** 健康检查间隔秒数（0=关闭；默认 300s，方案 §二.B 定稿） */
+        private const val KEY_HEALTH_PROBE_SECS = "health_probe_secs"
 
         const val TRUST_PINNED = "pinned"
         const val TRUST_CA = "ca"
@@ -128,4 +135,7 @@ data class HydraConfig(
     /** 智能分流（规则模式）：命中 CN 规则直连 · 其余走节点（默认 false = 全局代理，
      *  行为与关闭前逐字节一致）。切换在下次启动 VPN 时生效（运行中不热切换） */
     val runRuleMode: Boolean = false,
+    /** 健康检查间隔秒数（1m/3m/5m/10m/关 → 60/180/300/600/0；默认 300s）。
+     *  连接建立与网络切换瞬间各额外触发一次即时探测（不占用本间隔） */
+    val healthProbeSecs: Int = HEALTH_PROBE_DEFAULT_SECS,
 )
