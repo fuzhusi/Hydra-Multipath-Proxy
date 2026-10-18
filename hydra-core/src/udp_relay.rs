@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 
 use hydra_protocol::mask_target;
 use hydra_protocol::udp_frame::{
-    encode_udp_close, encode_udp_data, read_udp_frame, write_udp_frame, UdpFrame,
+    encode_udp_close, encode_udp_data_into, read_udp_frame, write_udp_frame, UdpFrame,
 };
 use hydra_protocol::Result;
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
@@ -59,6 +59,14 @@ where
     /// LRU 淘汰/号回收产生的待发下行 close 帧（下一帧数据前经同一有序流
     /// 发出，保证节点先删旧会话再建新会话，sid 复用不串话）
     pending_closes: Vec<u16>,
+    /// 批次 B3：会话级帧构造复用缓冲（encode_udp_data_into 先 clear 再写，
+    /// 稳态每包 0 分配）。生命周期：挂通道实例（单任务 &mut self 使用），
+    /// 不跨 await 持引用——write_udp_frame 只借用切片，await 返回后缓冲即可
+    /// 进入下一轮构造
+    frame_buf: Vec<u8>,
+    /// 批次 B3：keyed 会话键复用缓冲（`session_key\u{1f}target` 的组装，
+    /// 免每包 format! 分配）。同挂通道实例，发送前组装、用毕即弃
+    keyed_buf: String,
 }
 
 /// 真实节点流（connect_target 产出的 TcpNodeStream 拆分两半）上的通道
@@ -91,8 +99,14 @@ pub async fn open_udp_channel(
         next_sid: 1,
         max_sessions: UDP_MAX_LOCAL_SESSIONS,
         pending_closes: Vec::new(),
+        frame_buf: Vec::with_capacity(UDP_FRAME_BUF_CAP),
+        keyed_buf: String::new(),
     })
 }
+
+/// 批次 B3：帧构造复用缓冲初始容量（1 + 2 + 地址帧 + 典型 MTU 数据报 1200B
+/// 再留余量；超出按 Vec 增长语义扩容，稳态不再分配）
+const UDP_FRAME_BUF_CAP: usize = 2048;
 
 impl<R, W> UdpChannel<R, W>
 where
@@ -161,10 +175,11 @@ where
         // 09-P3-7（审查08 遗留）：sid 分配与编码都在写出前完成；淘汰产生的
         // close 帧先于数据帧发出。编码失败时映射已建立但 sid 可复用（下次
         // send_to 同目标直接命中映射），不再出现"登记残留 + sid 空耗"。
+        // 批次 B3：帧写入会话级复用缓冲（稳态 0 分配），行为零变化
         let sid = self.session_for(target)?;
-        let frame = encode_udp_data(sid, target, datagram)?;
+        encode_udp_data_into(&mut self.frame_buf, sid, target, datagram)?;
         self.flush_pending_closes().await;
-        write_udp_frame(&mut self.wr, &frame).await
+        write_udp_frame(&mut self.wr, &self.frame_buf).await
     }
 
     /// 【TUN 场景】带会话键的发送：`session_key`（如 TUN 四元组流键）参与本地
@@ -177,12 +192,29 @@ where
         target: &str,
         datagram: &[u8],
     ) -> Result<u16> {
-        let keyed = format!("{session_key}\u{1f}{target}");
-        let sid = self.session_for(&keyed)?;
-        let frame = encode_udp_data(sid, target, datagram)?;
+        // 批次 B3：键组装进复用缓冲（免每包 format!）+ 帧写复用缓冲——
+        // 稳态上行发送 0 分配；wire 字节与原 format! + encode_udp_data 一致
+        let sid = self.session_for_keyed(session_key, target)?;
+        encode_udp_data_into(&mut self.frame_buf, sid, target, datagram)?;
         self.flush_pending_closes().await;
-        write_udp_frame(&mut self.wr, &frame).await?;
+        write_udp_frame(&mut self.wr, &self.frame_buf).await?;
         Ok(sid)
+    }
+
+    /// [`Self::send_to_ext`] 的键组装（批次 B3）：`session_key\u{1f}target`
+    /// 写入会话级复用缓冲 [`UdpChannel::keyed_buf`]（take/put-back 绕开
+    /// `&mut self`（查表）与 `&self.keyed_buf` 的借用冲突，take 是移动非
+    /// 分配；错误路径同样归还）。查找命中（稳态）零分配，未命中仅表内
+    /// insert 一次分配。
+    fn session_for_keyed(&mut self, session_key: &str, target: &str) -> Result<u16> {
+        let mut keyed = std::mem::take(&mut self.keyed_buf);
+        keyed.clear();
+        keyed.push_str(session_key);
+        keyed.push('\u{1f}');
+        keyed.push_str(target);
+        let r = self.session_for(&keyed);
+        self.keyed_buf = keyed;
+        r
     }
 
     /// 主动关闭 keyed 会话（发 close 帧）。返回是否确有该会话。
@@ -261,28 +293,45 @@ where
                     // 按 sid 反查 keyed 映射，并校验帧内 target 与键内绑定一致
                     //（09-P2-2 加固在 keyed 路径的等价实现：被入侵节点不可把
                     // 会话 A 的数据报伪装成会话 B 的目标——sid 顺序分配可猜，
-                    // target 归属校验是实际防线）
+                    // target 归属校验是实际防线）。
+                    // 批次 B3：绑定校验以 &str 切片比对完成（键缓冲仍归映射表
+                    // 所有），命中路径不再 to_string 拷贝键——下行每包少 1 次
+                    // 分配；命中后仅 last_used 原位更新。
                     let found = self
                         .sessions
-                        .iter_mut()
+                        .iter()
                         .find(|(_, e)| e.sid == session_id)
-                        .map(|(k, e)| {
-                            e.last_used = std::time::Instant::now();
-                            k.split('\u{1f}').nth(1).unwrap_or(k).to_string()
+                        .map(|(k, _)| {
+                            let bound = k.split('\u{1f}').nth(1).unwrap_or(k);
+                            bound == target.as_str()
                         });
                     match found {
-                        Some(bound_target) if bound_target == target => {
+                        Some(true) => {
+                            // 命中：仅原位刷新 LRU 时钟（二次查找，避免持有
+                            // 不可变借用跨 return）
+                            if let Some((_, e)) =
+                                self.sessions.iter_mut().find(|(_, e)| e.sid == session_id)
+                            {
+                                e.last_used = std::time::Instant::now();
+                            }
                             return Ok(UdpRx::Data {
                                 sid: session_id,
                                 target,
                                 datagram,
                             });
                         }
-                        Some(bound_target) => {
+                        Some(false) => {
                             // A1 字段化：期望/实际目标掩码分列字段（热路径丢弃
-                            // 事件，仅 debug 级；字段化后 GUI 环 Layer 可筛选）
+                            // 事件，仅 debug 级；字段化后 GUI 环 Layer 可筛选）。
+                            // 冷路径：重新取绑定目标供日志（命中路径零拷贝不受影响）
+                            let bound_k = self
+                                .sessions
+                                .iter()
+                                .find(|(_, e)| e.sid == session_id)
+                                .map(|(k, _)| k.split('\u{1f}').nth(1).unwrap_or(k).to_string())
+                                .unwrap_or_default();
                             tracing::debug!(
-                                target = %mask_target(&bound_target),
+                                target = %mask_target(&bound_k),
                                 actual = %mask_target(&target),
                                 sid = session_id,
                                 "UDP 下行帧 target 与流绑定不一致，丢弃"
@@ -335,6 +384,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hydra_protocol::udp_frame::encode_udp_data;
     use tokio::io::duplex;
 
     type TestChannel = UdpChannel<
@@ -377,6 +427,8 @@ mod tests {
             next_sid: 1,
             max_sessions: UDP_MAX_LOCAL_SESSIONS,
             pending_closes: Vec::new(),
+            frame_buf: Vec::with_capacity(UDP_FRAME_BUF_CAP),
+            keyed_buf: String::new(),
         }
     }
 
@@ -389,6 +441,8 @@ mod tests {
             next_sid: 1,
             max_sessions: cap,
             pending_closes: Vec::new(),
+            frame_buf: Vec::with_capacity(UDP_FRAME_BUF_CAP),
+            keyed_buf: String::new(),
         }
     }
 

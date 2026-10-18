@@ -37,6 +37,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,127 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+// ── VPN 数据面流量统计（全局原子计数器）──────────────────────────────────────
+//
+// 背景：本地端口模式（EngineService）每秒读 uniffi `eng.stats()`（SOCKS 侧
+// TrafficMonitor）；全局 VPN 路径的数据面在 `run_stack`（Rust 用户态栈），
+// 此前没有任何计数器，Kotlin 侧只能把 sentBytes/receivedBytes 硬编码为 0。
+// 本组计数器即为该路径的**唯一统计面**，由 Android FFI `vpn_stats()` 读取。
+//
+// 口径（与 UI 文案一致，均为「应用数据字节」，不含 IP/TCP/UDP 头）：
+// - up_bytes：TCP 上行成功写入节点隧道的流字节 + UDP 中继成功发往节点的载荷；
+// - down_bytes：TCP 下行写入 TUN（smoltcp socket）的流字节 + UDP 中继回包注入
+//   TUN 的载荷；
+// - active_conns：当前活动 TCP 流数（流登记 +1 / 流回收 -1）；
+// - total_conns：累计建立的 TCP 流数。
+//
+// 性能：每包/每块一次 `Relaxed` 原子自增（无锁、无分配、无跨字段一致性要求），
+// 相对加密与 TLS 拷贝可忽略；计数器**不做每包日志**。
+
+/// VPN 数据面流量统计快照（FFI/UI 读取；未启动时全 0）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VpnStats {
+    /// 上行字节（应用 → 节点隧道）
+    pub up_bytes: u64,
+    /// 下行字节（节点隧道 → 应用）
+    pub down_bytes: u64,
+    /// 当前活动 TCP 流数
+    pub active_conns: u64,
+    /// 累计建立的 TCP 流数
+    pub total_conns: u64,
+}
+
+/// 全局计数器集合（独立 struct 便于单测：本地实例与全局 static 同一实现）。
+struct VpnCounters {
+    up_bytes: AtomicU64,
+    down_bytes: AtomicU64,
+    active_conns: AtomicU64,
+    total_conns: AtomicU64,
+}
+
+impl VpnCounters {
+    const fn new() -> Self {
+        Self {
+            up_bytes: AtomicU64::new(0),
+            down_bytes: AtomicU64::new(0),
+            active_conns: AtomicU64::new(0),
+            total_conns: AtomicU64::new(0),
+        }
+    }
+
+    /// 上行累加（Relaxed：纯观测计数，无同步依赖）
+    fn add_up(&self, n: u64) {
+        self.up_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// 下行累加（Relaxed）
+    fn add_down(&self, n: u64) {
+        self.down_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// 流建立：活跃 +1、累计 +1（同一原子操作序列，UI 允许瞬时不一致）
+    fn conn_opened(&self) {
+        self.active_conns.fetch_add(1, Ordering::Relaxed);
+        self.total_conns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 流关闭：活跃 -1（`try_update` 饱和到 0——防御重复回收导致下溢回绕，
+    /// 发生在每流一次，CAS 成本可忽略）
+    fn conn_closed(&self) {
+        let _ = self
+            .active_conns
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
+
+    /// 快照（四字段各读一次；不要求跨字段严格同一时刻）
+    fn snapshot(&self) -> VpnStats {
+        VpnStats {
+            up_bytes: self.up_bytes.load(Ordering::Relaxed),
+            down_bytes: self.down_bytes.load(Ordering::Relaxed),
+            active_conns: self.active_conns.load(Ordering::Relaxed),
+            total_conns: self.total_conns.load(Ordering::Relaxed),
+        }
+    }
+
+    /// 归零（栈启动/退出时调用：断开后 FFI 立即返回全 0）
+    fn reset(&self) {
+        self.up_bytes.store(0, Ordering::Relaxed);
+        self.down_bytes.store(0, Ordering::Relaxed);
+        self.active_conns.store(0, Ordering::Relaxed);
+        self.total_conns.store(0, Ordering::Relaxed);
+    }
+}
+
+/// 进程级唯一计数器（Android 进程同一时刻至多一个 VPN 数据面；桌面 CLI/GUI
+/// 的 TUN 模式也经 `run_stack`，同样可观测）
+static VPN_COUNTERS: VpnCounters = VpnCounters::new();
+
+/// 读取 VPN 数据面统计快照（FFI `vpn_stats()` 的数据源）。
+/// 未启动/已停止（`run_stack` 已返回）时全 0——退出守卫 [`VpnStatsGuard`]
+/// 已归零，不影响仍在运行的本地端口模式（其统计走 `EngineStats`）。
+pub fn vpn_stats_snapshot() -> VpnStats {
+    VPN_COUNTERS.snapshot()
+}
+
+/// 数据面生命周期守卫：`run_stack` 入口归零、任意退出路径（含 `?` 早退）
+/// drop 时再次归零——保证「断开后归零」且不依赖调用方清理。
+struct VpnStatsGuard;
+
+impl VpnStatsGuard {
+    fn new() -> Self {
+        VPN_COUNTERS.reset();
+        Self
+    }
+}
+
+impl Drop for VpnStatsGuard {
+    fn drop(&mut self) {
+        VPN_COUNTERS.reset();
+    }
+}
 
 // ── 配置 ─────────────────────────────────────────────────────────────────────
 
@@ -1191,6 +1313,10 @@ enum FlowMsg {
 /// 一条活动流
 struct Flow {
     target: String,
+    /// 批次 B4：原始目的地 `SocketAddr`（smoltcp 端点直转，零 parse 零分配）。
+    /// 旁路给规则 opener（`tun_rule_opener_by_addr`）免每连接 `target.parse()`
+    /// ——target String 仅保留作日志/掩码展示。
+    target_addr: SocketAddr,
     up_rx: mpsc::Receiver<FlowMsg>,
     up_task: tokio::task::JoinHandle<()>,
     /// 代理下行读取任务（读取 duplex.reader → Data 消息）
@@ -1212,13 +1338,20 @@ struct Flow {
 
 /// 派生上游建链任务（open_target → FlowMsg::Link/LinkErr）。
 /// 06-P2-8：从 accept 分支拆出，改由"待建立流"循环在流进入 Established 后调用。
+/// 批次 B4：`opener_addr`（Some = 规则模式旁路 opener）优先用原始 `addr`
+/// 规则判定，免 String 重复 parse；None（全局模式）走原 `ChannelOpener`。
 fn spawn_up_task(
     opener: ChannelOpener,
+    opener_addr: Option<hydra_core::proxy::ChannelOpenerAddr>,
+    addr: SocketAddr,
     target: String,
     tx: mpsc::Sender<FlowMsg>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let open_fut = opener(target.clone());
+        let open_fut = match &opener_addr {
+            Some(o) => o(addr, target.clone()),
+            None => opener(target.clone()),
+        };
         match tokio::time::timeout(OPEN_TIMEOUT, open_fut).await {
             Ok(Ok(duplex)) => {
                 let _ = tx.send(FlowMsg::Link(duplex)).await;
@@ -1250,23 +1383,70 @@ fn is_ipv6_packet(pkt: &[u8]) -> bool {
     pkt.len() >= 40 && pkt[0] >> 4 == 6
 }
 
+/// RFC 1071 校验和单遍累加器（批次 B2）：逐段 [`Checksum16::feed`] 后
+/// [`Checksum16::finalize`]，免除「先拼接 pseudo/covered Vec 再二遍求和」的
+/// 每包拼接分配（消 D4）。奇数长度段的尾字节自动与下一段首字节配对
+/// （网络字节序 16 位字），与一次性整段求和在位级严格等价（等价性测试
+/// `checksum16_acc_等价性_整段与分段喂入逐位一致` 锁定）。
+pub struct Checksum16 {
+    sum: u32,
+    /// 上一奇数长度段遗留的高字节（与下一段首字节配成一个 16 位字）
+    pending: Option<u8>,
+}
+
+impl Default for Checksum16 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Checksum16 {
+    pub fn new() -> Self {
+        Self {
+            sum: 0,
+            pending: None,
+        }
+    }
+
+    /// 喂入一段字节（可任意分段调用；段边界不改变结果）
+    pub fn feed(&mut self, data: &[u8]) {
+        let mut rest = data;
+        // 上一段遗留的奇字节作高字节，与本段首字节配对（BE 16 位字）
+        if let Some(hi) = self.pending.take() {
+            if rest.is_empty() {
+                self.pending = Some(hi);
+                return;
+            }
+            self.sum += u16::from_be_bytes([hi, rest[0]]) as u32;
+            rest = &rest[1..];
+        }
+        // as_chunks::<2>：定长 2 字节成组（clippy 建议形态），尾组即奇字节
+        let (words, tail) = rest.as_chunks::<2>();
+        for w in words {
+            self.sum += u16::from_be_bytes([w[0], w[1]]) as u32;
+        }
+        self.pending = tail.first().copied();
+    }
+
+    /// 折叠进位取反码，得到最终校验和（网络字节序语义，同 [`checksum16`]）。
+    /// 消费 self；末段为奇数长度时遗留字节按高字节补 0 计入（RFC 1071 语义）。
+    pub fn finalize(self) -> u16 {
+        let mut sum = self.sum + self.pending.map_or(0, |b| (b as u32) << 8);
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+}
+
 /// RFC 1071 校验和（16 位反码求和；输入网络字节序，输出网络字节序）。
 /// 批次 B0：改为 pub 供 hydra-core 基准（benches/udp_relay.rs）作基线——
 /// 后续 B2 单遍化优化的前后对比即以此函数为基线（纯函数，可见性放宽无风险）。
+/// 批次 B2：改为经 [`Checksum16`] 累加器单遍实现（等价性测试锁定位级一致）。
 pub fn checksum16(data: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    let mut i = 0;
-    while i + 1 < data.len() {
-        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
-        i += 2;
-    }
-    if i < data.len() {
-        sum += (data[i] as u32) << 8;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
+    let mut acc = Checksum16::new();
+    acc.feed(data);
+    acc.finalize()
 }
 
 /// IPv6 伪首部（上层校验和计算用）：src + dst + 4B 上层长度 + next header
@@ -1343,7 +1523,11 @@ fn build_tcp_rst_v6(pkt: &[u8]) -> Option<Vec<u8>> {
     tcp.extend_from_slice(&0u16.to_be_bytes()); // window 0
     tcp.extend_from_slice(&[0, 0]); // 校验和占位
     tcp.extend_from_slice(&[0, 0]); // urgent pointer
-    let ck = checksum16(&[ipv6_pseudo_header(&dst, &src, 20, 6), tcp.clone()].concat());
+    // 批次 B2：伪首部 + TCP 头逐段喂入累加器（免 Vec 拼接 + clone）
+    let mut acc = Checksum16::new();
+    acc.feed(&ipv6_pseudo_header(&dst, &src, 20, 6));
+    acc.feed(&tcp);
+    let ck = acc.finalize();
     tcp[16..18].copy_from_slice(&ck.to_be_bytes());
 
     let mut out = build_ipv6_header(&dst, &src, 20, 6);
@@ -1368,13 +1552,11 @@ fn build_icmpv6_unreachable_v6(pkt: &[u8]) -> Vec<u8> {
     icmp.extend_from_slice(&[0, 0]); // 校验和占位
     icmp.extend_from_slice(&[0, 0, 0, 0]); // 4B 保留
     icmp.extend_from_slice(quoted);
-    let ck = checksum16(
-        &[
-            ipv6_pseudo_header(&dst, &src, icmp_len as u32, 58),
-            icmp.clone(),
-        ]
-        .concat(),
-    );
+    // 批次 B2：伪首部 + ICMP 段逐段喂入累加器（免 Vec 拼接 + clone）
+    let mut acc = Checksum16::new();
+    acc.feed(&ipv6_pseudo_header(&dst, &src, icmp_len as u32, 58));
+    acc.feed(&icmp);
+    let ck = acc.finalize();
     icmp[2..4].copy_from_slice(&ck.to_be_bytes());
 
     let mut out = build_ipv6_header(&dst, &src, icmp_len as u16, 58);
@@ -1776,6 +1958,9 @@ impl UdpDirectNat {
         let transport = self.transport.clone();
         let pump = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
+            // 批次 B1：回包构造 scratch（泵级复用，稳态每包 0 分配）——
+            // send 只借用 &[u8]，await 完成后才进入下一轮构造，复用安全
+            let mut scratch: Vec<u8> = Vec::new();
             // 回包循环：读错误（含 abort 取消）→ 泵退出
             while let Ok((n, remote)) = pump_sock.recv_from(&mut buf).await {
                 // 评审 P3-7：来源校验——不在此前直发目的地集合内的回包一律
@@ -1785,22 +1970,33 @@ impl UdpDirectNat {
                     continue;
                 }
                 // 回包：src = 真实远端（应用看到的"远端"），dst = 客户端源
-                let reply = match (remote, client_src) {
-                    (SocketAddr::V4(s), SocketAddr::V4(d)) => Some(build_udp_reply_v4(
-                        *s.ip(), *d.ip(), s.port(), d.port(), &buf[..n],
-                    )),
-                    (SocketAddr::V6(s), SocketAddr::V6(d)) => Some(build_udp_reply_v6(
-                        *s.ip(), *d.ip(), s.port(), d.port(), &buf[..n],
-                    )),
-                    _ => None, // v4/v6 混线（不应发生）：丢弃
-                };
-                match reply {
-                    Some(pkt) => {
-                        if transport.send(&pkt).await.is_err() {
-                            break;
-                        }
+                let ok = match (remote, client_src) {
+                    (SocketAddr::V4(s), SocketAddr::V4(d)) => {
+                        build_udp_reply_v4_into(
+                            &mut scratch,
+                            *s.ip(),
+                            *d.ip(),
+                            s.port(),
+                            d.port(),
+                            &buf[..n],
+                        );
+                        transport.send(&scratch).await.is_ok()
                     }
-                    None => continue,
+                    (SocketAddr::V6(s), SocketAddr::V6(d)) => {
+                        build_udp_reply_v6_into(
+                            &mut scratch,
+                            *s.ip(),
+                            *d.ip(),
+                            s.port(),
+                            d.port(),
+                            &buf[..n],
+                        );
+                        transport.send(&scratch).await.is_ok()
+                    }
+                    _ => true, // v4/v6 混线（不应发生）：丢弃但泵继续
+                };
+                if !ok {
+                    break;
                 }
             }
         });
@@ -1988,6 +2184,9 @@ async fn udp_relay_task(
 
         // 2. 双向泵
         let mut flows = UdpFlowTable::default();
+        // 批次 B1：下行回包构造 scratch（通道级复用，稳态每包 0 分配）——
+        // transport.send 只借用 &[u8]，await 完成后 scratch 归还可复用
+        let mut reply_scratch: Vec<u8> = Vec::new();
         let mut janitor = tokio::time::interval(Duration::from_secs(30));
         loop {
             tokio::select! {
@@ -2006,7 +2205,11 @@ async fn udp_relay_task(
                     Some(UdpCmd::Send { flow, dst, src, data }) => {
                         let dst_str = sock_to_target(dst);
                         match ch.send_to_ext(&flow, &dst_str, &data).await {
-                            Ok(sid) => flows.touch(sid, dst, src),
+                            Ok(sid) => {
+                                // VPN 统计：UDP 上行成功发往节点 → 计载荷字节
+                                VPN_COUNTERS.add_up(data.len() as u64);
+                                flows.touch(sid, dst, src);
+                            }
                             Err(e) => {
                                 debug!("TUN UDP 中继上行写失败（通道重建）: {e}");
                                 break; // 重建通道；本包丢弃（UDP 语义）
@@ -2024,31 +2227,53 @@ async fn udp_relay_task(
                             continue;
                         };
                         let reply = match (flow_dst, client_src) {
-                            (SocketAddr::V4(s), SocketAddr::V4(d)) => Some(build_udp_reply_v4(
-                                *s.ip(), *d.ip(), s.port(), d.port(), &datagram,
-                            )),
-                            (SocketAddr::V6(s), SocketAddr::V6(d)) => Some(build_udp_reply_v6(
-                                *s.ip(), *d.ip(), s.port(), d.port(), &datagram,
-                            )),
+                            (SocketAddr::V4(s), SocketAddr::V4(d)) => {
+                                build_udp_reply_v4_into(
+                                    &mut reply_scratch,
+                                    *s.ip(),
+                                    *d.ip(),
+                                    s.port(),
+                                    d.port(),
+                                    &datagram,
+                                );
+                                Some(&reply_scratch)
+                            }
+                            (SocketAddr::V6(s), SocketAddr::V6(d)) => {
+                                build_udp_reply_v6_into(
+                                    &mut reply_scratch,
+                                    *s.ip(),
+                                    *d.ip(),
+                                    s.port(),
+                                    d.port(),
+                                    &datagram,
+                                );
+                                Some(&reply_scratch)
+                            }
                             _ => None, // v4/v6 混线（不应发生）：丢弃
                         };
                         if let Some(pkt) = reply {
-                            if let Err(e) = transport.send(&pkt).await {
-                                // 批次 A5：故障洪峰下此事件会退化为每包一条——
-                                // 采样放行（采样因子 N=50000，hydra_core::telemetry::Sampler）
-                                // P3-3（评审修复）：累计失败计数——聚合观测口径：
-                                // 采样日志仅反映放行样本（每 50000 次至多 1 条），
-                                // 累计值反映全量注入失败次数，供长时段排障估算
-                                // 丢包规模（Relaxed 序即可：纯观测计数，无同步依赖）
-                                static TUN_INJECT_FAILS: std::sync::atomic::AtomicU64 =
-                                    std::sync::atomic::AtomicU64::new(0);
-                                let total = TUN_INJECT_FAILS
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                    + 1;
-                                static INJECT_FAIL_SAMPLER: hydra_core::telemetry::Sampler =
-                                    hydra_core::telemetry::Sampler::new();
-                                if INJECT_FAIL_SAMPLER.should_log(50_000) {
-                                    error!("TUN UDP 回包注入失败（累计失败 {total} 次）: {e}");
+                            match transport.send(pkt).await {
+                                Ok(()) => {
+                                    // VPN 统计：UDP 下行回包成功注入 TUN → 计载荷字节
+                                    VPN_COUNTERS.add_down(datagram.len() as u64);
+                                }
+                                Err(e) => {
+                                    // 批次 A5：故障洪峰下此事件会退化为每包一条——
+                                    // 采样放行（采样因子 N=50000，hydra_core::telemetry::Sampler）
+                                    // P3-3（评审修复）：累计失败计数——聚合观测口径：
+                                    // 采样日志仅反映放行样本（每 50000 次至多 1 条），
+                                    // 累计值反映全量注入失败次数，供长时段排障估算
+                                    // 丢包规模（Relaxed 序即可：纯观测计数，无同步依赖）
+                                    static TUN_INJECT_FAILS: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let total = TUN_INJECT_FAILS
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        + 1;
+                                    static INJECT_FAIL_SAMPLER: hydra_core::telemetry::Sampler =
+                                        hydra_core::telemetry::Sampler::new();
+                                    if INJECT_FAIL_SAMPLER.should_log(50_000) {
+                                        error!("TUN UDP 回包注入失败（累计失败 {total} 次）: {e}");
+                                    }
                                 }
                             }
                         }
@@ -2139,16 +2364,43 @@ fn parse_udp_v6(pkt: &[u8]) -> Option<(SocketAddr, SocketAddr, usize, usize)> {
 /// 构造回包：UDP/IP 完整帧，src = 流目的地址（应用看到的远端），dst = 客户端源。
 /// v4：UDP 校验和按 RFC 768 伪首部计算（0 视为无校验和，但我们给出真实值，
 /// 与主流栈一致，避免个别应用/中间盒对 0 校验和的兼容性问题）。
-fn build_udp_reply_v4(
+///
+/// 批次 B1：就地版本 [`build_udp_reply_v4_into`]（调用方复用 scratch，稳态
+/// 零分配）；本函数保留为一次性分配形态（既有测试/低频调用方使用；pub 供
+/// hydra-core 基准作「前」基线对照，同 [`checksum16`] 的 B0 先例）。
+pub fn build_udp_reply_v4(
     src: Ipv4Addr,
     dst: Ipv4Addr,
     sport: u16,
     dport: u16,
     payload: &[u8],
 ) -> Vec<u8> {
+    let mut pkt = Vec::new();
+    build_udp_reply_v4_into(&mut pkt, src, dst, sport, dport, payload);
+    pkt
+}
+
+/// [`build_udp_reply_v4`] 的就地构造版（批次 B1）：写入调用方持有的可复用
+/// scratch（先 clear），稳态每包 0 次堆分配。契约：**send 完成后** scratch
+/// 方可复用——`PacketTransport::send(&self, buf: &[u8])` 只借用不消费，
+/// 返回的 future 持有借用直至完成，await 结束即归还（Tun2Transport/测试
+/// 通道实现内部均拷贝入队），泵循环 await send 后再进入下一轮构造即安全。
+/// 校验和经 [`Checksum16`] 逐段喂入（src/dst/UDP 头/载荷），**载荷写入先于
+/// 校验和计算**（审查 P0-1 不可回归，等价性测试锁定）。
+pub fn build_udp_reply_v4_into(
+    scratch: &mut Vec<u8>,
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    sport: u16,
+    dport: u16,
+    payload: &[u8],
+) {
     let udp_len = 8 + payload.len();
     let total = 20 + udp_len;
-    let mut pkt = vec![0u8; total];
+    scratch.clear();
+    scratch.reserve(total);
+    scratch.resize(total, 0);
+    let pkt = scratch.as_mut_slice();
     pkt[0] = 0x45;
     let total_be = (total as u16).to_be_bytes();
     pkt[2..4].copy_from_slice(&total_be);
@@ -2167,29 +2419,47 @@ fn build_udp_reply_v4(
     // 校验和覆盖的是全零载荷 → 所有非空回包被本机栈校验失败丢弃，
     // UDP 直连与既有中继回包全链路静默失效）
     pkt[28..].copy_from_slice(payload);
-    // 伪首部校验和（RFC 768：伪首部 + UDP 头 + 载荷）
-    let mut pseudo = Vec::with_capacity(12 + udp_len);
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.push(0);
-    pseudo.push(17);
-    pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
-    pseudo.extend_from_slice(&pkt[20..]);
-    let uc = checksum16(&pseudo);
+    // 伪首部校验和（RFC 768：伪首部 + UDP 头 + 载荷）——批次 B2：累加器
+    // 逐段喂入，免 pseudo Vec 拼接
+    let mut acc = Checksum16::new();
+    acc.feed(&src.octets());
+    acc.feed(&dst.octets());
+    acc.feed(&[0, 17]);
+    acc.feed(&(udp_len as u16).to_be_bytes());
+    acc.feed(&pkt[20..]);
+    let uc = acc.finalize();
     pkt[26..28].copy_from_slice(&uc.to_be_bytes());
-    pkt
 }
 
-/// v6 版回包（校验和必需，RFC 2460）。
-fn build_udp_reply_v6(
+/// v6 版回包（校验和必需，RFC 2460）。一次性分配形态，见
+/// [`build_udp_reply_v4_into`] 的 B1/B2 说明（pub 理由同 v4 版）。
+pub fn build_udp_reply_v6(
     src: Ipv6Addr,
     dst: Ipv6Addr,
     sport: u16,
     dport: u16,
     payload: &[u8],
 ) -> Vec<u8> {
+    let mut pkt = Vec::new();
+    build_udp_reply_v6_into(&mut pkt, src, dst, sport, dport, payload);
+    pkt
+}
+
+/// [`build_udp_reply_v6`] 的就地构造版（批次 B1，契约同 v4 版）。
+pub fn build_udp_reply_v6_into(
+    scratch: &mut Vec<u8>,
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    sport: u16,
+    dport: u16,
+    payload: &[u8],
+) {
     let udp_len = 8 + payload.len();
-    let mut pkt = vec![0u8; 40 + udp_len];
+    let total = 40 + udp_len;
+    scratch.clear();
+    scratch.reserve(total);
+    scratch.resize(total, 0);
+    let pkt = scratch.as_mut_slice();
     pkt[0] = 0x60;
     pkt[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
     pkt[6] = 17;
@@ -2201,15 +2471,18 @@ fn build_udp_reply_v6(
     pkt[44..46].copy_from_slice(&(udp_len as u16).to_be_bytes());
     // ⚠ 载荷先写（审查 P0-1 同 v4：校验和必须覆盖真实载荷）
     pkt[48..].copy_from_slice(payload);
-    // 校验和覆盖伪首部 + UDP 头 + 载荷（RFC 2460；checksum16 顺序无关）
-    let pseudo = ipv6_pseudo_header(&src.octets(), &dst.octets(), udp_len as u32, 17);
-    let mut covered = pseudo;
-    covered.extend_from_slice(&pkt[40..]);
-    let uc = checksum16(&covered);
+    // 校验和覆盖伪首部 + UDP 头 + 载荷（RFC 2460；反码求和顺序无关）——
+    // 批次 B2：伪首部/头/载荷逐段喂入累加器，免 pseudo+covered Vec 拼接
+    let mut acc = Checksum16::new();
+    acc.feed(&src.octets());
+    acc.feed(&dst.octets());
+    acc.feed(&(udp_len as u32).to_be_bytes());
+    acc.feed(&[0, 0, 0, 17]);
+    acc.feed(&pkt[40..]);
+    let uc = acc.finalize();
     // RFC 2460：v6 UDP 校验和算出 0 时须写 0xFFFF（0 表示"无校验和"仅 v4 合法）
     let uc = if uc == 0 { 0xFFFF } else { uc };
     pkt[46..48].copy_from_slice(&uc.to_be_bytes());
-    pkt
 }
 
 /// `HYDRA_ALLOW_PRIVATE_TARGETS=1` 放开私网目标（与节点侧同款 OnceLock 语义）：
@@ -2375,6 +2648,10 @@ pub async fn run_stack<T: PacketTransport>(
     udp_factory: Option<UdpChannelFactory>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    // VPN 统计生命周期：入口归零（新会话不继承上次残留），任意退出路径
+    // （含下方 `?` 早退）由 Drop 归零——FFI 在停止后立即读到全 0。
+    let _stats_guard = VpnStatsGuard::new();
+
     // ── 智能分流（规则模式 v1.1）接线 ──
     // 评审 P2-5：删除此前的「伪兜底」（原实现仅改本函数局部 `cfg.dns_via_proxy`
     // 再打一条误导性 info——真正生效在 builder 生成的 DNS 豁免路由，此处改值
@@ -2402,6 +2679,18 @@ pub async fn run_stack<T: PacketTransport>(
     // R10 接线：run_stack 入口包装 opener——闭包内按规则判定，DIRECT 走
     // 直连（bind 物理 IP + protect 钩子 + 短超时，失败/超时回退代理）；
     // spawn_up_task/Flow/中继泵零改动（ProxyDuplex 来源对下游无感知）
+    // 批次 B4：规则模式同时构造 SocketAddr 旁路 opener（判定输入免
+    // target.parse()——原始形态由 Flow 链路保留）；`opener` 仍保留
+    // （旁路 opener 内部回退走节点仍用 String 契约的 proxy_opener）
+    let opener_addr = match &cfg.rule_engine {
+        Some(engine) => Some(hydra_core::proxy::ProxyServer::tun_rule_opener_by_addr(
+            engine.clone(),
+            cfg.direct_bind_ipv4,
+            cfg.direct_bind_ipv6,
+            opener.clone(),
+        )),
+        None => None,
+    };
     let opener = match &cfg.rule_engine {
         Some(engine) => {
             info!(
@@ -2716,6 +3005,7 @@ pub async fn run_stack<T: PacketTransport>(
             &mut listeners,
             &mut flows,
             &opener,
+            opener_addr.as_ref(),
             &mut stack_buf,
         )
         .await?;
@@ -2839,6 +3129,8 @@ async fn step(
     listeners: &mut Vec<SocketHandle>,
     flows: &mut HashMap<SocketHandle, Flow>,
     opener: &ChannelOpener,
+    // 批次 B4：SocketAddr 旁路 opener（规则模式 Some；全局模式 None）
+    opener_addr: Option<&hydra_core::proxy::ChannelOpenerAddr>,
     // 06-P3-8：栈中转缓冲由调用方一次分配传入，step 每 tick 不再重新分配
     stack_buf: &mut [u8],
 ) -> Result<()> {
@@ -2881,6 +3173,19 @@ async fn step(
             IpAddress::Ipv4(a) => format!("{}:{}", a, dst_port),
             IpAddress::Ipv6(a) => format!("[{}]:{}", a, dst_port),
         };
+        // 批次 B4：原始 SocketAddr 直转（信息在源头本就有，零 parse 零分配），
+        // 供规则 opener 旁路（target String 仅日志展示）
+        let target_addr = match dst_ip {
+            // smoltcp wire 地址为字节组 newtype（同 2754 行 a.0 惯例），直转零 parse
+            IpAddress::Ipv4(a) => SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::from(a.0)),
+                dst_port,
+            ),
+            IpAddress::Ipv6(a) => SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(a.0)),
+                dst_port,
+            ),
+        };
         let port = dst_port;
         if flows.len() >= cfg.max_flows {
             // 超限：abort 发 RST 给应用（防资源耗尽，方案 §2）
@@ -2908,6 +3213,7 @@ async fn step(
             h,
             Flow {
                 target,
+                target_addr,
                 up_rx: rx,
                 up_task: tokio::spawn(async {}), // 占位：Established 后替换为真实 up 任务
                 reader_task: None,
@@ -2920,6 +3226,8 @@ async fn step(
                 accepted_at: Instant::now(),
             },
         );
+        // VPN 统计：TCP 流登记 → 活跃 +1 / 累计 +1（回收见下方第 5 段清理）
+        VPN_COUNTERS.conn_opened();
         // 补一个新监听 socket 接下一个连接
         listeners[i] = add_listener(sockets, port);
         i += 1;
@@ -2956,7 +3264,15 @@ async fn step(
     }
     for h in to_open {
         if let Some(flow) = flows.get_mut(&h) {
-            flow.up_task = spawn_up_task(opener.clone(), flow.target.clone(), flow.flow_tx.clone());
+            // 批次 B4：规则模式走 SocketAddr 旁路 opener（免每连接 parse），
+            // 全局模式维持原 String 契约
+            flow.up_task = spawn_up_task(
+                opener.clone(),
+                opener_addr.cloned(),
+                flow.target_addr,
+                flow.target.clone(),
+                flow.flow_tx.clone(),
+            );
         }
     }
 
@@ -3001,7 +3317,10 @@ async fn step(
                                     )
                                     .await;
                                     match wr {
-                                        Ok(Ok(())) => {}
+                                        Ok(Ok(())) => {
+                                            // VPN 统计：TCP 上行成功写入节点隧道
+                                            VPN_COUNTERS.add_up(chunk.len() as u64);
+                                        }
                                         Ok(Err(e)) => {
                                             warn!("TUN 流上行写失败（{target2}）: {e} → 回 RST");
                                             let _ = err_tx.send(FlowMsg::UpErr).await;
@@ -3055,6 +3374,8 @@ async fn step(
             if n == 0 {
                 break;
             }
+            // VPN 统计：TCP 下行实际写入 TUN 协议栈（smoltcp socket）的字节
+            VPN_COUNTERS.add_down(n as u64);
             if n < front_len {
                 let rest = flow.pending.front().unwrap()[n..].to_vec();
                 flow.pending.pop_front();
@@ -3136,6 +3457,8 @@ async fn step(
     // 5. 清理（socket 移除 + 相关任务收敛）
     for h in to_remove {
         if let Some(mut f) = flows.remove(&h) {
+            // VPN 统计：TCP 流回收 → 活跃 -1（累计数保留）
+            VPN_COUNTERS.conn_closed();
             // 批次 A6/A1 字段化：TUN 流关闭事件（掩码目标 + 存续时长）
             debug!(
                 target = %mask_target(&f.target),
@@ -4920,6 +5243,81 @@ mod tests {
         assert_ne!(stored, 0, "v6 校验和不得为 0（RFC 2460 要求 0xFFFF）");
     }
 
+    /// 批次 B2 等价性测试：Checksum16 累加器（逐段 feed + finalize）与
+    /// 一次性二遍求和（原实现参考版，就地重写锁定语义）对固定样例**逐位
+    /// 一致**——覆盖偶/奇长度、伪首部多段、1B/空段边界。
+    #[test]
+    fn checksum16_acc_等价性_整段与分段喂入逐位一致() {
+        // 原二遍实现参考版（B2 改造前语义的冻结副本，仅测试可见）
+        fn reference(data: &[u8]) -> u16 {
+            let mut sum = 0u32;
+            let mut i = 0;
+            while i + 1 < data.len() {
+                sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+                i += 2;
+            }
+            if i < data.len() {
+                sum += (data[i] as u32) << 8;
+            }
+            while sum >> 16 != 0 {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+            !(sum as u16)
+        }
+        let samples: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![0x01],
+            vec![0x01, 0x02],
+            vec![0x11u8; 576],                       // 基准样例长度
+            vec![0xF0u8; 577],                       // 奇数长度（尾字节高字节补 0）
+            vec![0xFF, 0xFF, 0xFF, 0xFF],            // 进位折叠
+            (0u16..=u16::MAX).map(|v| (v >> 8) as u8).collect(), // 64KB 递增高字节
+        ];
+        for (si, s) in samples.iter().enumerate() {
+            let whole = checksum16(s);
+            assert_eq!(whole, reference(s), "样例 {si}：整段喂入与参考实现不一致");
+            // 逐字节喂入（最碎分段）——段边界不得改变结果
+            let mut acc = Checksum16::new();
+            for b in s {
+                acc.feed(std::slice::from_ref(b));
+            }
+            assert_eq!(acc.finalize(), whole, "样例 {si}：逐字节喂入不一致");
+            // 伪首部形态多段喂入（src/dst/占位/长度/段，各段奇偶交错）
+            let mut acc = Checksum16::new();
+            acc.feed(&s[..s.len().min(4)]);
+            acc.feed(&s[s.len().min(4)..s.len().min(7)]);
+            acc.feed(&[]);
+            acc.feed(&s[s.len().min(7)..]);
+            assert_eq!(acc.finalize(), whole, "样例 {si}：多段（含空段/奇段）喂入不一致");
+        }
+    }
+
+    /// 批次 B1 就地构造等价性：`build_udp_reply_*_into`（scratch 复用）与
+    /// 一次性分配版逐字节一致（含二次复用残留覆盖——第二轮 longer 载荷写入
+    /// 必须完整覆盖第一轮更短的包，不得残留旧字节）。
+    #[test]
+    fn udp_reply_into_与一次性分配版逐字节等价且_scratch_复用无残留() {
+        use std::net::Ipv6Addr;
+        let src4 = Ipv4Addr::new(192, 168, 1, 5);
+        let dst4 = Ipv4Addr::new(93, 184, 216, 34);
+        let mut scratch = Vec::new();
+        build_udp_reply_v4_into(&mut scratch, src4, dst4, 54321, 443, b"hello");
+        assert_eq!(scratch, build_udp_reply_v4(src4, dst4, 54321, 443, b"hello"));
+        // 复用 + 第二轮更长载荷：验证 resize 后全覆盖（无第一轮残留）
+        build_udp_reply_v4_into(&mut scratch, src4, dst4, 54321, 443, &[0xABu8; 1300]);
+        assert_eq!(
+            scratch,
+            build_udp_reply_v4(src4, dst4, 54321, 443, &[0xABu8; 1300])
+        );
+        // v6 同样验证（含复用降长路径）
+        let src6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst6: Ipv6Addr = "2606:2800:220:1::1".parse().unwrap();
+        build_udp_reply_v6_into(&mut scratch, src6, dst6, 5353, 443, b"v6-payload");
+        assert_eq!(scratch, build_udp_reply_v6(src6, dst6, 5353, 443, b"v6-payload"));
+        build_udp_reply_v6_into(&mut scratch, src6, dst6, 5353, 443, b"");
+        assert_eq!(scratch, build_udp_reply_v6(src6, dst6, 5353, 443, b""));
+    }
+
     // ── 评审 P3-7：直连 UDP 回包来源白名单 ──
     #[test]
     fn udp_direct_回包来源allowlist_淘汰与过滤() {
@@ -5354,5 +5752,55 @@ mod tests {
         }
         shutdown.cancel();
         assert!(got, "bind 缺失 + protect 钩子应在超时前收到直发回包");
+    }
+
+    // ── VPN 数据面计数器（全局 VPN 流量统计）────────────────────────────────
+
+    /// 计数器累加 / 活跃数增减 / 重复回收饱和：用本地实例（与全局 static
+    /// 同一实现）——避免与本模块并行运行的 run_stack 测试争用全局计数器
+    /// （全局归零由 `VpnStatsGuard` 在栈启停时负责）。
+    #[test]
+    fn vpn_计数器_累加与活跃数增减() {
+        let c = VpnCounters::new();
+        assert_eq!(c.snapshot(), VpnStats::default());
+
+        c.add_up(100);
+        c.add_up(23);
+        c.add_down(4096);
+        assert_eq!(
+            c.snapshot(),
+            VpnStats {
+                up_bytes: 123,
+                down_bytes: 4096,
+                active_conns: 0,
+                total_conns: 0,
+            }
+        );
+
+        c.conn_opened();
+        c.conn_opened();
+        c.conn_closed();
+        let s = c.snapshot();
+        assert_eq!(s.active_conns, 1, "两条流关闭一条后活跃应为 1");
+        assert_eq!(s.total_conns, 2, "累计数不随关闭回退");
+
+        // 重复回收：饱和到 0，不得下溢为 u64::MAX
+        c.conn_closed();
+        c.conn_closed();
+        assert_eq!(c.snapshot().active_conns, 0);
+
+        // reset 归零（断开后 FFI 必须读到全 0）
+        c.add_up(1);
+        c.add_down(1);
+        c.reset();
+        assert_eq!(c.snapshot(), VpnStats::default());
+    }
+
+    /// 全局快照入口可读且字段口径正确（不与本模块并行栈测试断言具体值）。
+    #[test]
+    fn vpn_统计快照_全局入口可读() {
+        let s = vpn_stats_snapshot();
+        // 只断言类型/可读：并行测试可能正在累加或归零，具体值不可作为契约
+        let _ = (s.up_bytes, s.down_bytes, s.active_conns, s.total_conns);
     }
 }

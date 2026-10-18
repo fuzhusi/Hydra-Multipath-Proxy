@@ -228,6 +228,35 @@ pub fn vpn_rule_mode_degraded() -> bool {
     VPN_RULE_DEGRADED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// 全局 VPN 数据面流量统计快照（Kotlin `HydraVpnService` 每秒轮询）。
+/// 与本地端口模式的 [`EngineStats`] 相互独立：本结构只反映 TUN 用户态栈
+/// （Rust `run_stack`）的中继字节与 TCP 流数；本地模式统计仍走
+/// `HydraEngine::stats()`（SOCKS 侧 TrafficMonitor）。
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct VpnStats {
+    /// 上行字节（应用 → 节点隧道，TCP 流字节 + UDP 载荷）
+    pub up_bytes: u64,
+    /// 下行字节（节点隧道 → 应用，TCP 流字节 + UDP 载荷）
+    pub down_bytes: u64,
+    /// 当前活动 TCP 流数
+    pub active_conns: u64,
+    /// 累计建立的 TCP 流数
+    pub total_conns: u64,
+}
+
+/// 读取全局 VPN 数据面统计（未启动/已停止时全 0）。
+/// 每次调用只读 4 个 `Relaxed` 原子——无需加锁，可由 Kotlin 每秒轮询。
+#[uniffi::export]
+pub fn vpn_stats() -> VpnStats {
+    let s = hydra_client::tun::vpn_stats_snapshot();
+    VpnStats {
+        up_bytes: s.up_bytes,
+        down_bytes: s.down_bytes,
+        active_conns: s.active_conns,
+        total_conns: s.total_conns,
+    }
+}
+
 /// 智能分流引擎构建（start_vpn 与单测共用）：`rule_mode=false` → None（全局
 /// 模式零开销）；`rule_mode=true` 恒 Some——文件缺失/解析失败降级为内置
 /// CN 规则引擎（对齐桌面 hydra-client：内置 CN 直连保留，消除「开关在规则
@@ -571,6 +600,33 @@ pub fn start_vpn(
     on_exit: Box<dyn VpnExitCallback>,
 ) -> Result<(), HydraEngineError> {
     let mut guard = VPN_STATE.lock().unwrap_or_else(|p| p.into_inner());
+
+    // 诊断：初始化 tracing → 应用 filesDir/hydra.log（debug 包可 run-as 读取）。
+    // 此前无任何 subscriber，内核全部日志被静默丢弃。
+    {
+        use tracing::Level;
+        use std::io::Write;
+        struct LogFile(std::sync::Mutex<std::fs::File>);
+        impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogFile {
+            type Writer = LogFileWriter<'a>;
+            fn make_writer(&'a self) -> Self::Writer {
+                LogFileWriter(self.0.lock().unwrap_or_else(|p| p.into_inner()))
+            }
+        }
+        struct LogFileWriter<'a>(std::sync::MutexGuard<'a, std::fs::File>);
+        impl Write for LogFileWriter<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.0.write(buf) }
+            fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
+        }
+        // Android 无 TMPDIR；debug 诊断固定写应用私有 files 目录
+        let path = std::path::PathBuf::from("/data/user/0/dev.hydra.vpn/files/hydra.log");
+        if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(if cfg!(debug_assertions) { Level::DEBUG } else { Level::INFO })
+                .with_writer(LogFile(std::sync::Mutex::new(f)))
+                .try_init();
+        }
+    }
 
     // R4：保护钩子进程级安装（首装生效）——出站连接 connect 前回调 protect(fd)
     {
@@ -1036,6 +1092,8 @@ mod tests {
 
     #[test]
     fn rule_mode_off_tun_config_has_no_engine() {
+        // 进程级降级标记也会被本用例复位——必须与其他涉标记用例串行
+        let _g = DEGRADED_FLAG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // 全局模式（开关 OFF）：rule_engine=None 且 DNS 配置与基线逐字节一致
         let cfg = vpn_cfg(false, Some("whatever.txt".into()));
         assert!(build_rule_engine(&cfg).is_none(), "OFF 不得构建引擎");
@@ -1094,5 +1152,30 @@ mod tests {
         assert!(tun.rule_engine.is_some(), "规则模式必须接入 TunConfig");
         assert!(!tun.dns_via_proxy && tun.dns_direct, "DNS 直连联动（R2）");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── VPN 数据面统计 FFI（全局 VPN 流量显示）──────────────────────────────
+
+    #[test]
+    fn vpn_stats_unstarted_is_zero_and_mapping_consistent() {
+        // 未启动（本测试二进制从不跑 run_stack）→ FFI 必须全 0：
+        // Kotlin 首轮轮询不会显示上一会话的残留值
+        let s = vpn_stats();
+        assert_eq!(
+            s,
+            VpnStats {
+                up_bytes: 0,
+                down_bytes: 0,
+                active_conns: 0,
+                total_conns: 0,
+            }
+        );
+        // 映射一致性：FFI 记录逐字段来自 hydra-client 快照（同进程中唯一来源）
+        let raw = hydra_client::tun::vpn_stats_snapshot();
+        assert_eq!(raw, Default::default());
+        assert_eq!(s.up_bytes, raw.up_bytes);
+        assert_eq!(s.down_bytes, raw.down_bytes);
+        assert_eq!(s.active_conns, raw.active_conns);
+        assert_eq!(s.total_conns, raw.total_conns);
     }
 }

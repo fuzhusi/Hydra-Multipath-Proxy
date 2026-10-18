@@ -776,6 +776,8 @@ internal open class UniffiVTableCallbackInterfaceVpnExitCallback(
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -800,6 +802,8 @@ fun uniffi_hydra_android_checksum_func_stop_vpn(
 fun uniffi_hydra_android_checksum_func_test_node_connection(
 ): Short
 fun uniffi_hydra_android_checksum_func_vpn_rule_mode_degraded(
+): Short
+fun uniffi_hydra_android_checksum_func_vpn_stats(
 ): Short
 fun uniffi_hydra_android_checksum_method_hydraengine_bound_addr(
 ): Short
@@ -894,6 +898,8 @@ fun uniffi_hydra_android_fn_func_test_node_connection(`node`: RustBuffer.ByValue
 ): RustBuffer.ByValue
 fun uniffi_hydra_android_fn_func_vpn_rule_mode_degraded(uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
+fun uniffi_hydra_android_fn_func_vpn_stats(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun ffi_hydra_android_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun ffi_hydra_android_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1033,6 +1039,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_hydra_android_checksum_func_vpn_rule_mode_degraded() != 41889.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_hydra_android_checksum_func_vpn_stats() != 5193.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_hydra_android_checksum_method_hydraengine_bound_addr() != 10632.toShort()) {
@@ -2092,6 +2101,64 @@ public object FfiConverterTypeVpnConfig: FfiConverterRustBuffer<VpnConfig> {
 
 
 
+/**
+ * 全局 VPN 数据面流量统计快照（Kotlin `HydraVpnService` 每秒轮询）。
+ * 与本地端口模式的 [`EngineStats`] 相互独立：本结构只反映 TUN 用户态栈
+ * （Rust `run_stack`）的中继字节与 TCP 流数；本地模式统计仍走
+ * `HydraEngine::stats()`（SOCKS 侧 TrafficMonitor）。
+ */
+data class VpnStats (
+    /**
+     * 上行字节（应用 → 节点隧道，TCP 流字节 + UDP 载荷）
+     */
+    var `upBytes`: kotlin.ULong, 
+    /**
+     * 下行字节（节点隧道 → 应用，TCP 流字节 + UDP 载荷）
+     */
+    var `downBytes`: kotlin.ULong, 
+    /**
+     * 当前活动 TCP 流数
+     */
+    var `activeConns`: kotlin.ULong, 
+    /**
+     * 累计建立的 TCP 流数
+     */
+    var `totalConns`: kotlin.ULong
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeVpnStats: FfiConverterRustBuffer<VpnStats> {
+    override fun read(buf: ByteBuffer): VpnStats {
+        return VpnStats(
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: VpnStats) = (
+            FfiConverterULong.allocationSize(value.`upBytes`) +
+            FfiConverterULong.allocationSize(value.`downBytes`) +
+            FfiConverterULong.allocationSize(value.`activeConns`) +
+            FfiConverterULong.allocationSize(value.`totalConns`)
+    )
+
+    override fun write(value: VpnStats, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`upBytes`, buf)
+            FfiConverterULong.write(value.`downBytes`, buf)
+            FfiConverterULong.write(value.`activeConns`, buf)
+            FfiConverterULong.write(value.`totalConns`, buf)
+    }
+}
+
+
+
 
 
 sealed class HydraEngineException: kotlin.Exception() {
@@ -2589,6 +2656,19 @@ public object FfiConverterSequenceTypeNodeSpec: FfiConverterRustBuffer<List<Node
             return FfiConverterBoolean.lift(
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_hydra_android_fn_func_vpn_rule_mode_degraded(
+        _status)
+}
+    )
+    }
+    
+
+        /**
+         * 读取全局 VPN 数据面统计（未启动/已停止时全 0）。
+         * 每次调用只读 4 个 `Relaxed` 原子——无需加锁，可由 Kotlin 每秒轮询。
+         */ fun `vpnStats`(): VpnStats {
+            return FfiConverterTypeVpnStats.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_hydra_android_fn_func_vpn_stats(
         _status)
 }
     )

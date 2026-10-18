@@ -424,16 +424,34 @@ private fun RuleModeCard(isVpn: Boolean, ruleMode: Boolean, onToggle: (Boolean) 
 private fun StatBand() {
     val ui by EngineState.ui.collectAsState()
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        StatCell("发送", fmtBytes(ui.sentBytes), Modifier.weight(1f))
-        StatCell("接收", fmtBytes(ui.receivedBytes), Modifier.weight(1f))
-        StatCell("运行时长", formatDuration(ui.uptimeSecs), Modifier.weight(1f))
-        StatCell("活跃连接", ui.activeConns.toString(), Modifier.weight(1f))
+        StatCell(
+            "发送", fmtBytes(ui.sentBytes), Modifier.weight(1f),
+            speed = "↑${fmtSpeed(ui.upSpeedBps)}",
+        )
+        StatCell(
+            "接收", fmtBytes(ui.receivedBytes), Modifier.weight(1f),
+            speed = "↓${fmtSpeed(ui.downSpeedBps)}",
+        )
+        StatCell("运行时长", formatDuration(ui.uptimeSecs), Modifier.weight(1f), speed = "本会话")
+        StatCell(
+            "活跃连接", ui.activeConns.toString(), Modifier.weight(1f),
+            speed = "累计 ${ui.totalConns}",
+        )
     }
 }
 
-/** 单格：参数全为基本类型/String，流量跳字被 strong-skip 收敛在本格内。 */
+/**
+ * 单格：参数全为基本类型/String，流量跳字被 strong-skip 收敛在本格内。
+ * [speed] 为第二行小字（全局 VPN 速率 / 累计连接数等），四格都渲染以保持
+ * 卡片等高（空串也占一行）。
+ */
 @Composable
-private fun StatCell(label: String, value: String, modifier: Modifier = Modifier) {
+private fun StatCell(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+    speed: String = "",
+) {
     Card(modifier) {
         Column(Modifier.padding(10.dp)) {
             Text(
@@ -443,6 +461,11 @@ private fun StatCell(label: String, value: String, modifier: Modifier = Modifier
                 // R7/G4：统计带每格有标签（label 即读法）
             )
             Text(value, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.titleMedium)
+            Text(
+                speed,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
@@ -579,10 +602,14 @@ private fun phaseLabel(phase: ConnPhase): String = when (phase) {
 }
 
 internal fun fmtBytes(bytes: Long): String = when {
-    bytes >= 1 shl 20 -> "%.1f MB/s".format(bytes.toDouble() / (1 shl 20))
-    bytes >= 1 shl 10 -> "%.1f KB/s".format(bytes.toDouble() / (1 shl 10))
-    else -> "$bytes B/s"
+    bytes >= 1L shl 30 -> "%.1f GB".format(bytes.toDouble() / (1L shl 30))
+    bytes >= 1L shl 20 -> "%.1f MB".format(bytes.toDouble() / (1L shl 20))
+    bytes >= 1L shl 10 -> "%.1f KB".format(bytes.toDouble() / (1L shl 10))
+    else -> "$bytes B"
 }
+
+/** 速率（B/s）：复用 [fmtBytes] 换算，只补 /s 后缀（总量与速率不混用）。 */
+internal fun fmtSpeed(bps: Long): String = "${fmtBytes(bps)}/s"
 
 internal fun formatDuration(secs: Long): String = when {
     secs >= 3600 -> "%d:%02d:%02d".format(secs / 3600, (secs % 3600) / 60, secs % 60)

@@ -1,12 +1,14 @@
 //! 批次 B0：UDP 中继链路 criterion 基线基准。
 //!
-//! 三个基准面（后续批次 B1/B2/B3 优化以此表为前后对比基线，数字随代码
-//! 变化同步更新 benches/README.md）：
+//! 基准面（批次 B1/B2/B3 优化以此表为前后对比基线，数字随代码变化同步更新
+//! benches/README.md）：
 //! ① udp_relay 会话帧构造/解析往返（hydra_protocol::udp_frame，payload 1200B
 //!    ≈ 典型 MTU 数据报；往返经 block_on——附 block_on 空转对照组供校准）；
 //! ② RFC 1071 checksum16（实现位于 hydra-client/src/tun.rs，B2 单遍化基线）；
 //! ③ 路由 decide（RuleEngine::builtin_cn，GeoIP-CN 命中 114.114.114.114 与
 //!    未命中 8.8.8.8 两样例；每连接建连一次的热路径）。
+//! ④ 批次 B1/B3 追加：回包构造（一次性分配「前」 vs 就地 scratch「后」）、
+//!    帧构造复用（encode_udp_data_into 复用缓冲）。
 //!
 //! 分配计数：`cargo bench --features bench-alloc` 时启用计数分配器
 //! （#[global_allocator] 仅本 feature 门控，不影响生产分配器），每组基准
@@ -56,7 +58,9 @@ static GLOBAL: counting_alloc::CountingAlloc = counting_alloc::CountingAlloc;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use hydra_core::routing_rules::RuleEngine;
-use hydra_protocol::udp_frame::{encode_udp_data, read_udp_frame, UdpFrame};
+use hydra_protocol::udp_frame::{
+    encode_udp_data, encode_udp_data_into, read_udp_frame, UdpFrame,
+};
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -137,6 +141,21 @@ fn bench_udp_frame(c: &mut Criterion) {
     report_allocs("udp_frame/encode_1200B", 10_000, || {
         let _ = encode_udp_data(7, "1.2.3.4:5300", PAYLOAD_1200).unwrap();
     });
+
+    // ①-d 批次 B3「后」：帧构造复用（encode_udp_data_into 写入会话级复用
+    // 缓冲，clear 后重写；稳态 allocs/op 应为 0）
+    c.bench_function("udp_frame/encode_into_1200B", |b| {
+        let mut buf = Vec::with_capacity(2048);
+        b.iter(|| {
+            encode_udp_data_into(&mut buf, black_box(7), "1.2.3.4:5300", PAYLOAD_1200).unwrap();
+            black_box(buf.len())
+        })
+    });
+    let mut buf = Vec::with_capacity(2048);
+    report_allocs("udp_frame/encode_into_1200B", 10_000, || {
+        // 复用缓冲在闭包外持有（等价泵稳态），计数仅覆盖 encode 本身
+        encode_udp_data_into(&mut buf, 7, "1.2.3.4:5300", PAYLOAD_1200).unwrap();
+    });
 }
 
 fn bench_checksum16(c: &mut Criterion) {
@@ -147,6 +166,73 @@ fn bench_checksum16(c: &mut Criterion) {
     });
     report_allocs("checksum16/576B", 10_000, || {
         black_box(hydra_client::checksum16(&buf));
+    });
+    // ②-b 批次 B2「后」形态：伪首部多段喂入累加器（免拼接 Vec 的真实调用
+    // 形态：src/dst/占位/长度/载荷逐段 feed）
+    let src = std::net::Ipv4Addr::new(10, 7, 0, 2);
+    let dst = std::net::Ipv4Addr::new(93, 184, 216, 34);
+    let payload = &buf[..536]; // 536 + 8B UDP 头 + 12B v4 伪首部字段 = 576B 段总量
+    c.bench_function("checksum16/acc_pseudo_multiseg_576B", |b| {
+        b.iter(|| {
+            let mut acc = hydra_client::Checksum16::new();
+            acc.feed(&src.octets());
+            acc.feed(&dst.octets());
+            acc.feed(&[0, 17]);
+            acc.feed(&544u16.to_be_bytes());
+            acc.feed(black_box(payload));
+            black_box(acc.finalize())
+        })
+    });
+    report_allocs("checksum16/acc_pseudo_multiseg_576B", 10_000, || {
+        let mut acc = hydra_client::Checksum16::new();
+        acc.feed(&src.octets());
+        acc.feed(&dst.octets());
+        acc.feed(&[0, 17]);
+        acc.feed(&544u16.to_be_bytes());
+        acc.feed(payload);
+        black_box(acc.finalize());
+    });
+}
+
+/// ④ 批次 B1：UDP 回包构造（TUN 直连/中继回包泵热路径）
+fn bench_udp_reply(c: &mut Criterion) {
+    let src4 = std::net::Ipv4Addr::new(10, 7, 0, 2);
+    let dst4 = std::net::Ipv4Addr::new(93, 184, 216, 34);
+    // 「前」：一次性分配版（build_udp_reply_v4，B0 形态）
+    c.bench_function("udp_reply_build/v4_1200B_alloc", |b| {
+        b.iter(|| {
+            black_box(hydra_client::build_udp_reply_v4(
+                black_box(src4),
+                black_box(dst4),
+                40001,
+                443,
+                PAYLOAD_1200,
+            ))
+        })
+    });
+    report_allocs("udp_reply_build/v4_1200B_alloc", 10_000, || {
+        black_box(hydra_client::build_udp_reply_v4(src4, dst4, 40001, 443, PAYLOAD_1200));
+    });
+    // 「后」：就地构造 + 泵级 scratch 复用（build_udp_reply_v4_into；稳态
+    // allocs/op 应为 0）
+    c.bench_function("udp_reply_build/v4_1200B_into", |b| {
+        let mut scratch = Vec::with_capacity(2048);
+        b.iter(|| {
+            hydra_client::build_udp_reply_v4_into(
+                &mut scratch,
+                black_box(src4),
+                black_box(dst4),
+                40001,
+                443,
+                PAYLOAD_1200,
+            );
+            black_box(scratch.len())
+        })
+    });
+    let mut scratch2 = Vec::with_capacity(2048);
+    report_allocs("udp_reply_build/v4_1200B_into", 10_000, || {
+        // scratch 闭包外持有（等价回包泵稳态），计数仅覆盖构造本身
+        hydra_client::build_udp_reply_v4_into(&mut scratch2, src4, dst4, 40001, 443, PAYLOAD_1200);
     });
 }
 
@@ -170,6 +256,7 @@ criterion_group!(
     benches,
     bench_udp_frame,
     bench_checksum16,
+    bench_udp_reply,
     bench_routing_decide
 );
 criterion_main!(benches);

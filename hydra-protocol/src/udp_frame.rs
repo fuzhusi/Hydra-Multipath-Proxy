@@ -97,6 +97,47 @@ pub fn encode_udp_data(session_id: u16, target: &str, datagram: &[u8]) -> Result
     Ok(frame)
 }
 
+/// [`encode_udp_data`] 的就地构造版（批次 B3 帧构造复用）：写入调用方持有的
+/// 会话级复用缓冲（先 clear），稳态每包 0 次堆分配。校验逻辑与产出字节与
+/// [`encode_udp_data`] 完全一致（回环测试 `data_frame_roundtrip_and_layout`
+/// 与 `encode_into_与一次性分配版逐字节等价` 共同锁定）。
+pub fn encode_udp_data_into(
+    frame: &mut Vec<u8>,
+    session_id: u16,
+    target: &str,
+    datagram: &[u8],
+) -> Result<()> {
+    let addr = target.as_bytes();
+    if addr.is_empty() || addr.len() > MAX_TARGET_LEN {
+        return Err(HydraError::ProtocolError(format!(
+            "UDP 数据帧目标地址长度非法：{} 字节（1..={MAX_TARGET_LEN}）",
+            addr.len()
+        )));
+    }
+    if datagram.len() > MAX_DATAGRAM_LEN {
+        return Err(HydraError::ProtocolError(format!(
+            "UDP 数据报超限：{} 字节（≤{MAX_DATAGRAM_LEN}）",
+            datagram.len()
+        )));
+    }
+    let payload_len = 1 + 2 + addr.len() + datagram.len();
+    if payload_len > u16::MAX as usize {
+        return Err(HydraError::ProtocolError(format!(
+            "UDP 帧 payload 超限：{payload_len} 字节（≤{}）",
+            u16::MAX
+        )));
+    }
+    frame.clear();
+    frame.reserve(UDP_HEADER_LEN + payload_len);
+    frame.extend_from_slice(&session_id.to_be_bytes());
+    frame.extend_from_slice(&(payload_len as u16).to_be_bytes());
+    frame.push(UDP_KIND_DATA);
+    frame.extend_from_slice(&(addr.len() as u16).to_be_bytes());
+    frame.extend_from_slice(addr);
+    frame.extend_from_slice(datagram);
+    Ok(())
+}
+
 /// 编码 close 帧（4B 头 + 1B kind）。
 pub fn encode_udp_close(session_id: u16) -> Vec<u8> {
     let mut frame = Vec::with_capacity(UDP_HEADER_LEN + 1);
@@ -232,6 +273,25 @@ mod tests {
             }
             other => panic!("应为数据帧，实际 {other:?}"),
         }
+    }
+
+    #[test]
+    fn encode_into_与一次性分配版逐字节等价() {
+        // 批次 B3：就地版与一次性分配版产出逐字节一致（含复用后二次写入）
+        let mut buf = Vec::new();
+        encode_udp_data_into(&mut buf, 0x0102, "example.com:443", b"ping").unwrap();
+        assert_eq!(
+            buf,
+            encode_udp_data(0x0102, "example.com:443", b"ping").unwrap()
+        );
+        // 复用 + 二轮更长载荷（resize 全覆盖，无残留）
+        encode_udp_data_into(&mut buf, 7, "1.2.3.4:53", &[0xABu8; 1300]).unwrap();
+        assert_eq!(buf, encode_udp_data(7, "1.2.3.4:53", &[0xABu8; 1300]).unwrap());
+        // 校验拒绝路径与一次性版同语义
+        assert!(encode_udp_data_into(&mut buf, 1, "", b"x").is_err());
+        assert!(encode_udp_data_into(&mut buf, 1, "a:1", &[0u8; MAX_DATAGRAM_LEN + 1]).is_err());
+        let long_target = format!("{}.e.com:443", "a".repeat(1000));
+        assert!(encode_udp_data_into(&mut buf, 1, &long_target, &[0u8; MAX_DATAGRAM_LEN]).is_err());
     }
 
     #[test]

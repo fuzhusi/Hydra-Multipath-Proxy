@@ -10,12 +10,14 @@ import android.net.VpnService
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.hydra_android.SocketProtect
@@ -25,6 +27,7 @@ import uniffi.hydra_android.VpnExitCallback
 import uniffi.hydra_android.startVpn
 import uniffi.hydra_android.stopVpn
 import uniffi.hydra_android.vpnRuleModeDegraded
+import uniffi.hydra_android.vpnStats
 import java.util.Base64
 
 /**
@@ -67,6 +70,9 @@ class HydraVpnService : VpnService() {
 
     /** kill switch 重连循环任务（stopVpnLocal 取消以打断退避等待） */
     private var retryJob: kotlinx.coroutines.Job? = null
+
+    /** 每秒流量统计轮询任务（数据面启动成功后拉起，停止/销毁时取消） */
+    private var statsJob: kotlinx.coroutines.Job? = null
 
     /** 用户显式停止标志（区分「停止」与「新一轮启动」两种 gen 失效） */
     @Volatile
@@ -177,10 +183,11 @@ class HydraVpnService : VpnService() {
     }
 
     private fun startVpnFromStore() {
+        stopStatsPolling() // 新一轮启动：先停旧轮询，避免旧会话统计覆盖新状态
         EngineState.update {
             it.copy(running = false, transition = "正在建立 VPN 隧道…", boundAddr = null,
                 sentBytes = 0, receivedBytes = 0, activeConns = 0,
-                totalConns = 0, uptimeSecs = 0)
+                totalConns = 0, uptimeSecs = 0, upSpeedBps = 0, downSpeedBps = 0)
         }
         EngineState.addLog("正在建立全局 VPN…")
         startAsForeground("VPN 隧道建立中…")
@@ -292,6 +299,9 @@ class HydraVpnService : VpnService() {
                                             "全局 VPN（分流：CN 直连 · 其余走节点）"
                                         else "全局 VPN（所有应用流量经节点）")
                                 }
+                                // 数据面已启动：拉起每秒统计轮询（读 Rust TUN
+                                // 数据面原子计数器，见 startStatsPolling）
+                                startStatsPolling()
                                 EngineState.addLog(
                                     if (cfg.runRuleMode)
                                         "✓ 全局 VPN 已接管——智能分流：命中 CN 规则直连，其余走节点"
@@ -380,6 +390,60 @@ class HydraVpnService : VpnService() {
         }
     }
 
+    /**
+     * 全局 VPN 流量统计轮询（对齐 EngineService.pollStats 写法）。
+     *
+     * 数据源：uniffi `vpnStats()` —— Rust `run_stack` 数据面内的全局原子计数器
+     * （TCP 中继上下行字节 + UDP 中继发送/回包载荷 + TCP 活跃/累计流数）。
+     * 此前全局模式所有 EngineState.update 都把 sentBytes/receivedBytes 硬编码
+     * 为 0（该路径无任何计数器与 FFI），UI 流量恒为 0。
+     *
+     * 每秒一次：字节/连接/时长 + 相邻采样差的速率（B/s）；用 [withVpnStats]
+     * 只更新统计字段，**不覆盖** running/transition/boundAddr（并发写安全）。
+     * 服务停止/销毁时经 [stopStatsPolling] 取消。
+     */
+    private fun startStatsPolling() {
+        statsJob?.cancel()
+        statsJob = scope.launch {
+            val startedAt = SystemClock.elapsedRealtime()
+            var lastAt = startedAt
+            var lastUp = 0L
+            var lastDown = 0L
+            while (true) {
+                delay(1_000)
+                // FFI 失败（库未加载等）→ 停止轮询，不刷屏
+                val s = runCatching { vpnStats() }.getOrNull() ?: break
+                // 停止竞态：FFI 返回前可能已 cancel/停止——不得把旧统计写回已复位 UI
+                if (!isActive || userStopRequested) return@launch
+                val now = SystemClock.elapsedRealtime()
+                val elapsed = now - lastAt
+                val up = s.upBytes.toLong()
+                val down = s.downBytes.toLong()
+                EngineState.update {
+                    it.withVpnStats(
+                        sentBytes = up,
+                        receivedBytes = down,
+                        activeConns = s.activeConns.toLong(),
+                        totalConns = s.totalConns.toLong(),
+                        uptimeSecs = (now - startedAt) / 1000,
+                        upSpeedBps = computeSpeedBps(lastUp, up, elapsed),
+                        downSpeedBps = computeSpeedBps(lastDown, down, elapsed),
+                    )
+                }
+                lastAt = now
+                lastUp = up
+                lastDown = down
+                updateNotification()
+            }
+        }
+    }
+
+    /** 停止统计轮询（幂等；所有停止/销毁路径调用） */
+    private fun stopStatsPolling() {
+        statsJob?.cancel()
+        statsJob = null
+    }
+
     /** 建立 TUN 接口（v4/v6 全接管；节点出站连接经 protect 防回环，无需路由豁免）。
      *  分应用代理：白名单（仅所选应用走 VPN）/ 黑名单（所选应用直连）。
      *  规则模式 DNS（设计 §九，性能/正确性关键）：addDnsServer 换用国内公共
@@ -398,7 +462,6 @@ class HydraVpnService : VpnService() {
                 .addRoute("::", 1)
                 .addRoute("8000::", 1)
             if (cfg.runRuleMode) {
-                // 规则模式 DNS（设计 §九，性能/正确性关键）：addDnsServer 换用
                 // 国内公共 DNS（223.5.5.5，备 119.29.29.29）——CN 域名解析出近端
                 // CDN IP，GeoIP 才能判准直连（对齐桌面 R2 语义）。
                 // 评审一轮 P1-1 说明——为何不在此做 VpnBuilder 路由豁免：
@@ -411,6 +474,16 @@ class HydraVpnService : VpnService() {
                 // 上述公共 DNS（Android protect 形态直连）——应用硬编码的
                 // 8.8.8.8 等外部 DNS 同样入 TUN 判定，命中规则走节点。
                 b.addDnsServer("223.5.5.5").addDnsServer("119.29.29.29")
+            } else {
+                // 全局模式必须显式设置 DNS（修「已连接但没网」）：VpnBuilder 不调
+                // addDnsServer 时 VPN 网络 DNS 列表为空（logcat：Setting DNS
+                // servers for network 102 to []），Android 解析器回落到物理网络
+                // DNS 并按底层网络路由直接发出——**绕过 TUN**，墙内环境被 GFW
+                // 污染（A→Facebook IP、AAAA→2001::1），应用连假地址经节点全部
+                // 不可达回 RST = UI 已连接但「没网」。此处声明的 DNS IP 属 VPN
+                // 网络路由，查询进 TUN 由 Rust 数据面经节点中继解析（加密、无
+                // 污染），与注释「系统 DNS 随隧道经节点解析」的设计意图一致。
+                b.addDnsServer("8.8.8.8").addDnsServer("1.1.1.1")
             }
             // 分应用代理包名先经 PackageManager 校验——失效包名（已卸载/拼写错）
             // 在部分系统上会使 addAllowed/Disallowed 抛异常 → establish 持续失败
@@ -473,6 +546,7 @@ class HydraVpnService : VpnService() {
         generation.incrementAndGet() // 使在途看门狗/重连循环/启动结果失效
         userStopRequested = true
         retryJob?.cancel()           // 打断退避等待
+        stopStatsPolling()           // 停流量轮询（断开后统计归零）
         releaseHoldTun()             // 用户显式停止 = 恢复直连（kill switch 不拦用户）
         VpnProtectHolder.vpnActive = false // SEC-01：无 TUN 后 protect 放行（本地模式不受残留钩子影响）
         scope.launch(Dispatchers.IO) {
@@ -481,7 +555,7 @@ class HydraVpnService : VpnService() {
             EngineState.update {
                 it.copy(running = false, transition = null, boundAddr = null,
                     sentBytes = 0, receivedBytes = 0, activeConns = 0,
-                    totalConns = 0, uptimeSecs = 0)
+                    totalConns = 0, uptimeSecs = 0, upSpeedBps = 0, downSpeedBps = 0)
             }
             withContext(kotlinx.coroutines.Dispatchers.Main) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -497,13 +571,14 @@ class HydraVpnService : VpnService() {
         generation.incrementAndGet()
         userStopRequested = true
         retryJob?.cancel()
+        stopStatsPolling()
         releaseHoldTun()
         // stop_vpn FFI 持 VPN_STATE 锁 shutdown（最长 3s）——移出主线程
         Thread { runCatching { stopVpn() } }.apply { isDaemon = true; start() }
         EngineState.update {
             it.copy(running = false, transition = null, boundAddr = null,
                 sentBytes = 0, receivedBytes = 0, activeConns = 0,
-                totalConns = 0, uptimeSecs = 0)
+                totalConns = 0, uptimeSecs = 0, upSpeedBps = 0, downSpeedBps = 0)
         }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -515,6 +590,7 @@ class HydraVpnService : VpnService() {
         // （scope 即将 cancel，不能挂在其上）
         Thread { runCatching { stopVpn() } }.apply { isDaemon = true; start() }
         retryJob?.cancel()
+        stopStatsPolling()
         releaseHoldTun()
         scope.cancel()
         // 审查 SEC-01 修复：handler 不置空——Rust 钩子进程级 OnceLock 固化，
@@ -525,7 +601,7 @@ class HydraVpnService : VpnService() {
         EngineState.update {
             it.copy(running = false, transition = null, boundAddr = null,
                 sentBytes = 0, receivedBytes = 0, activeConns = 0,
-                totalConns = 0, uptimeSecs = 0)
+                totalConns = 0, uptimeSecs = 0, upSpeedBps = 0, downSpeedBps = 0)
         }
         super.onDestroy()
     }
@@ -583,7 +659,8 @@ class HydraVpnService : VpnService() {
         val s = EngineState.ui.value
         val text = when {
             s.transition != null -> s.transition
-            s.running -> "已接管全部流量 · ↑${fmt(s.sentBytes)} ↓${fmt(s.receivedBytes)}"
+            s.running -> "已接管全部流量 · ↑${fmt(s.sentBytes)} ↓${fmt(s.receivedBytes)}" +
+                " · ↑${fmt(s.upSpeedBps)}/s ↓${fmt(s.downSpeedBps)}/s"
             else -> "已停止"
         }
         getSystemService(NotificationManager::class.java)

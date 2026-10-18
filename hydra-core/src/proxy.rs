@@ -23,6 +23,13 @@ pub fn active_relay_count() -> usize {
     ACTIVE_RELAYS.load(Ordering::Relaxed)
 }
 
+/// 带原始 `SocketAddr` 的通道 opener（批次 B4 TUN 旁路）：与
+/// `crate::channel::ChannelOpener` 同构，但随 target 一并携带源头即有的
+/// `SocketAddr` 形态（tun.rs 的 Flow/FlowMsg 链路保留），规则判定免每连接
+/// `target.parse()`。仅 TUN 内部使用，不触碰 `ChannelOpener` 跨 crate 契约。
+pub type ChannelOpenerAddr =
+    std::sync::Arc<dyn Fn(SocketAddr, String) -> crate::channel::OpenFuture + Send + Sync>;
+
 /// Team-T：TCP/TLS 路径凭据（信任配置 / SNI / 认证密钥）。
 /// start 时随 ProxyServer 实例注入并随任务链传递（测试/多实例场景下
 /// 各代理实例持各自凭据，互不串扰）。
@@ -536,6 +543,10 @@ impl ProxyServer {
     ///      （评审 §1.3：不复用 OPEN_TIMEOUT 15s）；
     ///    - 直连失败/超时 → 回退 `proxy_opener` 走节点（永不断网）；
     ///    - PROXY → 直接走 `proxy_opener`。
+    ///
+    /// 批次 B4：TUN 侧已能零成本携带原始 `SocketAddr`（Flow 链路保留源头
+    /// 形态），走 [`Self::tun_rule_opener_by_addr`] 可免每连接重复 parse；
+    /// 本函数维持原 `ChannelOpener`（String）契约不变（兼容既有调用方/测试）。
     pub fn tun_rule_opener(
         engine: Arc<crate::routing_rules::RuleEngine>,
         direct_bind_ipv4: Option<std::net::IpAddr>,
@@ -547,103 +558,150 @@ impl ProxyServer {
             let engine = engine.clone();
             let proxy_opener = proxy_opener.clone();
             Box::pin(async move {
-                let addr: SocketAddr = match target.parse() {
-                    Ok(a) => a,
-                    Err(_) => return (proxy_opener)(target).await, // 非 IP 目标 → 走节点
-                };
-                if engine.decide(addr) == crate::routing_rules::Decision::Direct {
-                    // 评审 P2-4：非 Windows 显式禁用规则分流直连（强告警）——
-                    // Linux 弱主机模型下 bind 源 IP **不约束出接口**（目的路由
-                    // 仍可能命中 /1 接管 → 包回自身 TUN 回环），规则分流直连
-                    // 暂不可用（计划 SO_BINDTODEVICE/接口 index 方案）。非
-                    // Android（无 protect 钩子）一律跳过直连走节点；例外：
-                    // **回环目标**——127/8 与 ::1 走 local 路由表（优先级高于
-                    // main 表的 /1 接管），直连回环在 Linux 同样安全（CI 测试
-                    // 即依赖此路径）。AtomicBool 去重防每连接刷屏。
-                    #[cfg(not(windows))]
-                    if !addr.ip().is_loopback()
-                        && !crate::socket_protect::socket_protect_installed()
-                    {
-                        static NON_WIN_DIRECT_WARNED:
-                            std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                        if !NON_WIN_DIRECT_WARNED.swap(true, Ordering::Relaxed) {
-                            warn!(
-                                "TUN 规则分流直连在非 Windows 平台已禁用：Linux 弱主机模型下 \
-                                 bind 源 IP 不约束出接口，规则分流直连暂不可用（计划 \
-                                 SO_BINDTODEVICE）——全部走节点（回环目标除外）"
-                            );
-                        }
-                        return (proxy_opener)(target).await;
+                // String 契约入口：此处一次 parse 还原（B4 旁路路径可免）
+                match target.parse::<SocketAddr>() {
+                    Ok(addr) => {
+                        Self::rule_open(
+                            engine,
+                            direct_bind_ipv4,
+                            direct_bind_ipv6,
+                            proxy_opener,
+                            addr,
+                            target,
+                        )
+                        .await
                     }
-                    let bind = match addr {
-                        SocketAddr::V4(_) => direct_bind_ipv4,
-                        SocketAddr::V6(_) => direct_bind_ipv6,
-                    };
-                    // 审查 P1-3：该族**无物理源 IP** 时，**公网目标**绝不裸连——
-                    // 桌面无 protect 钩子时裸 connect 按目的地址路由命中 /1 接管
-                    // → 包回自身 TUN → any_ip 接受 → 再判 DIRECT → 再裸连，
-                    // 自激回环风暴（每 socket ~128KB 缓冲直至 max_flows）。
-                    // 例外：回环/私网/链路本地目标本就有豁免路由（直连安全），
-                    // 且「私网 → 直连」是 R5 的设计语义（有测试覆盖）
-                    let is_local = match addr.ip() {
-                        std::net::IpAddr::V4(v4) => {
-                            v4.is_loopback() || v4.is_private() || v4.is_link_local()
-                        }
-                        std::net::IpAddr::V6(v6) => {
-                            v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
-                        }
-                    };
-                    if bind.is_none()
-                        && !is_local
-                        && !crate::socket_protect::socket_protect_installed()
-                    {
-                        debug!("TUN 规则直连跳过（公网目标 + 该族无物理源 IP + 无 protect 钩子）→ 走节点");
-                        return (proxy_opener)(target).await;
-                    }
-                    match tokio::time::timeout(
-                        DIRECT_CONNECT_TIMEOUT,
-                        Self::tun_direct_duplex(addr, bind),
-                    )
-                    .await
-                    {
-                        Ok(Ok(duplex)) => {
-                            debug!(
-                                "TUN 规则直连: {}（bind {}）",
-                                mask_target(&target),
-                                bind.map(|b| b.to_string())
-                                    .unwrap_or_else(|| "无".into())
-                            );
-                            return Ok(duplex);
-                        }
-                        Ok(Err(e)) => {
-                            // 评审 P2-6：bind 失败计数告警（每 32 次一次，防刷屏）——
-                            // 物理网卡换网/DHCP 续租后源 IP 失效的可见信号。
-                            // **不做自动重探**：探测依赖 TUN 接管生成前的路由
-                            // 上下文，运行期 /1 接管路由在场时重探结果同样不可信
-                            // （可能选中 TUN 自身地址 → 回环），故仅提示重启
-                            static DIRECT_BIND_FAILS: AtomicUsize = AtomicUsize::new(0);
-                            let fails = DIRECT_BIND_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
-                            if fails.is_multiple_of(32) {
-                                warn!(
-                                    "TUN 规则直连已失败 {fails} 次：物理源 IP 可能已失效，\
-                                     建议重启代理"
-                                );
-                            }
-                            warn!("TUN 规则直连失败（{}: {e}）→ 回退走节点", mask_target(&target));
-                        }
-                        Err(_) => {
-                            warn!(
-                                "TUN 规则直连超时（{}，{:?}）→ 回退走节点",
-                                mask_target(&target),
-                                DIRECT_CONNECT_TIMEOUT
-                            );
-                        }
-                    }
-                    // 回退语义（评审 §1.3）：直连失败/超时 → 节点路径，永不因分流断网
+                    Err(_) => (proxy_opener)(target).await, // 非 IP 目标 → 走节点
                 }
-                (proxy_opener)(target).await
             }) as OpenFuture
         })
+    }
+
+    /// 带原始 `SocketAddr` 的通道 opener（批次 B4 TUN 旁路）：与
+    /// [`ChannelOpener`] 同构，但随 target 一并携带源头即有的 `SocketAddr`
+    /// 形态（Flow/FlowMsg 链路保留），规则判定免每连接 `target.parse()`。
+    /// 仅 TUN 内部使用，不触碰 `ChannelOpener` 跨 crate 契约（别名定义在
+    /// 模块级 [`ChannelOpenerAddr`]）。
+    /// [`Self::tun_rule_opener`] 的 B4 旁路版：调用方直接传原始 `SocketAddr`
+    ///（免 parse），规则判定/直连/回退语义与原实现逐行一致。
+    pub fn tun_rule_opener_by_addr(
+        engine: Arc<crate::routing_rules::RuleEngine>,
+        direct_bind_ipv4: Option<std::net::IpAddr>,
+        direct_bind_ipv6: Option<std::net::IpAddr>,
+        proxy_opener: crate::channel::ChannelOpener,
+    ) -> ChannelOpenerAddr {
+        Arc::new(move |addr: SocketAddr, target: String| {
+            let engine = engine.clone();
+            let proxy_opener = proxy_opener.clone();
+            Box::pin(Self::rule_open(
+                engine,
+                direct_bind_ipv4,
+                direct_bind_ipv6,
+                proxy_opener,
+                addr,
+                target,
+            ))
+        })
+    }
+
+    /// 规则分流判定主体（[`Self::tun_rule_opener`] / B4 旁路共用）：语义与
+    /// 原 tun_rule_opener 闭包体逐行一致，仅把「parse 还原 addr」提为入口
+    /// 参数（判定输入用 SocketAddr——智能分流方案 R10 性能注记）。
+    async fn rule_open(
+        engine: Arc<crate::routing_rules::RuleEngine>,
+        direct_bind_ipv4: Option<std::net::IpAddr>,
+        direct_bind_ipv6: Option<std::net::IpAddr>,
+        proxy_opener: crate::channel::ChannelOpener,
+        addr: SocketAddr,
+        target: String,
+    ) -> Result<crate::channel::ProxyDuplex> {
+        if engine.decide(addr) == crate::routing_rules::Decision::Direct {
+            // 评审 P2-4：非 Windows 显式禁用规则分流直连（强告警）——
+            // Linux 弱主机模型下 bind 源 IP **不约束出接口**（目的路由
+            // 仍可能命中 /1 接管 → 包回自身 TUN 回环），规则分流直连
+            // 暂不可用（计划 SO_BINDTODEVICE/接口 index 方案）。非
+            // Android（无 protect 钩子）一律跳过直连走节点；例外：
+            // **回环目标**——127/8 与 ::1 走 local 路由表（优先级高于
+            // main 表的 /1 接管），直连回环在 Linux 同样安全（CI 测试
+            // 即依赖此路径）。AtomicBool 去重防每连接刷屏。
+            #[cfg(not(windows))]
+            if !addr.ip().is_loopback() && !crate::socket_protect::socket_protect_installed() {
+                static NON_WIN_DIRECT_WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !NON_WIN_DIRECT_WARNED.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        "TUN 规则分流直连在非 Windows 平台已禁用：Linux 弱主机模型下 \
+                         bind 源 IP 不约束出接口，规则分流直连暂不可用（计划 \
+                         SO_BINDTODEVICE）——全部走节点（回环目标除外）"
+                    );
+                }
+                return (proxy_opener)(target).await;
+            }
+            let bind = match addr {
+                SocketAddr::V4(_) => direct_bind_ipv4,
+                SocketAddr::V6(_) => direct_bind_ipv6,
+            };
+            // 审查 P1-3：该族**无物理源 IP** 时，**公网目标**绝不裸连——
+            // 桌面无 protect 钩子时裸 connect 按目的地址路由命中 /1 接管
+            // → 包回自身 TUN → any_ip 接受 → 再判 DIRECT → 再裸连，
+            // 自激回环风暴（每 socket ~128KB 缓冲直至 max_flows）。
+            // 例外：回环/私网/链路本地目标本就有豁免路由（直连安全），
+            // 且「私网 → 直连」是 R5 的设计语义（有测试覆盖）
+            let is_local = match addr.ip() {
+                std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+                std::net::IpAddr::V6(v6) => {
+                    v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
+                }
+            };
+            if bind.is_none()
+                && !is_local
+                && !crate::socket_protect::socket_protect_installed()
+            {
+                debug!("TUN 规则直连跳过（公网目标 + 该族无物理源 IP + 无 protect 钩子）→ 走节点");
+                return (proxy_opener)(target).await;
+            }
+            match tokio::time::timeout(
+                DIRECT_CONNECT_TIMEOUT,
+                Self::tun_direct_duplex(addr, bind),
+            )
+            .await
+            {
+                Ok(Ok(duplex)) => {
+                    debug!(
+                        "TUN 规则直连: {}（bind {}）",
+                        mask_target(&target),
+                        bind.map(|b| b.to_string())
+                            .unwrap_or_else(|| "无".into())
+                    );
+                    return Ok(duplex);
+                }
+                Ok(Err(e)) => {
+                    // 评审 P2-6：bind 失败计数告警（每 32 次一次，防刷屏）——
+                    // 物理网卡换网/DHCP 续租后源 IP 失效的可见信号。
+                    // **不做自动重探**：探测依赖 TUN 接管生成前的路由
+                    // 上下文，运行期 /1 接管路由在场时重探结果同样不可信
+                    // （可能选中 TUN 自身地址 → 回环），故仅提示重启
+                    static DIRECT_BIND_FAILS: AtomicUsize = AtomicUsize::new(0);
+                    let fails = DIRECT_BIND_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if fails.is_multiple_of(32) {
+                        warn!(
+                            "TUN 规则直连已失败 {fails} 次：物理源 IP 可能已失效，\
+                             建议重启代理"
+                        );
+                    }
+                    warn!("TUN 规则直连失败（{}: {e}）→ 回退走节点", mask_target(&target));
+                }
+                Err(_) => {
+                    warn!(
+                        "TUN 规则直连超时（{}，{:?}）→ 回退走节点",
+                        mask_target(&target),
+                        DIRECT_CONNECT_TIMEOUT
+                    );
+                }
+            }
+            // 回退语义（评审 §1.3）：直连失败/超时 → 节点路径，永不因分流断网
+        }
+        (proxy_opener)(target).await
     }
 
     /// 直连通道：受保护建连（protect 钩子先行，R3——Android 防 VpnService
