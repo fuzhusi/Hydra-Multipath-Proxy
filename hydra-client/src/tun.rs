@@ -2492,6 +2492,24 @@ pub fn build_udp_reply_v6_into(
 /// 自建 LAN 节点场景下节点侧已放开，客户端 TUN 的 UDP 分发应同样放行——
 /// 单边硬拦会让"LAN 节点 + TUN"的私网访问无解（09 之前 TCP 路径即如此：
 /// 包进 TUN 被节点拒；UDP 接管后客户端同样尊重该开关）。
+/// 测试专用私网放行开关（cfg(test)，生产零影响）：E2E 用 127.0.0.1 作回显
+/// 服务器，但非规则模式默认拦 loopback——而 HYDRA_ALLOW_PRIVATE_TARGETS 是
+/// 进程级 OnceLock，测试执行顺序不同（Linux/Windows 并行调度差异）会导致
+/// 缓存值不同 → CI 平台间 flaky。测试显式置位，消除对全局 env 的依赖。
+#[cfg(test)]
+static TEST_ALLOW_PRIVATE_TARGETS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn test_allow_private() -> bool {
+    TEST_ALLOW_PRIVATE_TARGETS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+fn test_allow_private() -> bool {
+    false
+}
+
 fn private_targets_allowed() -> bool {
     static ALLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ALLOW.get_or_init(|| matches!(std::env::var("HYDRA_ALLOW_PRIVATE_TARGETS"), Ok(v) if v == "1"))
@@ -2532,7 +2550,7 @@ async fn try_forward_udp_inner(
     // 隧道；HYDRA_ALLOW_PRIVATE_TARGETS=1 时放开私网类。规则模式下私网类
     // 放行进入规则判定（内置私网 DIRECT 会直连，R5）；组播/广播/未指定仍拦。
     let rule_mode = rule.is_some() && direct.is_some();
-    let allow_private = private_targets_allowed() || rule_mode;
+    let allow_private = private_targets_allowed() || rule_mode || test_allow_private();
     let excluded = match dst.ip() {
         std::net::IpAddr::V4(v4) => {
             let private_like = v4.is_loopback()
@@ -5168,6 +5186,10 @@ mod tests {
         pkt.extend_from_slice(&[0, 0]); // UDP 校验和（v4 可为 0，分发路径不校验）
         pkt.extend_from_slice(payload);
         assert!(parse_udp_v4(&pkt).is_some(), "测试包应可被分发解析");
+
+        // 本测试用 127.0.0.1（loopback）作回显服务器：显式启用测试专用私网
+        // 放行开关，消除对进程级 env / 测试执行顺序的依赖（Linux CI flaky 根因）
+        TEST_ALLOW_PRIVATE_TARGETS.store(true, std::sync::atomic::Ordering::Relaxed);
 
         let shutdown = CancellationToken::new();
         tokio::spawn(run_stack(
