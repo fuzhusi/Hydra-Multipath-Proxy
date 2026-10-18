@@ -1,0 +1,16 @@
+# Cargo 构建配置（防 target 体积失控）
+#
+# 背景：Windows 下 debug 构建默认生成完整 DWARF 调试信息，PDB 单个可达
+# 150-215 MB，多 profile 多二进制累积后 target 曾达 153 GB（debug 147 GB，
+# 其中 incremental 82.7 GB、PDB 39 GB）。本配置把 dev/test 的调试信息降为
+# 行号表（line-tables-only）——backtrace 仍可定位到行，PDB 体积缩小约 80%。
+#
+# 说明：
+# - release 不动（发布产物需保持现状，且 strip 由打包流程控制）；
+# - incremental 保留（迭代速度优先），定期 `cargo clean` 或删除
+#   target/debug/incremental 即可回收（安全，仅重建缓存）。
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
