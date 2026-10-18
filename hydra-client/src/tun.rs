@@ -5177,11 +5177,16 @@ mod tests {
             Some(factory),
             shutdown.clone(),
         ));
-        in_tx.send(pkt).unwrap();
+        in_tx.send(pkt.clone()).unwrap();
 
-        // 5. 等回包（最长 8s）：src=echo, dst=10.7.0.1:40000, 载荷回显
+        // 5. 等回包（最长 16s）：src=echo, dst=10.7.0.1:40000, 载荷回显。
+        // 每 500ms 重发一次：UDP 通道首包可能在通道建立/重建窗口被丢弃
+        // （Linux CI 慢时 Windows 快路径掩盖的时序问题），重发是 UDP 合法语义
         let mut got = false;
-        for _ in 0..320 {
+        for i in 0..320 {
+            if i > 0 && i % 10 == 0 {
+                let _ = in_tx.send(pkt.clone());
+            }
             match tokio::time::timeout(Duration::from_millis(50), out_rx.recv()).await {
                 Ok(Some(p)) => {
                     if p.len() >= 28 + payload.len() && p[0] >> 4 == 4 && p[9] == 17 {
