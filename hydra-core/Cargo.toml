@@ -37,7 +37,7 @@ tracing = { workspace = true }
 url = "2.5"
 base64 = { workspace = true }
 # 恢复探测周期的随机抖动（±20%，防整周期被动特征）
-rand = "0.8"
+rand = "0.9"
 hydra-protocol = { path = "../hydra-protocol" }
 
 [dev-dependencies]
