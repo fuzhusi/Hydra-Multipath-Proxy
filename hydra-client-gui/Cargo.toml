@@ -28,7 +28,7 @@ rqrr = "0.7"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "ico"] }
 base64 = { workspace = true }
 # T2：系统托盘（Tauri 官方库；Windows 下事件经全局通道投递，GUI 线程轮询即可）
-tray-icon = "0.19"
+tray-icon = "0.26"
 # TUN 透明代理入口（tun_config_from_settings / run_tun / 环路检测）依赖 tun feature
 hydra-client = { path = "../hydra-client", features = ["tun"] }
 hydra-protocol = { path = "../hydra-protocol" }
