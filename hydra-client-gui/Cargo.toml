@@ -5,7 +5,7 @@ license = "PolyForm-Noncommercial-1.0.0"
 edition = "2021"
 
 [dependencies]
-eframe = "0.27"
+eframe = "0.36"
 egui = "0.27"
 # UI 重设计第三批：总览页仪表盘实时速率双曲线（与 egui/eframe 0.27 版本锁齐）
 egui_plot = "0.27"
