@@ -1673,14 +1673,46 @@ fn build_icmpv4_port_unreachable(pkt: &[u8]) -> Option<Vec<u8>> {
 
 // ── IPv6 动态 AnyIP（smoltcp 0.11 any-ip 仅 v4，v6 用显式地址接受）──────────
 
-/// 动态 AnyIP 地址池容量：smoltcp 接口地址表共 8 槽，静态占用 3 槽
-/// （v4 /30 + 链路本地 fe80::1/10 + 全局 addr6/64），余 5 槽轮转
+/// 动态 AnyIP 地址池容量：smoltcp 接口地址表（IFACE_MAX_ADDR_COUNT）静态占用
+/// 3 槽（v4 /30 + 链路本地 fe80::1/10 + 全局 addr6/64），其余全部用于 v6 目的
+/// 地址轮转。容量由 `.cargo/config.toml` 的 `SMOLTCP_IFACE_MAX_ADDR_COUNT=40`
+/// 决定（smoltcp 0.11 的 feature 只到 8；env 由 build.rs 读取、优先级更高），
+/// 即 40 - 3 = 37 槽——IPv6 站点多 CDN 地址，槽位过少会让新 v6 连接挂不上。
 const V6_DYNAMIC_SLOTS: usize = smoltcp::config::IFACE_MAX_ADDR_COUNT - 3;
+
+/// 「池满且全部活跃」放弃挂载的日志限频状态（修复项 3）：上次打印的 Unix
+/// 毫秒时刻。实测该路径每连接刷一条，日志页被淹没；改为每 10 秒最多一条。
+static V6_POOL_FULL_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 累计放弃挂载次数（含被限频吞掉的次数）：写入 warn 消息，便于判断扩容后
+/// 池是否仍然不足（功能退化信号必须对用户可见）。
+static V6_POOL_FULL_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// 记录一次「池满且全部活跃」的放弃挂载，返回（累计次数, 是否应打印 warn）。
+/// 并发安全：计数用 fetch_add，打印资格用 compare_exchange 抢占（10s 窗口内
+/// 只有一个线程能打印）。
+fn note_v6_pool_full() -> (u64, bool) {
+    let total = V6_POOL_FULL_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = V6_POOL_FULL_LAST_LOG_MS.load(Ordering::Relaxed);
+    let due = now_ms.saturating_sub(last) >= 10_000;
+    if !due {
+        return (total, false);
+    }
+    let won = V6_POOL_FULL_LAST_LOG_MS
+        .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok();
+    (total, won)
+}
 
 /// 把入站 v6 TCP 包的目的地址临时挂为接口 /128 地址（动态 AnyIP），使 smoltcp
 /// 的入站地址过滤放行（其 v6 路径不认 any-ip，见模块注释）。有界池轮转：
 /// 超出 [`V6_DYNAMIC_SLOTS`] 时淘汰最旧的**非活跃流**目的地址（活跃流受保护，
-/// 防止其在途包被过滤丢弃）；全部活跃时放弃添加（该包静默丢弃，TCP 重传兜底）。
+/// 防止其在途包被过滤丢弃）；全部活跃时放弃添加（该包静默丢弃，TCP 重传兜底），
+/// 并以 warn + 累计次数 + 10s 限频暴露该功能退化（修复项 3）。
 fn ensure_v6_dst(
     iface: &mut Interface,
     addr: std::net::Ipv6Addr,
@@ -1696,7 +1728,13 @@ fn ensure_v6_dst(
                 // 活跃流地址不可淘汰：挪回队尾，若池内全是活跃地址则放弃
                 pool.push_back(v);
                 if pool.iter().all(|a| protected.contains(a)) {
-                    debug!("v6 动态地址池满且全部活跃，放弃挂载 {addr}");
+                    // 功能退化信号：warn 且每 10s 最多一条，累计次数进消息
+                    let (total, should_log) = note_v6_pool_full();
+                    if should_log {
+                        warn!(
+                            "v6 动态地址池满且全部活跃，放弃挂载 {addr}（累计 {total} 次；每 10s 最多一条）"
+                        );
+                    }
                     return;
                 }
                 continue;

@@ -14,3 +14,18 @@ debug = "line-tables-only"
 
 [profile.test]
 debug = "line-tables-only"
+
+# smoltcp 用户态栈的接口地址表容量（Android TUN 的 IPv6 动态 AnyIP 需要）。
+#
+# 背景：smoltcp 0.11 的 IFACE_MAX_ADDR_COUNT 由 build.rs 读取（默认 2），可用
+# feature `iface-max-addr-count-N` 覆盖，但该版本只声明到 8。build.rs 还读取
+# 环境变量 `SMOLTCP_<CONFIG_NAME>` 且优先级高于 feature（见
+# smoltcp-0.11.0/build.rs：env::vars() 中 strip_prefix("SMOLTCP_") 后查表，
+# seen_env 为 true 时忽略 Cargo feature）。
+#
+# 用途：hydra-client/src/tun.rs 的 v6 动态 AnyIP 地址池 = 40 - 3 静态 = 37 槽；
+# 原先 8 - 3 = 5 槽在多 CDN IPv6 站点下易满，新 v6 连接挂不上而丢 SYN。
+# 影响：全局生效（CI 与 Android 交叉编译同样读取），仅增加接口地址表内存
+# （每接口 40 个 IpCidr，开销可忽略），不改变协议行为。
+[env]
+SMOLTCP_IFACE_MAX_ADDR_COUNT = "40"

@@ -289,31 +289,85 @@ pub struct VpnLogEntry {
     pub ts_ms: u64,
 }
 
-/// 环形缓冲 + 序号发生器（同一把锁保护，保证 seq 与入队顺序一致）
+/// 环形缓冲 + 序号发生器（同一把锁保护，保证 seq 与入队顺序一致）。
+///
+/// 连续重复折叠状态也在这把锁下维护（修复项 2）：同一 `(level, message)`
+/// 连续出现时不新增条目，仅把**最后一条**改写为 `原消息 ×N`（N 含首发）并
+/// 刷新时间戳；`seq` 保持不变（Kotlin 增量游标不会漏拉后续新条目）。
 struct LogRing {
     entries: VecDeque<VpnLogEntry>,
     next_seq: u64,
+    /// 上一条的级别标签（None = 新会话/尚无条目）
+    last_level: Option<&'static str>,
+    /// 上一条的**原始**消息（不含 ` ×N` 后缀——折叠后缀不参与相等判定）
+    last_message: Option<String>,
+    /// 连续出现次数（含首发；1 = 尚未折叠）
+    last_count: u64,
+    /// 被折叠条目的 seq（按 seq 定位更新；seq 本身不变）
+    last_seq: u64,
 }
 
 static LOG_RING: Mutex<LogRing> = Mutex::new(LogRing {
     entries: VecDeque::new(),
     next_seq: 1,
+    last_level: None,
+    last_message: None,
+    last_count: 0,
+    last_seq: 0,
 });
 
-/// 入环一条日志（短锁：只做一次 push_back / 可能一次 pop_front；锁中毒降级为丢弃）。
-fn push_log_entry(level: &'static str, message: String) {
-    let ts_ms = std::time::SystemTime::now()
+/// 当前 Unix 毫秒时间戳（系统时钟早于 epoch 时回退 0）。
+fn now_ts_ms() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// 入环一条日志（短锁：一次 push_back / 可能一次 pop_front；锁中毒降级为丢弃）。
+///
+/// 连续重复抑制（修复项 2）：同一 (level, message) 紧跟在上一条之后时不新增
+/// 条目，而是把最后一条的 message 改为 `原消息 ×N`、ts 更新为最新（seq 不变）。
+/// 出现不同消息后计数归零；上限计数自然增长（u64 饱和加法）。
+fn push_log_entry(level: &'static str, message: String) {
+    let ts_ms = now_ts_ms();
     let Ok(mut ring) = LOG_RING.lock() else {
         return;
     };
+
+    if ring.last_count > 0
+        && ring.last_level == Some(level)
+        && ring.last_message.as_deref() == Some(message.as_str())
+    {
+        let last_seq = ring.last_seq;
+        let count = ring.last_count.saturating_add(1);
+        let folded = format!("{message} ×{count}");
+        let updated = match ring.entries.iter_mut().rev().find(|e| e.seq == last_seq) {
+            Some(entry) => {
+                entry.message = folded;
+                entry.ts_ms = ts_ms;
+                true
+            }
+            // 目标条目已被环形缓冲淘汰（容量远大于 1，理论不可达）：
+            // 退化为新增，避免整条日志丢失
+            None => false,
+        };
+        if updated {
+            ring.last_count = count;
+            return;
+        }
+        ring.last_count = 0;
+    }
+
     if ring.entries.len() >= LOG_RING_CAPACITY {
         ring.entries.pop_front();
     }
     let seq = ring.next_seq;
     ring.next_seq = ring.next_seq.saturating_add(1);
+    ring.last_level = Some(level);
+    ring.last_message = Some(message.clone());
+    ring.last_count = 1;
+    ring.last_seq = seq;
     ring.entries.push_back(VpnLogEntry {
         seq,
         level: level.to_string(),
@@ -327,6 +381,12 @@ fn push_log_entry(level: &'static str, message: String) {
 fn reset_vpn_logs() {
     if let Ok(mut ring) = LOG_RING.lock() {
         ring.entries.clear();
+        // 折叠状态必须一并复位：否则新会话首条消息可能被误判为「连续重复」，
+        // 从而去更新一条已被清空的 seq（该条日志丢失）
+        ring.last_level = None;
+        ring.last_message = None;
+        ring.last_count = 0;
+        ring.last_seq = 0;
     }
 }
 
@@ -343,6 +403,29 @@ pub fn vpn_logs_since(seq: u64) -> Vec<VpnLogEntry> {
         .filter(|e| e.seq > seq)
         .cloned()
         .collect()
+}
+
+/// 本产品 crate 的 target 白名单（修复项 1：桥接层只收自家事件）。
+///
+/// 第三方日志桥（rustls 经 tracing-log 的 `log.target`、hyper/tokio/tracing
+/// 等）会把自身 debug 事件灌进同一 subscriber；实测导出日志 500 条几乎全被
+/// rustls 内部 debug 占满。判定只看 `metadata().target()`（rustls 的 target
+/// 形如 `rustls::client::hs`，与日志字段里的 `log.target` 值一致）：
+/// - Rust 模块路径 target 用下划线：`hydra_client::tun`；
+/// - 包名/集成测试 target 可能用连字符：`hydra-client`；
+/// - 片段匹配兜底历史/派生 target（`hydra_core` 等）。
+fn is_product_target(target: &str) -> bool {
+    target.starts_with("hydra_")
+        || target.starts_with("hydra-")
+        || [
+            "hydra_client",
+            "hydra_core",
+            "hydra_protocol",
+            "hydra_node",
+            "hydra_android",
+        ]
+        .iter()
+        .any(|name| target.contains(name))
 }
 
 /// tracing Level → 三档级别标签（GUI/Android 日志页只区分三档着色）
@@ -418,6 +501,11 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for KernelLogLayer {
     ) {
         let level = event.metadata().level();
         if *level > tracing::Level::DEBUG {
+            return;
+        }
+        // target 白名单（修复项 1）：级别过滤之后、字段提取之前丢弃第三方
+        // 事件（rustls/hyper/tokio/tracing 等）——它们不是本产品诊断信息
+        if !is_product_target(event.metadata().target()) {
             return;
         }
         let mut visitor = LogVisitor::default();
@@ -1683,5 +1771,90 @@ mod tests {
         assert!(logs[2].message.starts_with("[debug] "), "{}", logs[2].message);
         assert!(logs[2].message.contains("丢包"));
         assert!(logs.iter().all(|e| e.ts_ms > 0));
+    }
+
+    #[test]
+    fn kernel_layer_drops_third_party_targets() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let _g = LOG_RING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        reset_vpn_logs();
+        let subscriber = tracing_subscriber::registry().with(KernelLogLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            // 第三方库（实测噪声源）：metadata target 非本产品 → 必须丢弃
+            tracing::debug!(
+                target: "rustls::client::hs",
+                "No cached session for DnsName(\"hydra.node\")"
+            );
+            tracing::debug!(target: "rustls::client::hs", "Not resuming any session");
+            tracing::info!(target: "hyper::proto::h1", "parsed headers");
+            tracing::warn!(target: "tokio::task", "third-party warn");
+            // tracing-log 0.2 的实际形态：所有 `log` 记录桥接后 metadata target
+            // 恒为 "log"，真实 target 在 `log.target` 字段里 → 整桥丢弃
+            tracing::debug!(target: "log", "Using ciphersuite TLS13_AES_128_GCM_SHA256");
+            // 本产品：下划线模块路径与连字符 crate target 都必须通过
+            tracing::info!(target: "hydra_client::tun", "TUN 规则直连 xxxxxxxx:443");
+            tracing::info!(target: "hydra-android", "桥接层事件");
+        });
+        let logs = vpn_logs_since(0);
+        assert_eq!(logs.len(), 2, "仅本产品 target 入环: {logs:?}");
+        assert!(logs.iter().any(|e| e.message.contains("TUN 规则直连")));
+        assert!(logs.iter().any(|e| e.message.contains("桥接层事件")));
+        assert!(
+            logs.iter().all(|e| !e.message.contains("cached session")
+                && !e.message.contains("third-party")
+                && !e.message.contains("ciphersuite")),
+            "第三方事件不得漏网: {logs:?}"
+        );
+        assert!(
+            !is_product_target("log"),
+            "tracing-log 桥接事件 metadata target 为 \"log\"，必须整体丢弃"
+        );
+    }
+
+    #[test]
+    fn log_ring_folds_consecutive_duplicates() {
+        let _g = LOG_RING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        reset_vpn_logs();
+        let msg = "TUN 规则直连: abcd1234:443（bind 无）";
+        for _ in 0..3 {
+            push_log_entry("INFO", msg.to_string());
+        }
+        let logs = vpn_logs_since(0);
+        assert_eq!(logs.len(), 1, "同消息连续 3 次必须折叠为 1 条: {logs:?}");
+        assert_eq!(logs[0].message, format!("{msg} ×3"));
+        assert_eq!(logs[0].level, "INFO");
+        let seq = logs[0].seq;
+        let ts = logs[0].ts_ms;
+
+        // 继续重复：seq 不变（增量游标安全）、计数递增、时间戳刷新为最新
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        push_log_entry("INFO", msg.to_string());
+        let logs = vpn_logs_since(0);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].seq, seq, "折叠不得改变 seq");
+        assert_eq!(logs[0].message, format!("{msg} ×4"));
+        assert!(logs[0].ts_ms >= ts, "折叠须刷新为最新时间戳");
+
+        // 跨不同消息后计数重置：再次重复从 ×2 起（不得与历史消息误合并）
+        push_log_entry("INFO", "另一条事件".to_string());
+        push_log_entry("INFO", msg.to_string());
+        push_log_entry("INFO", msg.to_string());
+        let logs = vpn_logs_since(0);
+        assert_eq!(logs.len(), 3, "跨消息重置后不得误折叠: {logs:?}");
+        assert_eq!(logs[1].message, "另一条事件");
+        assert_eq!(logs[2].message, format!("{msg} ×2"));
+        assert!(logs[2].seq > seq, "新条目 seq 必须递增");
+
+        // 级别不同不算连续重复（同文本 WARN 独立成条）
+        push_log_entry("WARN", "同一文本".to_string());
+        push_log_entry("INFO", "同一文本".to_string());
+        let logs = vpn_logs_since(0);
+        assert_eq!(logs.len(), 5, "level 参与重复判定: {logs:?}");
+        assert_eq!(logs[3].level, "WARN");
+        assert_eq!(logs[4].level, "INFO");
     }
 }

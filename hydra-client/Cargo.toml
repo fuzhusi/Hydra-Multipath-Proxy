@@ -49,7 +49,7 @@ smoltcp = { version = "0.11", optional = true, default-features = false, feature
     "socket-tcp",
     "medium-ip",
     # 动态 AnyIP 需要地址表容量：默认仅 2 槽（放不下 v4 + 链路本地 + 全局 +
-    # 轮转池），扩到 8 槽 = 3 静态 + 5 动态（见 tun.rs V6_DYNAMIC_SLOTS）
+    # 轮转池），扩到 槽位由 .cargo/config.toml 的 SMOLTCP_IFACE_MAX_ADDR_COUNT 决定（当前 40 = 3 静态 + 37 动态）（见 tun.rs V6_DYNAMIC_SLOTS）
     "iface-max-addr-count-8",
 ] }
 # CancellationToken（TUN 任务优雅停机）
