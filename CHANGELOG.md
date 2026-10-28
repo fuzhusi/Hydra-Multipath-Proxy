@@ -43,7 +43,34 @@
 
 （本节即下方全部新增内容；[Unreleased] 清空待下轮）
 
-## [Unreleased]
+## [0.2.9] - 2026-10-28
+
+### 安卓端多节点独立证书（修复全局单证书覆盖导致握手 BadSignature）
+
+- **问题**：安卓端只有一张全局证书，多节点场景后导入节点的证书覆盖先前
+  节点——用 A 的证书连 B 节点握手必败 `invalid peer certificate: BadSignature`
+  （自签证书 Subject/Issuer 同名，rustls 只报 BadSignature 无法自行定位），
+  多节点容灾静默退化为单节点；桌面 GUI/CLI/Rust 内核均已支持，仅安卓缺失
+  （详见 `docs/issu/ISSSU-Draft-android-per-node-cert.md`）。
+- **FFI**：`ParsedShare` 新增 `node_certs: HashMap<addr, b64>`——
+  `parse_share_text` 逐链接按地址记录 `cc=`（同地址重复导入以最后为准 =
+  证书漂移修复路径；全局 `cert_der_b64` 保留首个作回落，坏 cc 不阻塞后续）。
+- **存储**：`SecureStore` 新增 `node_certs` 表（`addr\tb64` 行格式），
+  `HydraConfig.nodeCertB64Map` 缺项回落全局；旧配置空表全量由全局回落承接，
+  行为与修复前一致。
+- **导入**：各链接证书写入各自地址条目互不覆盖；删除节点同步清条目。
+- **引擎**：信任根池 = 各节点证书（缺项回落全局）∪ 全局去重（Rust
+  `Pinned` 本就是多张语义，内核与 FFI 签名零改动）。
+- **连通性测试**：手动测试与引擎自检改用被测节点自己的证书——证书错配
+  不再误报成节点故障。
+- **错误提示**：`BadSignature`/`invalid peer certificate` 映射为「证书
+  不匹配——请重新导入该节点的分享链接」（原文保留供排障）。
+- **UI**：节点页每行显示证书 SHA-256 指纹前 16 位（与分享链接 `cf=` 同
+  算法，识别证书漂移/导入错证书）；pin 模式无证书节点行红色警示；设置页
+  全局证书标注回落项语义。
+- 测试：Rust `parse_share_records_per_node_certs` 三场景 + Kotlin
+  `NodeCertsTest` 14 例；`cargo test --workspace` 30 二进制 0 失败、
+  Gradle 44 测试通过。
 
 ### 安卓端日志与健康观测（内核事件桥接 + 周期健康探测 + 网络事件 + 日志页增强）
 
