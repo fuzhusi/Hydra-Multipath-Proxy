@@ -1948,7 +1948,14 @@ data class ParsedShare (
      * Kotlin 导入层逐条落 SecureStore `node_certs` 表，互不覆盖——修复
      * "后导入节点覆盖先前节点证书 → 握手 BadSignature"（ISSUE 安卓多节点证书）
      */
-    var `nodeCerts`: Map<kotlin.String, kotlin.String>
+    var `nodeCerts`: Map<kotlin.String, kotlin.String>, 
+    /**
+     * 按节点地址索引的证书指纹（addr → 64 位小写 hex，链接 `cf=` 字段）：
+     * **紧凑分享链接**（公开渠道，只带指纹不带证书本体）的唯一证书信息——
+     * Kotlin 用于节点行显示预期指纹、并与本地证书 SHA-256 比对（匹配 =
+     * 本地证书即该节点信任锚；不符 = 证书漂移精准诊断）
+     */
+    var `nodeCertFps`: Map<kotlin.String, kotlin.String>
 ) {
     
     companion object
@@ -1965,6 +1972,7 @@ public object FfiConverterTypeParsedShare: FfiConverterRustBuffer<ParsedShare> {
             FfiConverterString.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterMapStringString.read(buf),
+            FfiConverterMapStringString.read(buf),
         )
     }
 
@@ -1973,7 +1981,8 @@ public object FfiConverterTypeParsedShare: FfiConverterRustBuffer<ParsedShare> {
             FfiConverterString.allocationSize(value.`authKeyHex`) +
             FfiConverterString.allocationSize(value.`certDerB64`) +
             FfiConverterUInt.allocationSize(value.`skipped`) +
-            FfiConverterMapStringString.allocationSize(value.`nodeCerts`)
+            FfiConverterMapStringString.allocationSize(value.`nodeCerts`) +
+            FfiConverterMapStringString.allocationSize(value.`nodeCertFps`)
     )
 
     override fun write(value: ParsedShare, buf: ByteBuffer) {
@@ -1982,6 +1991,7 @@ public object FfiConverterTypeParsedShare: FfiConverterRustBuffer<ParsedShare> {
             FfiConverterString.write(value.`certDerB64`, buf)
             FfiConverterUInt.write(value.`skipped`, buf)
             FfiConverterMapStringString.write(value.`nodeCerts`, buf)
+            FfiConverterMapStringString.write(value.`nodeCertFps`, buf)
     }
 }
 

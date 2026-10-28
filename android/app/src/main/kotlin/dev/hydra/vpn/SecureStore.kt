@@ -21,6 +21,9 @@ import androidx.security.crypto.MasterKey
  *   未携带 cc 的手动节点承接）
  * - node_certs：按节点地址索引的证书表（每行 `addr\tb64`），多节点各自
  *   独立证书互不覆盖；缺项回落 cert_der_b64（ISSUE 安卓多节点证书）
+ * - node_cert_fps：按节点地址索引的证书指纹表（每行 `addr\t64hex`）——
+ *   紧凑分享链接（只带 cf= 指纹）的唯一证书信息，用于节点行显示预期
+ *   指纹与证书漂移诊断（cf 匹配本地证书 = 该证书即信任锚）
  * - listen_port：进程内 SOCKS5 端口（0 = 随机）
  */
 class SecureStore(context: Context) {
@@ -51,6 +54,7 @@ class SecureStore(context: Context) {
         trustMode = prefs.getString(KEY_TRUST_MODE, TRUST_PINNED).orEmpty(),
         certDerB64 = prefs.getString(KEY_CERT_B64, "").orEmpty(),
         nodeCertB64Map = parseNodeCerts(prefs.getString(KEY_NODE_CERTS, "").orEmpty()),
+        nodeCertFpMap = parseNodeCerts(prefs.getString(KEY_NODE_CERT_FPS, "").orEmpty()),
         listenPort = prefs.getInt(KEY_LISTEN_PORT, DEFAULT_PORT),
         runMode = prefs.getString(KEY_RUN_MODE, MODE_VPN).orEmpty(),
         vpnKillSwitch = prefs.getBoolean(KEY_VPN_KILL_SWITCH, true),
@@ -72,6 +76,7 @@ class SecureStore(context: Context) {
             .putString(KEY_TRUST_MODE, c.trustMode)
             .putString(KEY_CERT_B64, c.certDerB64)
             .putString(KEY_NODE_CERTS, encodeNodeCerts(c.nodeCertB64Map))
+            .putString(KEY_NODE_CERT_FPS, encodeNodeCerts(c.nodeCertFpMap))
             .putInt(KEY_LISTEN_PORT, c.listenPort)
             .putString(KEY_RUN_MODE, c.runMode)
             .putBoolean(KEY_VPN_KILL_SWITCH, c.vpnKillSwitch)
@@ -94,6 +99,7 @@ class SecureStore(context: Context) {
         private const val KEY_TRUST_MODE = "trust_mode"
         private const val KEY_CERT_B64 = "cert_der_b64"
         private const val KEY_NODE_CERTS = "node_certs"
+        private const val KEY_NODE_CERT_FPS = "node_cert_fps"
         private const val KEY_LISTEN_PORT = "listen_port"
         private const val KEY_RUN_MODE = "run_mode"
         private const val KEY_VPN_KILL_SWITCH = "vpn_kill_switch"
@@ -130,6 +136,10 @@ data class HydraConfig(
      *  缺项回落 certDerB64（ISSUE 安卓多节点证书；旧配置无此表 = 空表，
      *  全部由全局回落承接，行为与修复前一致） */
     val nodeCertB64Map: Map<String, String> = emptyMap(),
+    /** 按节点地址索引的证书指纹（addr → 64 hex，链接 `cf=` 字段）：紧凑
+     *  分享链接的唯一证书信息——与本地证书 SHA-256 比对可确认"该证书即
+     *  此节点的信任锚"或诊断证书漂移 */
+    val nodeCertFpMap: Map<String, String> = emptyMap(),
     val listenPort: Int,
     /** "vpn"（默认）/ "local" */
     val runMode: String,

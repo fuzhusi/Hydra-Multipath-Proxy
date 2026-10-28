@@ -165,4 +165,91 @@ class NodeCertsTest {
         assertEquals(emptyMap<String, String>(), parseNodeCerts(""))
         assertEquals(emptyMap<String, String>(), parseNodeCerts("\n\n"))
     }
+
+    // ── 节点证书状态（紧凑链接 cf= 指纹诊断） ──────────────────────────────
+
+    /** SHA-256("certA bytes") 的指纹——certA 的 base64 解码即 byteArrayOf(1,2,3)，
+     *  此处用真实指纹函数计算，保证与 statusFor 内部比对同源。 */
+    private val certAFp = NodeCerts.fingerprint(byteArrayOf(1, 2, 3))
+    private val certBFp = NodeCerts.fingerprint(byteArrayOf(4, 5, 6))
+
+    @Test
+    fun status_has_cert_when_per_node_der_present() {
+        val c = cfg(nodes = "10.0.0.1:443", nodeCerts = mapOf("10.0.0.1:443" to certA))
+        val s = NodeCerts.statusFor(c, "10.0.0.1:443")
+        assertEquals(NodeCerts.NodeCertStatus.Status.HAS_CERT, s.status)
+        assertEquals(certAFp.take(16), s.fingerprint16)
+    }
+
+    @Test
+    fun status_has_cert_confirmed_when_fallback_global_matches_link_fp() {
+        // 紧凑链接 cf= 与全局证书一致——回落全局可用且带"指纹确认"
+        val c = cfg(
+            nodes = "10.0.0.1:443",
+            cert = certA,
+        ).copy(nodeCertFpMap = mapOf("10.0.0.1:443" to certAFp))
+        val s = NodeCerts.statusFor(c, "10.0.0.1:443")
+        assertEquals(NodeCerts.NodeCertStatus.Status.HAS_CERT, s.status)
+        assertEquals(certAFp.take(16), s.fingerprint16)
+    }
+
+    @Test
+    fun status_fp_mismatch_diagnoses_drift() {
+        // cf= 指纹与（回落将用的）全局证书不符——握手将失败，漂移诊断
+        val c = cfg(
+            nodes = "10.0.0.1:443",
+            cert = certA,
+        ).copy(nodeCertFpMap = mapOf("10.0.0.1:443" to certBFp))
+        val s = NodeCerts.statusFor(c, "10.0.0.1:443")
+        assertEquals(NodeCerts.NodeCertStatus.Status.FP_MISMATCH, s.status)
+        assertEquals(certBFp.take(16), s.fingerprint16)
+    }
+
+    @Test
+    fun status_fp_mismatch_for_stale_per_node_cert() {
+        // 独立证书本体与链接 cf 不符——同地址重导旧证书残留的漂移诊断
+        val c = cfg(
+            nodes = "10.0.0.1:443",
+            nodeCerts = mapOf("10.0.0.1:443" to certA),
+        ).copy(nodeCertFpMap = mapOf("10.0.0.1:443" to certBFp))
+        assertEquals(
+            NodeCerts.NodeCertStatus.Status.FP_MISMATCH,
+            NodeCerts.statusFor(c, "10.0.0.1:443").status,
+        )
+    }
+
+    @Test
+    fun status_fp_only_when_no_local_cert() {
+        val c = cfg(nodes = "10.0.0.1:443")
+            .copy(nodeCertFpMap = mapOf("10.0.0.1:443" to certAFp))
+        val s = NodeCerts.statusFor(c, "10.0.0.1:443")
+        assertEquals(NodeCerts.NodeCertStatus.Status.FP_ONLY, s.status)
+        assertEquals(certAFp.take(16), s.fingerprint16)
+    }
+
+    @Test
+    fun status_none_when_nothing() {
+        assertEquals(
+            NodeCerts.NodeCertStatus.Status.NONE,
+            NodeCerts.statusFor(cfg(nodes = "10.0.0.1:443"), "10.0.0.1:443").status,
+        )
+    }
+
+    @Test
+    fun status_none_in_ca_mode() {
+        val c = cfg(nodes = "10.0.0.1:443", cert = certA, trustMode = SecureStore.TRUST_CA)
+        assertEquals(
+            NodeCerts.NodeCertStatus.Status.NONE,
+            NodeCerts.statusFor(c, "10.0.0.1:443").status,
+        )
+    }
+
+    @Test
+    fun status_has_cert_without_fp_info() {
+        // 有本体（回落全局）但链接无 cf——无确认信息仍可用
+        val c = cfg(nodes = "10.0.0.1:443", cert = certA)
+        val s = NodeCerts.statusFor(c, "10.0.0.1:443")
+        assertEquals(NodeCerts.NodeCertStatus.Status.HAS_CERT, s.status)
+        assertEquals(certAFp.take(16), s.fingerprint16)
+    }
 }

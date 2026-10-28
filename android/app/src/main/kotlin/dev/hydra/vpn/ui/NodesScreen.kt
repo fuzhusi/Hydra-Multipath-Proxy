@@ -94,19 +94,27 @@ fun NodesScreen(
 
     val nodes = cfg.nodesText.lines().map { it.trim() }.filter { it.isNotEmpty() }
 
-    // 每节点证书指纹行（cfg 变化才重算；CA 模式不 pin 显示 null = 不渲染）。
-    // pin 模式下节点无任何证书（独立与全局均无）→ 明确提示连接将失败
+    // 每节点证书状态行（cfg 变化才重算；CA 模式不 pin 显示 null = 不渲染）。
+    // 三态：有证书本体（cf 一致时附确认）/ 本体与链接指纹不符（握手将失败的
+    // 漂移预警）/ 仅链接指纹待导入（紧凑链接）
     val certLines = remember(cfg) {
         val pin = cfg.trustMode != SecureStore.TRUST_CA
         nodes.associateWith { node ->
             if (!pin) {
                 null
             } else {
-                NodeCerts.certB64For(cfg, node)?.let { b64 ->
-                    runCatching {
-                        "证书 ${NodeCerts.fingerprint(NodeCerts.decodeCert(b64)).take(16)}…"
-                    }.getOrNull()
-                } ?: "未导入证书——连接将失败"
+                val s = NodeCerts.statusFor(cfg, node)
+                when (s.status) {
+                    NodeCerts.NodeCertStatus.Status.HAS_CERT ->
+                        if (s.fingerprint16 == null) "证书已导入"
+                        else "证书 ${s.fingerprint16}…"
+                    NodeCerts.NodeCertStatus.Status.FP_MISMATCH ->
+                        "链接指纹 ${s.fingerprint16}… 与本地证书不符——证书已漂移或导入错了证书，请重新导入该节点的分享链接"
+                    NodeCerts.NodeCertStatus.Status.FP_ONLY ->
+                        "链接指纹 ${s.fingerprint16}…（紧凑链接未带证书本体——到设置页导入证书 DER，或向管理员索取完整分享链接）"
+                    NodeCerts.NodeCertStatus.Status.NONE ->
+                        "未导入证书——连接将失败"
+                }
             }
         }
     }
@@ -302,6 +310,7 @@ fun NodesScreen(
                             // 同步清掉该节点的证书条目：残留会让此后手动添加的
                             // 同地址节点被旧证书抢先接管信任（回落全局失效）
                             nodeCertB64Map = cfg.nodeCertB64Map - target,
+                            nodeCertFpMap = cfg.nodeCertFpMap - target,
                         ),
                     )
                     deleteTarget = null
@@ -341,6 +350,8 @@ private fun NodeCard(
                     Text(
                         c, fontSize = 11.sp,
                         fontFamily = FontFamily.Monospace,
+                        // 正常（"证书…"：有本体可用，含确认态）= 灰；警示
+                        // （"链接指纹…"漂移/待导入、"未导入证书…"缺失）= 错误色
                         color = if (c.startsWith("证书"))
                             MaterialTheme.colorScheme.onSurfaceVariant
                         else MaterialTheme.colorScheme.error,

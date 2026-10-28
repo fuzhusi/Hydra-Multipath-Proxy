@@ -22,6 +22,45 @@ object NodeCerts {
             ?: cfg.certDerB64.takeIf { it.isNotBlank() }
 
     /**
+     * 节点行证书状态（UI 显示与漂移诊断用）：
+     * - [Status.HAS_CERT]：节点有可用的证书本体（独立条目，或回落全局；
+     *   若链接 `cf=` 同时存在且与全局一致，fingerprint16 即确认后的指纹）
+     * - [Status.FP_MISMATCH]：节点将回落全局证书，但链接 `cf=` 与全局证书
+     *   SHA-256 不符——握手将失败（BadSignature），证书漂移/导入错证书的
+     *   精准诊断
+     * - [Status.FP_ONLY]：仅有链接指纹，本地无任何证书本体——需导入
+     * - [Status.NONE]：无任何证书信息
+     */
+    data class NodeCertStatus(val status: Status, val fingerprint16: String?) {
+        enum class Status { HAS_CERT, FP_MISMATCH, FP_ONLY, NONE }
+    }
+
+    fun statusFor(cfg: HydraConfig, node: String): NodeCertStatus {
+        if (cfg.trustMode == SecureStore.TRUST_CA) return NodeCertStatus(NodeCertStatus.Status.NONE, null)
+        // 本节点实际会用的证书本体（独立条目优先，缺项回落全局）
+        val effectiveB64 = certB64For(cfg, node)
+        val effectiveFp = effectiveB64?.let { b64 ->
+            runCatching { fingerprint(decodeCert(b64)) }.getOrNull()
+        }
+        val nodeFp = cfg.nodeCertFpMap[node]?.takeIf { it.isNotBlank() }?.lowercase()
+        return when {
+            effectiveFp != null ->
+                if (nodeFp == null || nodeFp == effectiveFp) {
+                    // 有本体；cf 存在且一致 = "这就是节点证书"的确认
+                    NodeCertStatus(NodeCertStatus.Status.HAS_CERT, effectiveFp.take(16))
+                } else {
+                    // 本体与链接指纹不符：独立条目=旧证书漂移；回落=握手将失败
+                    NodeCertStatus(NodeCertStatus.Status.FP_MISMATCH, nodeFp.take(16))
+                }
+            nodeFp != null ->
+                // 无任何本体，仅有链接指纹——紧凑链接待导入
+                NodeCertStatus(NodeCertStatus.Status.FP_ONLY, nodeFp.take(16))
+            else ->
+                NodeCertStatus(NodeCertStatus.Status.NONE, null)
+        }
+    }
+
+    /**
      * 引擎信任根池：全部已配置节点的独立证书（缺项回落全局）+ 全局证书，
      * 按 base64 文本去重（保持首次出现顺序）。base64 非法条目跳过不致命
      * （个别证书坏不拖垮整池）；空池 = pin 模式不可启动，调用方负责报错。

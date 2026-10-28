@@ -41,12 +41,21 @@ object ShareImporter {
                     // （单证书部署惯例 + 无 cc 手动节点的回落承接）
                     nodeCertB64Map = if (p.nodeCerts.isEmpty()) cur.nodeCertB64Map
                         else cur.nodeCertB64Map + p.nodeCerts,
+                    // 紧凑链接（cf= 指纹）按节点记录——节点行显示预期指纹、
+                    // 与本地证书比对可确认信任锚/诊断证书漂移
+                    nodeCertFpMap = if (p.nodeCertFps.isEmpty()) cur.nodeCertFpMap
+                        else cur.nodeCertFpMap + p.nodeCertFps,
                 )
                 store.save(merged)
                 val extra = buildString {
                     if (p.authKeyHex.isNotEmpty()) append("，密钥✓")
                     if (p.nodeCerts.isNotEmpty()) append("，证书✓×${p.nodeCerts.size}")
                     else if (p.certDerB64.isNotEmpty()) append("，证书✓")
+                    // 紧凑链接（仅指纹）：明确告知需另行导入证书本体
+                    if (p.nodeCertFps.isNotEmpty() && p.nodeCerts.isEmpty()) {
+                        append("，证书指纹✓×${p.nodeCertFps.size}（紧凑链接未带证书本体——" +
+                            "请在设置页导入证书 DER，或向管理员索取完整分享链接）")
+                    }
                     if (p.skipped > 0u) append("（跳过 ${p.skipped} 条：域名节点/坏行）")
                 }
                 if (p.nodes.isNotEmpty()) {

@@ -79,6 +79,11 @@ pub struct ParsedShare {
     /// Kotlin 导入层逐条落 SecureStore `node_certs` 表，互不覆盖——修复
     /// "后导入节点覆盖先前节点证书 → 握手 BadSignature"（ISSUE 安卓多节点证书）
     pub node_certs: HashMap<String, String>,
+    /// 按节点地址索引的证书指纹（addr → 64 位小写 hex，链接 `cf=` 字段）：
+    /// **紧凑分享链接**（公开渠道，只带指纹不带证书本体）的唯一证书信息——
+    /// Kotlin 用于节点行显示预期指纹、并与本地证书 SHA-256 比对（匹配 =
+    /// 本地证书即该节点信任锚；不符 = 证书漂移精准诊断）
+    pub node_cert_fps: HashMap<String, String>,
 }
 
 /// 解析分享链接 / 订阅文本（hydra:// 多行、逐行或整体 base64 订阅），
@@ -92,6 +97,7 @@ pub fn parse_share_text(text: String) -> Result<ParsedShare, HydraEngineError> {
     let mut auth_key_hex = String::new();
     let mut cert_der_b64 = String::new();
     let mut node_certs: HashMap<String, String> = HashMap::new();
+    let mut node_cert_fps: HashMap<String, String> = HashMap::new();
     let mut skipped = parse.errors.len() as u32;
     for link in &parse.links {
         // IP 字面量节点入库；域名节点 M2 前不支持（计数跳过，给出可感知反馈）
@@ -120,8 +126,15 @@ pub fn parse_share_text(text: String) -> Result<ParsedShare, HydraEngineError> {
                 cert_der_b64 = b64.clone();
             }
             // 域名节点（addr=None）证书无处落位，仅留全局回落字段承接
-            if let Some(addr) = addr {
-                node_certs.insert(addr, b64);
+            if let Some(addr) = &addr {
+                node_certs.insert(addr.clone(), b64);
+            }
+        }
+        // 紧凑链接（cf= 指纹，无 cc= 本体）：指纹按节点记录——这是紧凑链接
+        // 唯一的证书信息，丢弃会让客户端无法核对/诊断证书漂移
+        if let Some(fp) = &link.cert_fp {
+            if let Some(addr) = &addr {
+                node_cert_fps.insert(addr.clone(), fp.clone());
             }
         }
     }
@@ -138,6 +151,7 @@ pub fn parse_share_text(text: String) -> Result<ParsedShare, HydraEngineError> {
         cert_der_b64,
         skipped,
         node_certs,
+        node_cert_fps,
     })
 }
 
@@ -1907,5 +1921,27 @@ mod tests {
             Some("CCCC")
         );
         assert_eq!(p.cert_der_b64, "AAAA");
+    }
+
+    #[test]
+    fn parse_share_records_compact_fingerprints() {
+        // 紧凑链接（公开渠道，只带 cf= 指纹不带证书本体）：指纹必须逐节点
+        // 记录——此前丢弃导致客户端"未导入证书"且无法核对证书漂移
+        let fp64 = "ab".repeat(32);
+        let fp64b = "cd".repeat(32);
+        let text = format!(
+            "hydra://10.0.0.1:11534?cf={fp64}\nhydra://10.0.0.2:11534?cf={fp64b}"
+        );
+        let p = parse_share_text(text).unwrap();
+        assert_eq!(p.nodes.len(), 2);
+        assert!(p.node_certs.is_empty(), "紧凑链接无证书本体");
+        assert_eq!(p.node_cert_fps.get("10.0.0.1:11534"), Some(&fp64));
+        assert_eq!(p.node_cert_fps.get("10.0.0.2:11534"), Some(&fp64b));
+
+        // 完整链接（with_cert_der 同置 cc 与 cf）：本体与指纹都按节点记录
+        let text = format!("hydra://10.0.0.3:11534?cc=AAAA&cf={fp64}");
+        let p = parse_share_text(text).unwrap();
+        assert_eq!(p.node_certs.get("10.0.0.3:11534"), Some(&"AAAA".to_string()));
+        assert_eq!(p.node_cert_fps.get("10.0.0.3:11534"), Some(&fp64));
     }
 }
