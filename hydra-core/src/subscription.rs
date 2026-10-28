@@ -77,26 +77,69 @@ pub fn parse_subscription(text: &str) -> SubscriptionParse {
         }
     };
 
-    for (i, line) in working.lines().enumerate() {
-        let line = line.trim();
+    // ── 折行重组 ──
+    // 实测痛点：聊天工具/网页把长链接折行显示，复制时折行变**真换行**——
+    // "hydra://...&loss_rate=0" + ".01&...&cc=..." 断成「合法但残缺的链接 +
+    // 坏行」：节点导入成功而密钥/证书全部丢失（v0.2.9.2 用户实测复现）。
+    // 分组：hydra:// 行与其后的非 hydra://、非空、非注释行同组——**仅当续
+    // 行含 key=value 对（含 '=' 且不以 '=' 结尾，排除 base64 padding 尾）**
+    // 才算折行续行；纯垃圾坏行（无 '='，如 "not-a-link"）不参与拼接、照常
+    // 报错（query_pairs 会把裸段当无值 key 静默忽略，激进拼接会吞坏行）。
+    // 每组先试拼接（去全部空白）解析，成功即整体采用；失败回退组内逐行
+    // （旧行为：链接行正常解析、其余按 base64/坏行报错）——既有场景零回归。
+    fn is_folded_continuation(line: &str) -> bool {
+        line.contains('=') && !line.ends_with('=')
+    }
+
+    let mut groups: Vec<Vec<(usize, &str)>> = Vec::new(); // (原始行号, 行)
+    for (i, raw) in working.lines().enumerate() {
+        let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-
-        let parsed = if line.starts_with("hydra://") {
-            ShareLink::from_share_url(line)
+        if line.starts_with("hydra://") {
+            groups.push(vec![(i, line)]);
+        } else if let Some(last) = groups.last_mut() {
+            if is_folded_continuation(line) {
+                // 含 key=value 的非 hydra 行 → 上一链接的折行续行
+                last.push((i, line));
+            } else {
+                // 纯垃圾坏行：独立组（照常报错，不参与拼接）
+                groups.push(vec![(i, line)]);
+            }
         } else {
-            ShareLink::from_base64(line)
-        };
+            groups.push(vec![(i, line)]); // 首行即非 hydra：独立组（base64/坏行）
+        }
+    }
 
-        match parsed {
-            Ok(link) => result.links.push(link),
-            Err(e) => result.errors.push(format!(
-                "第 {} 行: {}（内容: {}）",
-                i + 1,
-                e,
-                truncate(line, 40)
-            )),
+    for group in groups {
+        if group.len() > 1 {
+            let joined: String = group
+                .iter()
+                .map(|(_, l)| l.chars().filter(|c| !c.is_whitespace()).collect::<String>())
+                .collect();
+            if let Ok(link) = ShareLink::from_share_url(&joined) {
+                result.links.push(link);
+                continue;
+            }
+            // 拼接解析失败：回退逐行（完整链接行可用则仍可用，坏行照常报错）
+        }
+        for (lineno, line) in group {
+            let parsed = if line.starts_with("hydra://") {
+                ShareLink::from_share_url(line)
+            } else {
+                ShareLink::from_base64(line)
+            };
+
+            match parsed {
+                Ok(link) => result.links.push(link),
+                Err(e) => result.errors.push(format!(
+                    "第 {} 行: {}（内容: {}）",
+                    lineno + 1,
+                    e,
+                    truncate(line, 40)
+                )),
+            }
         }
     }
 
@@ -221,5 +264,87 @@ mod tests {
         assert_eq!(link.latency, 20.0);
         // 订阅内容不含密钥本体（hydra:// 链接本就不带 key）
         assert!(!text.contains("key="));
+    }
+
+    #[test]
+    fn test_folded_link_reassembles_with_cert_and_key() {
+        // 实测复现（v0.2.9.2 用户）：聊天工具复制长链接时折行变真换行——
+        // 断点落在参数中间（loss_rate=0 | .01），首行成了「合法但残缺」的
+        // 链接：节点导入成功而密钥/证书全丢。折行重组必须拼回完整链接。
+        let fp = "a".repeat(64);
+        let key_b64 = format!("{}A", "B".repeat(42)); // 43 字符 canonical base64url = 32 字节（末位 A：低 2 位为零）
+        let full = format!(
+            "hydra://1.2.3.4:11534?bandwidth=100&latency=10&loss_rate=0.01&load=0.5&status=online&v=3&k={key_b64}&cc=BBBB&cf={fp}&tp=tcp"
+        );
+        let cut = full.find(".01").expect("断点");
+        let folded = format!("{}\n{}", &full[..cut], &full[cut..]);
+        let parsed = parse_subscription(&folded);
+        assert!(parsed.errors.is_empty(), "折行不得产生坏行: {:?}", parsed.errors);
+        assert_eq!(parsed.links.len(), 1);
+        let link = &parsed.links[0];
+        assert_eq!(
+            format!("{}:{}", link.address, link.port),
+            "1.2.3.4:11534",
+            "地址必须随拼接恢复完整"
+        );
+        assert_eq!(link.cert_der.as_deref(), Some("BBBB"), "cc 必须随拼接恢复");
+        assert!(
+            link.auth_key_bytes().unwrap().is_some(),
+            "k 必须随拼接恢复（32 字节合法密钥）"
+        );
+    }
+
+    #[test]
+    fn test_complete_link_with_trailing_bad_line_zero_regression() {
+        // 零回归守卫：完整链接 + 尾部无关坏行（无 '=' 的纯垃圾）——坏行不
+        // 参与拼接、照常报错，好链接照常导入
+        let text = format!("{}\ngarbage-line-not-a-link", LINK_A);
+        let parsed = parse_subscription(&text);
+        assert_eq!(parsed.links.len(), 1, "好链接必须存活");
+        assert_eq!(parsed.errors.len(), 1, "坏行必须照常报错");
+    }
+
+    #[test]
+    fn test_multiple_folded_links_each_reassembled() {
+        // 多条折行链接各自重组（断行只归并到最近的前一个 hydra:// 行）
+        let fp = "b".repeat(64);
+        let mk = |ip: &str| {
+            format!(
+                "hydra://{}:11534?bandwidth=100&latency=10&loss_rate=0\n.01&status=online&cc=CCCC&cf={}&tp=tcp",
+                ip, fp
+            )
+        };
+        let text = format!("{}\n{}\n", mk("1.2.3.4"), mk("5.6.7.8"));
+        let parsed = parse_subscription(&text);
+        assert!(parsed.errors.is_empty(), "两条折行链接都应重组: {:?}", parsed.errors);
+        assert_eq!(parsed.links.len(), 2);
+        let addrs: Vec<String> = parsed
+            .links
+            .iter()
+            .map(|l| format!("{}:{}", l.address, l.port))
+            .collect();
+        assert_eq!(addrs, vec!["1.2.3.4:11534", "5.6.7.8:11534"]);
+        assert!(parsed.links.iter().all(|l| l.cert_der.as_deref() == Some("CCCC")));
+    }
+
+    #[test]
+    fn test_folded_but_still_invalid_falls_back_to_per_line_errors() {
+        // 含 key=value 的续行参与拼接但拼接后仍不合法（参数坏值）：回退逐行
+        // ——首行残链本身合法仍存活，坏续行照常报错
+        let text = "hydra://1.2.3.4:11534?bandwidth=100\nbandwidth=zzz&status=online";
+        let parsed = parse_subscription(text);
+        assert_eq!(parsed.links.len(), 1, "首行残链合法仍存活");
+        assert_eq!(parsed.errors.len(), 1, "拼接失败的续行照常报错");
+    }
+
+    #[test]
+    fn test_base64_lines_after_first_line_not_folded_into_links() {
+        // 混合订阅：hydra 链接行 + 单行 base64 链接行——后者不以 hydra://
+        // 开头且只有 base64 padding 尾 '='（非 key=value 形态），不参与拼接；
+        // 各行独立解析，两条链接都存活
+        let text = format!("{}\n{}", LINK_A, BASE64.encode(LINK_B.as_bytes()));
+        let parsed = parse_subscription(&text);
+        assert_eq!(parsed.links.len(), 2, "混合订阅两条链接都必须存活");
+        assert!(parsed.errors.is_empty());
     }
 }
