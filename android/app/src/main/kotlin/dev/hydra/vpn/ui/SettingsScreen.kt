@@ -221,22 +221,21 @@ fun SettingsScreen(
             if (trustMode == SecureStore.TRUST_PINNED) {
                 OutlinedButton(onClick = { certPicker.launch(arrayOf("*/*")) }) {
                     Text(
-                        if (certB64.isEmpty()) "导入节点证书 DER"
+                        if (certB64.isEmpty()) "导入全局证书 DER（回落项）"
                         else {
                             val size = runCatching {
                                 Base64.getDecoder().decode(certB64).size
                             }.getOrDefault(0)
-                            "已导入证书 ✓（$size 字节，重新选）"
+                            "已导入全局证书 ✓（$size 字节，重新选）"
                         }
                     )
                 }
-                if (certB64.isEmpty()) {
-                    Text(
-                        "提示：分享链接携带证书（cc=）时导入链接即可，无需手动选文件",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
+                Text(
+                    "各节点链接自带的证书按节点独立保存（节点页可见指纹），此处的全局证书" +
+                        "仅兜底「无独立证书的节点」；多节点各自证书时留空亦可",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
 

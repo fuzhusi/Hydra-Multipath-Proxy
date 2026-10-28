@@ -101,9 +101,10 @@ class EngineService : Service() {
             EngineState.addLog("① 读取加密配置…")
             val cfg = SecureStore(this@EngineService).load()
             val nodeCount = cfg.nodesText.lines().count { it.isNotBlank() }
+            val certCount = if (cfg.trustMode == SecureStore.TRUST_CA) -1 else NodeCerts.certPool(cfg).size
             EngineState.addLog(
                 "② 配置已加载（$nodeCount 个节点，密钥${if (cfg.authKeyHex.isNotEmpty()) "✓" else "✗"}，" +
-                    "证书${if (cfg.certDerB64.isNotEmpty()) "✓" else "✗"}，模式 ${cfg.trustMode}）"
+                    (if (certCount < 0) "公共 CA 模式" else "证书×$certCount") + "，模式 ${cfg.trustMode}）"
             )
             val result = runCatching { buildEngine(cfg) }
             result.fold(onSuccess = { eng ->
@@ -149,26 +150,35 @@ class EngineService : Service() {
                                 val t = if (cfg.trustMode == SecureStore.TRUST_CA) {
                                     TrustMode.PublicCa
                                 } else {
-                                    TrustMode.Pinned(listOf(
-                                        android.util.Base64.decode(cfg.certDerB64, android.util.Base64.DEFAULT)))
+                                    // 自检必须用**被测节点自己的证书**（缺项回落全局）：
+                                    // 用别的节点证书探测会把证书错配误报成节点故障
+                                    val b64 = NodeCerts.certB64For(cfg, first)
+                                        ?: return@withContext null
+                                    TrustMode.Pinned(listOf(NodeCerts.decodeCert(b64)))
                                 }
                                 uniffi.hydra_android.testNodeConnection(
                                     first, cfg.authKeyHex, t, cfg.sni.ifEmpty { null })
                             }
                         }
                         r.fold(onSuccess = { res ->
-                            if (res.ok) {
+                            if (res == null) {
+                                EngineState.addLog("⚠ 节点 $first 无独立证书且无全局证书——跳过连通性自检")
+                            } else if (res.ok) {
                                 EngineState.addLog("节点连通 ✓ ${res.latencyMs}ms（${first}）")
                             } else {
-                                EngineState.addLog("⚠ 节点连通失败：${res.detail}——浏览器将无法出网，请换节点或查网络")
+                                EngineState.addLog(
+                                    "⚠ 节点连通失败：${NodeCerts.friendlyError(res.detail)}" +
+                                        "——浏览器将无法出网，请换节点或查网络"
+                                )
                             }
                         }, onFailure = { EngineState.addLog("⚠ 连通性测试异常：${it.message}") })
                     }
                 } catch (e: Exception) {
                     runCatching { eng.close() }
-                    EngineState.addLog("✗ 启动失败：${e.message}")
+                    val msg = NodeCerts.friendlyError(e.message)
+                    EngineState.addLog("✗ 启动失败：$msg")
                     EngineState.update {
-                        it.copy(running = false, transition = "启动失败：${e.message}")
+                        it.copy(running = false, transition = "启动失败：$msg")
                     }
                     updateNotification()
                     stopForeground(STOP_FOREGROUND_REMOVE)
@@ -177,9 +187,10 @@ class EngineService : Service() {
             }, onFailure = { e ->
                 // 过期启动的失败不覆盖新状态（新一轮启动可能已在途）
                 if (startGeneration.get() == gen) {
-                    EngineState.addLog("✗ 启动失败：${e.message}")
+                    val msg = NodeCerts.friendlyError(e.message)
+                    EngineState.addLog("✗ 启动失败：$msg")
                     EngineState.update {
-                        it.copy(running = false, transition = "启动失败：${e.message}")
+                        it.copy(running = false, transition = "启动失败：$msg")
                     }
                     updateNotification()
                 }
@@ -198,11 +209,15 @@ class EngineService : Service() {
         val trust = if (cfg.trustMode == SecureStore.TRUST_CA) {
             TrustMode.PublicCa
         } else {
-            val der = android.util.Base64.decode(
-                cfg.certDerB64.ifEmpty { throw IllegalStateException("pin 模式必须提供节点证书") },
-                android.util.Base64.DEFAULT,
-            )
-            TrustMode.Pinned(listOf(der))
+            // 信任根池 = 各节点独立证书（缺项回落全局）∪ 全局——Rust 侧
+            // Pinned 本就是多张语义，逐张入 RootCertStore；多节点各自独立
+            // 证书时池内齐备即握手成功，不再"后导入覆盖先前"（ISSUE 安卓
+            // 多节点证书）
+            val pool = NodeCerts.certPool(cfg)
+            if (pool.isEmpty()) {
+                throw IllegalStateException("pin 模式必须提供节点证书")
+            }
+            TrustMode.Pinned(pool)
         }
         return HydraEngine(
             nodes = nodes,

@@ -45,7 +45,6 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.net.URL
-import java.util.Base64
 
 /**
  * M2：全局 VPN（VpnService）。
@@ -373,7 +372,7 @@ class HydraVpnService : VpnService() {
                     }
 
                     // ── 本轮失败 ──
-                    val msg = failMsg ?: "未知错误"
+                    val msg = NodeCerts.friendlyError(failMsg ?: "未知错误")
                     EngineState.addLog("✗ 建连失败：$msg", LogLevel.ERROR)
                     runCatching { stopVpn() } // 清 Rust 态并释放失败尝试的 fd
 
@@ -853,8 +852,11 @@ class HydraVpnService : VpnService() {
         val keyOk = cfg.authKeyHex.length == 64 &&
             cfg.authKeyHex.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }
         if (!keyOk) return "认证密钥非法（须恰好 64 位 hex）"
-        if (cfg.trustMode == SecureStore.TRUST_PINNED && cfg.certDerB64.isEmpty()) {
-            return "自签 pin 模式未导入节点证书"
+        // pin 模式信任根池 = 按节点证书 ∪ 全局回落（ISSUE 安卓多节点证书）：
+        // 任一非空即可启动——不再要求全局 certDerB64 必有（多节点逐节点携带
+        // cc= 时全局可以为空）；池解码在 NodeCerts.certPool 内对坏条目跳过
+        if (cfg.trustMode == SecureStore.TRUST_PINNED && NodeCerts.certPool(cfg).isEmpty()) {
+            return "自签 pin 模式未导入节点证书——请导入节点分享链接或到设置页选择证书 DER 文件"
         }
         return null
     }
@@ -1052,7 +1054,7 @@ class HydraVpnService : VpnService() {
         nodes = nodesText.lines().map { it.trim() }.filter { it.isNotEmpty() },
         authKeyHex = authKeyHex,
         trust = if (trustMode == SecureStore.TRUST_CA) TrustMode.PublicCa
-        else TrustMode.Pinned(listOf(Base64.getDecoder().decode(certDerB64))),
+        else TrustMode.Pinned(NodeCerts.certPool(this)),
         sni = sni.ifEmpty { null },
         mtu = 1500.toUShort(),
         addr4 = "10.7.0.1",

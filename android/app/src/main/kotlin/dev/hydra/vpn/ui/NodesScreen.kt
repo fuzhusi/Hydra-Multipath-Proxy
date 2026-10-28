@@ -45,11 +45,15 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.hydra.vpn.HydraConfig
+import dev.hydra.vpn.NodeCerts
+import dev.hydra.vpn.SecureStore
 import kotlinx.coroutines.launch
 
 /*
  * 节点页（T4 拆分平移，逻辑不变）：卡片列表 + 分享链接/扫码/手动导入。
  * R11：列表 item 用节点地址本身做稳定 key（导入合并后只重组受影响项）。
+ * ISSUE 安卓多节点证书：节点行显示自身证书指纹（SHA-256 前 16 位，与分享
+ * 链接 cf= 同算法）——多节点各持独立证书时用于识别"导入错了证书/证书漂移"。
  */
 
 @Composable
@@ -89,6 +93,23 @@ fun NodesScreen(
     var testingAddr by remember { mutableStateOf<String?>(null) }
 
     val nodes = cfg.nodesText.lines().map { it.trim() }.filter { it.isNotEmpty() }
+
+    // 每节点证书指纹行（cfg 变化才重算；CA 模式不 pin 显示 null = 不渲染）。
+    // pin 模式下节点无任何证书（独立与全局均无）→ 明确提示连接将失败
+    val certLines = remember(cfg) {
+        val pin = cfg.trustMode != SecureStore.TRUST_CA
+        nodes.associateWith { node ->
+            if (!pin) {
+                null
+            } else {
+                NodeCerts.certB64For(cfg, node)?.let { b64 ->
+                    runCatching {
+                        "证书 ${NodeCerts.fingerprint(NodeCerts.decodeCert(b64)).take(16)}…"
+                    }.getOrNull()
+                } ?: "未导入证书——连接将失败"
+            }
+        }
+    }
 
     Scaffold(
         floatingActionButton = {
@@ -133,6 +154,7 @@ fun NodesScreen(
                     items(nodes) { node ->
                         NodeCard(
                             node = node,
+                            certLine = certLines[node],
                             testResult = testResults[node],
                             testing = testingAddr == node,
                             busy = testingAddr != null,
@@ -274,7 +296,14 @@ fun NodesScreen(
             confirmButton = {
                 TextButton(onClick = {
                     val list = nodes.filter { it != target }
-                    onPersist(cfg.copy(nodesText = list.joinToString("\n")))
+                    onPersist(
+                        cfg.copy(
+                            nodesText = list.joinToString("\n"),
+                            // 同步清掉该节点的证书条目：残留会让此后手动添加的
+                            // 同地址节点被旧证书抢先接管信任（回落全局失效）
+                            nodeCertB64Map = cfg.nodeCertB64Map - target,
+                        ),
+                    )
                     deleteTarget = null
                 }) { Text("删除", color = MaterialTheme.colorScheme.error) }
             },
@@ -288,6 +317,7 @@ fun NodesScreen(
 @Composable
 private fun NodeCard(
     node: String,
+    certLine: String?,
     testResult: String?,
     testing: Boolean,
     busy: Boolean,
@@ -307,6 +337,15 @@ private fun NodeCard(
             Spacer(Modifier.size(10.dp))
             Column(Modifier.weight(1f)) {
                 Text(node, fontFamily = FontFamily.Monospace)
+                certLine?.let { c ->
+                    Text(
+                        c, fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = if (c.startsWith("证书"))
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        else MaterialTheme.colorScheme.error,
+                    )
+                }
                 testResult?.let { r ->
                     Text(
                         r, fontSize = 11.sp,

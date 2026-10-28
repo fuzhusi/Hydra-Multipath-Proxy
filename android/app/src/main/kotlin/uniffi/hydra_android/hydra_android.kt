@@ -1032,7 +1032,7 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_hydra_android_checksum_func_parse_share_text() != 52095.toShort()) {
+    if (lib.uniffi_hydra_android_checksum_func_parse_share_text() != 40176.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_hydra_android_checksum_func_start_vpn() != 20408.toShort()) {
@@ -1935,14 +1935,20 @@ data class ParsedShare (
      */
     var `authKeyHex`: kotlin.String, 
     /**
-     * 证书 DER base64（STANDARD；取首个携带证书的链接——分享链接 v2 的
-     * `cc=` 字段自带节点证书，导入后无需再手动选文件）
+     * 证书 DER base64（STANDARD；取首个携带证书的链接——全局回落项，
+     * 兼容单证书部署与未携带 cc 的手动节点）
      */
     var `certDerB64`: kotlin.String, 
     /**
      * 未能导入的条目数（域名节点/坏行——域名支持随 M2 tun_core）
      */
-    var `skipped`: kotlin.UInt
+    var `skipped`: kotlin.UInt, 
+    /**
+     * 按节点地址索引的证书（addr → DER base64）：多节点各自独立证书时
+     * Kotlin 导入层逐条落 SecureStore `node_certs` 表，互不覆盖——修复
+     * "后导入节点覆盖先前节点证书 → 握手 BadSignature"（ISSUE 安卓多节点证书）
+     */
+    var `nodeCerts`: Map<kotlin.String, kotlin.String>
 ) {
     
     companion object
@@ -1958,6 +1964,7 @@ public object FfiConverterTypeParsedShare: FfiConverterRustBuffer<ParsedShare> {
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterMapStringString.read(buf),
         )
     }
 
@@ -1965,7 +1972,8 @@ public object FfiConverterTypeParsedShare: FfiConverterRustBuffer<ParsedShare> {
             FfiConverterSequenceString.allocationSize(value.`nodes`) +
             FfiConverterString.allocationSize(value.`authKeyHex`) +
             FfiConverterString.allocationSize(value.`certDerB64`) +
-            FfiConverterUInt.allocationSize(value.`skipped`)
+            FfiConverterUInt.allocationSize(value.`skipped`) +
+            FfiConverterMapStringString.allocationSize(value.`nodeCerts`)
     )
 
     override fun write(value: ParsedShare, buf: ByteBuffer) {
@@ -1973,6 +1981,7 @@ public object FfiConverterTypeParsedShare: FfiConverterRustBuffer<ParsedShare> {
             FfiConverterString.write(value.`authKeyHex`, buf)
             FfiConverterString.write(value.`certDerB64`, buf)
             FfiConverterUInt.write(value.`skipped`, buf)
+            FfiConverterMapStringString.write(value.`nodeCerts`, buf)
     }
 }
 
@@ -2684,10 +2693,50 @@ public object FfiConverterSequenceTypeVpnLogEntry: FfiConverterRustBuffer<List<V
         }
     }
 }
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterMapStringString: FfiConverterRustBuffer<Map<kotlin.String, kotlin.String>> {
+    override fun read(buf: ByteBuffer): Map<kotlin.String, kotlin.String> {
+        val len = buf.getInt()
+        return buildMap<kotlin.String, kotlin.String>(len) {
+            repeat(len) {
+                val k = FfiConverterString.read(buf)
+                val v = FfiConverterString.read(buf)
+                this[k] = v
+            }
+        }
+    }
+
+    override fun allocationSize(value: Map<kotlin.String, kotlin.String>): ULong {
+        val spaceForMapSize = 4UL
+        val spaceForChildren = value.map { (k, v) ->
+            FfiConverterString.allocationSize(k) +
+            FfiConverterString.allocationSize(v)
+        }.sum()
+        return spaceForMapSize + spaceForChildren
+    }
+
+    override fun write(value: Map<kotlin.String, kotlin.String>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        // The parens on `(k, v)` here ensure we're calling the right method,
+        // which is important for compatibility with older android devices.
+        // Ref https://blog.danlew.net/2017/03/16/kotlin-puzzler-whose-line-is-it-anyways/
+        value.forEach { (k, v) ->
+            FfiConverterString.write(k, buf)
+            FfiConverterString.write(v, buf)
+        }
+    }
+}
         /**
          * 解析分享链接 / 订阅文本（hydra:// 多行、逐行或整体 base64 订阅），
          * 汇聚为一份引擎配置（节点列表 + 密钥 + 证书）。任一链接携带的 `k=`（密钥）
-         * 与 `cc=`（证书）都会被提取。
+         * 与 `cc=`（证书）都会被提取；证书额外按节点地址记录在 `node_certs`
+         * （同一地址重复导入以最后一次为准——证书漂移的修复路径）。
          */
     @Throws(HydraEngineException::class) fun `parseShareText`(`text`: kotlin.String): ParsedShare {
             return FfiConverterTypeParsedShare.lift(

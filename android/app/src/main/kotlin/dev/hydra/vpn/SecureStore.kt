@@ -17,8 +17,10 @@ import androidx.security.crypto.MasterKey
  * - auth_key_hex：64 hex（32B PSK）
  * - sni：可空（缺省 hydra.node）
  * - trust_mode：`pinned` / `ca`
- * - cert_der_b64：pin 模式证书 DER（base64；多节点共用同一自签证书是当前
- *   部署惯例，v1 单证书）
+ * - cert_der_b64：pin 模式证书 DER（base64；**全局回落项**——单证书部署与
+ *   未携带 cc 的手动节点承接）
+ * - node_certs：按节点地址索引的证书表（每行 `addr\tb64`），多节点各自
+ *   独立证书互不覆盖；缺项回落 cert_der_b64（ISSUE 安卓多节点证书）
  * - listen_port：进程内 SOCKS5 端口（0 = 随机）
  */
 class SecureStore(context: Context) {
@@ -48,6 +50,7 @@ class SecureStore(context: Context) {
         sni = prefs.getString(KEY_SNI, "").orEmpty(),
         trustMode = prefs.getString(KEY_TRUST_MODE, TRUST_PINNED).orEmpty(),
         certDerB64 = prefs.getString(KEY_CERT_B64, "").orEmpty(),
+        nodeCertB64Map = parseNodeCerts(prefs.getString(KEY_NODE_CERTS, "").orEmpty()),
         listenPort = prefs.getInt(KEY_LISTEN_PORT, DEFAULT_PORT),
         runMode = prefs.getString(KEY_RUN_MODE, MODE_VPN).orEmpty(),
         vpnKillSwitch = prefs.getBoolean(KEY_VPN_KILL_SWITCH, true),
@@ -68,6 +71,7 @@ class SecureStore(context: Context) {
             .putString(KEY_SNI, c.sni)
             .putString(KEY_TRUST_MODE, c.trustMode)
             .putString(KEY_CERT_B64, c.certDerB64)
+            .putString(KEY_NODE_CERTS, encodeNodeCerts(c.nodeCertB64Map))
             .putInt(KEY_LISTEN_PORT, c.listenPort)
             .putString(KEY_RUN_MODE, c.runMode)
             .putBoolean(KEY_VPN_KILL_SWITCH, c.vpnKillSwitch)
@@ -89,6 +93,7 @@ class SecureStore(context: Context) {
         private const val KEY_SNI = "sni"
         private const val KEY_TRUST_MODE = "trust_mode"
         private const val KEY_CERT_B64 = "cert_der_b64"
+        private const val KEY_NODE_CERTS = "node_certs"
         private const val KEY_LISTEN_PORT = "listen_port"
         private const val KEY_RUN_MODE = "run_mode"
         private const val KEY_VPN_KILL_SWITCH = "vpn_kill_switch"
@@ -121,6 +126,10 @@ data class HydraConfig(
     val sni: String,
     val trustMode: String,
     val certDerB64: String,
+    /** 按节点地址索引的证书 DER base64（addr → b64）：多节点各自独立证书，
+     *  缺项回落 certDerB64（ISSUE 安卓多节点证书；旧配置无此表 = 空表，
+     *  全部由全局回落承接，行为与修复前一致） */
+    val nodeCertB64Map: Map<String, String> = emptyMap(),
     val listenPort: Int,
     /** "vpn"（默认）/ "local" */
     val runMode: String,
@@ -139,3 +148,22 @@ data class HydraConfig(
      *  连接建立与网络切换瞬间各额外触发一次即时探测（不占用本间隔） */
     val healthProbeSecs: Int = HEALTH_PROBE_DEFAULT_SECS,
 )
+
+/**
+ * node_certs 表序列化（每行 `addr\tb64`）。addr 是 IP:port / [v6]:port 字面量、
+ * b64 是标准 base64——两者都不含 tab/换行，行切分无歧义；无需引入 JSON 依赖。
+ * internal 供桌面 JVM 单测覆盖（EncryptedSharedPreferences 依赖 Android 框架，
+ * SecureStore 本体无法在纯 JVM 构造）。
+ */
+internal fun encodeNodeCerts(m: Map<String, String>): String =
+    m.entries.joinToString("\n") { "${it.key}\t${it.value}" }
+
+internal fun parseNodeCerts(s: String): Map<String, String> =
+    s.lines().filter { it.isNotBlank() }.mapNotNull { line ->
+        val i = line.indexOf('\t')
+        if (i <= 0 || i == line.length - 1) {
+            null // 坏行跳过（半写/手工篡改不致命——缺项回落全局证书）
+        } else {
+            line.substring(0, i).trim() to line.substring(i + 1).trim()
+        }
+    }.toMap()

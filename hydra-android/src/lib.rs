@@ -15,7 +15,7 @@
 //! Kotlin 冒烟单测（android/app）：经绑定构造 → start → 查询监听地址 → stop。
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -70,43 +70,58 @@ pub struct ParsedShare {
     pub nodes: Vec<String>,
     /// 认证密钥 64 hex（取首个携带密钥的链接）
     pub auth_key_hex: String,
-    /// 证书 DER base64（STANDARD；取首个携带证书的链接——分享链接 v2 的
-    /// `cc=` 字段自带节点证书，导入后无需再手动选文件）
+    /// 证书 DER base64（STANDARD；取首个携带证书的链接——全局回落项，
+    /// 兼容单证书部署与未携带 cc 的手动节点）
     pub cert_der_b64: String,
     /// 未能导入的条目数（域名节点/坏行——域名支持随 M2 tun_core）
     pub skipped: u32,
+    /// 按节点地址索引的证书（addr → DER base64）：多节点各自独立证书时
+    /// Kotlin 导入层逐条落 SecureStore `node_certs` 表，互不覆盖——修复
+    /// "后导入节点覆盖先前节点证书 → 握手 BadSignature"（ISSUE 安卓多节点证书）
+    pub node_certs: HashMap<String, String>,
 }
 
 /// 解析分享链接 / 订阅文本（hydra:// 多行、逐行或整体 base64 订阅），
 /// 汇聚为一份引擎配置（节点列表 + 密钥 + 证书）。任一链接携带的 `k=`（密钥）
-/// 与 `cc=`（证书）都会被提取。
+/// 与 `cc=`（证书）都会被提取；证书额外按节点地址记录在 `node_certs`
+/// （同一地址重复导入以最后一次为准——证书漂移的修复路径）。
 #[uniffi::export]
 pub fn parse_share_text(text: String) -> Result<ParsedShare, HydraEngineError> {
     let parse = hydra_core::subscription::parse_subscription(&text);
     let mut nodes: Vec<String> = Vec::new();
     let mut auth_key_hex = String::new();
     let mut cert_der_b64 = String::new();
+    let mut node_certs: HashMap<String, String> = HashMap::new();
     let mut skipped = parse.errors.len() as u32;
     for link in &parse.links {
         // IP 字面量节点入库；域名节点 M2 前不支持（计数跳过，给出可感知反馈）
-        match link.to_node_info() {
+        let addr = match link.to_node_info() {
             Ok(info) => {
                 let addr = info.address.to_string();
                 if !nodes.contains(&addr) {
-                    nodes.push(addr);
+                    nodes.push(addr.clone());
                 }
+                Some(addr)
             }
-            Err(_) => skipped += 1,
-        }
+            Err(_) => {
+                skipped += 1;
+                None
+            }
+        };
         if auth_key_hex.is_empty() {
             if let Ok(Some(k)) = link.auth_key_bytes() {
                 auth_key_hex = hydra_core::share_link::hex_encode_lower(&k);
             }
         }
-        if cert_der_b64.is_empty() {
-            if let Ok(Some(der)) = link.cert_der_bytes() {
-                use base64::Engine as _;
-                cert_der_b64 = base64::engine::general_purpose::STANDARD.encode(&der);
+        if let Ok(Some(der)) = link.cert_der_bytes() {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&der);
+            if cert_der_b64.is_empty() {
+                cert_der_b64 = b64.clone();
+            }
+            // 域名节点（addr=None）证书无处落位，仅留全局回落字段承接
+            if let Some(addr) = addr {
+                node_certs.insert(addr, b64);
             }
         }
     }
@@ -122,6 +137,7 @@ pub fn parse_share_text(text: String) -> Result<ParsedShare, HydraEngineError> {
         auth_key_hex,
         cert_der_b64,
         skipped,
+        node_certs,
     })
 }
 
@@ -1856,5 +1872,40 @@ mod tests {
         assert_eq!(logs.len(), 5, "level 参与重复判定: {logs:?}");
         assert_eq!(logs[3].level, "WARN");
         assert_eq!(logs[4].level, "INFO");
+    }
+
+    #[test]
+    fn parse_share_records_per_node_certs() {
+        // ISSUE 安卓多节点证书：订阅中各链接携带各自 cc=——必须逐节点记录，
+        // 而非互相覆盖只剩一张（多节点握手 BadSignature 的根因）
+        let text = "hydra://10.0.0.1:11534?cc=AAAA\nhydra://10.0.0.2:11534?cc=BBBB";
+        let p = parse_share_text(text.to_string()).unwrap();
+        assert_eq!(p.nodes, vec!["10.0.0.1:11534", "10.0.0.2:11534"]);
+        assert_eq!(
+            p.node_certs.get("10.0.0.1:11534").map(String::as_str),
+            Some("AAAA")
+        );
+        assert_eq!(
+            p.node_certs.get("10.0.0.2:11534").map(String::as_str),
+            Some("BBBB")
+        );
+        assert_eq!(p.cert_der_b64, "AAAA", "全局回落取首个携带证书的链接");
+        assert_eq!(p.skipped, 0);
+
+        // 未携带 cc 的链接：不进 node_certs，全局字段保持空
+        let p = parse_share_text("hydra://10.0.0.3:443?tp=tcp".to_string()).unwrap();
+        assert!(p.node_certs.is_empty());
+        assert!(p.cert_der_b64.is_empty());
+
+        // 同地址重复导入带新证书：以最后一次为准（证书漂移的修复路径），
+        // 全局回落保持首个
+        let text = "hydra://10.0.0.1:11534?cc=AAAA\nhydra://10.0.0.1:11534?cc=CCCC";
+        let p = parse_share_text(text.to_string()).unwrap();
+        assert_eq!(p.nodes, vec!["10.0.0.1:11534"]);
+        assert_eq!(
+            p.node_certs.get("10.0.0.1:11534").map(String::as_str),
+            Some("CCCC")
+        );
+        assert_eq!(p.cert_der_b64, "AAAA");
     }
 }

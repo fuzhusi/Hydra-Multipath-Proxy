@@ -53,7 +53,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.hydra_android.TrustMode
 import uniffi.hydra_android.testNodeConnection
-import java.util.Base64
 
 /**
  * Hydra Android：本地 SOCKS5/HTTP 代理 + 全局 VPN（TUN）引擎 + 三页 UI。
@@ -182,13 +181,16 @@ private fun HydraApp(themeMode: ThemeMode, onSetTheme: (ThemeMode) -> Unit) {
                 val t = if (cur.trustMode == SecureStore.TRUST_CA) {
                     TrustMode.PublicCa
                 } else {
-                    TrustMode.Pinned(listOf(
-                        Base64.getDecoder().decode(cur.certDerB64)))
+                    // 用**被测节点自己的证书**（缺项回落全局）——用别的节点
+                    // 证书探测会把证书错配误报成节点故障（ISSUE 安卓多节点证书）
+                    val b64 = NodeCerts.certB64For(cur, addr)
+                        ?: return@withContext false to "未导入证书——请导入该节点的分享链接或到设置页选择证书 DER"
+                    TrustMode.Pinned(listOf(NodeCerts.decodeCert(b64)))
                 }
                 val r = testNodeConnection(addr, cur.authKeyHex, t, cur.sni.ifEmpty { null })
-                if (r.ok) true to "${r.latencyMs}ms" else false to r.detail
+                if (r.ok) true to "${r.latencyMs}ms" else false to NodeCerts.friendlyError(r.detail)
             } catch (e: Exception) {
-                false to (e.message ?: "测试失败")
+                false to NodeCerts.friendlyError(e.message ?: "测试失败")
             }
         }
     }
