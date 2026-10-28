@@ -43,14 +43,14 @@
 
 （本节即下方全部新增内容；[Unreleased] 清空待下轮）
 
-## [Unreleased]
+## [0.2.9] - 2026-10-28
 
 ### 安卓端紧凑分享链接（仅证书指纹 cf=）导入修复
 
 - **问题**：紧凑分享链接（公开渠道只带 `cf=` 证书指纹、不带证书本体——桌面
   GUI 紧凑模式或其本机未配证书路径时生成）导入后，安卓端 `parse_share_text`
   只处理 `cc=` 本体，`cf` 信息被整个丢弃——节点行显示"未导入证书"且无法
-  核对证书漂移（v0.2.9 用户实测反馈）。
+  核对证书漂移（v0.2.9 首发后用户实测反馈，随 v0.2.9 tag 重打一并发布）。
 - **FFI**：`ParsedShare` 新增 `node_cert_fps: HashMap<addr, fp>`——完整链接
   （`with_cert_der` 同置 cc 与 cf）与紧凑链接的指纹都按节点记录。
 - **存储**：`SecureStore` 新增 `node_cert_fps` 表；删除节点同步清理。
@@ -62,7 +62,7 @@
 - 测试：Rust `parse_share_records_compact_fingerprints` + Kotlin statusFor
   8 例；全仓 Rust 30 二进制 0 失败、Gradle 51 测试通过。
 
-## [0.2.9] - 2026-10-28
+### 安卓端多节点独立证书（修复全局单证书覆盖导致握手 BadSignature）
 
 ### 安卓端多节点独立证书（修复全局单证书覆盖导致握手 BadSignature）
 
