@@ -123,7 +123,8 @@ class VpnStatsTest {
         val engine = HydraEngine(
             nodes = listOf(NodeSpec(addr = "127.0.0.1:44300")),
             authKeyHex = "ab".repeat(32),
-            trust = TrustMode.Pinned(certDer = listOf(byteArrayOf(0x30, 0x00))),
+            nodeAuthKeys = emptyMap(),
+        trust = TrustMode.Pinned(certDer = listOf(byteArrayOf(0x30, 0x00))),
             sni = null,
             listenPort = 0u,
         )

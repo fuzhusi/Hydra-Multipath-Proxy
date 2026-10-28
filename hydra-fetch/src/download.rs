@@ -212,6 +212,8 @@ pub async fn run(cfg: FetchConfig) -> Result<(), String> {
         cfg.trust.clone(),
         cfg.sni.clone(),
         Arc::new(cfg.auth_key.clone()),
+        // 桌面下载器单密钥部署（HYDRA_AUTH_KEY 全局）：无按节点密钥表
+        Arc::new(std::collections::HashMap::new()),
         traffic,
     );
     let factory = TunnelFactory::new(

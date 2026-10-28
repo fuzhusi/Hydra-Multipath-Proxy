@@ -84,6 +84,10 @@ pub struct ParsedShare {
     /// Kotlin 用于节点行显示预期指纹、并与本地证书 SHA-256 比对（匹配 =
     /// 本地证书即该节点信任锚；不符 = 证书漂移精准诊断）
     pub node_cert_fps: HashMap<String, String>,
+    /// 按节点地址索引的认证密钥（addr → 64 hex）：多节点各自部署各持 PSK
+    /// （v0.2.9.3 实测——全局单密钥被后导入节点覆盖，其余节点 Noise msg2
+    /// 解密必败）；Kotlin 逐条落库，缺项回落全局
+    pub node_auth_keys: HashMap<String, String>,
 }
 
 /// 解析分享链接 / 订阅文本（hydra:// 多行、逐行或整体 base64 订阅），
@@ -98,6 +102,7 @@ pub fn parse_share_text(text: String) -> Result<ParsedShare, HydraEngineError> {
     let mut cert_der_b64 = String::new();
     let mut node_certs: HashMap<String, String> = HashMap::new();
     let mut node_cert_fps: HashMap<String, String> = HashMap::new();
+    let mut node_auth_keys: HashMap<String, String> = HashMap::new();
     let mut skipped = parse.errors.len() as u32;
     for link in &parse.links {
         // IP 字面量节点入库；域名节点 M2 前不支持（计数跳过，给出可感知反馈）
@@ -117,6 +122,12 @@ pub fn parse_share_text(text: String) -> Result<ParsedShare, HydraEngineError> {
         if auth_key_hex.is_empty() {
             if let Ok(Some(k)) = link.auth_key_bytes() {
                 auth_key_hex = hydra_core::share_link::hex_encode_lower(&k);
+            }
+        }
+        // 按节点记录认证密钥（同地址重复导入以最后一次为准）
+        if let Some(addr) = &addr {
+            if let Ok(Some(k)) = link.auth_key_bytes() {
+                node_auth_keys.insert(addr.clone(), hydra_core::share_link::hex_encode_lower(&k));
             }
         }
         if let Ok(Some(der)) = link.cert_der_bytes() {
@@ -152,6 +163,7 @@ pub fn parse_share_text(text: String) -> Result<ParsedShare, HydraEngineError> {
         skipped,
         node_certs,
         node_cert_fps,
+        node_auth_keys,
     })
 }
 
@@ -228,6 +240,8 @@ pub fn test_node_connection(
 pub struct VpnConfig {
     pub nodes: Vec<String>,
     pub auth_key_hex: String,
+    /// 按节点独立认证密钥（addr → 64 hex，可空表）：缺项回落 auth_key_hex
+    pub node_auth_keys: HashMap<String, String>,
     pub trust: TrustMode,
     pub sni: Option<String>,
     pub mtu: u16,
@@ -1181,8 +1195,23 @@ pub fn start_vpn(
             msg: "至少需要一个节点".into(),
         });
     }
-    let key = hydra_core::auth_key_from_hex(&config.auth_key_hex)
-        .map_err(|m| HydraEngineError::InvalidConfig { msg: m })?;
+    // 全局密钥可空（多节点各持 PSK 时允许仅按节点提供）；非空则照常校验
+    let key = if config.auth_key_hex.is_empty() {
+        Vec::new()
+    } else {
+        hydra_core::auth_key_from_hex(&config.auth_key_hex)
+            .map_err(|m| HydraEngineError::InvalidConfig { msg: m })?
+    };
+    // 按节点密钥逐条校验（坏 hex 在启动期显式报错，不留到握手期重连循环）
+    let mut per_node_keys: HashMap<std::net::SocketAddr, Vec<u8>> = HashMap::new();
+    for (addr, hex) in &config.node_auth_keys {
+        let k = hydra_core::auth_key_from_hex(hex).map_err(|m| HydraEngineError::InvalidConfig {
+            msg: format!("节点 {addr} 的独立认证密钥非法: {m}"),
+        })?;
+        if let Ok(a) = addr.parse::<std::net::SocketAddr>() {
+            per_node_keys.insert(a, k);
+        }
+    }
     let tls = match &config.trust {
         TrustMode::Pinned { cert_der } => {
             if cert_der.is_empty() {
@@ -1221,6 +1250,7 @@ pub fn start_vpn(
     let proxy = hydra_core::proxy::ProxyServer::new("127.0.0.1:0".parse().unwrap())
         .with_nodes(nodes)
         .with_auth_key(key)
+        .with_node_auth_keys(per_node_keys)
         .with_trust(tls)
         .with_sni(sni);
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -1313,6 +1343,8 @@ pub struct HydraEngine {
     state: Mutex<Option<EngineHandle>>,
     nodes: Vec<String>,
     auth_key: Vec<u8>,
+    /// 按节点独立认证密钥（v0.2.9.3 实测）：缺项回落 auth_key（全局）
+    node_auth_keys: HashMap<std::net::SocketAddr, Vec<u8>>,
     trust: TlsTrust,
     sni: String,
     listen_port: u16,
@@ -1321,13 +1353,17 @@ pub struct HydraEngine {
 #[uniffi::export]
 impl HydraEngine {
     /// 构造引擎（不做网络操作）。
-    /// - `auth_key_hex`：64 个 hex 字符（32 字节 PSK，snow NNpsk2 约束）
+    /// - `auth_key_hex`：全局认证密钥（64 hex；单密钥部署唯一来源，
+    ///   多节点各持 PSK 时作缺项回落）
+    /// - `node_auth_keys`：按节点独立密钥（addr → 64 hex，可空表）——
+    ///   多节点各自部署各持 PSK，缺项回落 auth_key_hex
     /// - `sni`：None = 默认 hydra.node
     /// - `listen_port`：进程内 SOCKS5 监听端口（0 = 系统随机分配）
     #[uniffi::constructor]
     pub fn new(
         nodes: Vec<NodeSpec>,
         auth_key_hex: String,
+        node_auth_keys: HashMap<String, String>,
         trust: TrustMode,
         sni: Option<String>,
         listen_port: u16,
@@ -1362,8 +1398,35 @@ impl HydraEngine {
                 msg: format!("节点地址无法解析为 IP:端口: {:?}", invalid),
             });
         }
-        let auth_key = hydra_core::auth_key_from_hex(&auth_key_hex)
-            .map_err(|msg| HydraEngineError::InvalidConfig { msg })?;
+        // 全局密钥可空——多节点各持 PSK 时允许仅按节点提供（与 core
+        // ProxyServer::auth_keys_ready 同语义）；非空则照常校验
+        let auth_key = if auth_key_hex.is_empty() {
+            Vec::new()
+        } else {
+            hydra_core::auth_key_from_hex(&auth_key_hex)
+                .map_err(|msg| HydraEngineError::InvalidConfig { msg })?
+        };
+        // 按节点密钥逐条校验（坏 hex 在构造期显式报错，不留到握手期）
+        let mut per_node_keys = HashMap::new();
+        for (addr, hex) in &node_auth_keys {
+            let key = hydra_core::auth_key_from_hex(hex).map_err(|msg| {
+                HydraEngineError::InvalidConfig {
+                    msg: format!("节点 {addr} 的独立认证密钥非法: {msg}"),
+                }
+            })?;
+            if let Ok(a) = addr.parse::<std::net::SocketAddr>() {
+                per_node_keys.insert(a, key);
+            }
+        }
+        // 就绪判定：全局空时必须全部节点都有独立密钥
+        if auth_key.is_empty()
+            && !parsed_nodes.iter().all(|n| per_node_keys.contains_key(n))
+        {
+            return Err(HydraEngineError::InvalidConfig {
+                msg: "认证密钥缺失：全局密钥为空时全部节点都必须有独立密钥（重新导入对应节点的分享链接）"
+                    .to_string(),
+            });
+        }
         let trust = match trust {
             TrustMode::Pinned { cert_der } => {
                 if cert_der.is_empty() {
@@ -1383,6 +1446,7 @@ impl HydraEngine {
             state: Mutex::new(None),
             nodes: parsed_nodes.into_iter().map(|a| a.to_string()).collect(),
             auth_key,
+            node_auth_keys: per_node_keys,
             trust,
             sni: sni.unwrap_or_else(|| hydra_core::DEFAULT_SNI.to_string()),
             listen_port,
@@ -1422,6 +1486,7 @@ impl HydraEngine {
         )))
         .with_nodes(self.nodes.iter().filter_map(|a| a.parse().ok()).collect())
         .with_auth_key(self.auth_key.clone())
+        .with_node_auth_keys(self.node_auth_keys.clone())
         .with_trust(self.trust.clone())
         .with_sni(self.sni.clone());
 
@@ -1514,6 +1579,7 @@ mod tests {
                 addr: "127.0.0.1:44300".to_string(),
             }],
             HEX.repeat(32),
+            HashMap::new(),
             TrustMode::Pinned {
                 // 占位 der（启动只校验非空，握手期才会真正解析）
                 cert_der: vec![vec![0x30u8, 0x00]],
@@ -1550,6 +1616,7 @@ mod tests {
         assert!(HydraEngine::new(
             vec![],
             "00".repeat(32),
+            HashMap::new(),
             TrustMode::Pinned {
                 cert_der: vec![vec![0x30]]
             },
@@ -1562,6 +1629,7 @@ mod tests {
                 addr: "127.0.0.1:443".to_string()
             }],
             "00".repeat(31), // 31 字节：NNpsk2 约束必须 32
+            HashMap::new(),
             TrustMode::Pinned {
                 cert_der: vec![vec![0x30]]
             },
@@ -1574,6 +1642,7 @@ mod tests {
                 addr: "127.0.0.1:443".to_string()
             }],
             "00".repeat(32),
+            HashMap::new(),
             TrustMode::Pinned { cert_der: vec![] },
             None,
             0
@@ -1591,6 +1660,7 @@ mod tests {
         VpnConfig {
             nodes: vec!["127.0.0.1:44300".into()],
             auth_key_hex: HEX.repeat(32),
+            node_auth_keys: HashMap::new(),
             trust: TrustMode::Pinned {
                 cert_der: vec![vec![0x30u8, 0x00]],
             },
@@ -1943,5 +2013,27 @@ mod tests {
         let p = parse_share_text(text).unwrap();
         assert_eq!(p.node_certs.get("10.0.0.3:11534"), Some(&"AAAA".to_string()));
         assert_eq!(p.node_cert_fps.get("10.0.0.3:11534"), Some(&fp64));
+    }
+
+    #[test]
+    fn parse_share_records_per_node_auth_keys() {
+        // 多节点各持 PSK（v0.2.9.3 实测：全局单密钥被后导入覆盖 → 其余节点
+        // Noise msg2 解密必败）：k= 必须按节点记录；同地址重导以最后为准
+        let key_a = "B".repeat(42) + "A"; // canonical base64url = 32 字节
+        let key_b = "C".repeat(42) + "A";
+        let text = format!(
+            "hydra://10.0.0.1:11534?k={key_a}
+hydra://10.0.0.2:11534?k={key_b}"
+        );
+        let p = parse_share_text(text).unwrap();
+        assert_eq!(p.nodes.len(), 2);
+        // 32 字节密钥 → 64 hex；两条链接各自成条
+        let k1 = p.node_auth_keys.get("10.0.0.1:11534").expect("节点1独立密钥必须记录");
+        let k2 = p.node_auth_keys.get("10.0.0.2:11534").expect("节点2独立密钥必须记录");
+        assert_eq!(k1.len(), 64);
+        assert_eq!(k2.len(), 64);
+        assert_ne!(k1, k2, "两条链接的密钥互不相同");
+        assert_eq!(p.auth_key_hex.len(), 64, "全局回落取首个");
+        assert_eq!(p.node_auth_keys.len(), 2);
     }
 }

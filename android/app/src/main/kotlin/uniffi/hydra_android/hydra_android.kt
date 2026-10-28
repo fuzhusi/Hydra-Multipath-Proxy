@@ -878,7 +878,7 @@ internal interface UniffiLib : Library {
 ): Pointer
 fun uniffi_hydra_android_fn_free_hydraengine(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-fun uniffi_hydra_android_fn_constructor_hydraengine_new(`nodes`: RustBuffer.ByValue,`authKeyHex`: RustBuffer.ByValue,`trust`: RustBuffer.ByValue,`sni`: RustBuffer.ByValue,`listenPort`: Short,uniffi_out_err: UniffiRustCallStatus, 
+fun uniffi_hydra_android_fn_constructor_hydraengine_new(`nodes`: RustBuffer.ByValue,`authKeyHex`: RustBuffer.ByValue,`nodeAuthKeys`: RustBuffer.ByValue,`trust`: RustBuffer.ByValue,`sni`: RustBuffer.ByValue,`listenPort`: Short,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
 fun uniffi_hydra_android_fn_method_hydraengine_bound_addr(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1065,7 +1065,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_hydra_android_checksum_method_hydraengine_stop() != 46625.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_hydra_android_checksum_constructor_hydraengine_new() != 57904.toShort()) {
+    if (lib.uniffi_hydra_android_checksum_constructor_hydraengine_new() != 19843.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_hydra_android_checksum_method_socketprotect_protect() != 63365.toShort()) {
@@ -1661,15 +1661,18 @@ open class HydraEngine: Disposable, AutoCloseable, HydraEngineInterface
     }
     /**
      * 构造引擎（不做网络操作）。
-     * - `auth_key_hex`：64 个 hex 字符（32 字节 PSK，snow NNpsk2 约束）
+     * - `auth_key_hex`：全局认证密钥（64 hex；单密钥部署唯一来源，
+     * 多节点各持 PSK 时作缺项回落）
+     * - `node_auth_keys`：按节点独立密钥（addr → 64 hex，可空表）——
+     * 多节点各自部署各持 PSK，缺项回落 auth_key_hex
      * - `sni`：None = 默认 hydra.node
      * - `listen_port`：进程内 SOCKS5 监听端口（0 = 系统随机分配）
      */
-    constructor(`nodes`: List<NodeSpec>, `authKeyHex`: kotlin.String, `trust`: TrustMode, `sni`: kotlin.String?, `listenPort`: kotlin.UShort) :
+    constructor(`nodes`: List<NodeSpec>, `authKeyHex`: kotlin.String, `nodeAuthKeys`: Map<kotlin.String, kotlin.String>, `trust`: TrustMode, `sni`: kotlin.String?, `listenPort`: kotlin.UShort) :
         this(
     uniffiRustCallWithError(HydraEngineException) { _status ->
     UniffiLib.INSTANCE.uniffi_hydra_android_fn_constructor_hydraengine_new(
-        FfiConverterSequenceTypeNodeSpec.lower(`nodes`),FfiConverterString.lower(`authKeyHex`),FfiConverterTypeTrustMode.lower(`trust`),FfiConverterOptionalString.lower(`sni`),FfiConverterUShort.lower(`listenPort`),_status)
+        FfiConverterSequenceTypeNodeSpec.lower(`nodes`),FfiConverterString.lower(`authKeyHex`),FfiConverterMapStringString.lower(`nodeAuthKeys`),FfiConverterTypeTrustMode.lower(`trust`),FfiConverterOptionalString.lower(`sni`),FfiConverterUShort.lower(`listenPort`),_status)
 }
     )
 
@@ -1955,7 +1958,13 @@ data class ParsedShare (
      * Kotlin 用于节点行显示预期指纹、并与本地证书 SHA-256 比对（匹配 =
      * 本地证书即该节点信任锚；不符 = 证书漂移精准诊断）
      */
-    var `nodeCertFps`: Map<kotlin.String, kotlin.String>
+    var `nodeCertFps`: Map<kotlin.String, kotlin.String>, 
+    /**
+     * 按节点地址索引的认证密钥（addr → 64 hex）：多节点各自部署各持 PSK
+     * （v0.2.9.3 实测——全局单密钥被后导入节点覆盖，其余节点 Noise msg2
+     * 解密必败）；Kotlin 逐条落库，缺项回落全局
+     */
+    var `nodeAuthKeys`: Map<kotlin.String, kotlin.String>
 ) {
     
     companion object
@@ -1973,6 +1982,7 @@ public object FfiConverterTypeParsedShare: FfiConverterRustBuffer<ParsedShare> {
             FfiConverterUInt.read(buf),
             FfiConverterMapStringString.read(buf),
             FfiConverterMapStringString.read(buf),
+            FfiConverterMapStringString.read(buf),
         )
     }
 
@@ -1982,7 +1992,8 @@ public object FfiConverterTypeParsedShare: FfiConverterRustBuffer<ParsedShare> {
             FfiConverterString.allocationSize(value.`certDerB64`) +
             FfiConverterUInt.allocationSize(value.`skipped`) +
             FfiConverterMapStringString.allocationSize(value.`nodeCerts`) +
-            FfiConverterMapStringString.allocationSize(value.`nodeCertFps`)
+            FfiConverterMapStringString.allocationSize(value.`nodeCertFps`) +
+            FfiConverterMapStringString.allocationSize(value.`nodeAuthKeys`)
     )
 
     override fun write(value: ParsedShare, buf: ByteBuffer) {
@@ -1992,6 +2003,7 @@ public object FfiConverterTypeParsedShare: FfiConverterRustBuffer<ParsedShare> {
             FfiConverterUInt.write(value.`skipped`, buf)
             FfiConverterMapStringString.write(value.`nodeCerts`, buf)
             FfiConverterMapStringString.write(value.`nodeCertFps`, buf)
+            FfiConverterMapStringString.write(value.`nodeAuthKeys`, buf)
     }
 }
 
@@ -2048,6 +2060,10 @@ public object FfiConverterTypeTestResult: FfiConverterRustBuffer<TestResult> {
 data class VpnConfig (
     var `nodes`: List<kotlin.String>, 
     var `authKeyHex`: kotlin.String, 
+    /**
+     * 按节点独立认证密钥（addr → 64 hex，可空表）：缺项回落 auth_key_hex
+     */
+    var `nodeAuthKeys`: Map<kotlin.String, kotlin.String>, 
     var `trust`: TrustMode, 
     var `sni`: kotlin.String?, 
     var `mtu`: kotlin.UShort, 
@@ -2086,6 +2102,7 @@ public object FfiConverterTypeVpnConfig: FfiConverterRustBuffer<VpnConfig> {
         return VpnConfig(
             FfiConverterSequenceString.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterMapStringString.read(buf),
             FfiConverterTypeTrustMode.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterUShort.read(buf),
@@ -2101,6 +2118,7 @@ public object FfiConverterTypeVpnConfig: FfiConverterRustBuffer<VpnConfig> {
     override fun allocationSize(value: VpnConfig) = (
             FfiConverterSequenceString.allocationSize(value.`nodes`) +
             FfiConverterString.allocationSize(value.`authKeyHex`) +
+            FfiConverterMapStringString.allocationSize(value.`nodeAuthKeys`) +
             FfiConverterTypeTrustMode.allocationSize(value.`trust`) +
             FfiConverterOptionalString.allocationSize(value.`sni`) +
             FfiConverterUShort.allocationSize(value.`mtu`) +
@@ -2115,6 +2133,7 @@ public object FfiConverterTypeVpnConfig: FfiConverterRustBuffer<VpnConfig> {
     override fun write(value: VpnConfig, buf: ByteBuffer) {
             FfiConverterSequenceString.write(value.`nodes`, buf)
             FfiConverterString.write(value.`authKeyHex`, buf)
+            FfiConverterMapStringString.write(value.`nodeAuthKeys`, buf)
             FfiConverterTypeTrustMode.write(value.`trust`, buf)
             FfiConverterOptionalString.write(value.`sni`, buf)
             FfiConverterUShort.write(value.`mtu`, buf)

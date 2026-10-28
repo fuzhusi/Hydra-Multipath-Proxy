@@ -62,6 +62,31 @@
   零回归 / 拼接仍失败回退 / 混合订阅存活；hydra-core 123 全绿、全仓
   30 测试二进制 0 失败、Gradle 51 通过、assembleRelease 成功。
 
+## [0.2.9.4] - 2026-10-28
+
+### 按节点独立认证密钥（多节点各持 PSK——全局单密钥覆盖致其余节点 Noise 握手必败，v0.2.9.3 实测）
+
+- **问题**：多节点各自部署、各持 PSK——导入节点 2 的链接把全局唯一密钥
+  覆盖成节点 2 的，节点 1 从此用错密钥做 Noise 握手（msg2 解密必败，
+  用户实测"节点 1 单独正常、导入节点 2 并测试后节点 1 报 connection
+  error: Noise 握手失败"）。证书已按节点独立（v0.2.9），密钥仍是全局
+  单值——同一设计缺口的另一半。
+- **core（hydra-core）**：`ProxyServer` 新增 `with_node_auth_keys`（addr →
+  32B PSK，缺项回落全局）；`TcpCreds.key_for` 数据面/温池/TUN opener/UDP
+  工厂全路径按节点取密钥；恢复探测/测速同步按节点取（用别节点 PSK 探测
+  会把密钥覆盖误判成节点离线）；凭据就绪判定放宽——全局空但按节点全覆盖
+  亦可启动。
+- **FFI（hydra-android）**：`ParsedShare` 新增 `node_auth_keys`（逐链接
+  `k=` 按地址记录）；`HydraEngine::new` / `VpnConfig` 新增 `node_auth_keys`
+  参数（逐条校验 hex，坏值构造期显式报错；全局可空）；绑定重生成。
+- **Kotlin**：`SecureStore` 新增 `node_auth_keys` 表；`NodeKeys` 纯逻辑
+  助手（单节点取用 + 就绪判定）；导入逐条合并互不覆盖；引擎/VPN/连通性
+  测试/自检全链路按节点取密钥；删除节点同步清理；VPN 预校验缺失密钥
+  直接点名节点。
+- 测试：Rust `per_node_auth_keys_ready_and_fallback`（就绪判定 + 回落）+
+  `parse_share_records_per_node_auth_keys`；Kotlin `NodeKeysTest` 7 例；
+  hydra-core 124 / hydra-android 15 / Gradle 58 全绿。
+
 ## [0.2.9.2] - 2026-10-28
 
 - 重新分发 tag：与 [0.2.9] 同代码（含紧凑链接 cf= 修复），versionCode 11 /

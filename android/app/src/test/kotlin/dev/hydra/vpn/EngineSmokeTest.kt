@@ -22,6 +22,7 @@ class EngineSmokeTest {
     private fun newEngine(): HydraEngine = HydraEngine(
         nodes = listOf(NodeSpec(addr = "127.0.0.1:44300")),
         authKeyHex = "ab".repeat(32),
+        nodeAuthKeys = emptyMap(),
         trust = TrustMode.Pinned(certDer = listOf(byteArrayOf(0x30, 0x00))),
         sni = null,
         listenPort = 0u,
@@ -49,6 +50,7 @@ class EngineSmokeTest {
             HydraEngine(
                 nodes = listOf(NodeSpec(addr = "127.0.0.1:443")),
                 authKeyHex = "ab".repeat(31), // NNpsk2 要求恰好 32 字节
+                nodeAuthKeys = emptyMap(),
                 trust = TrustMode.Pinned(certDer = listOf(byteArrayOf(0x30))),
                 sni = null,
                 listenPort = 0u,

@@ -55,6 +55,7 @@ class SecureStore(context: Context) {
         certDerB64 = prefs.getString(KEY_CERT_B64, "").orEmpty(),
         nodeCertB64Map = parseNodeCerts(prefs.getString(KEY_NODE_CERTS, "").orEmpty()),
         nodeCertFpMap = parseNodeCerts(prefs.getString(KEY_NODE_CERT_FPS, "").orEmpty()),
+        nodeAuthKeyMap = parseNodeCerts(prefs.getString(KEY_NODE_AUTH_KEYS, "").orEmpty()),
         listenPort = prefs.getInt(KEY_LISTEN_PORT, DEFAULT_PORT),
         runMode = prefs.getString(KEY_RUN_MODE, MODE_VPN).orEmpty(),
         vpnKillSwitch = prefs.getBoolean(KEY_VPN_KILL_SWITCH, true),
@@ -77,6 +78,7 @@ class SecureStore(context: Context) {
             .putString(KEY_CERT_B64, c.certDerB64)
             .putString(KEY_NODE_CERTS, encodeNodeCerts(c.nodeCertB64Map))
             .putString(KEY_NODE_CERT_FPS, encodeNodeCerts(c.nodeCertFpMap))
+            .putString(KEY_NODE_AUTH_KEYS, encodeNodeCerts(c.nodeAuthKeyMap))
             .putInt(KEY_LISTEN_PORT, c.listenPort)
             .putString(KEY_RUN_MODE, c.runMode)
             .putBoolean(KEY_VPN_KILL_SWITCH, c.vpnKillSwitch)
@@ -100,6 +102,7 @@ class SecureStore(context: Context) {
         private const val KEY_CERT_B64 = "cert_der_b64"
         private const val KEY_NODE_CERTS = "node_certs"
         private const val KEY_NODE_CERT_FPS = "node_cert_fps"
+        private const val KEY_NODE_AUTH_KEYS = "node_auth_keys"
         private const val KEY_LISTEN_PORT = "listen_port"
         private const val KEY_RUN_MODE = "run_mode"
         private const val KEY_VPN_KILL_SWITCH = "vpn_kill_switch"
@@ -140,6 +143,10 @@ data class HydraConfig(
      *  分享链接的唯一证书信息——与本地证书 SHA-256 比对可确认"该证书即
      *  此节点的信任锚"或诊断证书漂移 */
     val nodeCertFpMap: Map<String, String> = emptyMap(),
+    /** 按节点地址索引的认证密钥（addr → 64 hex）：多节点各自部署各持 PSK，
+     *  缺项回落 authKeyHex（v0.2.9.3 实测——全局单密钥被后导入节点覆盖，
+     *  其余节点 Noise msg2 解密必败） */
+    val nodeAuthKeyMap: Map<String, String> = emptyMap(),
     val listenPort: Int,
     /** "vpn"（默认）/ "local" */
     val runMode: String,

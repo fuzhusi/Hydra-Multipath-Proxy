@@ -198,6 +198,9 @@ pub fn spawn_recovery_probe(
     trust: crate::tcp_transport::TlsTrust,
     sni: String,
     auth_key: Arc<Vec<u8>>,
+    // 按节点独立密钥（缺项回落 auth_key）：多节点各持 PSK 时探测必须用
+    // 各自的密钥——用别节点的 PSK 探测会把"密钥覆盖"误判成节点离线
+    node_keys: Arc<std::collections::HashMap<SocketAddr, Vec<u8>>>,
     traffic: Arc<TrafficMonitor>,
 ) {
     tokio::spawn(async move {
@@ -237,7 +240,11 @@ pub fn spawn_recovery_probe(
                 let sem = sem.clone();
                 let trust = trust.clone();
                 let sni = sni.clone();
-                let auth_key = auth_key.clone();
+                // 按节点取密钥（缺项回落全局）——探测与数据面同密钥语义
+                let auth_key = node_keys
+                    .get(&node.address)
+                    .cloned()
+                    .unwrap_or_else(|| (*auth_key).clone());
                 set.spawn(async move {
                     // permit 在探测全程持有（离开作用域自动释放）
                     let _permit = sem.acquire().await;

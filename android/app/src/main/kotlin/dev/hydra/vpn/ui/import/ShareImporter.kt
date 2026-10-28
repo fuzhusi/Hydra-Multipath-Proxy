@@ -45,10 +45,16 @@ object ShareImporter {
                     // 与本地证书比对可确认信任锚/诊断证书漂移
                     nodeCertFpMap = if (p.nodeCertFps.isEmpty()) cur.nodeCertFpMap
                         else cur.nodeCertFpMap + p.nodeCertFps,
+                    // 按节点认证密钥：多节点各自部署各持 PSK，逐条落各自地址
+                    // 条目互不覆盖（v0.2.9.3 实测——全局单密钥被后导入覆盖，
+                    // 其余节点 Noise msg2 解密必败）；同地址重导以新为准
+                    nodeAuthKeyMap = if (p.nodeAuthKeys.isEmpty()) cur.nodeAuthKeyMap
+                        else cur.nodeAuthKeyMap + p.nodeAuthKeys,
                 )
                 store.save(merged)
                 val extra = buildString {
-                    if (p.authKeyHex.isNotEmpty()) append("，密钥✓")
+                    if (p.nodeAuthKeys.isNotEmpty()) append("，密钥✓×${p.nodeAuthKeys.size}")
+                    else if (p.authKeyHex.isNotEmpty()) append("，密钥✓")
                     if (p.nodeCerts.isNotEmpty()) append("，证书✓×${p.nodeCerts.size}")
                     else if (p.certDerB64.isNotEmpty()) append("，证书✓")
                     // 紧凑链接（仅指纹）：明确告知需另行导入证书本体

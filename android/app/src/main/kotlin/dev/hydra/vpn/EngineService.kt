@@ -102,8 +102,9 @@ class EngineService : Service() {
             val cfg = SecureStore(this@EngineService).load()
             val nodeCount = cfg.nodesText.lines().count { it.isNotBlank() }
             val certCount = if (cfg.trustMode == SecureStore.TRUST_CA) -1 else NodeCerts.certPool(cfg).size
+            val keyCount = cfg.nodeAuthKeyMap.size + if (cfg.authKeyHex.length == 64) 1 else 0
             EngineState.addLog(
-                "② 配置已加载（$nodeCount 个节点，密钥${if (cfg.authKeyHex.isNotEmpty()) "✓" else "✗"}，" +
+                "② 配置已加载（$nodeCount 个节点，密钥×$keyCount，" +
                     (if (certCount < 0) "公共 CA 模式" else "证书×$certCount") + "，模式 ${cfg.trustMode}）"
             )
             val result = runCatching { buildEngine(cfg) }
@@ -156,8 +157,11 @@ class EngineService : Service() {
                                         ?: return@withContext null
                                     TrustMode.Pinned(listOf(NodeCerts.decodeCert(b64)))
                                 }
+                                // 密钥同理按节点取（多节点各持 PSK）
+                                val keyHex = NodeKeys.authKeyHexFor(cfg, first)
+                                    ?: return@withContext null
                                 uniffi.hydra_android.testNodeConnection(
-                                    first, cfg.authKeyHex, t, cfg.sni.ifEmpty { null })
+                                    first, keyHex, t, cfg.sni.ifEmpty { null })
                             }
                         }
                         r.fold(onSuccess = { res ->
@@ -222,6 +226,7 @@ class EngineService : Service() {
         return HydraEngine(
             nodes = nodes,
             authKeyHex = cfg.authKeyHex,
+            nodeAuthKeys = cfg.nodeAuthKeyMap,
             trust = trust,
             sni = cfg.sni.ifEmpty { null },
             listenPort = cfg.listenPort.coerceIn(0, UShort.MAX_VALUE.toInt()).toUShort(),

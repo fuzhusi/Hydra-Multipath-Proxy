@@ -311,6 +311,7 @@ fun NodesScreen(
                             // 同地址节点被旧证书抢先接管信任（回落全局失效）
                             nodeCertB64Map = cfg.nodeCertB64Map - target,
                             nodeCertFpMap = cfg.nodeCertFpMap - target,
+                            nodeAuthKeyMap = cfg.nodeAuthKeyMap - target,
                         ),
                     )
                     deleteTarget = null

@@ -187,7 +187,10 @@ private fun HydraApp(themeMode: ThemeMode, onSetTheme: (ThemeMode) -> Unit) {
                         ?: return@withContext false to "未导入证书——请导入该节点的分享链接或到设置页选择证书 DER"
                     TrustMode.Pinned(listOf(NodeCerts.decodeCert(b64)))
                 }
-                val r = testNodeConnection(addr, cur.authKeyHex, t, cur.sni.ifEmpty { null })
+                // 密钥同理按节点取（多节点各持 PSK；缺项回落全局）
+                val keyHex = NodeKeys.authKeyHexFor(cur, addr)
+                    ?: return@withContext false to "未导入认证密钥——请重新导入该节点的分享链接"
+                val r = testNodeConnection(addr, keyHex, t, cur.sni.ifEmpty { null })
                 if (r.ok) true to "${r.latencyMs}ms" else false to NodeCerts.friendlyError(r.detail)
             } catch (e: Exception) {
                 false to NodeCerts.friendlyError(e.message ?: "测试失败")

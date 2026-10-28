@@ -4,6 +4,7 @@ use crate::tcp_transport::{self, TcpReadHalf, TcpWriteHalf};
 use crate::traffic::{ByteCounter, CountingStream, TrafficMonitor};
 use crate::transport::DEFAULT_SNI;
 use hydra_protocol::{mask_target, HydraError, NodeInfo, NodeStatus, Result};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -39,7 +40,12 @@ pub type ChannelOpenerAddr =
 struct TcpCreds {
     trust: Arc<tcp_transport::TlsTrust>,
     sni: String,
+    /// 全局回落密钥（单密钥部署惯例；多节点各持 PSK 时由 node_keys 接管）
     auth_key: Arc<Vec<u8>>,
+    /// 按节点独立认证密钥（addr → 32B PSK）：多节点各自部署各持密钥——
+    /// 全局单密钥被后导入节点覆盖会让其余节点 Noise msg2 解密必败（实测）。
+    /// 缺项回落 auth_key（与按节点证书同构的全局回落语义）
+    node_keys: Arc<HashMap<SocketAddr, Vec<u8>>>,
     /// 温连接池（pre-warm）：Arc 共享 ProxyServer 实例级单池（start /
     /// tun_channel_opener / udp_factory 三处凭据构建点共享同一池面与
     /// reaper）。池是尽力而为优化——温连接失败一律弃连回退全新握手，
@@ -48,6 +54,14 @@ struct TcpCreds {
 }
 
 impl TcpCreds {
+    /// 该节点应使用的认证密钥：按节点条目优先，缺项回落全局。
+    fn key_for(&self, node: SocketAddr) -> Vec<u8> {
+        self.node_keys
+            .get(&node)
+            .cloned()
+            .unwrap_or_else(|| (*self.auth_key).clone())
+    }
+
     /// 后台补充温连接：低于上限才回填（握手与当前请求的转发完全重叠）。
     /// 构建失败静默丢弃——池是尽力而为优化，不影响请求本身；并发突发下的
     /// 多余补充在 checkin 处被上限自然丢弃。
@@ -58,7 +72,7 @@ impl TcpCreds {
         let pool = self.pool.clone();
         let sni = self.sni.clone();
         let trust = (*self.trust).clone();
-        let auth_key = (*self.auth_key).clone();
+        let auth_key = self.key_for(node);
         tokio::spawn(async move {
             if pool.idle_len(node) >= crate::pool::IDLE_CAP_PER_NODE {
                 return; // 并发补充已到位，避免超额握手
@@ -198,6 +212,10 @@ pub struct ProxyServer {
     nodes: Vec<SocketAddr>,
     traffic_monitor: Option<Arc<TrafficMonitor>>,
     auth_key: Vec<u8>,
+    /// 按节点独立认证密钥（addr → 32B PSK）：缺项回落 auth_key（全局）。
+    /// 多节点各持 PSK（各自部署生成）时逐节点携带——全局单密钥覆盖会让
+    /// 其余节点 Noise msg2 解密必败（v0.2.9.3 实测）
+    node_auth_keys: HashMap<SocketAddr, Vec<u8>>,
     node_certs: Vec<Vec<u8>>,
     trust: Option<tcp_transport::TlsTrust>,
     sni: String,
@@ -219,6 +237,7 @@ impl ProxyServer {
             nodes: Vec::new(),
             traffic_monitor: None,
             auth_key: Vec::new(),
+            node_auth_keys: HashMap::new(),
             node_certs: Vec::new(),
             trust: None,
             sni: DEFAULT_SNI.to_string(),
@@ -232,10 +251,28 @@ impl ProxyServer {
         self
     }
 
-    /// 节点预共享认证密钥（必填：没有认证的节点是公网开放代理）
+    /// 节点预共享认证密钥（必填：没有认证的节点是公网开放代理）。
+    /// 全局回落项——多节点各持 PSK 时另经 [`Self::with_node_auth_keys`]
+    /// 逐节点提供，缺项节点回落本密钥。
     pub fn with_auth_key(mut self, key: Vec<u8>) -> Self {
         self.auth_key = key;
         self
+    }
+
+    /// 按节点独立认证密钥（addr → 32B PSK）：多节点各自部署、各持 PSK 时
+    /// 逐节点提供；缺项回落 [`Self::with_auth_key`] 的全局密钥。
+    pub fn with_node_auth_keys(mut self, keys: HashMap<SocketAddr, Vec<u8>>) -> Self {
+        self.node_auth_keys = keys;
+        self
+    }
+
+    /// 凭据就绪判定：全局密钥非空，或全部已配置节点都有独立密钥。
+    fn auth_keys_ready(&self) -> bool {
+        !self.auth_key.is_empty()
+            || self
+                .nodes
+                .iter()
+                .all(|n| self.node_auth_keys.contains_key(n))
     }
 
     /// 节点证书 DER 列表，加入客户端信任根执行标准校验（必填：防中间人；
@@ -316,9 +353,9 @@ impl ProxyServer {
     }
 
     pub async fn start(&self) -> Result<()> {
-        if self.auth_key.is_empty() {
+        if !self.auth_keys_ready() {
             return Err(HydraError::ConnectionError(
-                "未设置认证密钥：请设置 HYDRA_AUTH_KEY 环境变量（或调用 with_auth_key）"
+                "未设置认证密钥：请设置 HYDRA_AUTH_KEY 环境变量（或调用 with_auth_key）；多节点各持 PSK 时用 with_node_auth_keys 逐节点提供"
                     .to_string(),
             ));
         }
@@ -342,6 +379,7 @@ impl ProxyServer {
             trust: Arc::new(trust.clone()),
             sni: self.sni.clone(),
             auth_key: Arc::new(self.auth_key.clone()),
+            node_keys: Arc::new(self.node_auth_keys.clone()),
             pool: Arc::clone(&self.pool),
         };
         self.start_pool_reaper();
@@ -368,6 +406,7 @@ impl ProxyServer {
             trust,
             self.sni.clone(),
             creds.auth_key.clone(),
+            creds.node_keys.clone(),
             traffic.clone(),
         );
 
@@ -445,9 +484,10 @@ impl ProxyServer {
     pub fn tun_channel_opener(&self) -> Result<crate::channel::ChannelOpener> {
         use crate::channel::{ChannelOpener, OpenFuture, ProxyDuplex};
 
-        if self.auth_key.is_empty() {
+        if !self.auth_keys_ready() {
             return Err(HydraError::ConnectionError(
-                "未设置认证密钥：TUN 模式通道开启器无法构建".to_string(),
+                "未设置认证密钥：TUN 模式通道开启器无法构建（with_auth_key / with_node_auth_keys）"
+                    .to_string(),
             ));
         }
         // 与 start() 同构的凭据打包（TcpCreds 为模块私有，此处直接构造）
@@ -459,6 +499,7 @@ impl ProxyServer {
             trust: Arc::new(trust),
             sni: self.sni.clone(),
             auth_key: Arc::new(self.auth_key.clone()),
+            node_keys: Arc::new(self.node_auth_keys.clone()),
             pool: Arc::clone(&self.pool),
         };
         self.start_pool_reaper();
@@ -495,9 +536,10 @@ impl ProxyServer {
     pub fn tun_udp_channel_factory(&self) -> Result<crate::udp_relay::UdpChannelFactory> {
         use crate::udp_relay::{open_udp_channel, NodeUdpChannel, UdpChannelFactory};
 
-        if self.auth_key.is_empty() {
+        if !self.auth_keys_ready() {
             return Err(HydraError::ConnectionError(
-                "未设置认证密钥：TUN UDP 通道工厂无法构建".to_string(),
+                "未设置认证密钥：TUN UDP 通道工厂无法构建（with_auth_key / with_node_auth_keys）"
+                    .to_string(),
             ));
         }
         let trust = self
@@ -508,6 +550,7 @@ impl ProxyServer {
             trust: Arc::new(trust),
             sni: self.sni.clone(),
             auth_key: Arc::new(self.auth_key.clone()),
+            node_keys: Arc::new(self.node_auth_keys.clone()),
             pool: Arc::clone(&self.pool),
         };
         let scheduler = self.scheduler.clone();
@@ -522,7 +565,8 @@ impl ProxyServer {
                     .into_iter()
                     .next()
                     .ok_or_else(|| HydraError::ConnectionError("无可用节点".to_string()))?;
-                open_udp_channel(node.address, &creds.sni, &creds.trust, &creds.auth_key).await
+                open_udp_channel(node.address, &creds.sni, &creds.trust, &creds.key_for(node.address))
+                    .await
             })
                 as std::pin::Pin<
                     Box<dyn std::future::Future<Output = Result<NodeUdpChannel>> + Send>,
@@ -826,7 +870,6 @@ impl ProxyServer {
         );
 
         let sni = &creds.sni;
-        let auth_key = &creds.auth_key;
 
         let candidates = scheduler.get_nodes_by_priority().await;
         if candidates.is_empty() {
@@ -886,7 +929,8 @@ impl ProxyServer {
                     }
                 }
             }
-            match tcp_transport::connect_target(node.address, sni, &creds.trust, auth_key, target)
+            let auth_key = creds.key_for(node.address);
+            match tcp_transport::connect_target(node.address, sni, &creds.trust, &auth_key, target)
                 .await
             {
                 Ok(tls) => {
@@ -2395,5 +2439,44 @@ mod unified_routing_tests {
         // 同规则面 IP 侧：decide 判定（TUN 与 SOCKS IP 路径同一入口）
         assert_eq!(eng.decide("9.9.9.9:443".parse().unwrap()), crate::routing_rules::Decision::Direct);
         assert_eq!(eng.decide("9.10.0.1:443".parse().unwrap()), crate::routing_rules::Decision::Proxy);
+    }
+
+    #[test]
+    fn per_node_auth_keys_ready_and_fallback() {
+        // 多节点各持 PSK（v0.2.9.3 实测：全局单密钥被后导入节点覆盖 →
+        // 其余节点 Noise msg2 解密必败）：就绪判定 + 缺项回落全局
+        let n1: SocketAddr = "10.0.0.1:443".parse().unwrap();
+        let n2: SocketAddr = "10.0.0.2:443".parse().unwrap();
+        let key = vec![7u8; 32];
+
+        // 全局密钥非空：无论按节点表如何都就绪
+        let s = ProxyServer::new("127.0.0.1:0".parse().unwrap())
+            .with_nodes(vec![n1, n2])
+            .with_auth_key(key.clone());
+        assert!(s.auth_keys_ready());
+
+        // 无全局密钥：按节点表全覆盖 → 就绪
+        let s = ProxyServer::new("127.0.0.1:0".parse().unwrap())
+            .with_nodes(vec![n1, n2])
+            .with_node_auth_keys(HashMap::from([(n1, key.clone()), (n2, key.clone())]));
+        assert!(s.auth_keys_ready());
+
+        // 无全局密钥且 n2 缺独立密钥 → 不就绪（启动应报错）
+        let s = ProxyServer::new("127.0.0.1:0".parse().unwrap())
+            .with_nodes(vec![n1, n2])
+            .with_node_auth_keys(HashMap::from([(n1, key.clone())]));
+        assert!(!s.auth_keys_ready());
+
+        // TcpCreds.key_for：按节点优先，缺项回落全局
+        let node_keys = HashMap::from([(n1, key.clone())]);
+        let creds = TcpCreds {
+            trust: Arc::new(tcp_transport::TlsTrust::pinned(vec![vec![0x30]])),
+            sni: crate::transport::DEFAULT_SNI.to_string(),
+            auth_key: Arc::new(vec![1u8; 32]),
+            node_keys: Arc::new(node_keys),
+            pool: Arc::new(crate::pool::ChannelPool::new()),
+        };
+        assert_eq!(creds.key_for(n1), key, "n1 用独立密钥");
+        assert_eq!(creds.key_for(n2), vec![1u8; 32], "n2 缺项回落全局");
     }
 }

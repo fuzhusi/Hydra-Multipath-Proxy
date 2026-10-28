@@ -849,9 +849,15 @@ class HydraVpnService : VpnService() {
         if (!hasParsableNode) {
             return "节点地址均无法解析（M2 暂不支持域名节点，需 IP:port，IPv6 用 [..]:port）"
         }
-        val keyOk = cfg.authKeyHex.length == 64 &&
-            cfg.authKeyHex.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }
-        if (!keyOk) return "认证密钥非法（须恰好 64 位 hex）"
+        // 密钥就绪：全局合法，或全部节点都有独立密钥（v0.2.9.3 起多节点
+        // 各持 PSK；缺失列表直接点名，用户可定位补导）
+        val missingKeys = NodeKeys.missingKeyNodes(cfg)
+        if (cfg.authKeyHex.isNotEmpty() && cfg.authKeyHex.length != 64) {
+            return "认证密钥非法（须恰好 64 位 hex）"
+        }
+        if (missingKeys.isNotEmpty()) {
+            return "认证密钥缺失：${missingKeys.joinToString("、")}——请重新导入对应节点的分享链接"
+        }
         // pin 模式信任根池 = 按节点证书 ∪ 全局回落（ISSUE 安卓多节点证书）：
         // 任一非空即可启动——不再要求全局 certDerB64 必有（多节点逐节点携带
         // cc= 时全局可以为空）；池解码在 NodeCerts.certPool 内对坏条目跳过
@@ -1055,6 +1061,7 @@ class HydraVpnService : VpnService() {
         authKeyHex = authKeyHex,
         trust = if (trustMode == SecureStore.TRUST_CA) TrustMode.PublicCa
         else TrustMode.Pinned(NodeCerts.certPool(this)),
+        nodeAuthKeys = nodeAuthKeyMap,
         sni = sni.ifEmpty { null },
         mtu = 1500.toUShort(),
         addr4 = "10.7.0.1",
