@@ -36,4 +36,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 批次 A3：每日滚动日志（hydra-node 常驻日志 + GUI「自动保存日志」开关共用）
 tracing-appender = "0.2"
 # 批次 B0：criterion 基准（仅 hydra-core dev-dependencies 引用）
-criterion = "0.5"
+criterion = "0.8"
