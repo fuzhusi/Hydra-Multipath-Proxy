@@ -31,7 +31,7 @@ tracing-subscriber = { workspace = true }
 # 协议传输/代理/调度/流量统计在 core；本 crate 保留桌面专有封装与 TUN 设备层
 hydra-core = { path = "../hydra-core" }
 # 恢复探测周期的随机抖动（±20%，防整周期被动特征；tun.rs 重连逻辑）
-rand = "0.8"
+rand = "0.9"
 hydra-protocol = { path = "../hydra-protocol" }
 
 # ── TUN 透明代理模式（feature = "tun"）───────────────────────────────────────
