@@ -144,16 +144,16 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-release-
 
-      # GUI 构建期链接依赖（Linux-GUI适配方案-v1 §4.1）：
-      # - libgtk-3-dev：rfd 文件对话框 + tray-icon 托盘（Linux 后端 GTK3）
-      # - libayatana-appindicator3-dev：托盘图标系统总线（tray-icon → libappindicator）
-      # - libxkbcommon-dev / libwayland-dev：winit 键盘/Wayland（运行时 dlopen，装 dev 兜底）
+      # GUI 构建依赖：与 ci.yml「安装 Linux 系统依赖」**逐包一致**（该清单在
+      # 每次 push 的 ubuntu 矩阵上验证 workspace 全量编译，含 GUI）——
+      # libx11-dev：gtk3 pkg-config 传递链接需要；libxdo-dev：tray-icon Linux
+      # 后端；librsvg2-dev：gtk 生态。缺任一（首跑缺 libx11/libxdo/rsvg）
+      # build-linux 即失败——教训：此处必须与 ci.yml 同步维护。
       - name: 安装 GUI 构建依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-3-dev libayatana-appindicator3-dev \
-            libxkbcommon-dev libwayland-dev
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
+            libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
 
       # 客户端全家桶（设计 §二.目标1）：此前只编节点+下载器，GUI/CLI 缺位
       # ——README 声称的"GUI/CLI/hydra-fetch 三二进制"从未进过 Linux 包
