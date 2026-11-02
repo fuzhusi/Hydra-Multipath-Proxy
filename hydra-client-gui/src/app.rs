@@ -7,6 +7,7 @@ use crate::nodes::{NodeStatusInfo, Tab};
 use crate::palette;
 use crate::speed_history::SpeedHistory;
 use crate::theme::{apply_theme, setup_custom_fonts};
+#[cfg(not(target_os = "linux"))]
 use crate::tray;
 use crate::HydraApp;
 use std::collections::{HashMap, VecDeque};
@@ -87,10 +88,12 @@ impl Default for HydraApp {
             conn_prev: HashMap::new(),
             conn_rates: HashMap::new(),
             conn_last_refresh: None,
+            #[cfg(not(target_os = "linux"))]
             tray: None,
             current_tab: Tab::Overview,
             really_quit: false,
             about_open: false,
+            #[cfg(not(target_os = "linux"))]
             last_tray_tooltip: String::new(),
             tun_shutdown: None,
             #[cfg(windows)]
@@ -135,7 +138,10 @@ impl HydraApp {
     pub(crate) fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // 设置自定义字体
         setup_custom_fonts(&cc.egui_ctx);
-        // T2：系统托盘（失败不阻断 GUI，仅记日志）
+        // T2：系统托盘（失败不阻断 GUI，仅记日志）。
+        // [G 修复] Linux 不创建：后端要求 gtk 事件循环（见 tray 模块注释），
+        // 关窗语义随之变为真退出（handle_close_request 的 has_tray 守卫）。
+        #[cfg(not(target_os = "linux"))]
         let tray = match tray::create_tray(cc.egui_ctx.clone()) {
             Ok(t) => Some(t),
             Err(e) => {
@@ -266,9 +272,11 @@ impl HydraApp {
             conn_rates: HashMap::new(),
             conn_last_refresh: None,
             current_tab: Tab::Overview,
+            #[cfg(not(target_os = "linux"))]
             tray,
             really_quit: false,
             about_open: false,
+            #[cfg(not(target_os = "linux"))]
             last_tray_tooltip: "Hydra 代理已停止".to_string(),
             tun_shutdown: None,
             #[cfg(windows)]

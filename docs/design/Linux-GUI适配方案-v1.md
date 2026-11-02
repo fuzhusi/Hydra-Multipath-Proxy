@@ -87,8 +87,29 @@
 
 ## 六、已知限制（如实）
 
-1. Linux 无系统代理一键开关（见非目标）；TUN 是全接管唯一路径，需权限。
-2. 托盘在 Wayland 会话依赖 AppIndicator 扩展（GNOME 默认带 AppIndicator
-   支持的发行版可用；纯 Wayline 无托盘槽位时托盘静默不可见，主窗功能不受影响）。
+1. ~~Linux 无系统代理一键开关~~ → **v1.1 已承接**（linux_proxy 快照-恢复 +
+   启动自愈，对齐 windows_proxy 语义）；TUN 是全接管唯一路径，需权限。
+2. ~~托盘在 Wayland 会话依赖 AppIndicator~~ → **v1.1 直接禁用托盘**（见下）。
 3. 深链 `hydra://` 桌面关联未注册（Windows 亦未注册到安装器）——两平台一致，
    留待桌面关联统一批次。
+
+## 七、v1.1 修订（全项目 code review 落地，2026-11-03）
+
+审查发现（P0）：tray-icon 0.19 官方约束 Linux 后端**必须**在创建线程持有
+gtk 事件循环（tray-icon-0.19.3/src/lib.rs:17），eframe 0.27 为 winit/glutin
+循环不提供——v1 原方案"代码零改动"的判断**不成立**：图标不出现、菜单/点击
+事件永不触发、且关窗默认"隐藏到托盘"= 窗口假死（无任何唤回入口）。
+
+修订内容：
+1. **托盘 Linux 整体禁用**：tray-icon 依赖 target-gate 到 not(linux)
+   （顺带解除 libappindicator/libxdo 链接依赖），tray.rs 模块/字段/轮询函数
+   全部 cfg 隔离；关窗语义 = 真退出（on_exit 完整收敛：停代理/还原系统代理/
+   落盘——已从 eframe 源码核实）。设置页与 LINUX-README 明示。
+2. **系统代理承接**：linux_proxy 模块实现快照-恢复 + 启动自愈（原方案列为
+   非目标——既有的裸 gsettings 覆写会抹掉用户自有代理，属数据丢失缺陷）。
+3. **CI 打包勘误**：.desktop 的 Exec 依赖桌面会话 PATH（装完不重登必失败）
+   ——LINUX-README 改为 sed 写入绝对路径；补 libxkbcommon-x11-0/libegl1/
+   libgl1 运行时依赖；移除 22.04 支持声明（glibc 门槛，未验证）；
+   install.sh 标注仅适用仓库布局。
+4. CI 的 apt 清单保留 libayatana-appindicator3-dev（tray-icon 依赖虽已
+   target-gate 出 Linux 构建图，多装无害；与 ci.yml 保持逐包一致）。

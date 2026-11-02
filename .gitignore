@@ -41,6 +41,8 @@ android/scripts/android/
 android/app/build/
 hydra-android-m1-debug.apk
 *.apk
+# [P1-2] 单测真证书夹具例外（NodeCertsTest X.509 预过滤需要）
+!android/app/src/test/resources/*.der
 # Android 原生库是构建产物（cargo-ndk 产出，不入库）
 *.so
 android/.gradle/

@@ -71,6 +71,63 @@ pub(crate) async fn run_proxy_until_stopped(
     }
 }
 
+/// I 修复：TUN 失败消息前缀（发送点与判定点同源常量——新增 Err 发送点必须复用）
+pub(crate) const TUN_FAIL_PREFIX: &str = "TUN 模式启动失败";
+
+fn is_tun_failure(e: &std::io::Error) -> bool {
+    e.to_string().starts_with(TUN_FAIL_PREFIX)
+}
+
+/// 信号批次分类结果（I 修复）
+pub(crate) struct SignalBatch {
+    pub(crate) readys: Vec<std::net::SocketAddr>,
+    pub(crate) failure: Option<std::io::Error>,
+    pub(crate) degraded: Vec<std::io::Error>,
+    pub(crate) dead_errors: Vec<std::io::Error>,
+}
+
+/// 按时序与来源分类一批就绪/失败信号（纯函数，表驱动测试覆盖）。
+/// - `Ok(addr)`：首个置 saw_ready，其后为附加就绪信号；
+/// - `Err(e)` 且 `is_tun_failure`：任何时点 → degraded（TUN 失败永远降级不致命）；
+/// - 其余 `Err(e)` 且尚未就绪 → failure（本体未就绪即失败，看门狗语义，截断后续）；
+/// - 其余 `Err(e)` 且已就绪：disconnected → dead_errors（随线程死亡到达，收敛交
+///   断开分支），否则 degraded（运行态兜底维持旧降级语义）。
+pub(crate) fn classify_signals(
+    msgs: &[std::result::Result<std::net::SocketAddr, std::io::Error>],
+    proxy_running: bool,
+    disconnected: bool,
+) -> SignalBatch {
+    let mut b = SignalBatch {
+        readys: Vec::new(),
+        failure: None,
+        degraded: Vec::new(),
+        dead_errors: Vec::new(),
+    };
+    let mut saw_ready = proxy_running;
+    for sig in msgs {
+        match sig {
+            Ok(addr) => {
+                b.readys.push(*addr);
+                saw_ready = true;
+            }
+            Err(e) if is_tun_failure(e) => {
+                b.degraded.push(std::io::Error::other(e.to_string()));
+            }
+            Err(e) if !saw_ready => {
+                b.failure = Some(std::io::Error::other(e.to_string()));
+                break;
+            }
+            Err(e) if disconnected => {
+                b.dead_errors.push(std::io::Error::other(e.to_string()));
+            }
+            Err(e) => {
+                b.degraded.push(std::io::Error::other(e.to_string()));
+            }
+        }
+    }
+    b
+}
+
 impl HydraApp {
     pub(crate) fn start_proxy(&mut self) {
         if self.proxy_running {
@@ -389,7 +446,7 @@ impl HydraApp {
                                             // 经就绪通道透传到 GUI 日志区，不静默
                                             let _ =
                                                 tun_tx.send(Err(std::io::Error::other(format!(
-                                            "TUN 模式启动失败: {e}（设备创建需管理员/root；\
+                                            "{TUN_FAIL_PREFIX}: {e}（设备创建需管理员/root；\
                                              Windows 还需 wintun.dll）"
                                         ))));
                                         }
@@ -398,7 +455,7 @@ impl HydraApp {
                                 }
                                 Err(e) => {
                                     let _ = tx.send(Err(std::io::Error::other(format!(
-                                        "TUN 模式启动失败: {e}"
+                                        "{TUN_FAIL_PREFIX}: {e}"
                                     ))));
                                     None
                                 }
@@ -432,6 +489,33 @@ impl HydraApp {
     }
 
     /// update 轮询：消费代理就绪信号（非阻塞，替代原先冻结 UI 的阻塞 recv）
+    /// 代理会话死亡完整收敛（H 修复）：状态复位 + 停采样 + 清统计 + 移除
+    /// 系统代理 + 作废 TUN 令牌。**不碰 proxy_exit_receiver**——它兼作
+    /// start_proxy 的「上一实例正在退出」守卫与 ui_shell 兜底清理的信号
+    /// （线程完全退出后由 ui_shell 64-75 清理）。Windows：disable() 槽位
+    /// 空时为幂等 no-op；Linux：走 linux_proxy::disable 的快照恢复。
+    pub(crate) fn converge_dead_session(&mut self) {
+        if let Some(flag) = self.stop_flag.take() {
+            flag.store(true, Ordering::Relaxed);
+        }
+        self.proxy_running = false;
+        self.proxy_starting = false;
+        self.proxy_thread_handle = None;
+        if let Some(stop) = self.traffic_sampler_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Ok(mut slot) = self.traffic_stats_cache.lock() {
+            *slot = None;
+        }
+        if let Ok(mut hist) = self.traffic_history.lock() {
+            hist.reset_samples();
+        }
+        if let Some(token) = self.tun_shutdown.take() {
+            token.cancel(); // RouteGuard 双保险：线程已死时令牌兜底清路由
+        }
+        Self::remove_system_proxy_static();
+    }
+
     pub(crate) fn poll_start_receiver(&mut self) -> Option<()> {
         // 07-P2-5：必须区分 Empty 与 Disconnected——Empty = 结果尚未产生，保留
         // receiver 下帧再收；Disconnected = 代理线程在就绪信号发出前已退出
@@ -455,21 +539,27 @@ impl HydraApp {
                 }
             }
         }
+        // ── I 修复：信号批次分类（纯函数 classify_signals，可测核心）─────
+        // failure 仅保留「本体未就绪且非 TUN 根因」；TUN Err 任何时点一律
+        // degraded；随线程断开到达的运行态本体 Err 进 dead_errors（仅记日志，
+        // 收敛交断开分支——绝不按降级给死代理设系统代理）。
+        let batch = classify_signals(&messages, self.proxy_running, disconnected);
+
         if messages.is_empty() {
             if disconnected {
                 // 代理线程异常退出：清 receiver、复位启动态，恢复可再次启动。
-                // 09-G-1：同时清 stop_flag / handle / exit_receiver——此前只清
-                // 前两者，残留的 stop_flag 使 update 收敛分支
-                //（!proxy_running && stop_flag.is_none()）永不接管，残留的
-                // exit_receiver 使 start_proxy 永久命中"上一实例正在退出"。
+                // 09-G-1 保留项由 converge_dead_session 完整承接（H 修复）：
+                // 状态复位 + 停采样 + 清统计 + 移除系统代理 + 作废 TUN 令牌。
+                // 此前不置 proxy_running、不清系统代理、日志谎称"已移除"；且
+                // 清空 exit_receiver 把 ui_shell 的清理分支堵死。本收敛**不碰
+                // proxy_exit_receiver**（留给 ui_shell 作「上一实例正在退出」守卫）。
+                let was_running = self.proxy_running;
+                self.converge_dead_session();
                 self.proxy_start_receiver = None;
-                self.proxy_starting = false;
-                self.stop_flag = None;
-                self.proxy_thread_handle = None;
-                self.proxy_exit_receiver = None;
-                if self.proxy_running {
-                    // 运行中代理线程死亡：exit_receiver 分支已清系统代理，此处补日志
-                    self.add_log("代理线程异常退出（已移除系统代理，可重新启动）".to_string());
+                if was_running {
+                    self.add_log(
+                        "⚠ 代理线程异常退出——已自动清除系统代理设置，可重新启动".to_string(),
+                    );
                 } else {
                     self.add_log("代理启动线程异常退出（未发出就绪信号即终止）".to_string());
                 }
@@ -477,63 +567,42 @@ impl HydraApp {
             }
             return None;
         }
-        // 09-P1-6（TUN 竞态修复）：按序处理**全部**消息，且运行态保持 receiver
-        // 存活（TUN 任务失败可在就绪信号之后数秒才发出）。已置运行态后到达的
-        // Err（典型：SOCKS 就绪信号先于 TUN 失败信号经同一通道到达）触发降级
-        // 处理——回退设置系统代理。此前该 Err 只进一行日志：UI 显示“TUN 已全
-        // 局接管”而 TUN 已死、系统代理又被跳过，流量明文直连且无系统代理兜底。
-        let mut degraded: Vec<std::io::Error> = Vec::new();
-        let mut failure = None;
-        for sig in messages {
-            match sig {
-                Ok(addr) if !self.proxy_running => {
-                    self.proxy_running = true;
-                    self.proxy_starting = false;
-                    self.proxy_bound_addr = Some(addr);
-                    self.add_log(format!("✓ 代理已就绪，监听地址: {addr}"));
-                    self.maybe_save_config(true);
-                    // 审查修复：TUN 模式已全局接管流量，就绪后不再叠加系统代理
-                    //（否则制造"系统代理 + TUN"二次进本代理的被警示终态）
-                    if self.config.tun_enabled {
-                        self.add_log(
-                            "TUN 模式运行中：已全局接管流量，跳过系统代理设置".to_string(),
-                        );
-                    } else {
-                        let proxy_url = format!("socks5://{addr}");
-                        self.set_system_proxy(&proxy_url);
-                        self.add_log("已设置系统全局代理".to_string());
-                    }
+        // 09-P1-6（TUN 竞态修复）+ I 修复：按序应用分类后的信号。TUN Err 任何
+        // 时点一律降级（时序不再决定结局——就绪前的 TUN 秒败同样回退系统代理
+        // 而非全停）；failure 仅保留本体未就绪即失败（看门狗语义）；随断开到达
+        // 的运行态本体 Err 只记日志，收敛交上方 disconnected 分支（H）。
+        for addr in &batch.readys {
+            if !self.proxy_running {
+                self.proxy_running = true;
+                self.proxy_starting = false;
+                self.proxy_bound_addr = Some(*addr);
+                self.add_log(format!("✓ 代理已就绪，监听地址: {addr}"));
+                self.maybe_save_config(true);
+                // 审查修复：TUN 模式已全局接管流量，就绪后不再叠加系统代理
+                //（否则制造"系统代理 + TUN"二次进本代理的被警示终态）
+                if self.config.tun_enabled {
+                    self.add_log(
+                        "TUN 模式运行中：已全局接管流量，跳过系统代理设置".to_string(),
+                    );
+                } else {
+                    let proxy_url = format!("socks5://{addr}");
+                    self.set_system_proxy(&proxy_url);
+                    self.add_log("已设置系统全局代理".to_string());
                 }
-                Ok(addr) => {
-                    self.add_log(format!("（附加就绪信号）代理监听地址: {addr}"));
-                }
-                Err(e) if !self.proxy_running => {
-                    // 启动失败（就绪信号之前的失败）：停掉代理线程，交收敛分支清理
-                    failure = Some(e);
-                    break;
-                }
-                Err(e) => {
-                    degraded.push(e);
-                }
+            } else {
+                self.add_log(format!("（附加就绪信号）代理监听地址: {addr}"));
             }
         }
-        if let Some(e) = failure {
+        if let Some(e) = &batch.failure {
             self.add_log(format!("代理启动失败: {e}"));
-            if let Some(flag) = &self.stop_flag {
-                flag.store(true, Ordering::Relaxed);
-            }
-            // 07-P3-10 零成本顺修：置位 stop_flag 后立即清空，让 update 的
-            // 收敛分支（!proxy_running && stop_flag.is_none()）正常接管
-            // JoinHandle / exit_receiver 清理
-            self.stop_flag = None;
+            self.converge_dead_session();
             // 失败态 receiver 使命完成（后续可能有附加消息，但失败已定）
             self.proxy_start_receiver = None;
-            self.proxy_starting = false;
             return Some(());
         }
-        if !degraded.is_empty() && self.proxy_running {
-            for e in &degraded {
-                self.add_log(format!("⚠ TUN 模式启动失败: {e}"));
+        if !batch.degraded.is_empty() && self.proxy_running && !disconnected {
+            for e in &batch.degraded {
+                self.add_log(format!("⚠ {e}"));
             }
             self.add_log(
                 "⚠ TUN 全局接管未生效：已自动回退为系统代理模式（若回退失败请手动开启系统代理）"
@@ -543,6 +612,9 @@ impl HydraApp {
                 let proxy_url = format!("socks5://{addr}");
                 self.set_system_proxy(&proxy_url);
             }
+        }
+        for e in &batch.dead_errors {
+            self.add_log(format!("⚠ 代理异常退出: {e}"));
         }
         Some(())
     }
@@ -585,87 +657,10 @@ impl HydraApp {
             }
         }
 
-        // Linux 桌面代理（gsettings / KDE），Windows 下不执行
-        #[cfg(unix)]
-        {
-            // 设置 GNOME 桌面代理（参考 v2rayN 实现）
-            let _ = std::process::Command::new("gsettings")
-                .args(["set", "org.gnome.system.proxy", "mode", "manual"])
-                .output();
-
-            // 设置所有协议的代理（http, https, ftp, socks）
-            for protocol in &["http", "https", "ftp", "socks"] {
-                let _ = std::process::Command::new("gsettings")
-                    .args([
-                        "set",
-                        &format!("org.gnome.system.proxy.{}", protocol),
-                        "host",
-                        proxy_host,
-                    ])
-                    .output();
-                let _ = std::process::Command::new("gsettings")
-                    .args([
-                        "set",
-                        &format!("org.gnome.system.proxy.{}", protocol),
-                        "port",
-                        proxy_port,
-                    ])
-                    .output();
-            }
-
-            // 设置忽略的主机（本地地址不走代理）
-            let _ = std::process::Command::new("gsettings")
-                .args([
-                    "set",
-                    "org.gnome.system.proxy",
-                    "ignore-hosts",
-                    "['localhost', '127.0.0.0/8', '::1', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']",
-                ])
-                .output();
-
-            // 检测并设置 KDE 代理（如果在 KDE 环境下）
-            if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
-                if desktop.contains("KDE") || desktop.contains("plasma") {
-                    let kwriteconfig =
-                        if std::env::var("KDE_SESSION_VERSION").unwrap_or_default() == "6" {
-                            "kwriteconfig6"
-                        } else {
-                            "kwriteconfig5"
-                        };
-                    let _ = std::process::Command::new(kwriteconfig)
-                        .args([
-                            "--file",
-                            "kioslaverc",
-                            "--group",
-                            "Proxy Settings",
-                            "--key",
-                            "ProxyType",
-                            "1",
-                        ])
-                        .output();
-                    let _ = std::process::Command::new(kwriteconfig)
-                        .args([
-                            "--file",
-                            "kioslaverc",
-                            "--group",
-                            "Proxy Settings",
-                            "--key",
-                            "socksProxy",
-                            &format!("socks://{}:{}", proxy_host, proxy_port),
-                        ])
-                        .output();
-                    // 通知 KDE 重新加载配置
-                    let _ = std::process::Command::new("dbus-send")
-                        .args([
-                            "--type=signal",
-                            "/KIO/Scheduler",
-                            "org.kde.KIO.Scheduler.reparseSlaveConfiguration",
-                            "string:",
-                        ])
-                        .output();
-                }
-            }
-        }
+        // Linux 桌面代理（J 修复：enable 前快照用户配置，disable 时恢复；
+        // gsettings/KDE 缺失时安全跳过），Windows/macOS 下不执行
+        #[cfg(target_os = "linux")]
+        crate::linux_proxy::enable(proxy_host, proxy_port);
 
         let _ = (proxy_host, proxy_port);
     }
@@ -678,45 +673,10 @@ impl HydraApp {
         #[cfg(windows)]
         crate::windows_proxy::disable();
 
-        // Linux 桌面代理清理，Windows 下不执行
-        #[cfg(unix)]
-        {
-            // 清除 GNOME 桌面代理
-            let _ = std::process::Command::new("gsettings")
-                .args(["set", "org.gnome.system.proxy", "mode", "none"])
-                .output();
-
-            // 清除 KDE 代理
-            if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
-                if desktop.contains("KDE") || desktop.contains("plasma") {
-                    let kwriteconfig =
-                        if std::env::var("KDE_SESSION_VERSION").unwrap_or_default() == "6" {
-                            "kwriteconfig6"
-                        } else {
-                            "kwriteconfig5"
-                        };
-                    let _ = std::process::Command::new(kwriteconfig)
-                        .args([
-                            "--file",
-                            "kioslaverc",
-                            "--group",
-                            "Proxy Settings",
-                            "--key",
-                            "ProxyType",
-                            "0",
-                        ])
-                        .output();
-                    let _ = std::process::Command::new("dbus-send")
-                        .args([
-                            "--type=signal",
-                            "/KIO/Scheduler",
-                            "org.kde.KIO.Scheduler.reparseSlaveConfiguration",
-                            "string:",
-                        ])
-                        .output();
-                }
-            }
-        }
+        // Linux 桌面代理清理（J 修复：恢复 enable 前快照；无快照 = 从未
+        // enable，绝不动用户配置——崩溃残留由启动自愈兜底）
+        #[cfg(target_os = "linux")]
+        crate::linux_proxy::disable();
     }
 
     pub(crate) fn remove_system_proxy(&self) {
@@ -929,5 +889,94 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
         let _ = load.await;
+    }
+}
+
+#[cfg(test)]
+mod signal_classification_tests {
+    use super::*;
+
+    fn ok(addr: &str) -> std::result::Result<std::net::SocketAddr, std::io::Error> {
+        Ok(addr.parse().unwrap())
+    }
+    fn err(msg: &str) -> std::result::Result<std::net::SocketAddr, std::io::Error> {
+        Err(std::io::Error::other(msg.to_string()))
+    }
+    fn tun_err() -> std::result::Result<std::net::SocketAddr, std::io::Error> {
+        err(&format!("{TUN_FAIL_PREFIX}: 权限不足"))
+    }
+
+    /// I 回归主用例：TUN 失败早于就绪信号 → 降级而非全停（旧实现按
+    /// !proxy_running 判 failure 全停——同一故障两种结局由时序决定）。
+    #[test]
+    fn tun_failure_before_ready_degrades_not_fails() {
+        let b = classify_signals(&[tun_err(), ok("127.0.0.1:1080")], false, false);
+        assert!(b.failure.is_none(), "TUN 失败不得判全停");
+        assert_eq!(b.degraded.len(), 1);
+        assert_eq!(b.readys.len(), 1);
+        assert!(
+            b.degraded[0].to_string().starts_with(TUN_FAIL_PREFIX),
+            "degraded 项必须是 TUN 失败"
+        );
+    }
+
+    #[test]
+    fn tun_failure_after_ready_also_degrades() {
+        let b = classify_signals(&[ok("127.0.0.1:1080"), tun_err()], false, false);
+        assert!(b.failure.is_none());
+        assert_eq!(b.degraded.len(), 1);
+        assert_eq!(b.readys.len(), 1);
+    }
+
+    /// 看门狗语义保留：本体未就绪即失败（非 TUN 根因）仍判 failure 并截断后续。
+    #[test]
+    fn non_tun_failure_before_ready_is_failure() {
+        let b = classify_signals(
+            &[err("代理监听 60s 内未就绪"), ok("127.0.0.1:1080")],
+            false,
+            false,
+        );
+        assert!(b.failure.is_some(), "本体未就绪失败必须判 failure");
+        assert!(b.degraded.is_empty());
+        assert!(b.readys.is_empty(), "failure 截断后续消息");
+    }
+
+    /// H 配套：随线程断开到达的运行态本体 Err 进 dead_errors（不按降级给
+    /// 死代理设系统代理），收敛交断开分支。
+    #[test]
+    fn runtime_body_error_with_disconnect_goes_to_dead_errors() {
+        let b = classify_signals(&[err("代理异常退出")], true, true);
+        assert_eq!(b.dead_errors.len(), 1);
+        assert!(b.degraded.is_empty());
+        assert!(b.failure.is_none());
+    }
+
+    #[test]
+    fn runtime_body_error_without_disconnect_degrades() {
+        // 运行态兜底维持旧降级语义（线程未断开 = TUN 或后台任务失败）
+        let b = classify_signals(&[err("后台任务失败")], true, false);
+        assert_eq!(b.degraded.len(), 1);
+        assert!(b.dead_errors.is_empty());
+    }
+
+    /// failure 与 TUN 失败同批：failure 取本体（break 语义，截断后续消息）；
+    /// break 之前已分类的 TUN 项保留在 degraded（时序保序，不重排不丢弃）。
+    #[test]
+    fn mixed_batch_failure_takes_body_only() {
+        let b = classify_signals(
+            &[tun_err(), err("代理监听 60s 内未就绪"), ok("127.0.0.1:1080")],
+            false,
+            false,
+        );
+        assert!(b.failure.is_some());
+        assert_eq!(b.degraded.len(), 1, "仅 break 前的 TUN 项");
+        assert!(b.readys.is_empty(), "failure 截断后续消息");
+    }
+
+    #[test]
+    fn ready_resets_saw_ready_for_subsequent_batches() {
+        // proxy_running=true 起步：后续本体 Err 在未断开时仍走降级兜底
+        let b = classify_signals(&[err("X")], true, false);
+        assert_eq!(b.degraded.len(), 1);
     }
 }

@@ -27,7 +27,13 @@ fast_qr = "0.12"
 rqrr = "0.7"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "ico"] }
 base64 = { workspace = true }
-# T2：系统托盘（Tauri 官方库；Windows 下事件经全局通道投递，GUI 线程轮询即可）
+# T2：系统托盘（Tauri 官方库；Windows 下事件经全局通道投递，GUI 线程轮询即可）。
+# [G 修复] Linux 不编译：tray-icon 0.19 的 Linux 后端要求创建线程持有 gtk 事件
+# 循环（tray-icon-0.19.3/src/lib.rs:17 官方约束），eframe 0.27 为 winit/glutin
+# 循环不提供——图标不出现、菜单/点击事件永不触发、关窗隐藏后无唤回入口（假死）。
+# Linux 关窗语义 = 真退出（见 ui_shell::handle_close_request）。顺带解除 Linux
+# 构建对 libappindicator/libxdo 的链接依赖（libgtk-3 仍需：rfd 对话框）。
+[target.'cfg(not(target_os = "linux"))'.dependencies]
 tray-icon = "0.19"
 # TUN 透明代理入口（tun_config_from_settings / run_tun / 环路检测）依赖 tun feature
 hydra-client = { path = "../hydra-client", features = ["tun"] }

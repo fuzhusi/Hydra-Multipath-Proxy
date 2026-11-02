@@ -410,9 +410,13 @@ impl ProxyServer {
             traffic.clone(),
         );
 
+        // [C 修复] accept 持续错误退避：EMFILE/EBADF 等持续性错误此前以
+        // 100% CPU 忙转并刷爆日志——指数退避 1ms→1s 封顶，成功重置
+        let mut accept_backoff_ms: u64 = 1;
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
+                    accept_backoff_ms = 1;
                     // A1 字段化：入站连接事件（peer 字段；目标地址在中继起点
                     // 的「连接建立」事件给出掩码值）
                     info!(direction = "inbound", peer = %addr, "SOCKS5/HTTP 入站连接建立");
@@ -438,7 +442,14 @@ impl ProxyServer {
                     });
                 }
                 Err(e) => {
-                    error!(direction = "inbound", error = %e, "accept 失败");
+                    error!(
+                        direction = "inbound",
+                        error = %e,
+                        backoff_ms = accept_backoff_ms,
+                        "accept 失败（退避后重试）"
+                    );
+                    tokio::time::sleep(Duration::from_millis(accept_backoff_ms)).await;
+                    accept_backoff_ms = (accept_backoff_ms.saturating_mul(2)).min(1000);
                 }
             }
         }
@@ -2439,6 +2450,50 @@ mod unified_routing_tests {
         // 同规则面 IP 侧：decide 判定（TUN 与 SOCKS IP 路径同一入口）
         assert_eq!(eng.decide("9.9.9.9:443".parse().unwrap()), crate::routing_rules::Decision::Direct);
         assert_eq!(eng.decide("9.10.0.1:443".parse().unwrap()), crate::routing_rules::Decision::Proxy);
+    }
+
+    /// [B 修复] 核心回归：超长目标（本地协议错误）返回 ProtocolError 且**不标
+    /// 节点 Offline**——此前两条调用点把编码失败包装成 ConnectionError，守卫
+    /// （09-P3-3）永不生效，最多 3 个健康节点被超长 Host 连环误标。
+    #[tokio::test]
+    async fn oversized_target_protocol_error_does_not_mark_offline() {
+        let sched = Arc::new(Scheduler::new());
+        sched
+            .add_node(hydra_protocol::NodeInfo {
+                address: "127.0.0.1:9".parse().unwrap(),
+                bandwidth: 10.0,
+                latency: 10.0,
+                loss_rate: 0.01,
+                load: 0.5,
+                status: NodeStatus::Online,
+            })
+            .await;
+        let creds = TcpCreds {
+            trust: Arc::new(tcp_transport::TlsTrust::pinned(vec![vec![0x30, 0x00]])),
+            sni: crate::transport::DEFAULT_SNI.to_string(),
+            auth_key: Arc::new(vec![0u8; 32]),
+            node_keys: Arc::new(HashMap::new()),
+            pool: Arc::new(crate::pool::ChannelPool::new()),
+        };
+        let err = ProxyServer::open_target(
+            &sched,
+            &Arc::new(TrafficMonitor::new()),
+            &creds,
+            &"a".repeat(2048),
+            "127.0.0.1:1".parse().unwrap(),
+        )
+        .await
+        .err()
+        .expect("超长目标必须报错");
+        assert!(
+            matches!(err, HydraError::ProtocolError(_)),
+            "必须透传 ProtocolError，实际: {err:?}"
+        );
+        let nodes = sched.get_all_nodes().await;
+        assert!(
+            matches!(nodes[0].status, NodeStatus::Online),
+            "本地协议错误不得污染节点评分（09-P3-3 承诺）"
+        );
     }
 
     #[test]

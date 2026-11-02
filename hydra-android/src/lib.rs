@@ -1094,6 +1094,30 @@ pub trait VpnExitCallback: Send + Sync {
     fn on_stack_exit(&self, reason: String);
 }
 
+/// [D 修复] VPN 节点解析（纯函数，可测）：部分失败显式报错并列出坏地址，
+/// 对齐 HydraEngine::new 的 09-A-1 语义；全失败文案与旧行为逐字一致。
+fn resolve_vpn_nodes(raw: &[String]) -> Result<Vec<std::net::SocketAddr>, String> {
+    let mut ok = Vec::new();
+    let mut bad = Vec::new();
+    for a in raw {
+        match a.parse::<std::net::SocketAddr>() {
+            Ok(parsed) => ok.push(parsed),
+            Err(_) => bad.push(a.clone()),
+        }
+    }
+    if ok.is_empty() {
+        // 全失败：文案与旧 filter_map 路径逐字一致（兼容既有文案依赖）
+        return Err("节点地址全部无法解析（域名节点 M2 暂不支持）".into());
+    }
+    if !bad.is_empty() {
+        return Err(format!(
+            "部分节点地址无法解析为 IP:端口（域名节点暂不支持，已拒绝启动）: {:?}",
+            bad
+        ));
+    }
+    Ok(ok)
+}
+
 /// 启动全局 VPN 数据面：tun fd → 用户态栈（TCP 任意端口动态接流 + UDP 中继）
 /// → 经节点隧道。protect 回调（R4）在每个出站 socket connect 前调用，失败即
 /// 中止连接。快速返回（栈任务后台运行，建连异步）。
@@ -1208,9 +1232,13 @@ pub fn start_vpn(
         let k = hydra_core::auth_key_from_hex(hex).map_err(|m| HydraEngineError::InvalidConfig {
             msg: format!("节点 {addr} 的独立认证密钥非法: {m}"),
         })?;
-        if let Ok(a) = addr.parse::<std::net::SocketAddr>() {
-            per_node_keys.insert(a, k);
-        }
+        // [D 修复] 地址解析失败显式报错（此前静默丢弃该条独立密钥）
+        let a = addr.parse::<std::net::SocketAddr>().map_err(|_| {
+            HydraEngineError::InvalidConfig {
+                msg: format!("按节点密钥的地址 \"{addr}\" 无法解析为 IP:端口"),
+            }
+        })?;
+        per_node_keys.insert(a, k);
     }
     let tls = match &config.trust {
         TrustMode::Pinned { cert_der } => {
@@ -1223,13 +1251,11 @@ pub fn start_vpn(
         }
         TrustMode::PublicCa => hydra_core::tcp_transport::TlsTrust::public_ca(None),
     };
-    let nodes: Vec<std::net::SocketAddr> =
-        config.nodes.iter().filter_map(|a| a.parse().ok()).collect();
-    if nodes.is_empty() {
-        return Err(HydraEngineError::InvalidConfig {
-            msg: "节点地址全部无法解析（域名节点 M2 暂不支持）".into(),
-        });
-    }
+    // [D 修复] 节点解析严格化：此前 filter_map 静默丢弃解析失败的节点
+    //（仅全失败才报错）——VPN"成功"启动但节点集悄然变少、无任何反馈。
+    // 对齐 HydraEngine::new 的 09-A-1 语义：部分失败显式拒绝启动并列出坏地址。
+    let nodes = resolve_vpn_nodes(&config.nodes)
+        .map_err(|msg| HydraEngineError::InvalidConfig { msg })?;
     let sni = config
         .sni
         .clone()
@@ -1247,18 +1273,40 @@ pub fn start_vpn(
         .map_err(|e| HydraEngineError::Start { msg: e.to_string() })?;
 
     // opener/udp 工厂：复用 ProxyServer 的凭据与调度器（不 start——不监听本地端口）
+    // [E 修复] 恢复探测所需克隆（builder 链会 move；数据面与探测共用同一
+    // 计数面）——VPN 模式此前从不挂载 spawn_recovery_probe（它只挂在
+    // ProxyServer::start 内，而 TUN 数据面不走 start()），节点被标 Offline
+    // 后永不恢复，多节点容灾静默退化为单节点
+    let probe_trust = tls.clone();
+    let probe_key = Arc::new(key.clone());
+    let probe_node_keys = Arc::new(per_node_keys.clone());
+    let probe_sni = sni.clone();
+    let probe_traffic = Arc::new(hydra_core::traffic::TrafficMonitor::new());
     let proxy = hydra_core::proxy::ProxyServer::new("127.0.0.1:0".parse().unwrap())
         .with_nodes(nodes)
         .with_auth_key(key)
         .with_node_auth_keys(per_node_keys)
         .with_trust(tls)
-        .with_sni(sni);
+        .with_sni(sni.clone())
+        .with_traffic_monitor(probe_traffic.clone());
     let shutdown = tokio_util::sync::CancellationToken::new();
     let shutdown2 = shutdown.clone();
     let on_exit = std::sync::Arc::new(on_exit);
 
     runtime.spawn(async move {
         proxy.register_nodes().await;
+        // [E 修复] 恢复探测/活性探测/测速（与桌面 start() 同参同频；任务随
+        // stop_vpn 的 runtime shutdown_timeout(3s) 一并收起，无需额外停机令牌）。
+        // 探测连接同样经 socket_protect 钩子（probe_node 底层是 connect_target/
+        // connect_channel），不绕过 VpnService 保护
+        hydra_core::speedtest::spawn_recovery_probe(
+            proxy.scheduler().clone(),
+            probe_trust,
+            probe_sni,
+            probe_key,
+            probe_node_keys,
+            probe_traffic,
+        );
         let opener = match proxy.tun_channel_opener() {
             Ok(o) => o,
             Err(e) => {
@@ -1956,6 +2004,20 @@ mod tests {
         assert_eq!(logs.len(), 5, "level 参与重复判定: {logs:?}");
         assert_eq!(logs[3].level, "WARN");
         assert_eq!(logs[4].level, "INFO");
+    }
+
+    #[test]
+    fn resolve_vpn_nodes_strict_parsing() {
+        // [D 修复] 全成功 → 原序返回
+        let ok = resolve_vpn_nodes(&["127.0.0.1:443".into(), "[::1]:443".into()]).unwrap();
+        assert_eq!(ok.len(), 2);
+        // 部分失败 → 显式报错并列出坏地址（此前静默丢弃）
+        let err = resolve_vpn_nodes(&["127.0.0.1:443".into(), "example.com:443".into()])
+            .unwrap_err();
+        assert!(err.contains("example.com:443"), "报错须点名坏地址: {err}");
+        // 全失败 → 旧文案逐字保留
+        let err = resolve_vpn_nodes(&["example.com:443".into()]).unwrap_err();
+        assert_eq!(err, "节点地址全部无法解析（域名节点 M2 暂不支持）");
     }
 
     #[test]

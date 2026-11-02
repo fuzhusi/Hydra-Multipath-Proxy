@@ -11,8 +11,19 @@ import java.util.Base64
  */
 class NodeCertsTest {
 
-    private val certA = Base64.getEncoder().encodeToString(byteArrayOf(1, 2, 3))
-    private val certB = Base64.getEncoder().encodeToString(byteArrayOf(4, 5, 6))
+    // [K 修复] 真实 X.509 夹具（预过滤上线后非证书字节会被剔除）——从
+    // test/resources 读入仓库自带的节点证书 + openssl 现成生成的第二张
+    private val certA: String by lazy { resourceDer("hydra-node-cert.der") }
+    private val certB: String by lazy { resourceDer("hydra-test-cert2.der") }
+    private val certAFp: String by lazy { NodeCerts.fingerprint(NodeCerts.decodeCert(certA)) }
+    private val certBFp: String by lazy { NodeCerts.fingerprint(NodeCerts.decodeCert(certB)) }
+    /** 合法 base64 的垃圾字节（非 X.509）——K 预过滤的坏条目夹具 */
+    private val certGarbage: String = Base64.getEncoder().encodeToString("garbage-not-a-cert".toByteArray())
+
+    private fun resourceDer(name: String): String {
+        val bytes = javaClass.classLoader!!.getResourceAsStream(name)!!.readBytes()
+        return Base64.getEncoder().encodeToString(bytes)
+    }
 
     private fun cfg(
         nodes: String = "",
@@ -115,8 +126,12 @@ class NodeCertsTest {
 
     @Test
     fun decodeCert_tolerates_whitespace() {
-        val wrapped = certA.chunked(2).joinToString("\n")
-        assertTrue(NodeCerts.decodeCert(wrapped).contentEquals(byteArrayOf(1, 2, 3)))
+        // [K 夹具迁移] 真证书换行/空白容忍解码须与原文一致
+        val wrapped = certA.chunked(4).joinToString(System.lineSeparator())
+        assertTrue(
+            "换行/空白容忍解码须与原文一致",
+            NodeCerts.decodeCert(wrapped).contentEquals(NodeCerts.decodeCert(certA)),
+        )
     }
 
     // ── BadSignature → 用户可读映射 ────────────────────────────────────────
@@ -168,10 +183,7 @@ class NodeCertsTest {
 
     // ── 节点证书状态（紧凑链接 cf= 指纹诊断） ──────────────────────────────
 
-    /** SHA-256("certA bytes") 的指纹——certA 的 base64 解码即 byteArrayOf(1,2,3)，
-     *  此处用真实指纹函数计算，保证与 statusFor 内部比对同源。 */
-    private val certAFp = NodeCerts.fingerprint(byteArrayOf(1, 2, 3))
-    private val certBFp = NodeCerts.fingerprint(byteArrayOf(4, 5, 6))
+    // 指纹由真证书派生（certAFp/certBFp 见上方夹具定义）
 
     @Test
     fun status_has_cert_when_per_node_der_present() {
@@ -251,5 +263,60 @@ class NodeCertsTest {
         val s = NodeCerts.statusFor(c, "10.0.0.1:443")
         assertEquals(NodeCerts.NodeCertStatus.Status.HAS_CERT, s.status)
         assertEquals(certAFp.take(16), s.fingerprint16)
+    }
+    // ── K 修复：X.509 预过滤 ────────────────────────────────────────────────
+
+    @Test
+    fun wellformed_x509_accepts_real_cert_rejects_garbage() {
+        assertTrue(NodeCerts.isWellFormedX509(NodeCerts.decodeCert(certA)))
+        assertTrue(!NodeCerts.isWellFormedX509(NodeCerts.decodeCert(certGarbage)))
+        assertTrue(!NodeCerts.isWellFormedX509(ByteArray(0)))
+    }
+
+    @Test
+    fun pool_excludes_non_x509_garbage_with_warning() {
+        val c = cfg(
+            nodes = "10.0.0.1:443",
+            nodeCerts = mapOf("10.0.0.1:443" to certGarbage),
+        )
+        val (pool, warnings) = NodeCerts.certPoolWithWarnings(c)
+        assertTrue("垃圾条目不得入池", pool.isEmpty())
+        assertTrue("告警须可读: $warnings", warnings.any { it.contains("不是有效 X.509") })
+    }
+
+    @Test
+    fun pool_keeps_valid_among_garbage() {
+        val c = cfg(
+            nodes = "10.0.0.1:443\n10.0.0.2:443",
+            nodeCerts = mapOf("10.0.0.1:443" to certGarbage, "10.0.0.2:443" to certA),
+        )
+        val (pool, _) = NodeCerts.certPoolWithWarnings(c)
+        assertEquals(listOf(certA), pool.map { Base64.getEncoder().encodeToString(it) })
+    }
+
+    @Test
+    fun status_garbage_body_without_fp_is_none() {
+        // 垃圾本体 + 无 cf → NONE（此前假指纹显示 HAS_CERT，误导排障）
+        val c = cfg(
+            nodes = "10.0.0.1:443",
+            nodeCerts = mapOf("10.0.0.1:443" to certGarbage),
+        )
+        assertEquals(
+            NodeCerts.NodeCertStatus.Status.NONE,
+            NodeCerts.statusFor(c, "10.0.0.1:443").status,
+        )
+    }
+
+    @Test
+    fun status_garbage_body_with_fp_guides_import() {
+        // 垃圾本体 + 有 cf → FP_ONLY（引导导入，而非误报 HAS_CERT）
+        val c = cfg(
+            nodes = "10.0.0.1:443",
+            nodeCerts = mapOf("10.0.0.1:443" to certGarbage),
+        ).copy(nodeCertFpMap = mapOf("10.0.0.1:443" to certAFp))
+        assertEquals(
+            NodeCerts.NodeCertStatus.Status.FP_ONLY,
+            NodeCerts.statusFor(c, "10.0.0.1:443").status,
+        )
     }
 }

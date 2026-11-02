@@ -125,6 +125,76 @@
   `parse_share_records_per_node_auth_keys`；Kotlin `NodeKeysTest` 7 例；
   hydra-core 124 / hydra-android 15 / Gradle 58 全绿。
 
+## [0.2.9.6] - 2026-11-03
+
+### 全项目 code review 修复（审查 4 路 → 方案 2 份 → 审核 → 编码 → 复审 流程）
+
+**GUI（双平台/Linux）**
+- **[G·P0·Linux] 托盘整体禁用 + 关窗语义修正**：tray-icon 0.19 Linux 后端要求
+  创建线程持有 gtk 事件循环（官方 lib.rs:17 约束），eframe 0.27 不提供——图标
+  不出现、菜单事件永不触发，且关窗默认"隐藏到托盘"= 无唤回入口假死。托盘
+  依赖/模块/字段/轮询全部 cfg 隔离；Linux 关窗 = 真退出（on_exit 完整收敛）；
+  设置页与 LINUX-README 明示。依赖 target-gate 顺带解除 libappindicator/libxdo
+  链接依赖。
+- **[H·P1] 代理线程异常死亡完整收敛**：此前不置 proxy_running、不移除系统
+  代理、不停采样线程、清空 exit_receiver 堵死兜底分支、日志谎称"已清理"——
+  收敛为 converge_dead_session（不碰 exit_receiver，保留「上一实例正在退出」
+  守卫）。
+- **[I·P1] TUN 失败时序非确定全停**：TUN 秒败早于就绪信号走 failure 分支
+  杀掉整个代理（含可用的 SOCKS），与降级设计矛盾——classify_signals 纯函数
+  按来源/时序分类（TUN Err 任何时点一律降级；failure 仅本体未就绪；随断开
+  到达的运行态 Err 只记日志），表驱动 7 测试。
+- **[J·P2·Linux] 系统代理快照-恢复 + 启动自愈**：此前裸 gsettings 覆写会抹掉
+  用户自有代理（数据丢失）；linux_proxy 模块对齐 windows_proxy 语义（快照
+  gsettings 原始 GVariant 输出原样回写；自愈仅清回环死端口残留）。
+
+**Rust core / CLI**
+- **[B·P1] 超长目标误标节点 Offline 根治**：tcp_transport 两处调用点把
+  write_target/encode_target 的 ProtocolError 包装成 ConnectionError，
+  proxy.rs 的"本地协议错误不标 Offline"守卫（09-P3-3）永不生效——本地校验
+  前移到拨号之前，结构上杜绝；核心回归测试断言节点保持 Online。
+- **[A·P1] CLI 多 hydra:// 链接聚合**：此前 N 条链接只有最后一条的密钥/证书
+  生效（env 单槽覆盖）——密钥全等校验（不一致显式报错点名链接序号）+ 证书
+  并集走 HYDRA_NODE_CERTS；临时证书 RAII 清理 + 24h 陈旧清扫。
+- **[C·P2] accept 持续错误指数退避**（1ms→1s 封顶，成功重置）——EMFILE 类
+  错误不再 100% CPU 忙转。
+
+**Android**
+- **[M·P1] kill switch 自动放弃不再释放黑洞 TUN**：连退 5 次此前调
+  stopVpnLocal 释放 holdTun → 流量静默恢复明文直连（防泄漏契约违约）——
+  改为保持黑洞阻断 + 服务前台存活 + 独立告警通知（ID=4），恢复路径=显式停止。
+- **[N·P2] stopVpnLocal 异步收尾 generation 守卫**：快速停止→连接不再拆新会话。
+- **[D·P2] start_vpn 节点解析严格化**：部分解析失败显式拒绝启动并列出坏地址
+  （此前静默丢弃节点集悄然变少）；per_node_keys 地址同款。
+- **[E·P2] VPN 模式挂载恢复探测/活性探测/测速**：此前 spawn_recovery_probe
+  只在 ProxyServer::start 内，TUN 数据面不走 start()——节点被标 Offline 永不
+  恢复，多节点容灾静默退化为单节点。
+- **[K·P2] 信任池 X.509 预过滤**：MimeDecoder 对垃圾不抛异常，垃圾 DER 混入
+  池令 rustls roots.add 整池失败（一张坏证书打死全部节点）——入池前逐条
+  语法校验剔除 + 可读告警；statusFor 垃圾本体视同无证书（不再假指纹误报）。
+- **[L·P2] 手动添加 IPv6 归一化**：裸 v6/带括号统一 `[host]:port`（此前产出
+  非法 "::1:443" 双端拒绝）。
+- **[O·P3] EngineService 启动看门狗 CAS 作废**：慢启动不再出现"已中止"后
+  又"已就绪"的僵尸窗口。
+- [P3] 分享导入落新 cc 时清该地址陈旧 cf 指纹（防 FP_MISMATCH 误报）；
+  restartCount @Volatile。
+
+**打包/CI**
+- .desktop Exec 依赖桌面会话 PATH 的安装指引勘误（sed 写绝对路径）；
+  运行时依赖补 libxkbcommon-x11-0/libegl1/libgl1；移除 22.04 支持声明；
+  install.sh 标注仅适用仓库布局；release.yml 注释乱码修正；gui.log 回退
+  显示串分隔符。
+
+**缓行项（如实）**：start_vpn/stop_vpn 共用 VPN_STATE 锁的看门狗死锁面
+（epoch 两段锁方案已设计并审核，触及 fd 接管最敏感路径，本机无法集成
+测试——下轮专项）。
+
+**验证**：Rust 全仓 30+ 测试二进制 0 失败（新增 target_frame×2、
+oversized_target 不标 Offline、accept 无、resolve_vpn_nodes、
+classify_signals×7、CLI 聚合×7）；Gradle 68 测试通过（NodeCertsTest 真证书
+夹具改造 + NodeAddrTest 6 例）；GUI 94 测试 + clippy 0 告警；Linux cfg 面
+由 ci.yml ubuntu 矩阵（clippy -D warnings）验证。
+
 ## [0.2.9.2] - 2026-10-28
 
 - 重新分发 tag：与 [0.2.9] 同代码（含紧凑链接 cf= 修复），versionCode 11 /

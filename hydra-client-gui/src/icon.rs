@@ -50,6 +50,7 @@ pub fn load_window_icon() -> Option<egui::IconData> {
 
 /// 托盘图标 RGBA（32×32）：解码最大帧后缩放到 32×32 RGBA。
 /// 任何失败返回 None（调用方 fallback 到代码生成的默认图标）并记 warn。
+#[cfg(not(target_os = "linux"))]
 pub fn load_tray_icon_rgba() -> Option<Vec<u8>> {
     match decode_largest_rgba() {
         Ok(rgba) => {

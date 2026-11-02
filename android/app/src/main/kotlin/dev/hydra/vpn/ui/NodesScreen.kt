@@ -262,7 +262,7 @@ fun NodesScreen(
                         value = manualAddr,
                         onValueChange = { manualAddr = it.trim() },
                         label = { Text("IP 地址") },
-                        placeholder = { Text("1.2.3.4（IPv6 用 [::1]）") },
+                        placeholder = { Text("1.2.3.4（IPv6 填 ::1 或 [::1]）") },
                         singleLine = true,
                     )
                     OutlinedTextField(
@@ -275,12 +275,13 @@ fun NodesScreen(
             },
             confirmButton = {
                 Button(onClick = {
-                    val a = manualAddr.removePrefix("[").removeSuffix("]")
-                    if (a.isEmpty() || manualPort.toIntOrNull() == null) {
-                        onToast("请填写 IP 与端口")
+                    // [L 修复] 归一化：IPv6 统一 [host]:port 方括号字面量——
+                    // 此前剥方括号再拼端口产出 "::1:443"（非法，双端拒绝）
+                    val node = dev.hydra.vpn.NodeAddr.normalizeManual(manualAddr, manualPort)
+                    if (node == null) {
+                        onToast("请填写有效 IP 与端口（IPv6 填 ::1 或 [::1] 均可）")
                         return@Button
                     }
-                    val node = "${a}:${manualPort}"
                     val list = cfg.nodesText.lines().map { it.trim() }
                         .filter { it.isNotEmpty() }.toMutableList()
                     if (!list.contains(node)) list.add(node)

@@ -3,7 +3,8 @@
 # - Windows 安装包: Hydra-Setup-<版本>-x64.exe（NSIS，自动包含官方签名 wintun.dll）
 # - Windows 便携包: hydra-windows-x64.zip（已内置 wintun.dll，解压即用）
 # - Linux:   hydra-node 打 tar.gz
-# - Android: hydra-android-<版本>.apk（release 构建、R8 优化；签名优先级：`n#   HYDRA_KEYSTORE_PATH/PASSWORD Secrets → 仓库 keystore（本地）→ debug 签名回退）
+# - Android: hydra-android-<版本>.apk（release 构建、R8 优化；签名优先级：
+#   HYDRA_KEYSTORE_PATH/PASSWORD Secrets → 仓库 keystore（本地）→ debug 签名回退）
 # 注意：wintun.dll 从官方 https://www.wintun.net/ 下载（0.14.1，WireGuard LLC 签名），
 #       不进仓库（体积）；amd64 架构随包分发。
 name: Release

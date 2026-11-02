@@ -42,6 +42,7 @@ mod speed_history;
 mod subscription;
 mod subscription_actions;
 mod theme;
+#[cfg(not(target_os = "linux"))]
 mod tray;
 mod ui_connections;
 mod ui_logs;
@@ -55,6 +56,11 @@ mod ui_subscriptions;
 /// Windows 系统代理注册表操作（A1）：enable / disable / WinINet 刷新。
 #[cfg(windows)]
 mod windows_proxy;
+
+/// Linux 系统代理（J 修复）：GNOME gsettings + KDE 快照-恢复 + 启动自愈，
+/// 语义对齐 windows_proxy（SavedProxyState / STALE_PROXY_CLEANED）。
+#[cfg(target_os = "linux")]
+mod linux_proxy;
 
 use config::GuiConfig;
 use nodes::{NodeStatusInfo, Tab};
@@ -219,13 +225,15 @@ struct HydraApp {
     // ── T2：托盘 + UI 重排 ──
     /// 当前导航页签
     current_tab: Tab,
-    /// 系统托盘（None = 初始化失败，GUI 照常运行）
+    /// 系统托盘（None = 初始化失败，GUI 照常运行；Linux 不编译——见 tray 模块注释）
+    #[cfg(not(target_os = "linux"))]
     tray: Option<tray::HydraTray>,
     /// 真·退出标记：托盘「退出」或菜单退出后放行窗口关闭（区别于隐藏到托盘）
     really_quit: bool,
     /// 「关于」对话框开关（侧栏底部入口：版本/许可说明）
     about_open: bool,
     /// 托盘 tooltip 缓存（变化才 set_tooltip）
+    #[cfg(not(target_os = "linux"))]
     last_tray_tooltip: String,
     /// TUN 停机令牌（审查修复：从代理线程内部提升到 HydraApp，真退出路径
     /// 可直接 cancel，确保 RouteGuard 执行路由清理，不再依赖线程内时序）
@@ -290,6 +298,9 @@ async fn main() -> eframe::Result<()> {
     // Hydra，判定不与他实例竞态；"端口无监听"校验保证不误伤他软件活代理
     #[cfg(windows)]
     crate::windows_proxy::cleanup_stale_system_proxy();
+    // [J 修复] Linux 同语义自愈：仅清「回环 + 死端口」的本工具残留
+    #[cfg(target_os = "linux")]
+    crate::linux_proxy::cleanup_stale_system_proxy();
 
     // 设置 panic hook，确保代理异常时清除系统代理
     let main_thread_id = std::thread::current().id();
@@ -332,7 +343,19 @@ async fn main() -> eframe::Result<()> {
         app
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    fn build_app(cc: &eframe::CreationContext<'_>) -> HydraApp {
+        let mut app = HydraApp::new(cc);
+        // 启动自愈命中时在应用日志里留痕（与 Windows 同款）
+        if crate::linux_proxy::STALE_PROXY_CLEANED.load(std::sync::atomic::Ordering::SeqCst) {
+            app.add_log(
+                "启动自愈：检测到上次异常退出残留的系统代理（指向死端口），已自动清除".to_string(),
+            );
+        }
+        app
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
     fn build_app(cc: &eframe::CreationContext<'_>) -> HydraApp {
         HydraApp::new(cc)
     }

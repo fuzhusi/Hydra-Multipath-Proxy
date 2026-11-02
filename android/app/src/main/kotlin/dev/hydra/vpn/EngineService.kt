@@ -84,6 +84,11 @@ class EngineService : Service() {
         Thread {
             Thread.sleep(20_000)
             if (startGeneration.get() == gen && !EngineState.ui.value.running) {
+                // [O 修复] CAS 递增代数作废在途成功路径——此前不递增，慢启动
+                // 完成后两道守卫照常通过 → 用户刚看到「已中止」又变「已就绪」
+                //（僵尸引擎上线转发）。CAS 保证与 stopEngine/新 START 竞争时
+                // 只有一个赢家；成功路径的既有守卫随后 close 慢启动的引擎
+                if (startGeneration.compareAndSet(gen, gen + 1)) {
                 engine?.let { e ->
                     runCatching { e.stop() }
                     runCatching { e.close() }
@@ -94,6 +99,7 @@ class EngineService : Service() {
                     it.copy(running = false, transition = "启动超时（20s）：请重试")
                 }
                 updateNotification()
+                }
             }
         }.apply { isDaemon = true; start() }
 
@@ -102,6 +108,12 @@ class EngineService : Service() {
             val cfg = SecureStore(this@EngineService).load()
             val nodeCount = cfg.nodesText.lines().count { it.isNotBlank() }
             val certCount = if (cfg.trustMode == SecureStore.TRUST_CA) -1 else NodeCerts.certPool(cfg).size
+            // [复审 P3-8] 坏证书条目告警接入启动日志（预过滤剔除需可感知）
+            if (cfg.trustMode != SecureStore.TRUST_CA) {
+                NodeCerts.certPoolWithWarnings(cfg).second.forEach {
+                    EngineState.addLog("⚠ $it")
+                }
+            }
             val keyCount = cfg.nodeAuthKeyMap.size + if (cfg.authKeyHex.length == 64) 1 else 0
             EngineState.addLog(
                 "② 配置已加载（$nodeCount 个节点，密钥×$keyCount，" +
@@ -134,6 +146,17 @@ class EngineService : Service() {
                         return@launch
                     }
                     engine = eng
+                    // [复审 P3-7] 赋值与守卫之间的看门狗 CAS 插入窗口收口：
+                    // engine 落位后再复查一次，被作废则立即摘除（引擎不残留）
+                    if (startGeneration.get() != gen) {
+                        runCatching { eng.stop() }
+                        runCatching { eng.close() }
+                        engine = null
+                        EngineState.addLog("启动完成前收到停止请求——引擎已终止")
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                        return@launch
+                    }
                     val addr = eng.boundAddr()
                     EngineState.update {
                         it.copy(running = true, transition = null, boundAddr = addr)

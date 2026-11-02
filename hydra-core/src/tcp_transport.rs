@@ -23,7 +23,7 @@
 
 use crate::transport::DEFAULT_SNI;
 use hydra_protocol::handshake;
-use hydra_protocol::tcp_frame::{read_reply, write_target, MAX_TARGET_LEN};
+use hydra_protocol::tcp_frame::{encode_target, read_reply};
 use hydra_protocol::{mask_target, HydraError, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -381,6 +381,12 @@ pub async fn connect_target(
     // RTT 压缩（内核优化 #3）：冷路径握手与地址帧合并——confirm_c 与地址帧
     // 一次写（5RTT→4RTT，100ms RTT 下 500ms→400ms）；节点侧零改动兼容
     // （写完 confirm_s 后即读目标帧，TCP 字节流下捎带字节已在缓冲）。
+    // [B 修复] 本地协议校验前移：空/超长目标在接触任何节点前即以
+    // ProtocolError 报错——proxy.rs 的「本地协议错误不标节点 Offline」守卫
+    // （09-P3-3）此前因两处调用点把编码失败包装成 ConnectionError 而永不
+    // 生效，超长 Host 会连环误标健康节点 Offline。结构上杜绝（省一次 TLS
+    // 拨号，错误顺序也更合理）。
+    let frame = encode_target(target)?;
     // TLS 连接（与 connect_channel 前半段一致——捎带版不复用它：其刻意停在
     // 发帧前，与握手捎带互斥）
     let tls = tls_connect_for_node(node_addr, sni, trust).await?;
@@ -405,9 +411,6 @@ pub async fn connect_target(
     }
     let cert_fp = handshake::cert_fingerprint(&peer_leaf);
     let (mut rd, mut wr) = tokio::io::split(tls);
-    let mut frame = Vec::with_capacity(2 + MAX_TARGET_LEN);
-    write_target_into(&mut frame, target)
-        .map_err(|e| HydraError::ConnectionError(format!("目标帧编码失败: {e}")))?;
     tokio::time::timeout(
         CONNECT_TIMEOUT,
         handshake::client_side_with_payload(
@@ -441,26 +444,6 @@ pub async fn connect_target(
         "TCP/TLS 通道打开"
     );
     Ok(tls)
-}
-
-/// 目标帧编码到缓冲（RTT 压缩捎带用；与 write_target 同格式）
-fn write_target_into(buf: &mut Vec<u8>, target: &str) -> std::result::Result<(), std::io::Error> {
-    let bytes = target.as_bytes();
-    if bytes.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "目标地址为空",
-        ));
-    }
-    if bytes.len() > MAX_TARGET_LEN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("目标地址超长（>{MAX_TARGET_LEN}B）"),
-        ));
-    }
-    buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-    buf.extend_from_slice(bytes);
-    Ok(())
 }
 
 /// TCP + TLS 连接节点（捎带版冷路径专用：与 connect_channel 前半段一致——
@@ -661,9 +644,12 @@ pub async fn request_target_with_timeout(
     response_timeout: Duration,
 ) -> Result<TcpNodeStream> {
     let (mut rd, mut wr) = tokio::io::split(stream);
+    // [B 修复] 本地协议校验前移：编码错误（空/超长目标）以 ProtocolError 原样
+    // 上抛——不落 ConnectionError，温池路径同样不触发节点 Offline 误标
+    let frame = encode_target(target)?;
     // 地址帧 + 2B 应答（09-P3-1：write_target 是建链序列中唯一无超时 I/O，
     // 恶意节点完成 Noise 后停读可挂住写端——补 CONNECT_TIMEOUT 与同序列对齐）
-    tokio::time::timeout(CONNECT_TIMEOUT, write_target(&mut wr, target))
+    tokio::time::timeout(CONNECT_TIMEOUT, wr.write_all(&frame))
         .await
         .map_err(|_| HydraError::ConnectionError("write request timed out".to_string()))?
         .map_err(|e| HydraError::ConnectionError(format!("write request failed: {}", e)))?;
@@ -833,5 +819,44 @@ mod tests {
         assert!(none.alpn_protocols.is_empty(), "none 模式保持无 ALPN");
         // 禁会话恢复两模式一致（resumption 无公开读取口，禁恢复由既有行为覆盖）
         let _ = (&chrome, &none);
+    }
+}
+
+#[cfg(test)]
+mod target_frame_tests {
+    use super::*;
+    use hydra_protocol::tcp_frame::MAX_TARGET_LEN;
+
+    /// [B 修复] 回归：超长目标在接触任何节点前即以 ProtocolError 报错——
+    /// 此前被包装成 ConnectionError，proxy.rs 的"本地协议错误不标 Offline"
+    /// 守卫永不生效。127.0.0.1:1 拒连：若修复失效会先走 TLS 拨号（错误类型
+    /// 变 ConnectionError），断言类型即可捕捉。
+    #[tokio::test]
+    async fn oversized_target_is_protocol_error_before_dialing() {
+        let node: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let trust = TlsTrust::pinned(vec![vec![0x30, 0x00]]);
+        let err = connect_target(
+            node,
+            "hydra.node",
+            &trust,
+            &[0u8; 32],
+            &"a".repeat(MAX_TARGET_LEN + 1),
+        )
+        .await
+        .expect_err("超长目标必须报错");
+        assert!(
+            matches!(err, HydraError::ProtocolError(_)),
+            "超长目标必须报 ProtocolError（本地校验前移），实际: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_target_is_protocol_error_before_dialing() {
+        let node: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let trust = TlsTrust::pinned(vec![vec![0x30, 0x00]]);
+        let err = connect_target(node, "hydra.node", &trust, &[0u8; 32], "")
+            .await
+            .expect_err("空目标必须报错");
+        assert!(matches!(err, HydraError::ProtocolError(_)));
     }
 }

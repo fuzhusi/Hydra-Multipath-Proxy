@@ -389,6 +389,13 @@ impl HydraApp {
                 });
             }
             ui.small("托盘左键单击 = 显示/隐藏主窗；托盘右键菜单 = 显示主窗 / 启动 / 停止 / 退出");
+            // [G 修复] Linux 无托盘（tray-icon 需要 gtk 事件循环，eframe 不提供）：
+            // 关窗即退出，上述托盘/隐藏语义不适用——明示避免"关窗后找不到应用"
+            #[cfg(target_os = "linux")]
+            ui.colored_label(
+                palette::text_weak(),
+                "Linux：无系统托盘——关闭窗口即退出（自动停止代理并还原系统代理设置）",
+            );
         });
 
         // ◈ 📝 日志（批次 A3/A4：级别热调 + 自动保存开关；沿用既有设置行样式）
@@ -480,7 +487,7 @@ impl HydraApp {
                             let path = config::config_dir()
                                 .map(|d| d.join("logs").join("gui.log"))
                                 .map(|p| p.display().to_string())
-                                .unwrap_or_else(|| "logs\\gui.log".to_string());
+                                .unwrap_or_else(|| format!("logs{}gui.log", std::path::MAIN_SEPARATOR));
                             self.add_log(if on {
                                 format!("自动保存日志：已开启（{}）", path)
                             } else {

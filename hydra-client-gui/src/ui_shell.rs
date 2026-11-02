@@ -5,6 +5,7 @@ use crate::config;
 use crate::nodes::Tab;
 use crate::palette;
 use crate::qr;
+#[cfg(not(target_os = "linux"))]
 use crate::tray::TrayCommand;
 use crate::HydraApp;
 use eframe::egui;
@@ -77,19 +78,15 @@ impl eframe::App for HydraApp {
         self.poll_tray_commands(ctx);
         self.handle_close_request(ctx);
 
-        // 检查代理线程是否异常退出
+        // 检查代理线程是否异常退出（[复审 P3-6] 改走 converge_dead_session：
+        // 旧半清理不停采样/不清统计/cancel 不了 TUN 令牌，且会在下帧
+        // poll_start_receiver 打出误导性的"未发出就绪信号即终止"）
         if self.proxy_running {
             if let Some(receiver) = &self.proxy_exit_receiver {
                 match receiver.try_recv() {
                     Ok(_) => {
                         // 代理线程退出了（非正常退出，因为没有通过 stop_proxy）
-                        self.proxy_running = false;
-                        self.stop_flag = None;
-                        self.proxy_thread_handle = None;
-                        self.proxy_exit_receiver = None;
-
-                        // 自动清除系统代理
-                        Self::remove_system_proxy_static();
+                        self.converge_dead_session();
                         self.add_warn("⚠️ 代理异常退出，已自动清除系统代理设置".to_string());
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -97,13 +94,7 @@ impl eframe::App for HydraApp {
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         // 通道断开，代理线程已退出
-                        self.proxy_running = false;
-                        self.stop_flag = None;
-                        self.proxy_thread_handle = None;
-                        self.proxy_exit_receiver = None;
-
-                        // 自动清除系统代理
-                        Self::remove_system_proxy_static();
+                        self.converge_dead_session();
                         self.add_warn("⚠️ 代理线程异常断开，已自动清除系统代理设置".to_string());
                     }
                 }
@@ -473,41 +464,61 @@ impl eframe::App for HydraApp {
 // ═══════════════ T2（Team-G）：托盘接线 + UI 六区实现 ═══════════════
 impl HydraApp {
     /// 托盘命令轮询：把托盘菜单/点击事件落到与 UI 按钮相同的内部方法上。
+    /// [G 修复] Linux 无托盘：函数体整体 cfg 掉（ctx 参数保留调用点不动）。
+    #[cfg_attr(target_os = "linux", allow(unused_variables))]
     pub(crate) fn poll_tray_commands(&mut self, ctx: &egui::Context) {
-        let commands: Vec<TrayCommand> = match &self.tray {
-            Some(t) => t.command_rx.try_iter().collect(),
-            None => return,
-        };
-        for cmd in commands {
-            match cmd {
-                TrayCommand::ToggleWindow | TrayCommand::ShowWindow => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                TrayCommand::StartProxy => self.start_proxy(),
-                TrayCommand::StopProxy => self.stop_proxy(),
-                TrayCommand::Quit => {
-                    // 退出兜底看门狗**先行**（用户实测第二轮：清理链上的
-                    // remove_system_proxy 走 reg/netsh 子进程，可能挂起——
-                    // 看门狗若排在清理之后则永不触发）。8s 足够正常清理；
-                    // 超时无论卡在哪都强制结束，宁断连接不留僵尸进程。
-                    std::thread::spawn(|| {
-                        std::thread::sleep(std::time::Duration::from_secs(8));
-                        std::process::exit(0);
-                    });
-                    self.really_quit = true;
-                    self.stop_proxy();
-                    if let Some(token) = &self.tun_shutdown {
-                        token.cancel();
+        #[cfg(target_os = "linux")]
+        {
+            let _ = ctx;
+            return;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let commands: Vec<TrayCommand> = match &self.tray {
+                Some(t) => t.command_rx.try_iter().collect(),
+                None => return,
+            };
+            for cmd in commands {
+                match cmd {
+                    TrayCommand::ToggleWindow | TrayCommand::ShowWindow => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
-                    self.add_log("正在退出 Hydra...".to_string());
-                    // 先移除托盘图标（process::exit 不跑析构——图标会残留到
-                    // 鼠标划过才消失）
-                    self.tray.take();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    TrayCommand::StartProxy => self.start_proxy(),
+                    TrayCommand::StopProxy => self.stop_proxy(),
+                    TrayCommand::Quit => {
+                        // 退出兜底看门狗**先行**（用户实测第二轮：清理链上的
+                        // remove_system_proxy 走 reg/netsh 子进程，可能挂起——
+                        // 看门狗若排在清理之后则永不触发）。8s 足够正常清理；
+                        // 超时无论卡在哪都强制结束，宁断连接不留僵尸进程。
+                        std::thread::spawn(|| {
+                            std::thread::sleep(std::time::Duration::from_secs(8));
+                            std::process::exit(0);
+                        });
+                        self.really_quit = true;
+                        self.stop_proxy();
+                        if let Some(token) = &self.tun_shutdown {
+                            token.cancel();
+                        }
+                        self.add_log("正在退出 Hydra...".to_string());
+                        // 先移除托盘图标（process::exit 不跑析构——图标会残留到
+                        // 鼠标划过才消失）
+                        self.tray.take();
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                 }
             }
         }
+    }
+
+    /// 是否有可用托盘（G 修复：Linux 恒 false → 关窗恒真退出，防假死）
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn has_tray(&self) -> bool {
+        self.tray.is_some()
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_tray(&self) -> bool {
+        false
     }
 
     /// 关窗行为：默认隐藏到托盘（代理继续跑，隐藏 ≠ 退出）；
@@ -517,9 +528,11 @@ impl HydraApp {
         if !close_requested {
             return;
         }
-        // 托盘不存在时隐藏=应用不可达（无任何唤回入口），必须放行真关闭
-        if self.really_quit || !self.config.close_to_tray || self.tray.is_none() {
-            return; // 放行关闭；on_exit 会停代理 + 清系统代理 + 强制落盘
+        // 托盘不存在时隐藏=应用不可达（无任何唤回入口），必须放行真关闭。
+        // G 修复：Linux 恒无托盘 → 此处恒放行 = 关窗即退出（on_exit 会停代理
+        // + 清系统代理 + 强制落盘，无残留；文档见 LINUX-README 已知限制）
+        if self.really_quit || !self.config.close_to_tray || !self.has_tray() {
+            return; // 放行关闭
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -528,26 +541,34 @@ impl HydraApp {
         );
     }
 
-    /// 托盘 tooltip 与菜单禁用态和代理运行状态同步（变化才调用系统 API）
+    /// 托盘 tooltip 与菜单禁用态和代理运行状态同步（变化才调用系统 API）。
+    /// [G 修复] Linux 无托盘：函数体整体 cfg 掉（空实现，调用点不动）。
     pub(crate) fn sync_tray_tooltip(&mut self) {
-        let tip = if self.proxy_running {
-            "Hydra 代理运行中"
-        } else if self.proxy_starting {
-            "Hydra 代理启动中…"
-        } else {
-            "Hydra 代理已停止"
-        };
-        if self.last_tray_tooltip != tip {
-            if let Some(t) = &self.tray {
-                t.set_tooltip(tip);
-            }
-            self.last_tray_tooltip = tip.to_string();
+        #[cfg(target_os = "linux")]
+        {
+            return;
         }
-        // 菜单禁用态必须在去重块外无条件同步：last_tray_tooltip 启动即预置
-        // 「已停止」文案，首帧会被 tooltip 去重跳过——若放块内，「停止代理」
-        // 在停止态保持可点（set_running_state 自带 last_running 去重，零成本）
-        if let Some(t) = &mut self.tray {
-            t.set_running_state(self.proxy_running, self.proxy_starting);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let tip = if self.proxy_running {
+                "Hydra 代理运行中"
+            } else if self.proxy_starting {
+                "Hydra 代理启动中…"
+            } else {
+                "Hydra 代理已停止"
+            };
+            if self.last_tray_tooltip != tip {
+                if let Some(t) = &self.tray {
+                    t.set_tooltip(tip);
+                }
+                self.last_tray_tooltip = tip.to_string();
+            }
+            // 菜单禁用态必须在去重块外无条件同步：last_tray_tooltip 启动即预置
+            // 「已停止」文案，首帧会被 tooltip 去重跳过——若放块内，「停止代理」
+            // 在停止态保持可点（set_running_state 自带 last_running 去重，零成本）
+            if let Some(t) = &mut self.tray {
+                t.set_running_state(self.proxy_running, self.proxy_starting);
+            }
         }
     }
 }

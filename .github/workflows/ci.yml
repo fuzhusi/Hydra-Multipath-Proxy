@@ -52,7 +52,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # eframe/egui: xkbcommon/wayland/x11；tray-icon（Linux 后端）: gtk3 + ayatana-appindicator + xdo
+          # eframe/egui: xkbcommon/wayland/x11；rfd: gtk3；tray-icon 已在
+          # Linux target-gate（G 修复）——gtk3/ayatana/xdo 为 rfd 与历史兜底保留
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
             libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
 

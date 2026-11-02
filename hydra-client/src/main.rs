@@ -381,6 +381,177 @@ async fn run_p2p_demo(p2p: P2pArgs, trust: TlsTrust, auth_key: Vec<u8>) -> Resul
     Ok(())
 }
 
+
+/// [A 修复] 证书临时文件的 RAII 清理：进程正常退出路径删除本会话临时证书
+/// （TUN 停机的 process::exit 路径不跑 Drop——由下次启动的 24h 陈旧清扫兜底）
+struct CertCleanup(Vec<std::path::PathBuf>);
+
+impl Drop for CertCleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// 陈旧证书临时文件判定（纯函数，可测）：hydra-share-cert-*.der 且超过 24h
+fn is_stale_cert_path(
+    name: &str,
+    modified: std::time::SystemTime,
+    now: std::time::SystemTime,
+) -> bool {
+    name.starts_with("hydra-share-cert-")
+        && name.ends_with(".der")
+        && now
+            .duration_since(modified)
+            .map(|d| d > std::time::Duration::from_secs(24 * 3600))
+            .unwrap_or(false)
+}
+
+fn sweep_stale_certs() {
+    let now = std::time::SystemTime::now();
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|m| is_stale_cert_path(&name, m, now))
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// 多链接聚合结果：密钥（全等校验后唯一）+ 证书 DER 并集（按出现顺序去重）
+#[derive(Debug)]
+struct AggregatedShare {
+    hex_key: String,
+    certs: Vec<Vec<u8>>,
+}
+
+/// 聚合校验（纯函数，可测）：逐条提取 k=/cc=；密钥与首条全等比较，不一致
+/// 报错（列出链接序号，绝不回显密钥内容）；缺 k=/cc= 沿用单链接既有文案。
+fn aggregate_share_links(links: &[(usize, hydra_client::ShareLink)]) -> Result<AggregatedShare> {
+    let mut hex_key = String::new();
+    let mut certs: Vec<Vec<u8>> = Vec::new();
+    for (idx, link) in links {
+        let key = link
+            .auth_key_bytes()
+            .map_err(|e| {
+                hydra_protocol::HydraError::ProtocolError(format!("分享链接密钥非法: {e}"))
+            })?
+            .ok_or_else(|| {
+                hydra_protocol::HydraError::ProtocolError(
+                    "分享链接未携带认证密钥（k=）——CLI 无法无密钥连接".to_string(),
+                )
+            })?;
+        let this_hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        if hex_key.is_empty() {
+            hex_key = this_hex;
+        } else if hex_key != this_hex {
+            return Err(hydra_protocol::HydraError::ProtocolError(format!(
+                "第 {} 条 hydra:// 分享链接的认证密钥与其余链接不一致——同一客户端的全部节点\
+                 须共用同一预共享密钥；请核对分享链接是否来自同一部署（不同密钥的多节点请用 GUI/Android）",
+                idx + 1
+            )));
+        }
+        let cert = link
+            .cert_der_bytes()
+            .map_err(|e| {
+                hydra_protocol::HydraError::ProtocolError(format!("分享链接证书非法: {e}"))
+            })?
+            .ok_or_else(|| {
+                hydra_protocol::HydraError::ProtocolError(
+                    "分享链接未携带节点证书（cc=）——pin 模式必需".to_string(),
+                )
+            })?;
+        if !certs.contains(&cert) {
+            certs.push(cert);
+        }
+    }
+    Ok(AggregatedShare { hex_key, certs })
+}
+
+/// 分享链接注入（[A 修复]）：解析全部 hydra:// 参数 → 聚合校验 → 写临时证书
+/// （单张走 HYDRA_NODE_CERT 既有路径；多张走 HYDRA_NODE_CERTS 逗号路径清单）
+/// → argv 按记录下标替换为节点地址。返回 RAII 清理守卫（存 main 作用域）。
+fn inject_share_link_args(argv: &mut [String]) -> Result<CertCleanup> {
+    use hydra_client::ShareLink;
+    sweep_stale_certs();
+    let mut links: Vec<(usize, ShareLink)> = Vec::new();
+    for (i, a) in argv.iter().enumerate() {
+        if !a.starts_with("hydra://") {
+            continue;
+        }
+        let link = ShareLink::from_share_url(a).map_err(|e| {
+            hydra_protocol::HydraError::ProtocolError(format!("分享链接解析失败: {e}"))
+        })?;
+        links.push((i, link));
+    }
+    if links.is_empty() {
+        return Ok(CertCleanup(Vec::new()));
+    }
+    let agg = aggregate_share_links(&links)?;
+
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    for (i, cert) in agg.certs.iter().enumerate() {
+        let cert_path = if agg.certs.len() == 1 {
+            // 单链接路径：文件名与既有行为逐字节一致
+            std::env::temp_dir().join(format!("hydra-share-cert-{}.der", std::process::id()))
+        } else {
+            std::env::temp_dir().join(format!(
+                "hydra-share-cert-{}-{}.der",
+                std::process::id(),
+                i
+            ))
+        };
+        std::fs::write(&cert_path, cert).map_err(|e| {
+            hydra_protocol::HydraError::IoError(std::io::Error::new(
+                e.kind(),
+                format!("证书临时文件写入失败: {e}"),
+            ))
+        })?;
+        paths.push(cert_path);
+    }
+    // 启动早期（任务线程 spawn 前）注入 env——下游 trust_from_env 与认证密钥
+    // 检查照常读取，零改动复用既有链路
+    std::env::set_var("HYDRA_AUTH_KEY", &agg.hex_key);
+    if paths.len() == 1 {
+        std::env::set_var("HYDRA_NODE_CERT", &paths[0]);
+    } else {
+        let joined = paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        std::env::set_var("HYDRA_NODE_CERTS", &joined);
+    }
+    for (idx, link) in &links {
+        argv[*idx] = format!("{}:{}", link.address, link.port);
+    }
+    if links.len() == 1 && paths.len() == 1 {
+        // 单链接路径：日志与既有行为逐字节一致（[A] 意图承诺）
+        let link = &links[0].1;
+        info!(
+            "已从分享链接自动配置：节点 {}、密钥 ✓、证书 ✓（证书临时文件 {}）",
+            hydra_protocol::mask_target(&format!("{}:{}", link.address, link.port)),
+            paths[0].display()
+        );
+    } else {
+        info!(
+            "已从分享链接自动配置：节点 {} 个、密钥 ✓、证书 ✓×{}（临时文件 {}）",
+            links.len(),
+            paths.len(),
+            paths[0].display()
+        );
+    }
+    Ok(CertCleanup(paths))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // 日志初始化：HYDRA_LOG_LEVEL（默认 info；RUST_LOG 存在时优先）——与 README
@@ -412,62 +583,15 @@ async fn main() -> Result<()> {
     // CLI 分享链接自动配置（v0.2.3 功能缺口补齐：此前分享链接只在 GUI/Android
     // 实现——CLI 传 hydra:// 链接既不解析密钥也不解析证书，报"未设置
     // HYDRA_AUTH_KEY"，与用户「链接给到即配好」的预期相悖）。
-    // 位置参数以 hydra:// 开头 → 解析 k=/cc= 自动注入 env（auth hex +
-    // 证书临时文件），参数本身替换为节点地址后照常走 parse_args。
+    // 位置参数以 hydra:// 开头 → 解析 k=/cc= 自动注入 env（auth hex + 证书
+    // 临时文件），参数本身替换为节点地址后照常走 parse_args。
+    // [A 修复] 多链接聚合：此前循环对每条链接覆盖写同一 env/临时文件——
+    // N 条链接只有最后一条的密钥/证书对全部节点生效（节点列表却全量合并）。
+    // 现按"密钥全等校验 + 证书并集"聚合（TlsTrust::pinned_certs 是信任根
+    // 集合、Noise 指纹取对端叶证书——R-02 已消除配对错位类故障，证书无需
+    // 与节点顺序配对）；密钥不一致显式报错（CLI 单密钥模式约束）。
     let mut argv: Vec<String> = std::env::args().collect();
-    {
-        use hydra_client::ShareLink;
-        let mut changed = false;
-        for a in argv.iter_mut() {
-            if !a.starts_with("hydra://") {
-                continue;
-            }
-            let link = ShareLink::from_share_url(a).map_err(|e| {
-                hydra_protocol::HydraError::ProtocolError(format!("分享链接解析失败: {e}"))
-            })?;
-            let key = link
-                .auth_key_bytes()
-                .map_err(|e| {
-                    hydra_protocol::HydraError::ProtocolError(format!("分享链接密钥非法: {e}"))
-                })?
-                .ok_or_else(|| {
-                    hydra_protocol::HydraError::ProtocolError(
-                        "分享链接未携带认证密钥（k=）——CLI 无法无密钥连接".to_string(),
-                    )
-                })?;
-            let hex_key: String = key.iter().map(|b| format!("{b:02x}")).collect();
-            let cert = link
-                .cert_der_bytes()
-                .map_err(|e| {
-                    hydra_protocol::HydraError::ProtocolError(format!("分享链接证书非法: {e}"))
-                })?
-                .ok_or_else(|| {
-                    hydra_protocol::HydraError::ProtocolError(
-                        "分享链接未携带节点证书（cc=）——pin 模式必需".to_string(),
-                    )
-                })?;
-            let cert_path =
-                std::env::temp_dir().join(format!("hydra-share-cert-{}.der", std::process::id()));
-            std::fs::write(&cert_path, &cert).map_err(|e| {
-                hydra_protocol::HydraError::IoError(std::io::Error::new(
-                    e.kind(),
-                    format!("证书临时文件写入失败: {e}"),
-                ))
-            })?;
-            // 启动早期（任务线程 spawn 前）注入 env——下游 trust_from_env 与
-            // 认证密钥检查照常读取，零改动复用既有链路
-            std::env::set_var("HYDRA_AUTH_KEY", &hex_key);
-            std::env::set_var("HYDRA_NODE_CERT", &cert_path);
-            *a = format!("{}:{}", link.address, link.port);
-            changed = true;
-            info!(
-                "已从分享链接自动配置：节点 {}、密钥 ✓、证书 ✓（证书临时文件 {}）",
-                hydra_protocol::mask_target(&format!("{}:{}", link.address, link.port)),
-                cert_path.display()
-            );
-        }
-        let _ = changed;
-    }
+    let _cert_cleanup = inject_share_link_args(&mut argv)?;
 
     let (listen_arg, nodes, p2p) = parse_args(&argv);
 
@@ -658,4 +782,97 @@ async fn main() -> Result<()> {
 #[cfg(feature = "tun")]
 fn new_shutdown_token() -> tokio_util::sync::CancellationToken {
     tokio_util::sync::CancellationToken::new()
+}
+
+#[cfg(test)]
+mod share_link_aggregate_tests {
+    use super::*;
+    use hydra_client::ShareLink;
+    use std::time::{Duration, SystemTime};
+
+    fn link_with(k: Option<&[u8]>, cert: Option<&[u8]>) -> ShareLink {
+        let mut link = ShareLink::from_share_url("hydra://10.0.0.1:443?tp=tcp").unwrap();
+        if let Some(k) = k {
+            link = link.with_auth_key_bytes(k).unwrap();
+        }
+        if let Some(c) = cert {
+            link = link.with_cert_der(c);
+        }
+        link
+    }
+
+    const KEY_A: &[u8] = &[0xAA; 32];
+    const KEY_B: &[u8] = &[0xBB; 32];
+
+    #[test]
+    fn single_link_aggregates_key_and_cert() {
+        let links = [(0usize, link_with(Some(KEY_A), Some(b"cert-a")))];
+        let agg = aggregate_share_links(&links).unwrap();
+        assert_eq!(agg.certs, vec![b"cert-a".to_vec()]);
+        assert_eq!(agg.hex_key.len(), 64);
+    }
+
+    #[test]
+    fn two_links_same_key_union_certs() {
+        let links = [
+            (0usize, link_with(Some(KEY_A), Some(b"cert-a"))),
+            (1, link_with(Some(KEY_A), Some(b"cert-b"))),
+        ];
+        let agg = aggregate_share_links(&links).unwrap();
+        assert_eq!(agg.certs.len(), 2, "证书并集去重前按出现顺序收集");
+        assert_eq!(agg.certs[0], b"cert-a");
+        assert_eq!(agg.certs[1], b"cert-b");
+    }
+
+    #[test]
+    fn duplicate_certs_dedup() {
+        let links = [
+            (0usize, link_with(Some(KEY_A), Some(b"cert-a"))),
+            (1, link_with(Some(KEY_A), Some(b"cert-a"))),
+        ];
+        assert_eq!(aggregate_share_links(&links).unwrap().certs.len(), 1);
+    }
+
+    #[test]
+    fn mismatched_keys_rejected_with_index_without_leaking_secret() {
+        let links = [
+            (0usize, link_with(Some(KEY_A), Some(b"cert-a"))),
+            (1, link_with(Some(KEY_B), Some(b"cert-b"))),
+        ];
+        let err = aggregate_share_links(&links).unwrap_err().to_string();
+        assert!(err.contains("第 2 条"), "报错须定位到链接序号: {err}");
+        assert!(!err.contains("bbbb"), "报错不得回显密钥内容: {err}");
+    }
+
+    #[test]
+    fn missing_key_keeps_existing_error_text() {
+        let links = [(0usize, link_with(None, Some(b"cert-a")))];
+        let err = aggregate_share_links(&links).unwrap_err().to_string();
+        assert!(err.contains("未携带认证密钥（k=）"));
+    }
+
+    #[test]
+    fn missing_cert_keeps_existing_error_text() {
+        let links = [(0usize, link_with(Some(KEY_A), None))];
+        let err = aggregate_share_links(&links).unwrap_err().to_string();
+        assert!(err.contains("未携带节点证书（cc=）"));
+    }
+
+    #[test]
+    fn stale_cert_path_window() {
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(25 * 3600);
+        let fresh = now - Duration::from_secs(3600);
+        assert!(is_stale_cert_path(
+            "hydra-share-cert-123.der",
+            old,
+            now
+        ));
+        assert!(!is_stale_cert_path(
+            "hydra-share-cert-123.der",
+            fresh,
+            now
+        ));
+        assert!(!is_stale_cert_path("other.der", old, now));
+    }
 }

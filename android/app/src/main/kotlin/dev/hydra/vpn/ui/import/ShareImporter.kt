@@ -42,9 +42,15 @@ object ShareImporter {
                     nodeCertB64Map = if (p.nodeCerts.isEmpty()) cur.nodeCertB64Map
                         else cur.nodeCertB64Map + p.nodeCerts,
                     // 紧凑链接（cf= 指纹）按节点记录——节点行显示预期指纹、
-                    // 与本地证书比对可确认信任锚/诊断证书漂移
-                    nodeCertFpMap = if (p.nodeCertFps.isEmpty()) cur.nodeCertFpMap
-                        else cur.nodeCertFpMap + p.nodeCertFps,
+                    // 与本地证书比对可确认信任锚/诊断证书漂移。
+                    // [P3 修复] 落了新 cc 的地址先清旧 fp（链接允许 cc/cf 独立
+                    // 存在——cc-without-cf 重导后残留旧指纹会让 statusFor 对
+                    // 新证书误报 FP_MISMATCH）；本链接自带的新 fp 随后覆盖
+                    nodeCertFpMap = run {
+                        val cleaned = if (p.nodeCerts.isEmpty()) cur.nodeCertFpMap
+                        else cur.nodeCertFpMap - p.nodeCerts.keys
+                        if (p.nodeCertFps.isEmpty()) cleaned else cleaned + p.nodeCertFps
+                    },
                     // 按节点认证密钥：多节点各自部署各持 PSK，逐条落各自地址
                     // 条目互不覆盖（v0.2.9.3 实测——全局单密钥被后导入覆盖，
                     // 其余节点 Noise msg2 解密必败）；同地址重导以新为准

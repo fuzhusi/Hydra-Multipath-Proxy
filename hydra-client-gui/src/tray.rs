@@ -11,6 +11,11 @@
 use eframe::egui;
 use std::sync::mpsc::{channel, Receiver};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+// 系统托盘（T2）。**平台边界（G 修复）**：本模块仅在 Windows/macOS 编译
+// （main.rs 中 `#[cfg(not(target_os = "linux"))]`）。tray-icon 0.19 的 Linux
+// 后端要求创建线程持有 gtk 事件循环（tray-icon-0.19.3/src/lib.rs:17），
+// eframe 0.27 为 winit/glutin 循环不提供——Linux 上图标不出现、事件永不
+// 触发，故 Linux 整体禁用托盘，关窗语义 = 真退出（见 ui_shell::has_tray）。
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 /// 托盘事件 → GUI 命令（在 egui update 线程上执行）

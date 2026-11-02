@@ -37,10 +37,15 @@ object NodeCerts {
 
     fun statusFor(cfg: HydraConfig, node: String): NodeCertStatus {
         if (cfg.trustMode == SecureStore.TRUST_CA) return NodeCertStatus(NodeCertStatus.Status.NONE, null)
-        // 本节点实际会用的证书本体（独立条目优先，缺项回落全局）
+        // 本节点实际会用的证书本体（独立条目优先，缺项回落全局）。
+        // [K 修复] 非 X.509 垃圾本体视同无证书（此前算出假指纹显示 HAS_CERT，
+        // 误导排障；实际信任池在 certPool 已剔除该条目）
         val effectiveB64 = certB64For(cfg, node)
         val effectiveFp = effectiveB64?.let { b64 ->
-            runCatching { fingerprint(decodeCert(b64)) }.getOrNull()
+            runCatching {
+                val der = decodeCert(b64)
+                if (isWellFormedX509(der)) fingerprint(der) else null
+            }.getOrNull()
         }
         val nodeFp = cfg.nodeCertFpMap[node]?.takeIf { it.isNotBlank() }?.lowercase()
         return when {
@@ -60,20 +65,47 @@ object NodeCerts {
         }
     }
 
+    private val x509Factory: java.security.cert.CertificateFactory by lazy {
+        java.security.cert.CertificateFactory.getInstance("X.509")
+    }
+
+    /** [K 修复] X.509 语法预过滤：MimeDecoder 对垃圾不抛异常（非字母表字符
+     *  静默忽略、合法 base64 的垃圾字节原样产出），垃圾 DER 混入池会让 rustls
+     *  roots.add 整池失败（一张坏证书打死全部节点）。仅 JVM 标准库，可单测。 */
+    fun isWellFormedX509(der: ByteArray): Boolean = der.isNotEmpty() && runCatching {
+        x509Factory.generateCertificate(der.inputStream())
+    }.isSuccess
+
     /**
      * 引擎信任根池：全部已配置节点的独立证书（缺项回落全局）+ 全局证书，
-     * 按 base64 文本去重（保持首次出现顺序）。base64 非法条目跳过不致命
-     * （个别证书坏不拖垮整池）；空池 = pin 模式不可启动，调用方负责报错。
+     * 按 base64 文本去重（保持首次出现顺序）。坏条目跳过不致命（[K 修复]
+     * 起按 X.509 语法预过滤——此前垃圾 DER 混入池会让整池报错）；空池 =
+     * pin 模式不可启动，调用方负责报错。需要告警细节用 [certPoolWithWarnings]。
      */
-    fun certPool(cfg: HydraConfig): List<ByteArray> {
+    fun certPool(cfg: HydraConfig): List<ByteArray> = certPoolWithWarnings(cfg).first
+
+    /** [K 修复] 信任池 + 坏条目告警（UI 日志展示用）：空 base64 / 非 X.509
+     *  条目剔除并给出可读的修复指引。 */
+    fun certPoolWithWarnings(cfg: HydraConfig): Pair<List<ByteArray>, List<String>> {
         val b64s = LinkedHashSet<String>()
         for (node in cfg.nodesText.lines().map { it.trim() }.filter { it.isNotEmpty() }) {
             certB64For(cfg, node)?.let { b64s.add(it) }
         }
         cfg.certDerB64.takeIf { it.isNotBlank() }?.let { b64s.add(it) }
-        // Mime 解码对"纯非字母表字符"不抛异常而是返回空数组——空 DER 无用，滤除
-        return b64s.mapNotNull { runCatching { decodeCert(it) }.getOrNull() }
-            .filter { it.isNotEmpty() }
+        val pool = ArrayList<ByteArray>()
+        val warnings = ArrayList<String>()
+        for (b64 in b64s) {
+            val der = runCatching { decodeCert(b64) }.getOrNull() ?: ByteArray(0)
+            when {
+                der.isEmpty() -> warnings.add("有 1 条证书无法 base64 解码，已跳过")
+                !isWellFormedX509(der) -> warnings.add(
+                    "有 1 条证书不是有效 X.509（指纹前 16 位 " +
+                        "${fingerprint(der).take(16)}），已跳过——请重新导入对应节点的分享链接",
+                )
+                else -> pool.add(der)
+            }
+        }
+        return pool to warnings
     }
 
     /** 证书 DER base64 → DER 字节（Mime 解码：容忍换行/空白等手工粘贴形态）。 */

@@ -108,6 +108,7 @@ class HydraVpnService : VpnService() {
     @Volatile
     private var lastStartAt = 0L
 
+    @Volatile
     private var restartCount = 0
 
     /**
@@ -142,14 +143,56 @@ class HydraVpnService : VpnService() {
                 restartCount++
                 EngineState.addLog("✗ 数据面退出（$reason）——自动重连（第 $restartCount 次）", LogLevel.ERROR)
                 if (restartCount >= 5) {
+                    // [M 修复] 自动放弃 ≠ 用户显式停止：**不调 stopVpnLocal**——
+                    // 其 releaseHoldTun 会拆掉 kill switch 黑洞 TUN，流量静默
+                    // 恢复明文直连（防真实 IP 泄漏契约违约）。保持黑洞阻断 +
+                    // 服务前台存活（onDestroy 会释放黑洞——绝不在本路径停服），
+                    // 用户唯一的恢复路径 = 通知/主页「停止」（显式语义）或「启动」
                     EngineState.addLog(
-                        "✗ 连续 5 次数据面退出——停止自动重连，请检查网络/节点后手动重试",
+                        "✗ 连续 5 次数据面退出——停止自动重连，流量保持阻断（防泄漏）；" +
+                            "如需恢复直连请点停止",
                         LogLevel.ERROR,
                     )
+                    generation.incrementAndGet()
+                    userStopRequested = true
+                    retryJob?.cancel()
+                    stopStatsPolling()
+                    stopHealthPolling()
+                    VpnProtectHolder.vpnActive = true // 黑洞 TUN 是活动 VPN 接口：protect 保持 fail-closed
                     EngineState.update {
-                        it.copy(running = false, transition = "启动失败：数据面反复退出（$reason）")
+                        it.copy(
+                            running = false,
+                            transition =
+                                "✗ 已放弃重连：数据面反复退出——流量保持阻断（防泄漏）；如需恢复直连请点停止",
+                        )
                     }
-                    stopVpnLocal()
+                    // [复审 P1-3] 数据面死亡时 transport 已 drop（TUN fd 关闭），
+                    // 上一会话 holdTun 也早已释放——"保持黑洞"无黑洞可保持。
+                    // 必须先建立黑洞 TUN（establish 是 Android 系统 API 非 Rust
+                    // FFI，符合回调禁同步 FFI 硬约束）再清 Rust 态，否则流量
+                    // 明文直连而 UI/通知声称阻断——恰是本修复要堵的违约
+                    if (holdTun == null) {
+                        val cfg = runCatching { SecureStore(this@HydraVpnService).load() }.getOrNull()
+                        if (cfg?.vpnKillSwitch == true) {
+                            var myHold = runCatching { establish(cfg) }.getOrNull()
+                            if (myHold == null && cfg.appFilterMode != SecureStore.APP_FILTER_ALL) {
+                                // 分应用过滤建立失败：回退全量阻断（防泄漏优先）
+                                myHold = runCatching {
+                                    establish(cfg.copy(appFilterMode = SecureStore.APP_FILTER_ALL))
+                                }.getOrNull()
+                            }
+                            holdTun = myHold
+                            if (myHold != null) {
+                                EngineState.addLog(
+                                    "🛡 kill switch：数据面反复退出——已阻断流量防泄漏",
+                                    LogLevel.WARN,
+                                )
+                            }
+                        }
+                    }
+                    runCatching { stopVpn() } // 清 Rust 死句柄（≤3s，同既有模式）
+                    updateNotification() // 前台通知展示阻断态，保留「停止」按钮
+                    notifyKillSwitchBlocked()
                     return@launch
                 }
                 // 审查 SEC-02 修复：数据面死亡路径在 stopVpn() **之前**先建立
@@ -216,6 +259,8 @@ class HydraVpnService : VpnService() {
     }
 
     private fun startVpnFromStore(clearLogs: Boolean = true) {
+        cancelKillSwitchNotification() // [P3-9] 放弃告警在重新启动时清除
+
         stopStatsPolling() // 新一轮启动：先停旧轮询，避免旧会话统计覆盖新状态
         stopHealthPolling() // 旧会话探测循环作废（新会话成功后再拉起）
         // 日志纯内存：用户点击连接即开启新会话日志（旧会话日志清空）。
@@ -868,26 +913,34 @@ class HydraVpnService : VpnService() {
     }
 
     private fun stopVpnLocal() {
-        generation.incrementAndGet() // 使在途看门狗/重连循环/启动结果失效
+        // [N 修复] 捕获本代：异步收尾逐段复查——快速「停止→连接」时旧收尾
+        // 不得拆新会话的 UI 状态与前台服务（对照 startVpnFromStore 守卫风格）
+        val gen = generation.incrementAndGet() // 使在途看门狗/重连循环/启动结果失效
         userStopRequested = true
         retryJob?.cancel()           // 打断退避等待
         stopStatsPolling()           // 停流量轮询（断开后统计归零）
         stopHealthPolling()          // 停健康探测（含清告警通知）
+        cancelKillSwitchNotification() // [M 联动] 显式停止清阻断告警
         releaseHoldTun()             // 用户显式停止 = 恢复直连（kill switch 不拦用户）
         VpnProtectHolder.vpnActive = false // SEC-01：无 TUN 后 protect 放行（本地模式不受残留钩子影响）
         // 日志纯内存：服务停止即清空（会话结束）。**同步清**——异步清空会在
         // 随后启动的本地代理模式写入日志之后执行，误伤新会话日志（模式切换竞态）
         EngineState.clearLogs()
         scope.launch(Dispatchers.IO) {
-            runCatching { stopVpn() }
+            runCatching { stopVpn() } // 无条件执行：Rust 全局态清理不依赖 gen
+            // [N 修复] 新会话已启动（generation 已变）→ 本轮收尾全部作废
+            if (generation.get() != gen) return@launch
             EngineState.update {
                 it.copy(running = false, transition = null, boundAddr = null,
                     sentBytes = 0, receivedBytes = 0, activeConns = 0,
                     totalConns = 0, uptimeSecs = 0, upSpeedBps = 0, downSpeedBps = 0)
             }
+            if (generation.get() != gen) return@launch
             withContext(kotlinx.coroutines.Dispatchers.Main) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                if (generation.get() == gen) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
             }
         }
     }
@@ -993,6 +1046,42 @@ class HydraVpnService : VpnService() {
         }
     }
 
+    /** [M 修复] kill switch 阻断告警（独立 ID=4——复用健康告警 ID 会互相冲掉）。 */
+    private fun notifyKillSwitchBlocked() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        runCatching {
+            val text = "数据面反复退出，已停止自动重连。流量保持阻断（防真实 IP 泄漏）；" +
+                "点「停止」恢复直连，排查后重新连接"
+            val n = NotificationCompat.Builder(this, HEALTH_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_notify_error)
+                .setContentTitle("Hydra 已放弃重连（流量阻断中）")
+                .setContentText(text)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setAutoCancel(true)
+                .setContentIntent(
+                    PendingIntent.getActivity(
+                        this, 0,
+                        Intent(this, MainActivity::class.java),
+                        PendingIntent.FLAG_IMMUTABLE,
+                    ),
+                )
+                .build()
+            getSystemService(NotificationManager::class.java).notify(KILL_SWITCH_NOTIF_ID, n)
+        }
+    }
+
+    private fun cancelKillSwitchNotification() {
+        runCatching {
+            getSystemService(NotificationManager::class.java).cancel(KILL_SWITCH_NOTIF_ID)
+        }
+    }
+
     private fun baseBuilder(text: String): NotificationCompat.Builder =
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_secure)
@@ -1080,6 +1169,8 @@ class HydraVpnService : VpnService() {
         /** 健康告警渠道/通知 ID（独立于常驻前台通知，恢复即撤） */
         private const val HEALTH_CHANNEL_ID = "hydra_health"
         private const val HEALTH_NOTIF_ID = 3
+        /** [M 修复] kill switch 阻断告警通知 ID（独立，避免与健康告警互冲） */
+        private const val KILL_SWITCH_NOTIF_ID = 4
         private val generation = java.util.concurrent.atomic.AtomicLong(0)
     }
 }
