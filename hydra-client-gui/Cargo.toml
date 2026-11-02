@@ -49,4 +49,4 @@ winresource = "0.1"
 # 注意：本表必须在所有普通 [dependencies] 条目之后（表头会截断主依赖表——
 # 曾因插在 tray-icon 原位导致 Linux 上 hydra-client/hydra-protocol 失联，CI 实测）。
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-tray-icon = "0.19"
+tray-icon = "0.26"
