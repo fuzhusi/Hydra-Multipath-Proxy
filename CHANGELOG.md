@@ -82,6 +82,24 @@
   真实的"需 root/CAP_NET_ADMIN"而非误导性的"另一实例在运行"。hydra-client
   79 测试全绿；clippy 0 告警。
 
+### feat(linux): Linux（Ubuntu）GUI 适配落地——CI 产出全套客户端 + 桌面集成（设计 docs/design/Linux-GUI适配方案-v1.md）
+
+- **缺口**：官方 Linux 包从未含 GUI——build-linux 只编 node+fetch（README
+  却声称三二进制）。审计确认代码层早已就绪：`windows_proxy`/`winreg` 全部
+  target-gated，托盘/对话框走 tray-icon/rfd 跨平台后端，ci.yml 的
+  ubuntu 矩阵**一直在编译并通过 GUI**（含 clippy -D warnings）——纯打包缺口。
+- **CI（release.yml build-linux）**：apt 装 GUI 构建依赖（libgtk-3-dev/
+  libayatana-appindicator3-dev/libxkbcommon-dev/libwayland-dev）→ 构建
+  node+fetch+**CLI+GUI** 四二进制 → 冒烟（`hydra-client --help` + 可执行位
+  断言）→ tar.gz 附 `.desktop` + 256×256 PNG 图标 + LINUX-README.txt。
+- **打包资产（packaging/linux/）**：desktop 文件（应用列表入口）、图标
+  （从 assets/app.ico 内嵌 PNG 无损提取）、LINUX-README（三命令免 root
+  安装 + TUN 权限两法 + 已知限制）。
+- **GUI 代码（最小改动）**：设置页 TUN 区块加 `cfg(target_os = "linux")`
+  权限提示（sudo 直启或 setcap cap_net_admin+ep）；Windows 路径逐字节不变。
+- **已知限制**：Linux 无一键系统代理（发行版差异大，v1 不做）；纯 Wayland
+  无托盘槽位时托盘不可见（主窗不受影响）；开机自启两平台同为规划中。
+
 ## [0.2.9.4] - 2026-10-28
 
 ### 按节点独立认证密钥（多节点各持 PSK——全局单密钥覆盖致其余节点 Noise 握手必败，v0.2.9.3 实测）

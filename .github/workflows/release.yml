@@ -125,7 +125,7 @@ jobs:
           if-no-files-found: error
 
   build-linux:
-    name: Linux 产物（hydra-node）
+    name: Linux 产物（节点 + 下载器 + CLI + GUI）
     # 固定 24.04：ubuntu-latest 2026-10-19 起迁 Ubuntu 26（同 ci.yml 注释）
     runs-on: ubuntu-24.04
     steps:
@@ -144,19 +144,41 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-release-
 
-      # 构建节点 + 下载器（Linux 产物定位是 VPS 服务端/服务器侧工具；客户端 GUI 走 Windows 包）
-      - name: cargo build --release -p hydra-node -p hydra-fetch
-        run: cargo build --release -p hydra-node -p hydra-fetch
+      # GUI 构建期链接依赖（Linux-GUI适配方案-v1 §4.1）：
+      # - libgtk-3-dev：rfd 文件对话框 + tray-icon 托盘（Linux 后端 GTK3）
+      # - libayatana-appindicator3-dev：托盘图标系统总线（tray-icon → libappindicator）
+      # - libxkbcommon-dev / libwayland-dev：winit 键盘/Wayland（运行时 dlopen，装 dev 兜底）
+      - name: 安装 GUI 构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libayatana-appindicator3-dev \
+            libxkbcommon-dev libwayland-dev
+
+      # 客户端全家桶（设计 §二.目标1）：此前只编节点+下载器，GUI/CLI 缺位
+      # ——README 声称的"GUI/CLI/hydra-fetch 三二进制"从未进过 Linux 包
+      - name: cargo build --release（节点 + 下载器 + CLI + GUI）
+        run: cargo build --release -p hydra-node -p hydra-fetch -p hydra-client -p hydra-client-gui
 
       - name: 打包 tar.gz
         run: |
           mkdir -p dist
           cp target/release/hydra-node dist/
           cp target/release/hydra-fetch dist/
+          cp target/release/hydra-client dist/
+          cp target/release/hydra-client-gui dist/
           cp README.md dist/
           cp deploy/hydra-node.service dist/
           cp deploy/install.sh dist/
           cp deploy/env.example dist/
+          cp packaging/linux/hydra-client-gui.desktop dist/
+          cp packaging/linux/hydra-client-gui.png dist/
+          cp packaging/linux/LINUX-README.txt dist/
+          # 冒烟：CLI 可执行且 --help 退出 0；四二进制存在且可执行位齐备
+          ./dist/hydra-client --help > /dev/null
+          for b in hydra-node hydra-fetch hydra-client hydra-client-gui; do
+            test -x "dist/$b" || { echo "缺少可执行 $b"; exit 1; }
+          done
           tar -czf hydra-linux-x64.tar.gz -C dist .
 
       - name: 上传到 GitHub Release（tag 触发时）

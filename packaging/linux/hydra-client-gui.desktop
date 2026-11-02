@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Hydra
+Name[zh_CN]=Hydra 多路径代理
+Comment=Hydra Multipath Proxy Client
+Comment[zh_CN]=Hydra 多路径代理客户端（本地代理 / TUN 全局接管）
+Exec=hydra-client-gui
+Icon=hydra-client-gui
+Terminal=false
+Categories=Network;
+Keywords=proxy;vpn;hydra;

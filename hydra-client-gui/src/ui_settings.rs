@@ -216,6 +216,15 @@ impl HydraApp {
                 palette::text_weak(),
                 "说明：全局透明接管 TCP 流量，应用无需配置代理；首页亦有快捷开关",
             );
+            // Linux 权限提示（设计 docs/design/Linux-GUI适配方案-v1.md §4.3）：
+            // TUN 需 root/CAP_NET_ADMIN——给出两条可行路径，避免用户撞上
+            // 报错才回头排查
+            #[cfg(target_os = "linux")]
+            ui.colored_label(
+                palette::text_weak(),
+                "Linux：TUN 需要权限——sudo 启动本应用，或执行 \
+                 sudo setcap cap_net_admin+ep <本程序路径> 后普通用户运行",
+            );
         if ui
             .checkbox(
                 &mut self.config.tun_enabled,

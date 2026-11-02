@@ -154,7 +154,7 @@
 |---|---|---|
 | `Hydra-Setup-v0.2.9.3-x64.exe` | Windows 普通用户 | 安装器：程序 + 官方签名 wintun.dll + 快捷方式 + 卸载器 |
 | `hydra-windows-x64.zip` | Windows 便携党 | 解压即用（GUI/CLI/hydra-fetch + wintun.dll + README） |
-| `hydra-linux-x64.tar.gz` | Linux x64 | GUI/CLI/hydra-fetch 三二进制（GUI 需 GTK 运行库） |
+| `hydra-linux-x64.tar.gz` | Linux x64 | GUI/CLI/hydra-node/hydra-fetch 四二进制 + .desktop/图标（v0.2.9.5 起；安装见包内 LINUX-README.txt，GUI 需 GTK 运行库） |
 
 - **双击安装**：自动复制程序与官方签名 `wintun.dll` 到 Program Files，创建开始菜单/桌面快捷方式，自带卸载器
 - **TUN 模式开箱即用**：安装版 GUI 快捷方式默认请求管理员权限（UAC），无需手动处理 wintun.dll
