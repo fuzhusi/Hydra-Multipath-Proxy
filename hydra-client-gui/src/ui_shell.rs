@@ -467,10 +467,10 @@ impl HydraApp {
     /// [G 修复] Linux 无托盘：函数体整体 cfg 掉（ctx 参数保留调用点不动）。
     #[cfg_attr(target_os = "linux", allow(unused_variables))]
     pub(crate) fn poll_tray_commands(&mut self, ctx: &egui::Context) {
+        // [Linux] 无托盘：空体（块置尾避免 needless_return）
         #[cfg(target_os = "linux")]
         {
             let _ = ctx;
-            return;
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -544,10 +544,9 @@ impl HydraApp {
     /// 托盘 tooltip 与菜单禁用态和代理运行状态同步（变化才调用系统 API）。
     /// [G 修复] Linux 无托盘：函数体整体 cfg 掉（空实现，调用点不动）。
     pub(crate) fn sync_tray_tooltip(&mut self) {
+        // [Linux] 无托盘：空体（块置尾避免 needless_return）
         #[cfg(target_os = "linux")]
-        {
-            return;
-        }
+        {}
         #[cfg(not(target_os = "linux"))]
         {
             let tip = if self.proxy_running {

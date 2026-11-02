@@ -167,7 +167,7 @@ fn snapshot_is_dead(s: &SavedProxyState, is_live: impl Fn(u16) -> bool) -> bool 
 }
 
 fn write_manual(proxy_host: &str, proxy_port: &str) {
-    let _ = gsettings_set("org.gnome.system.proxy", "mode", "manual");
+    gsettings_set("org.gnome.system.proxy", "mode", "manual");
     for proto in PROTOS {
         gsettings_set(
             &format!("org.gnome.system.proxy.{proto}"),
