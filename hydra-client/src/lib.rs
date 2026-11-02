@@ -245,12 +245,20 @@ pub struct InstanceGuard {
     _listener: std::net::TcpListener,
 }
 
-/// CLI TUN 模式互斥端口：两个 TUN 实例会争抢同一 TUN 网卡与 /1 接管路由
-/// （第二实例路由失败半途退出虽安全，但期间路由可能指向错误适配器）。
+/// CLI 实例互斥端口：双 CLI 实例会并发写配置/抢系统代理状态。
+/// 仅在 `--tun` 时于 main 早期持有（TUN 模式两实例会争抢同一 TUN 网卡与
+/// /1 接管路由）。
 pub const INSTANCE_PORT_CLI_TUN: u16 = 52810;
 /// GUI 互斥端口：双 GUI 实例会并发写配置（虽已 pid 唯一化）且互相抢系统代理
 /// 开关状态，单实例语义更安全。
 pub const INSTANCE_PORT_GUI: u16 = 52811;
+/// TUN 设备跨形态共享互斥端口：CLI(`--tun`) 与 GUI(TUN) 均经 `tun::run_tun`
+/// 入口，共用本端口互斥——两者并发会争抢同一 TUN 网卡与 /1 接管路由。
+///
+/// **不得与 52810/52811 复用**：CLI 进程内 main 已持有 52810 守卫，同进程对
+/// 同端口二次 bind 必然 EADDRINUSE（内核按 (addr,port) 唯一，不区分同进程
+/// 还是跨进程）——曾导致 CLI `--tun` 100% 启动失败，报错文案误指"另一实例在运行"。
+pub const INSTANCE_PORT_TUN_SHARED: u16 = 52812;
 
 /// 尝试取得实例互斥。已有一实例在运行 → Err（携带用户可读信息）；
 /// 其余绑定错误原样透传。守卫须由调用方保存到 main 作用域直至退出。
@@ -356,5 +364,41 @@ mod tun_settings_tests {
             .exclude_routes
             .contains(&std::net::Ipv4Addr::new(1, 2, 3, 4)));
         assert_eq!(cfg.exclude_routes_v6.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod instance_guard_tests {
+    use super::*;
+
+    /// 回归：CLI `--tun` 曾在同一进程内对 52810 二次 bind（main 的 CLI 实例
+    /// 守卫 + run_tun 的跨形态 TUN 互斥），内核按 (addr,port) 唯一 → 必然
+    /// EADDRINUSE → CLI --tun 100% 启动失败，报错误指"另一实例在运行"。
+    /// 三个互斥端口必须互不相同。
+    #[test]
+    fn instance_guard_ports_are_distinct() {
+        let ports = [
+            INSTANCE_PORT_CLI_TUN,
+            INSTANCE_PORT_GUI,
+            INSTANCE_PORT_TUN_SHARED,
+        ];
+        for (i, a) in ports.iter().enumerate() {
+            for b in ports.iter().skip(i + 1) {
+                assert_ne!(a, b, "互斥端口复用会导致同进程二次 bind EADDRINUSE");
+            }
+        }
+    }
+
+    /// 同进程对同一端口二次 acquire 必须失败（EADDRINUSE）——这正是旧实现
+    /// 让 CLI --tun 恒定失败的机制；端口分离后 CLI 可同时持有 52810 + 52812。
+    #[test]
+    fn same_port_second_acquire_fails_but_distinct_ports_coexist() {
+        let g1 = acquire_instance_guard(INSTANCE_PORT_CLI_TUN).expect("首次 bind 应成功");
+        // 同端口二次 bind → 必须失败
+        assert!(acquire_instance_guard(INSTANCE_PORT_CLI_TUN).is_err());
+        // 不同端口 → 可共存（CLI 实例守卫 + 跨形态 TUN 互斥）
+        let g2 = acquire_instance_guard(INSTANCE_PORT_TUN_SHARED).expect("不同端口应共存");
+        drop(g1);
+        drop(g2);
     }
 }

@@ -473,6 +473,10 @@ async fn main() -> Result<()> {
 
     // 09-P3-5：TUN 模式双实例互斥——两个 TUN 实例会争抢同一 TUN 网卡与 /1
     // 接管路由。守卫存到 main 作用域直至退出（进程死自动释放端口）。
+    //
+    // 端口与 run_tun 的跨形态共享互斥（52812）刻意分离：同一进程对同一
+    // (addr,port) 二次 bind 必然 EADDRINUSE（内核不区分同进程/跨进程），
+    // 若两处复用同一端口则 CLI --tun 恒定启动失败。
     let _instance_guard = if tun_enabled(&std::env::args().collect::<Vec<String>>()) {
         match hydra_client::acquire_instance_guard(hydra_client::INSTANCE_PORT_CLI_TUN) {
             Ok(g) => Some(g),
